@@ -75,6 +75,7 @@ def clean_state(monkeypatch, tmp_path):
     """
     voice_server.reset_caches()
     monkeypatch.setattr(voice_server, "STRESS_FILE", tmp_path / "stress.json")
+    monkeypatch.setattr(voice_server, "HALLUCINATIONS_FILE", tmp_path / "stt_hallucinations.txt")
     monkeypatch.setattr(voice_server, "USE_ACCENT", False)
     monkeypatch.setattr(voice_server, "TTS_MODEL_OVERRIDE", "")
     monkeypatch.setattr(voice_server, "TTS_SPEAKER_OVERRIDE", "")
@@ -93,6 +94,13 @@ def accent_enabled(monkeypatch):
 def stress_file(tmp_path, monkeypatch):
     path = tmp_path / "stress.json"
     monkeypatch.setattr(voice_server, "STRESS_FILE", path)
+    return path
+
+
+@pytest.fixture
+def hallucinations_file(tmp_path, monkeypatch):
+    path = tmp_path / "stt_hallucinations.txt"
+    monkeypatch.setattr(voice_server, "HALLUCINATIONS_FILE", path)
     return path
 
 

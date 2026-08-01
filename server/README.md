@@ -99,6 +99,15 @@ The `+` goes immediately **before** the stressed vowel (Silero's notation). Your
 marked — otherwise it re-stresses them from its own dictionary and silently undoes your override. You
 can also just type a combining acute in the text you send (`робо́та`); it is converted for you.
 
+### Hallucination blocklist (`stt_hallucinations.txt`)
+
+Whisper on a near-silent clip sometimes invents a well-known junk transcript instead of returning
+nothing — TV end-credits, «Спасибо за просмотр», "Thank you for watching". `/stt` drops a transcript
+whose **full** normalized text equals (or extends, at a word boundary) an entry in
+`server/stt_hallucinations.txt` — one pattern per line, `#` comments allowed; genuine speech that
+merely contains a phrase is never touched. Extend the file freely; every drop is logged and counted
+in `GET /health` → `stt_hallucinations_dropped`.
+
 ## Tests
 
 ```sh
