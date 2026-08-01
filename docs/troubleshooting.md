@@ -110,3 +110,7 @@ The desktop does not expand `${CLAUDE_PLUGIN_ROOT}` — a hotkey needs the **abs
 `dictate-toggle.sh`. And a hotkey launched by the desktop gets a minimal environment: if your config
 references tools installed in a shell-only `PATH` (Homebrew, `~/.local/bin`), use absolute paths in
 `config.json`.
+
+### Dictation echoes the assistant back
+
+You pressed the hotkey while a spoken line was still playing, and the microphone transcribed the speakers. The dictation script now stops in-flight speech playback when a recording starts (the echo guard). If you still catch echo (external speakers, high volume), start recording after the line finishes, or use headphones.
