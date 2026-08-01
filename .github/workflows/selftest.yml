@@ -25,22 +25,51 @@ jobs:
             python3 -c "import json,sys; json.load(open(sys.argv[1]))" "$f" || exit 1
           done
 
+  coverage:
+    name: server unit tests (python ${{ matrix.python }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        # model-free and fast (well under a second of test time), so the version grid is cheap here.
+        # The heavy loopback jobs stay single-version per OS.
+        python: ["3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+      - name: install test dependencies (no models, no network at test time)
+        run: |
+          python -m pip install --upgrade pip
+          pip install --index-url https://download.pytorch.org/whl/cpu torch
+          pip install -r tests/requirements.txt
+      - name: pytest with a hard 100% coverage gate
+        run: pytest --cov=voice_server --cov-report=term-missing --cov-fail-under=100
+
   loopback:
-    name: loopback selftest (${{ matrix.os }})
+    name: loopback selftest (${{ matrix.os }}, ${{ matrix.language }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
         include:
-          # accentuation (RUAccent) is exercised on Linux; the macOS lane keeps the adapter path fast
+          # Two lanes, two languages: Russian exercises the accentuation pipeline on Linux, English
+          # exercises the macOS adapter path — English is a first-class language, not a fallback.
           - os: ubuntu-latest
             accent: "1"
+            language: ru
+            hook_phrase: Проверка озвучки.
           - os: macos-latest
             accent: "0"
+            language: en
+            hook_phrase: Speech check complete.
     env:
       VOICE_LOOP_STT_MODEL: small
-      VOICE_LOOP_LANGUAGE: ru
+      VOICE_LOOP_LANGUAGE: ${{ matrix.language }}
       VOICE_LOOP_DEVICE: cpu
       VOICE_LOOP_ACCENT: ${{ matrix.accent }}
       HF_HOME: ${{ github.workspace }}/.cache/hf
@@ -64,7 +93,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ github.workspace }}/.cache
-          key: models-${{ matrix.os }}-${{ env.VOICE_LOOP_STT_MODEL }}-v1
+          key: models-${{ matrix.os }}-${{ matrix.language }}-${{ env.VOICE_LOOP_STT_MODEL }}-v1
 
       - name: install server dependencies
         run: |
@@ -74,43 +103,61 @@ jobs:
           fi
           pip install -r server/requirements.txt
 
-      - name: prefetch models (cached across runs)
+      - name: prefetch models for this lane's language (cached across runs)
         run: |
           python - <<'PY'
-          import os, torch
+          import os, sys, torch
+          sys.path.insert(0, "server")
+          from voice_server import SILERO_VOICES
           from faster_whisper import WhisperModel
+
+          language = os.environ["VOICE_LOOP_LANGUAGE"]
+          silero_language, model_id, speaker = SILERO_VOICES[language]
+          print(f"prefetching whisper + silero {model_id} ({silero_language}, {speaker}) for {language}")
           WhisperModel(os.environ["VOICE_LOOP_STT_MODEL"], device="cpu", compute_type="int8")
-          torch.hub.load("snakers4/silero-models", "silero_tts", language="ru", speaker="v4_ru", trust_repo=True)
+          torch.hub.load(
+              "snakers4/silero-models", "silero_tts",
+              language=silero_language, speaker=model_id, trust_repo=True,
+          )
           PY
 
       - name: start the server
         run: |
           python server/voice_server.py &
           echo $! > /tmp/voice-loop.pid
+          # `if` keeps a failing poll from tripping the step's `set -e` while the server warms up
           for _ in $(seq 1 60); do
-            curl -fsS http://127.0.0.1:8355/health && break
+            if curl -fsS http://127.0.0.1:8355/health; then break; fi
             sleep 2
           done
           curl -fsS http://127.0.0.1:8355/health
 
       - name: loopback selftest (TTS -> STT -> compare)
-        run: bash plugins/voice-loop/scripts/selftest.sh --endpoint http://127.0.0.1:8355 --strict --threshold 0.7
+        run: |
+          bash plugins/voice-loop/scripts/selftest.sh \
+            --endpoint http://127.0.0.1:8355 \
+            --language "$VOICE_LOOP_LANGUAGE" \
+            --strict --threshold 0.7
 
       - name: Stop-hook contract (real invocation, no speakers)
+        env:
+          PHRASE: ${{ matrix.hook_phrase }}
+          LANGUAGE: ${{ matrix.language }}
         run: |
           mkdir -p "$HOME/.config/voice-loop"
-          cat > "$HOME/.config/voice-loop/config.json" <<'JSON'
+          cat > "$HOME/.config/voice-loop/config.json" <<JSON
           {
-            "language": "ru",
+            "language": "$LANGUAGE",
             "tts": { "backend": "lan", "endpoint": "http://127.0.0.1:8355" },
             "speak": { "marker": "🔊", "player": "true", "timeout": 180 }
           }
           JSON
-          printf '%s\n' '{"type":"assistant","message":{"content":[{"type":"text","text":"обычная строка\n🔊 Проверка озвучки."}]}}' > /tmp/transcript.jsonl
+          python3 -c 'import json, os; print(json.dumps({"type": "assistant", "message": {"content": [{"type": "text", "text": "a plain line that must NOT be spoken\n\U0001F50A " + os.environ["PHRASE"]}]}}))' > /tmp/transcript.jsonl
           printf '%s' '{"transcript_path": "/tmp/transcript.jsonl"}' | bash plugins/voice-loop/scripts/speak.sh
           state="${XDG_STATE_HOME:-$HOME/.local/state}/voice-loop"
           echo "--- speak.log"; cat "$state/speak.log"
-          grep -q "Проверка озвучки" "$state/last-spoken" || { echo "marker extraction failed"; exit 1; }
+          grep -q "$PHRASE" "$state/last-spoken" || { echo "marker extraction failed"; exit 1; }
+          if grep -q "plain line" "$state/last-spoken"; then echo "an unmarked line was spoken"; exit 1; fi
           grep -q "played rc=0" "$state/speak.log" || { echo "synthesis/playback path failed"; exit 1; }
 
       - name: server log on failure

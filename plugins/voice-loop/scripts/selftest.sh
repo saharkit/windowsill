@@ -63,6 +63,7 @@ if [ -z "$PHRASE" ]; then
   case "$LANG_" in
     ru) PHRASE="Проверка связи. Голосовой контур работает нормально." ;;
     uk) PHRASE="Перевірка зв'язку. Голосовий контур працює нормально." ;;
+    en) PHRASE="This is a connection check. The voice loop is working normally." ;;
     de) PHRASE="Verbindungstest. Der Sprachkreis funktioniert einwandfrei." ;;
     es) PHRASE="Prueba de conexión. El circuito de voz funciona correctamente." ;;
     fr) PHRASE="Test de liaison. La boucle vocale fonctionne correctement." ;;

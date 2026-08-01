@@ -1,9 +1,62 @@
-# voice-loop — human acceptance checklist
+# voice-loop — testing
 
-CI proves the parts a machine can reach: the scripts parse, the manifests are valid, and the loopback
-(TTS → STT → compare) plus the Stop-hook contract run green on Linux and macOS. **Everything below is
-what CI structurally cannot check** — a real microphone, a real hotkey, real ears, and a real user
-sitting in default permission mode.
+Two halves: what CI proves mechanically (below), and the human acceptance checklist (further down)
+for everything a machine structurally cannot reach.
+
+## What "tested" means here — the honest version
+
+The code in this plugin is two different materials, and they get two different guarantees. Saying
+"100% coverage" without this paragraph would be marketing; here is exactly what the number is.
+
+### Python (`server/voice_server.py`) — 100%, gated
+
+`pytest --cov=voice_server --cov-fail-under=100` runs on **every commit**, on **Python 3.10, 3.11,
+3.12 and 3.13**, and the build fails below 100% — statements *and* branches (`branch = True` in
+`.coveragerc`). It is a **gate, not a score**: it does not drift, and it is not a claim that the
+server is bug-free. It is a claim that no line and no branch of that file is unexercised, so a change
+cannot quietly add an untested path.
+
+What makes 100% honest rather than decorative:
+
+- **No models, no network, no audio hardware in the unit tests.** Every expensive dependency is
+  loaded through a seam the tests replace: the recognizer comes from an importable module
+  (`faster_whisper`), the voices from `torch.hub.load`, the accentuators from the packages named in
+  `ACCENTUATORS`. The tests install fakes and then run the **real function bodies**.
+- **The parts whose behaviour is the contract are real**: real torch tensors, real WAV encoding by
+  `soundfile`, real FastAPI request handling. A `/tts` test asserts an actual `RIFF` file comes back —
+  the same thing `selftest.sh` checks before feeding those bytes to recognition.
+- **One exclusion, declared:** the `if __name__ == "__main__":` guard, whose entire body is a call to
+  `main()` — and `main()` itself is tested (with `uvicorn.run` patched). Nothing else is excluded.
+- Accentuation is **off by default in the fixtures**, so a language package that happens to be
+  installed in someone's environment can never make the tests reach for a model over the network.
+
+### Shell (`scripts/*.sh`) — shellcheck plus a real invocation
+
+There is deliberately **no line-coverage number for the shell scripts**. Line coverage is not a
+meaningful metric for glue that spends its life calling `curl`, `pw-record`, `wl-copy` and `ydotool`:
+a script can be 100% "covered" by mocks and still fail on the only thing that matters — the real
+runtime. So the guarantee is different in kind:
+
+1. `bash -n` and **shellcheck** (`-S warning`) on every script, every commit;
+2. a **real invocation of the Stop hook in CI**: a synthetic transcript, the actual `speak.sh`, the
+   actual speech server, a no-op player — asserting that the marked line was extracted, that an
+   unmarked line was *not* spoken, and that synthesis and playback returned success;
+3. the **loopback selftest** (`selftest.sh`), which is itself one of the scripts, exercised against a
+   live server on both Linux and macOS.
+
+Real invocation is the guarantee. Everything a mock could tell us about these scripts, we have
+decided we do not want to hear.
+
+### What neither of those covers
+
+The hotkey, the microphone, the paste keystroke into a real window, the Accessibility consent, and
+whether you can actually *hear* it. That is the checklist below, and it needs a human.
+
+## Human acceptance checklist
+
+Run it on a machine that has never had voice-loop on it (a clean container or a fresh VM for Linux; a
+teammate's untouched Mac for the macOS branch). "Works on the machine it was built on" is not a
+result.
 
 Run this before every release, on a machine that has never had voice-loop on it (a clean container or a
 fresh VM for Linux; a teammate's untouched Mac for the macOS branch). "Works on the machine it was
