@@ -1,7 +1,7 @@
 # voice-loop
 
 [![selftest](https://github.com/saharkit/windowsill/actions/workflows/selftest.yml/badge.svg)](https://github.com/saharkit/windowsill/actions/workflows/selftest.yml)
-[![coverage: 100% (gated)](https://img.shields.io/badge/coverage-100%25%20(gated)-brightgreen)](TESTING.md)
+[![coverage: 100% (gated)](https://img.shields.io/badge/coverage-100%25%20%28gated%29-brightgreen)](TESTING.md)
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue)](../../LICENSE)
 [![python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)](../../server/README.md#requirements)
 
