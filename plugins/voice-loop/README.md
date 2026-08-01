@@ -92,12 +92,36 @@ cloud as above, mint a reference recording from the voice you chose, and run **X
 GPU** with that reference — after which the cloud key is no longer needed and synthesis is local
 again. Same ethics rule applies to the reference: your own voice, or one you have explicit rights to.
 
+## Latency — speak-back streams
+
+The Stop hook does not synthesize the whole message before you hear anything. The marked text is
+split into **sentence chunks** (tiny sentences are merged so a chunk is at least ~40 characters);
+the first chunk starts playing the moment *it* is synthesized, and the next chunk synthesizes
+while the previous one plays. What you wait for is one short synthesis, not the whole line. A
+fresher turn still wins: a new hook invocation stops the playing chain (precisely — by the PIDs it
+recorded, nothing pattern-matched) and speaks the new line instead.
+
+The hook also reads the transcript **immediately** and retries only on the actual flush-race
+signatures (an empty extract, or one identical to the last spoken line), with adaptive backoff —
+an already-flushed transcript costs zero sleep.
+
+Every spoken run logs its own before/after evidence to `~/.local/state/voice-loop/speak.log`:
+
+```
+timings extract_ms=450 first_audio_ms=583 total_ms=1581
+```
+
+`extract_ms` is the transcript read including any flush-race retries, `first_audio_ms` is when
+sound actually started, `total_ms` is the whole run. On a multi-sentence line, `first_audio_ms`
+sitting far below `total_ms` *is* the streaming, visible in numbers.
+
 ## What is in here
 
 ```
 plugins/voice-loop/
   hooks/hooks.json        registers the Stop hook
-  scripts/speak.sh        the Stop hook: extract marked lines -> synthesize -> play
+  scripts/speak.sh        the Stop hook's launcher (stable entry point; never fails a turn)
+  scripts/speak.py        the Stop hook: extract marked lines -> chunk -> synthesize -> stream-play
   scripts/dictate-toggle.sh   push-to-talk toggle: record -> transcribe -> clipboard/paste
   scripts/selftest.sh     hardware-free loopback proof (TTS -> STT -> compare)
   skills/voice-setup/     the agent installer
