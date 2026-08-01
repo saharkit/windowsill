@@ -1,5 +1,14 @@
 # voice-loop
 
+[![selftest](https://github.com/saharkit/windowsill/actions/workflows/selftest.yml/badge.svg)](https://github.com/saharkit/windowsill/actions/workflows/selftest.yml)
+[![coverage: 100% (gated)](https://img.shields.io/badge/coverage-100%25%20(gated)-brightgreen)](TESTING.md)
+[![license: MIT](https://img.shields.io/badge/license-MIT-blue)](../../LICENSE)
+[![python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)](../../server/README.md#requirements)
+
+> The coverage badge is a **gate** (`--cov-fail-under=100` on the server's Python, statements and
+> branches, on 3.10–3.13), not a drifting number; the shell scripts are held to shellcheck plus a
+> real Stop-hook invocation in CI instead. [TESTING.md](TESTING.md) spells out both.
+
 Talk to Claude Code, and hear it answer.
 
 A Claude Code plugin that closes the voice loop in both directions:
@@ -44,9 +53,23 @@ reasonable mix.
 | `lan` | another box you own, over HTTP or an ssh tunnel | free | stays on your network | the honest sweet spot if you have a GPU machine — `server/` is that server |
 | `cloud` | a hosted speech API | per-use billing | **your audio and text leave your machine** | off by default; keys live in a file the config points at, never in the config |
 
-Languages: recognition is multilingual (whisper); local synthesis ships `ru`, `uk`, `en`, `de`, `es`,
-`fr`, with automatic stress marking for `ru` and `uk` — see
-[`server/README.md`](../../server/README.md).
+## Languages
+
+Recognition (whisper) is multilingual. Local synthesis ships the Silero voices below; **English is a
+first-class language, not a fallback** — it has its own selftest phrase and its own CI loopback lane
+(the macOS one).
+
+| language | synthesis model | default speaker | automatic stress marking |
+|---|---|---|---|
+| `en` English | `v3_en` | `en_0` | not needed |
+| `ru` Russian | `v4_ru` | `baya` | RUAccent |
+| `uk` Ukrainian | `v4_ua` | `mykyta` | ukrainian-word-stress |
+| `de` German | `v3_de` | `eva_k` | — |
+| `es` Spanish | `v3_es` | `es_0` | — |
+| `fr` French | `v3_fr` | `fr_0` | — |
+
+Any other language: recognition still works; for synthesis use a cloud backend or the macOS built-in
+`say` voice. Details in [`server/README.md`](../../server/README.md).
 
 ## A voice of your own
 
@@ -107,8 +130,13 @@ Synthesizes a known phrase, feeds the audio straight back into recognition, and 
 transcript (case, punctuation and stress marks ignored). No microphone, no speakers, no display — it
 runs in a bare container, and it is what CI runs on Linux and macOS on every commit.
 
-The parts a machine cannot check for you — the hotkey, a real microphone, whether you actually hear
-it — are a written checklist: [TESTING.md](TESTING.md).
+The server's own Python is unit-tested with a hard 100% coverage gate on Python 3.10–3.13, and the
+Stop hook is invoked for real in CI. The parts a machine cannot check for you — the hotkey, a real
+microphone, whether you actually hear it — are a written checklist. Both halves, and what the
+coverage number honestly claims, are in [TESTING.md](TESTING.md).
+
+Deeper reading: [architecture](../../docs/architecture.md) ·
+[troubleshooting](../../docs/troubleshooting.md) · [FAQ](../../docs/faq.md).
 
 ## Author
 

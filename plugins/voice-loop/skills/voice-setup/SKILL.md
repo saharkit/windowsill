@@ -94,7 +94,8 @@ models. Say this **before** installing, not after.
 ```
 This is the one place a `sudo` line may appear — **printed for the user to run**, never executed by you.
 
-Server (only for `local`):
+Server (only for `local`) — needs **Python >= 3.10**; check `python3 --version` from the probe first
+and, if the system python is older, use a newer interpreter explicitly (`python3.12 -m venv …`):
 
 ```sh
 python3 -m venv ~/.local/share/voice-loop/venv && \

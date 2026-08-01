@@ -21,6 +21,8 @@ Silero ships a model for — an unsupported code returns 400 with the supported 
 
 No authentication: bind to loopback (the default) and reach it over ssh, or put it behind a reverse
 proxy if you expose it. Do not put it on an untrusted network as-is.
+
+Requires Python >= 3.10.
 """
 
 from __future__ import annotations
@@ -30,6 +32,7 @@ import json
 import logging
 import os
 import re
+import sys
 import tempfile
 from pathlib import Path
 
@@ -37,6 +40,20 @@ import torch
 import uvicorn
 from fastapi import FastAPI, File, UploadFile
 from fastapi.responses import JSONResponse, Response
+
+MIN_PYTHON = (3, 10)
+
+
+def require_python(version: tuple[int, int] | None = None) -> None:
+    """Fail loudly and legibly on an interpreter too old, instead of a confusing SyntaxError later."""
+    version = version or sys.version_info[:2]
+    if version < MIN_PYTHON:
+        raise SystemExit(
+            "voice-loop server needs Python {}.{} or newer, found {}.{}".format(*MIN_PYTHON, *version)
+        )
+
+
+require_python()
 
 log = logging.getLogger("voice-loop")
 app = FastAPI(title="voice-loop", docs_url=None, redoc_url=None)
@@ -72,10 +89,26 @@ TTS_SR = 48000
 MAX_TTS_CHARS = 800  # Silero degrades past ~1000 characters per call
 PAUSE_SECONDS = 0.4
 
+# Lazily filled caches. Everything expensive is loaded on first use through a seam a test can
+# replace — the loaders below take their dependencies from importable modules and torch.hub, both
+# patchable, so the whole file is exercisable without a single model on disk.
 _whisper = None
 _tts: dict[str, object] = {}
 _accent: dict[str, object] = {}
 _stress: list[tuple[re.Pattern[str], str]] | None = None
+
+
+def reset_caches() -> None:
+    """Drop every lazily loaded model, accentuator and stress rule set.
+
+    Used by the tests between cases, and by anyone who edits stress.json and wants it re-read
+    without restarting the process.
+    """
+    global _whisper, _stress
+    _whisper = None
+    _stress = None
+    _tts.clear()
+    _accent.clear()
 
 
 def resolve_device() -> str:
@@ -310,6 +343,11 @@ async def tts_endpoint(payload: dict) -> Response:
     return Response(out.getvalue(), media_type="audio/wav")
 
 
-if __name__ == "__main__":
+def main() -> None:
     logging.basicConfig(level=os.environ.get("VOICE_LOOP_LOG_LEVEL", "INFO"))
+    log.info("voice-loop server on %s:%s (language=%s, device=%s)", HOST, PORT, LANGUAGE, resolve_device())
     uvicorn.run(app, host=HOST, port=PORT)
+
+
+if __name__ == "__main__":  # pragma: no cover - the one-line shell around the tested main()
+    main()
