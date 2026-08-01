@@ -1,0 +1,120 @@
+# voice-loop
+
+Talk to Claude Code, and hear it answer.
+
+A Claude Code plugin that closes the voice loop in both directions:
+
+- **out** — a `Stop` hook speaks the lines your assistant marks with `🔊`. Only marked lines are
+  voiced, so you hear the summary and read the detail. Nothing else about your session changes.
+- **in** — a push-to-talk script: press a hotkey, speak, press again. The audio is transcribed and
+  lands in the focused window (or on your clipboard, which is the default no-permissions path).
+
+Speech runs where you choose: **on this machine**, on **a box on your network**, or in the **cloud**.
+Setup is not a document you follow — it is `/voice-setup`, a skill that probes your machine, installs
+what is missing, writes your config, wires a hotkey, and proves the result with a loopback test.
+
+## Quickstart
+
+```
+claude marketplace add saharkit/windowsill
+/plugin install voice-loop@windowsill
+```
+
+then, in a session:
+
+```
+/voice-setup
+```
+
+Answer two or three questions (language, where speech should run) and it finishes with a green
+selftest. To pick a custom synthetic voice afterwards: `/voice-design`.
+
+To hear something, ask for it in your `CLAUDE.md` — one line is enough:
+
+> End each reply with a one-sentence spoken summary on its own line, starting with 🔊.
+
+## The three backends
+
+Each direction is configured independently — recognition local and synthesis cloud is a perfectly
+reasonable mix.
+
+| | where it runs | cost | privacy | notes |
+|---|---|---|---|---|
+| `local` | your machine | free | audio never leaves it | whisper `small` ≈ 2 GB RAM, a second or two per phrase on a modern CPU; Silero TTS is near real time. First run downloads ~0.5–1.5 GB of models |
+| `lan` | another box you own, over HTTP or an ssh tunnel | free | stays on your network | the honest sweet spot if you have a GPU machine — `server/` is that server |
+| `cloud` | a hosted speech API | per-use billing | **your audio and text leave your machine** | off by default; keys live in a file the config points at, never in the config |
+
+Languages: recognition is multilingual (whisper); local synthesis ships `ru`, `uk`, `en`, `de`, `es`,
+`fr`, with automatic stress marking for `ru` and `uk` — see
+[`server/README.md`](../../server/README.md).
+
+## A voice of your own
+
+`/voice-design` casts a custom synthetic voice: you describe the timbre you want in your own words, it
+auditions candidates through ElevenLabs text-to-voice, and the one you pick is written into your
+config. It will not imitate a real, identifiable person — generalized timbre descriptions only.
+
+**If it sounds robotic, it is usually not the model.** Two levers, in order. *Cloud:* raise
+`stability` first (0.6–0.75 — breathy voices go metallic at LOW stability, not high), keep `style`
+≤ 0.15, `similarity_boost` 0.75–0.85, `use_speaker_boost` on; keep each request short; and if
+artifacts survive the settings, regenerate a new preview instead of tuning further. *Local ru/uk:*
+what sounds robotic is nearly always **wrong stress** — install the accentuation package for your
+language and add proper names to `stress.json` (or type a combining acute, `Ка́тя`, and the server
+converts it). The full recipe lives in the `voice-design` skill.
+
+**v0.2 roadmap — design in the cloud, then drop the key.** The planned path is: design the voice in the
+cloud as above, mint a reference recording from the voice you chose, and run **XTTS-v2 on your own LAN
+GPU** with that reference — after which the cloud key is no longer needed and synthesis is local
+again. Same ethics rule applies to the reference: your own voice, or one you have explicit rights to.
+
+## What is in here
+
+```
+plugins/voice-loop/
+  hooks/hooks.json        registers the Stop hook
+  scripts/speak.sh        the Stop hook: extract marked lines -> synthesize -> play
+  scripts/dictate-toggle.sh   push-to-talk toggle: record -> transcribe -> clipboard/paste
+  scripts/selftest.sh     hardware-free loopback proof (TTS -> STT -> compare)
+  skills/voice-setup/     the agent installer
+  skills/voice-design/    voice casting
+  TESTING.md              the human acceptance checklist
+server/                   the self-hostable speech server (FastAPI + faster-whisper + Silero), Dockerfile
+```
+
+## Permissions — the ladder, and why the default rung is the low one
+
+Hooks run without permission prompts, so speak-back works under any permission mode with no extra
+grants. Dictation is where privileges can creep in, so it is tiered and **starts at the bottom**:
+
+1. **Default — no root, no consent dialogs, works everywhere.** The transcript goes to your clipboard
+   and you press your own paste key. This is fully functional; everything below is convenience.
+2. **Auto-paste, no root.** `wtype` (KDE/wlroots) or `xdotool` (X11) on Linux; on macOS a single
+   Accessibility consent for `osascript`.
+3. **Auto-paste on GNOME/Wayland — one root step.** Mutter exposes no virtual-keyboard protocol, so
+   this needs the `ydotool` daemon. `/voice-setup` **prints** that command for you to run rather than
+   running it, and says plainly what it grants.
+
+`/voice-setup` is written for default permission mode: it announces its plan, batches its work into a
+few coarse actions, and never hides a `sudo`.
+
+## Verify it yourself
+
+```sh
+bash plugins/voice-loop/scripts/selftest.sh --endpoint http://127.0.0.1:8355
+```
+
+Synthesizes a known phrase, feeds the audio straight back into recognition, and compares the
+transcript (case, punctuation and stress marks ignored). No microphone, no speakers, no display — it
+runs in a bare container, and it is what CI runs on Linux and macOS on every commit.
+
+The parts a machine cannot check for you — the hotkey, a real microphone, whether you actually hear
+it — are a written checklist: [TESTING.md](TESTING.md).
+
+## Author
+
+**Sahar** — AI engineer at saharkit. Designed and built live on 2026-08-01, generalized from a working
+deployment.
+
+## License
+
+MIT — see [LICENSE](../../LICENSE).
