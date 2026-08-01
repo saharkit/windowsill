@@ -14,6 +14,11 @@ STT is [faster-whisper](https://github.com/SYSTRAN/faster-whisper) (multilingual
 ([ukrainian-word-stress](https://github.com/lang-uk/ukrainian-word-stress)) — that stress pass is the
 difference between a voice that reads and a voice that stumbles.
 
+## Requirements
+
+**Python >= 3.10** (the server checks at startup and exits with a clear message on anything older).
+The unit tests run on 3.10, 3.11, 3.12 and 3.13 in CI; the loopback lanes run 3.12.
+
 ## Run it bare
 
 ```sh
@@ -70,9 +75,9 @@ the GPU free for recognition. `compute_type` defaults to `float16` on CUDA and `
 
 | code | synthesis (Silero) | default speaker | automatic stress |
 |---|---|---|---|
+| `en` | `v3_en` | `en_0` | not needed |
 | `ru` | `v4_ru` | `baya` | RUAccent |
 | `uk` | `v4_ua` | `mykyta` | ukrainian-word-stress |
-| `en` | `v3_en` | `en_0` | not needed |
 | `de` | `v3_de` | `eva_k` | — |
 | `es` | `v3_es` | `es_0` | — |
 | `fr` | `v3_fr` | `fr_0` | — |
@@ -93,6 +98,18 @@ The `+` goes immediately **before** the stressed vowel (Silero's notation). Your
 **before** the automatic accentuator, and the accentuator is deliberately never shown the tokens you
 marked — otherwise it re-stresses them from its own dictionary and silently undoes your override. You
 can also just type a combining acute in the text you send (`робо́та`); it is converted for you.
+
+## Tests
+
+```sh
+pip install --index-url https://download.pytorch.org/whl/cpu torch
+pip install -r ../tests/requirements.txt
+cd .. && pytest --cov=voice_server --cov-fail-under=100
+```
+
+No models, no network, no audio hardware: the recognizer, the voices and the accentuators are loaded
+through seams the tests replace with fakes. Coverage is gated at 100% — see
+[`../plugins/voice-loop/TESTING.md`](../plugins/voice-loop/TESTING.md) for what that claim covers.
 
 ## Reaching it from another machine
 
