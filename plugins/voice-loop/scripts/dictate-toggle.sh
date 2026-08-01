@@ -74,6 +74,8 @@ sound() { # sound <path>
 }
 
 start_recording() {
+  # echo guard: never record our own speakers — stop any in-flight speak playback first (windowsill#3)
+  pkill -u "$(id -u)" -f "voice-loop-speak" 2>/dev/null || true
   case "$RECORDER" in
     auto)
       if [ "$OS" = "Darwin" ]; then
