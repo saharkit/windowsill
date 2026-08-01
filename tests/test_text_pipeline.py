@@ -7,12 +7,31 @@ and the part with no hardware in it at all — so it gets the closest tests.
 from __future__ import annotations
 
 import json
+import time
 
 import pytest
 
 import voice_server
 
 ACUTE = "́"
+
+
+def bracket(segment: str) -> str:
+    """A fake accentuator that shows exactly which runs were handed to the engine."""
+    return f"[{segment}]"
+
+
+@pytest.fixture
+def bracketing(monkeypatch, accent_enabled):
+    """Accentuation on, with `bracket` as the engine; the returned list records every call."""
+    calls: list[str] = []
+
+    def engine(segment: str) -> str:
+        calls.append(segment)
+        return bracket(segment)
+
+    monkeypatch.setitem(voice_server.ACCENTUATORS, "ru", lambda: engine)
+    return calls
 
 
 def test_acute_to_plus_moves_the_mark_before_the_vowel():
@@ -43,6 +62,55 @@ def test_marked_tokens_are_hidden_from_the_accentuator(monkeypatch, accent_enabl
 
     assert "Сах+ар" in result  # the marked token reached the model untouched
     assert " И ОБЫЧНЫЕ СЛОВА" in result  # the free segments went through the accentuator
+
+
+def test_a_marked_token_at_the_start_protects_only_itself(bracketing):
+    assert voice_server.mark_stress("Сах+ар и обычные слова", "ru") == "Сах+ар[ и обычные слова]"
+    assert bracketing == [" и обычные слова"]
+
+
+def test_a_marked_token_in_the_middle_keeps_both_sides_whole(bracketing):
+    assert voice_server.mark_stress("мама Сах+ар мыла раму", "ru") == "[мама ]Сах+ар[ мыла раму]"
+    assert bracketing == ["мама ", " мыла раму"]
+
+
+def test_a_marked_token_at_the_end_protects_only_itself(bracketing):
+    assert voice_server.mark_stress("обычные слова Сах+ар", "ru") == "[обычные слова ]Сах+ар"
+    assert bracketing == ["обычные слова "]
+
+
+def test_consecutive_marked_tokens_leave_the_whitespace_between_them_untouched(bracketing):
+    """The run between two marked tokens is whitespace only — nothing to accentuate."""
+    assert voice_server.mark_stress("Сах+ар м+ыло с+ода", "ru") == "Сах+ар м+ыло с+ода"
+    assert bracketing == []
+
+
+def test_text_without_a_marked_token_reaches_the_engine_as_one_run(bracketing):
+    """Multi-word context matters to the engine, so an unmarked text is never split into words."""
+    assert voice_server.mark_stress("совсем обычные слова", "ru") == "[совсем обычные слова]"
+    assert bracketing == ["совсем обычные слова"]
+
+
+def test_text_of_marked_tokens_only_never_reaches_the_engine(bracketing):
+    assert voice_server.mark_stress("Сах+ар", "ru") == "Сах+ар"
+    assert bracketing == []
+
+
+def test_a_long_unbroken_input_is_segmented_in_linear_time(bracketing):
+    """Guards the /tts segmentation against a quadratic-backtracking regex (py/polynomial-redos).
+
+    50k characters with no whitespace and no '+' is the worst case for the pattern this replaced;
+    the linear pass finishes in milliseconds.
+    """
+    text = "а" * 50_000
+
+    started = time.perf_counter()
+    result = voice_server.mark_stress(text, "ru")
+    elapsed = time.perf_counter() - started
+
+    assert result == bracket(text)
+    assert bracketing == [text]
+    assert elapsed < 1.0
 
 
 def test_accentuator_failure_on_a_segment_degrades_to_the_raw_text(monkeypatch, accent_enabled):

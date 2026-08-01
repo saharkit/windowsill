@@ -236,6 +236,32 @@ def default_speaker(language: str) -> str:
     return SILERO_VOICES[language][2]
 
 
+def protected_segments(text: str) -> list[tuple[str, bool]]:
+    """Cut text into `(segment, is_marked)` runs — the seam that hides '+'-marked tokens.
+
+    A whitespace-delimited token carrying a '+' is already stressed, so it becomes a segment of its
+    own and never reaches the accentuator. Everything between two such tokens — the words AND the
+    whitespace around them — accumulates into ONE run, so the engine still sees multi-word context
+    instead of isolated words it cannot disambiguate.
+
+    Tokenizing on whitespace and grouping afterwards is deliberate. Matching the marked tokens
+    directly with a pattern like `(\\S*\\+\\S*)` selects the same segments, but its two unbounded
+    quantifiers make the matcher retry every start position against the rest of the input: quadratic
+    on a long unbroken string, which /tts accepts straight from the network. `(\\s+)` has no such
+    ambiguity, and the grouping below is a single linear pass.
+    """
+    segments: list[list[str]] = []
+    marked: list[bool] = []
+    for token in re.split(r"(\s+)", text):
+        is_marked = "+" in token  # whitespace tokens never carry one, so this only picks words
+        if is_marked or not segments or marked[-1]:
+            segments.append([token])
+            marked.append(is_marked)
+        else:
+            segments[-1].append(token)
+    return [("".join(parts), is_marked) for parts, is_marked in zip(segments, marked)]
+
+
 def mark_stress(text: str, language: str) -> str:
     """Normalize stress marking to Silero's '+' notation. ORDER IS LOAD-BEARING (debugged live):
 
@@ -243,7 +269,8 @@ def mark_stress(text: str, language: str) -> str:
     2. the user's override dictionary (adds '+' to known proper names);
     3. the automatic accentuator LAST (RUAccent for ru, ukrainian-word-stress for uk) — and it must
        never see the already-'+'-marked tokens: it re-stresses them from ITS own dictionary and undoes
-       the override. So the text is split on marked tokens and only the free segments are accentuated.
+       the override. So the text is cut into runs by protected_segments() and only the free ones are
+       accentuated.
 
     One mechanism, one place: languages differ only by which callable fills slot 3. Languages with no
     accentuator and no user rules pass through untouched.
@@ -255,14 +282,16 @@ def mark_stress(text: str, language: str) -> str:
         text = pattern.sub(replacement, text)
     engine = accentuator(language)
     if engine is not None:
-        parts = re.split(r"(\S*\+\S*)", text)
-        for i, part in enumerate(parts):
-            if "+" in part or not part.strip():
+        parts: list[str] = []
+        for segment, is_marked in protected_segments(text):
+            if is_marked or not segment.strip():
+                parts.append(segment)
                 continue
             try:
-                parts[i] = engine(part)
+                parts.append(engine(segment))
             except Exception as exc:
                 log.debug("accentuation failed on a segment (%s) — kept as is", exc)
+                parts.append(segment)
         text = "".join(parts)
     return text
 
