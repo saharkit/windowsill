@@ -1,0 +1,118 @@
+name: selftest
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  shellcheck:
+    name: scripts parse and lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: bash -n every script
+        run: for f in plugins/voice-loop/scripts/*.sh; do bash -n "$f" || exit 1; done
+      - name: shellcheck
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+          shellcheck -S warning plugins/voice-loop/scripts/*.sh
+      - name: plugin manifests are valid JSON
+        run: |
+          for f in .claude-plugin/marketplace.json plugins/voice-loop/.claude-plugin/plugin.json \
+                   plugins/voice-loop/hooks/hooks.json; do
+            python3 -c "import json,sys; json.load(open(sys.argv[1]))" "$f" || exit 1
+          done
+
+  loopback:
+    name: loopback selftest (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # accentuation (RUAccent) is exercised on Linux; the macOS lane keeps the adapter path fast
+          - os: ubuntu-latest
+            accent: "1"
+          - os: macos-latest
+            accent: "0"
+    env:
+      VOICE_LOOP_STT_MODEL: small
+      VOICE_LOOP_LANGUAGE: ru
+      VOICE_LOOP_DEVICE: cpu
+      VOICE_LOOP_ACCENT: ${{ matrix.accent }}
+      HF_HOME: ${{ github.workspace }}/.cache/hf
+      TORCH_HOME: ${{ github.workspace }}/.cache/torch
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: system audio libraries
+        run: |
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            sudo apt-get update -qq && sudo apt-get install -y -qq libsndfile1 jq
+          else
+            brew install libsndfile jq
+          fi
+
+      - name: cache speech models
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/.cache
+          key: models-${{ matrix.os }}-${{ env.VOICE_LOOP_STT_MODEL }}-v1
+
+      - name: install server dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            pip install --index-url https://download.pytorch.org/whl/cpu torch
+          fi
+          pip install -r server/requirements.txt
+
+      - name: prefetch models (cached across runs)
+        run: |
+          python - <<'PY'
+          import os, torch
+          from faster_whisper import WhisperModel
+          WhisperModel(os.environ["VOICE_LOOP_STT_MODEL"], device="cpu", compute_type="int8")
+          torch.hub.load("snakers4/silero-models", "silero_tts", language="ru", speaker="v4_ru", trust_repo=True)
+          PY
+
+      - name: start the server
+        run: |
+          python server/voice_server.py &
+          echo $! > /tmp/voice-loop.pid
+          for _ in $(seq 1 60); do
+            curl -fsS http://127.0.0.1:8355/health && break
+            sleep 2
+          done
+          curl -fsS http://127.0.0.1:8355/health
+
+      - name: loopback selftest (TTS -> STT -> compare)
+        run: bash plugins/voice-loop/scripts/selftest.sh --endpoint http://127.0.0.1:8355 --strict --threshold 0.7
+
+      - name: Stop-hook contract (real invocation, no speakers)
+        run: |
+          mkdir -p "$HOME/.config/voice-loop"
+          cat > "$HOME/.config/voice-loop/config.json" <<'JSON'
+          {
+            "language": "ru",
+            "tts": { "backend": "lan", "endpoint": "http://127.0.0.1:8355" },
+            "speak": { "marker": "🔊", "player": "true", "timeout": 180 }
+          }
+          JSON
+          printf '%s\n' '{"type":"assistant","message":{"content":[{"type":"text","text":"обычная строка\n🔊 Проверка озвучки."}]}}' > /tmp/transcript.jsonl
+          printf '%s' '{"transcript_path": "/tmp/transcript.jsonl"}' | bash plugins/voice-loop/scripts/speak.sh
+          state="${XDG_STATE_HOME:-$HOME/.local/state}/voice-loop"
+          echo "--- speak.log"; cat "$state/speak.log"
+          grep -q "Проверка озвучки" "$state/last-spoken" || { echo "marker extraction failed"; exit 1; }
+          grep -q "played rc=0" "$state/speak.log" || { echo "synthesis/playback path failed"; exit 1; }
+
+      - name: server log on failure
+        if: failure()
+        run: kill "$(cat /tmp/voice-loop.pid)" 2>/dev/null || true

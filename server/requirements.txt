@@ -1,0 +1,23 @@
+# voice-loop speech server.
+#
+# CPU-only install (much smaller — the default PyPI torch wheel for Linux pulls the CUDA stack):
+#   pip install --index-url https://download.pytorch.org/whl/cpu torch
+#   pip install -r requirements.txt
+#
+# GPU install: install torch per https://pytorch.org/get-started/locally/ first, then this file.
+
+fastapi>=0.110,<1.0
+uvicorn[standard]>=0.27,<1.0
+python-multipart>=0.0.9          # FastAPI needs it for multipart /stt uploads
+faster-whisper>=1.0,<2.0         # STT (multilingual)
+torch>=2.2                       # Silero TTS runs on torch.hub
+soundfile>=0.12                  # WAV encoding (needs libsndfile on the system)
+numpy>=1.26
+
+# --- optional per-language accentuation extras -------------------------------------------------
+# Stress marking is what makes a synthetic voice stop sounding drunk. Install only your language;
+# each one is optional and the server degrades to your stress.json (or to nothing) without it.
+#
+#   [ru]  ruaccent — context-aware stress + yo-fication (installed by default below)
+#   [uk]  pip install "ukrainian-word-stress>=1.0"   # dictionary-based Ukrainian accentuation
+ruaccent>=1.5

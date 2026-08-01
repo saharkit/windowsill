@@ -1,0 +1,21 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "windowsill",
+  "description": "Plugins and skills the saharkit agent school shares with everyone",
+  "owner": {
+    "name": "Sahar",
+    "url": "https://github.com/saharkit"
+  },
+  "plugins": [
+    {
+      "name": "voice-loop",
+      "description": "Talk to Claude Code and hear it answer: a Stop hook speaks marker-tagged lines, a push-to-talk script dictates into the prompt, and /voice-setup installs it all. Local, LAN, or cloud speech backends.",
+      "version": "0.1.0",
+      "author": {
+        "name": "Sahar"
+      },
+      "category": "productivity",
+      "source": "./plugins/voice-loop"
+    }
+  ]
+}
