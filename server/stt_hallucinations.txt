@@ -1,0 +1,41 @@
+# Known Whisper silence hallucinations — transcripts the model invents on near-silent or noisy
+# clips instead of returning nothing. One pattern per line; blank lines and '#' comments are
+# ignored. Matching is normalized (whitespace collapsed, lowercased, trailing punctuation
+# stripped) and applies only when the FULL transcript equals a pattern or starts with one at a
+# word boundary — genuine speech that merely contains a phrase is never touched.
+#
+# Extend freely; the server re-reads the file after reset_caches() or a restart.
+
+# --- Russian TV end-credits (the classic subtitle-corpus artifacts) ---
+Редактор субтитров
+Корректор А.Егорова
+Субтитры делал DimaTorzok
+Субтитры сделал DimaTorzok
+Субтитры создавал DimaTorzok
+Субтитры подготовил DimaTorzok
+Продолжение следует...
+
+# --- Russian gratitude / channel pleas ---
+Спасибо за просмотр
+Подписывайтесь на канал
+Подпишись на канал
+Ставьте лайки
+До новых встреч
+Всем пока
+Добро пожаловать на канал
+
+# --- English gratitude / channel pleas ---
+Thank you for watching
+Thanks for watching
+Please subscribe
+Don't forget to subscribe
+Like and subscribe
+See you in the next video
+See you next time
+
+# --- Widely reported in the whisper / faster-whisper issue trackers ---
+Subtitles by the Amara.org community
+Subtitles created by the Amara.org community
+Sous-titres réalisés para la communauté d'Amara.org
+www.mooji.org
+Дякую за перегляд

@@ -89,6 +89,7 @@ stack trace.
 |---|---|
 | `~/.config/voice-loop/config.json` | the only configuration; written by `/voice-setup` |
 | `~/.config/voice-loop/stress.json` | optional stress overrides for the synthesizer |
+| `server/stt_hallucinations.txt` | known Whisper silence hallucinations `/stt` drops (user-extendable) |
 | `~/.config/voice-loop/*.key` | optional cloud key files (mode 600) |
 | `~/.local/state/voice-loop/` | logs, the last spoken line, the recorder PID, the last WAV |
 | `~/.local/share/voice-loop/` | optional: the venv, models, voice previews |

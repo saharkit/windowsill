@@ -89,6 +89,11 @@ TTS_SR = 48000
 MAX_TTS_CHARS = 800  # Silero degrades past ~1000 characters per call
 PAUSE_SECONDS = 0.4
 
+# Whisper on near-silent clips hallucinates well-known junk ("Спасибо за просмотр", TV credits,
+# "Thank you for watching") instead of returning nothing. The blocklist lives next to the server,
+# one pattern per line, user-extendable — see the file's own header for the format.
+HALLUCINATIONS_FILE = Path(__file__).with_name("stt_hallucinations.txt")
+
 # Lazily filled caches. Everything expensive is loaded on first use through a seam a test can
 # replace — the loaders below take their dependencies from importable modules and torch.hub, both
 # patchable, so the whole file is exercisable without a single model on disk.
@@ -96,17 +101,21 @@ _whisper = None
 _tts: dict[str, object] = {}
 _accent: dict[str, object] = {}
 _stress: list[tuple[re.Pattern[str], str]] | None = None
+_hallucinations: list[str] | None = None
+_hallucinations_dropped = 0
 
 
 def reset_caches() -> None:
-    """Drop every lazily loaded model, accentuator and stress rule set.
+    """Drop every lazily loaded model, accentuator, stress rule set and hallucination blocklist.
 
-    Used by the tests between cases, and by anyone who edits stress.json and wants it re-read
-    without restarting the process.
+    Used by the tests between cases, and by anyone who edits stress.json or the hallucination
+    blocklist and wants it re-read without restarting the process.
     """
-    global _whisper, _stress
+    global _whisper, _stress, _hallucinations, _hallucinations_dropped
     _whisper = None
     _stress = None
+    _hallucinations = None
+    _hallucinations_dropped = 0
     _tts.clear()
     _accent.clear()
 
@@ -161,6 +170,57 @@ def stress_rules() -> list[tuple[re.Pattern[str], str]]:
         _stress = rules
         log.info("loaded %d stress override(s) from %s", len(rules), STRESS_FILE)
     return _stress
+
+
+def normalize_transcript(text: str) -> str:
+    """Fold a transcript to the shape hallucinations are matched in.
+
+    Whitespace collapsed, lowercased, trailing punctuation stripped — the axes along which the same
+    hallucination varies between runs ("Спасибо за просмотр!", "спасибо за просмотр.").
+    """
+    return re.sub(r"\s+", " ", text).strip().lower().rstrip(" .!?…,:;")
+
+
+def hallucination_blocklist() -> list[str]:
+    """Known silence-hallucination transcripts, loaded from HALLUCINATIONS_FILE and cached.
+
+    One pattern per line, '#' comments and blank lines skipped; each pattern is stored normalized
+    (see normalize_transcript). A missing or unreadable file degrades to an empty list, never fatal.
+    """
+    global _hallucinations
+    if _hallucinations is None:
+        patterns: list[str] = []
+        try:
+            if HALLUCINATIONS_FILE.is_file():
+                for line in HALLUCINATIONS_FILE.read_text(encoding="utf-8").splitlines():
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    normalized = normalize_transcript(line)
+                    if normalized:
+                        patterns.append(normalized)
+        except Exception as exc:
+            log.warning("stt_hallucinations.txt: ignored (%s)", exc)
+        _hallucinations = patterns
+        log.info("loaded %d hallucination pattern(s) from %s", len(patterns), HALLUCINATIONS_FILE)
+    return _hallucinations
+
+
+def matched_hallucination(text: str) -> str | None:
+    """The blocklist pattern a transcript IS, or None.
+
+    A transcript matches when its FULL normalized form equals a pattern, or starts with one at a
+    word boundary — silence hallucinations often repeat or extend themselves. Genuine speech that
+    merely CONTAINS a phrase mid-sentence is never touched.
+    """
+    normalized = normalize_transcript(text)
+    if not normalized:
+        return None
+    for pattern in hallucination_blocklist():
+        if normalized.startswith(pattern):
+            if len(normalized) == len(pattern) or not normalized[len(pattern)].isalnum():
+                return pattern
+    return None
 
 
 def acute_to_plus(text: str) -> str:
@@ -323,6 +383,7 @@ def health() -> dict[str, object]:
         "accentuated_languages": sorted(ACCENTUATORS),
         "stt_loaded": _whisper is not None,
         "tts_loaded": sorted(_tts),
+        "stt_hallucinations_dropped": _hallucinations_dropped,
     }
 
 
@@ -337,6 +398,12 @@ async def stt(audio: UploadFile = File(...), language: str = "") -> JSONResponse
             handle.name, language=language, vad_filter=True, initial_prompt=STT_HINT
         )
         text = " ".join(segment.text.strip() for segment in segments).strip()
+    pattern = matched_hallucination(text)
+    if pattern is not None:
+        global _hallucinations_dropped
+        _hallucinations_dropped += 1
+        log.info("dropped a hallucinated transcript %r (matched %r)", text, pattern)
+        text = ""
     return JSONResponse({"text": text, "language": info.language, "duration": info.duration})
 
 
