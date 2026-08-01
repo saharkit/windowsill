@@ -193,8 +193,9 @@ referenced). Full schema — omit what you do not need, the scripts have default
 ```
 
 Field notes worth telling the user:
-- `speak.marker` — only lines starting with it are voiced. Tell the user to ask for it in their
-  `CLAUDE.md` if they want it used consistently, e.g. *"start a one-line spoken summary with 🔊"*.
+- `speak.marker` — only lines starting with it are voiced. Step 7 offers to add the matching
+  one-line convention to the user's `CLAUDE.md`, so it gets used consistently — and if they picked a
+  different marker, the convention line uses theirs.
 - `speak.player` — `aplay -q` (Linux), `afplay` (macOS), `mpg123 -q` / `ffplay -autoexit -nodisp
   -loglevel quiet` if a cloud provider returns mp3.
 - `dictate.paste_key` — must match the target app: terminals usually `ctrl+shift+v` or `shift+insert`,
@@ -264,7 +265,29 @@ the real absolute path — `${CLAUDE_PLUGIN_ROOT}` is not expanded by the deskto
 
 Always tell the user the script is a **toggle**: press to start, press again to stop and transcribe.
 
-## Step 7 — verify (mandatory, this is how the install ends)
+## Step 7 — the speak convention (the line that makes the model speak)
+
+The hook voices marked lines, but nothing yet tells the model to *write* them — without this line in
+a `CLAUDE.md`, the plugin sits silent. Offer to add it now (AskUserQuestion, three options):
+
+1. **Global `~/.claude/CLAUDE.md`** *(recommended default)* — every project speaks.
+2. **This project's `CLAUDE.md`** — voice only here.
+3. **Skip** — the user adds it themselves; point them at the Quickstart section of the plugin
+   README, which carries the same one-liner.
+
+The line, appended verbatim as its own paragraph — but substitute the marker the user actually
+configured in Step 4 if they changed `speak.marker` from `🔊`:
+
+> End each reply with a one-sentence spoken summary on its own line, starting with 🔊.
+
+On append: create the file if it does not exist. **Never append a duplicate** — first check whether
+an equivalent line is already there (grep the target file loosely for the marker and "spoken
+summary"); if one exists, say so and leave the file alone.
+
+Whichever option they pick, note that the next step's speak-back check now proves the **whole**
+loop — convention included, not just the plumbing.
+
+## Step 8 — verify (mandatory, this is how the install ends)
 
 ```sh
 bash "${CLAUDE_PLUGIN_ROOT}/scripts/selftest.sh"

@@ -38,7 +38,9 @@ then, in a session:
 Answer two or three questions (language, where speech should run) and it finishes with a green
 selftest. To pick a custom synthetic voice afterwards: `/voice-design`.
 
-To hear something, ask for it in your `CLAUDE.md` — one line is enough:
+To hear something, the model must be *asked* to speak — one line in your `CLAUDE.md` is enough, and
+`/voice-setup` now offers to add it for you (globally or per-project). If you skipped that offer,
+add it yourself:
 
 > End each reply with a one-sentence spoken summary on its own line, starting with 🔊.
 
