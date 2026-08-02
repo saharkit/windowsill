@@ -112,10 +112,11 @@ files from the repo instead. Either clone it:
 
 ```sh
 git clone --depth 1 https://github.com/saharkit/windowsill ~/.local/share/voice-loop/src && \
-cp ~/.local/share/voice-loop/src/plugins/voice-loop/server/voice_server.py ~/.local/share/voice-loop/
+cp ~/.local/share/voice-loop/src/plugins/voice-loop/server/voice_server.py \
+   ~/.local/share/voice-loop/src/plugins/voice-loop/server/stt_hallucinations.txt ~/.local/share/voice-loop/
 ```
 
-or fetch just the two files by raw URL:
+or fetch the three files by raw URL:
 
 ```sh
 # REF=main — this repo's layout is plugin-scoped and stable; substitute a tag or a commit sha here
@@ -125,7 +126,9 @@ mkdir -p ~/.local/share/voice-loop && \
 curl -fsSL "https://raw.githubusercontent.com/saharkit/windowsill/$REF/plugins/voice-loop/server/voice_server.py" \
   -o ~/.local/share/voice-loop/voice_server.py && \
 curl -fsSL "https://raw.githubusercontent.com/saharkit/windowsill/$REF/plugins/voice-loop/server/requirements.txt" \
-  -o ~/.local/share/voice-loop/requirements.txt
+  -o ~/.local/share/voice-loop/requirements.txt && \
+curl -fsSL "https://raw.githubusercontent.com/saharkit/windowsill/$REF/plugins/voice-loop/server/stt_hallucinations.txt" \
+  -o ~/.local/share/voice-loop/stt_hallucinations.txt
 ```
 
 Then build the venv (with the clone,

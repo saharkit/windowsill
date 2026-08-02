@@ -65,7 +65,9 @@ The rules that follow from that:
 - **The catalog row above is part of the plugin's own PR**, together with its `marketplace.json`
   entry. A plugin that is not in the table is not on the shelf.
 - **CI is shared, per-plugin.** One workflow in `.github/workflows/` runs every plugin's checks; a
-  new plugin adds its own jobs (or its own matrix entry) there rather than a second workflow.
+  new plugin adds its own jobs (or its own matrix entry) there rather than a second workflow —
+  the shape to copy: scope every job with `working-directory: plugins/<name>` and prefix its job id
+  with the plugin name so two plugins' checks stay distinguishable on a PR.
 
 Root-level, and this is the whole list: this README (the catalog), `.claude-plugin/marketplace.json`
 (the manifest `marketplace add` reads), `.github/` (shared CI), `tales/`, `LICENSE`.
