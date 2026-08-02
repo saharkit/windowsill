@@ -269,10 +269,21 @@ def _load_ru_accentuator():
 
 
 def _load_uk_accentuator():
-    """ukrainian-word-stress: dictionary-based accentuation; it emits combining acute, so normalize."""
-    from ukrainian_word_stress import Stressifier
+    """ukrainian-word-stress: dictionary-based accentuation, normalized to Silero's '+' notation.
 
-    stressify = Stressifier()
+    Neither argument is decorative. Left to its default the package marks stress with a SPACING
+    acute ("приві´т", U+00B4) that acute_to_plus() does not match and Silero cannot read; the
+    combining acute (U+0301) is the format this pipeline normalizes FROM. And its default
+    disambiguation backend builds a Stanza pipeline that downloads ~500 MB of models on first use —
+    dictionary mode is what this server advertises, needs no network, and resolves ~98.7% of
+    entries identically (the ambiguous rest are simply left unstressed).
+    """
+    from ukrainian_word_stress import Disambiguation, Stressifier, StressSymbol
+
+    stressify = Stressifier(
+        stress_symbol=StressSymbol.CombiningAcuteAccent,
+        disambiguation=Disambiguation.Dictionary,
+    )
 
     def process(segment: str) -> str:
         return acute_to_plus(stressify(segment))

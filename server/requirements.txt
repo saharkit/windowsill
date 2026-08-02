@@ -22,8 +22,10 @@ numpy>=1.26
 #   [ru]  ruaccent — context-aware stress + yo-fication
 #   [uk]  ukrainian-word-stress — dictionary-based Ukrainian accentuation
 # Both are small and installed by default; remove the one you don't speak if you care to.
+# ukrainian-word-stress pulls stanza as a hard dependency, but the server runs its dictionary-only
+# backend (2.0+), so the ~500 MB of Stanza models are never downloaded.
 ruaccent>=1.5
-ukrainian-word-stress>=1.0
+ukrainian-word-stress>=2.0       # 2.0 added the dictionary-only mode the server asks for
 
 # --- optional TTS engines ----------------------------------------------------------------------
 # XTTS-v2 voice cloning (VOICE_LOOP_TTS_ENGINE=xtts) — deliberately NOT installed here:
