@@ -16,9 +16,14 @@ Deliberate behaviours, found by live debugging — do not "simplify" them away:
 
 * toggle — one hotkey, two meanings: a pidfile with a LIVE pid means "recording, stop it";
   anything else (absent, stale pid) means "start". A stale pidfile is removed, never obeyed.
+* start is an ATOMIC claim — the pidfile is created with O_CREAT|O_EXCL before any recorder is
+  spawned, so of two near-simultaneous hotkey invocations exactly one starts a recorder; the
+  loser exits with a note. Stop removes the pidfile BEFORE signalling the recorder, so a racing
+  start claims a fresh slot instead of adopting a dying recorder.
 * echo guard — starting a recording first stops any in-flight speak playback, so the microphone
-  never records our own speakers (windowsill#3). Same pattern-scope as the shell version:
-  pkill -f "voice-loop-speak" matches speak's player children by their temp-WAV path.
+  never records our own speakers (windowsill#3). Primary path: read speak.py's playing.pid and
+  SIGTERM exactly the recorded chain (identity-checked against /proc); the historical
+  pkill -f "voice-loop-speak" pattern-kill is only the fallback when no pidfile exists.
 * recorder table — auto picks pw-record -> arecord -> ffmpeg on Linux, sox(rec) -> ffmpeg on
   macOS; every recorder is pinned to 16 kHz mono S16 (what STT wants, and what the clip-length
   guard's byte math assumes).
@@ -74,6 +79,18 @@ _PID_PATH = os.path.join(_STATE_DIR, "dictate.pid")
 _WAV_PATH = os.path.join(_STATE_DIR, "dictate.wav")
 _LAST_WAV_PATH = os.path.join(_STATE_DIR, "dictate-last.wav")
 
+# CROSS-SCRIPT CONTRACT (keep in sync with speak.py): speak.py records its live speaking chain in
+# playing.pid — space-separated PIDs, its python process first, then the current player/command
+# child. The echo guard below reads THIS file to stop in-flight playback before recording, and
+# verifies each pid via /proc/<pid>/cmdline before signalling (PID-reuse guard), exactly like
+# speak.py's own take_over does.
+_SPEAK_PID_PATH = os.path.join(_STATE_DIR, "playing.pid")
+
+# A freshly O_EXCL-claimed pidfile holds no pid for only milliseconds (until the recorder is
+# spawned and its pid written). An EMPTY/unparseable pidfile older than this is dead garbage from
+# a crashed invocation and is removed — otherwise the toggle would wedge until a manual rm.
+_CLAIM_GRACE_SECONDS = 5.0
+
 
 def log(message: str) -> None:
     try:
@@ -90,7 +107,12 @@ def load_config(path: str) -> dict:
         with open(path, encoding="utf-8") as fh:
             loaded = json.load(fh)
         return loaded if isinstance(loaded, dict) else {}
-    except (OSError, ValueError):
+    except FileNotFoundError:
+        return {}  # no config at all is the normal zero-setup case — not worth a log line
+    except (OSError, ValueError) as err:
+        # ValueError covers both corrupt JSON and UnicodeDecodeError (a non-UTF-8 file); one
+        # informative line so a broken config is diagnosable instead of silently ignored
+        log(f"config ignored ({path}): {type(err).__name__}: {err}")
         return {}
 
 
@@ -124,7 +146,7 @@ def resolve_settings(config: dict, system: str) -> dict:
         "endpoint": str(cfg(config, "stt.endpoint", "http://127.0.0.1:8355")),
         # top-level "language" is the one the user sets; ".stt.language" is the advanced escape
         # for people who dictate in one language and listen in another.
-        "language": str(cfg(config, "stt.language", cfg(config, "language", "ru"))),
+        "language": str(cfg(config, "stt.language", cfg(config, "language", "en"))),
         "stt_model": str(cfg(config, "stt.model", "whisper-1")),
         "stt_command": str(cfg(config, "stt.command", "")),
         "key_env": str(cfg(config, "stt.cloud.api_key_env", cfg(config, "stt.api_key_env", "VOICE_LOOP_STT_API_KEY"))),
@@ -140,8 +162,9 @@ def read_key(key_file: str, key_env: str, environ) -> str:
         try:
             with open(path, encoding="utf-8") as fh:
                 return re.sub(r"[ \t\r\n]", "", fh.read())
-        except OSError:
-            pass
+        except (OSError, UnicodeDecodeError) as err:
+            # the type name only — never the file's content (it may be a half-corrupt key)
+            log(f"key file unreadable ({path}): {type(err).__name__} — falling back to ${key_env}")
     return environ.get(key_env, "")
 
 
@@ -287,6 +310,14 @@ def transcript_from_response(raw: bytes | None) -> str:
     return str(data.get("text", "")).strip() if isinstance(data, dict) else ""
 
 
+def applescript_escape(text: str) -> str:
+    """Escape a string for interpolation into an AppleScript double-quoted literal.
+
+    Backslash FIRST, then the quote — the message may carry config-controlled text (paste_key),
+    and an unescaped quote would otherwise let it break out of the literal."""
+    return text.replace("\\", "\\\\").replace('"', '\\"')
+
+
 # --- runtime glue --------------------------------------------------------------------------------
 
 
@@ -295,7 +326,7 @@ def note(message: str, system: str) -> None:
     try:
         if system == "Darwin":
             subprocess.run(
-                ["osascript", "-e", f'display notification "{message}" with title "voice-loop"'],
+                ["osascript", "-e", f'display notification "{applescript_escape(message)}" with title "voice-loop"'],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 check=False,
@@ -402,24 +433,117 @@ def _pid_alive(pid: int) -> bool:
     return True
 
 
-def start_recording(s: dict, system: str) -> int:
-    # echo guard: never record our own speakers — stop any in-flight speak playback first
-    # (windowsill#3); the pattern matches speak's temp-WAV path in its player's argv
+def _cmdline_of(pid: int) -> str | None:
+    """/proc/<pid>/cmdline with NULs as spaces — None when unreadable (process already gone, or
+    not ours to inspect). Linux-only by construction; callers gate on the platform.
+    Duplicated helper — keep in sync with speak.py."""
     try:
-        subprocess.run(
-            ["pkill", "-u", str(os.getuid()), "-f", "voice-loop-speak"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=False,
-        )
+        with open(f"/proc/{pid}/cmdline", "rb") as fh:
+            raw = fh.read()
+    except OSError:
+        return None
+    return raw.replace(b"\0", b" ").decode("utf-8", "replace")
+
+
+def pid_looks_like_speak(pid: int, read_cmdline=_cmdline_of, platform_id: str = sys.platform) -> bool:
+    """PID-reuse guard (duplicated helper — keep in sync with speak.py): a pidfile outlives its
+    process and the kernel recycles PIDs, so before SIGTERMing a recorded pid, confirm it still
+    looks like the voice-loop speaking chain: the player child's argv carries the
+    "voice-loop-speak-" temp-WAV prefix, the python half of the chain carries "speak.py".
+
+    Non-Linux has no /proc/<pid>/cmdline; rather than depend on parsing `ps` there, the check is
+    skipped and the historical raw-signal behaviour kept (the pidfile is same-user state, so the
+    blast radius of a stale pid is one same-user SIGTERM — unchanged from before). On Linux an
+    unreadable cmdline means the process is already gone (nothing to stop) or is not ours to
+    inspect (then not ours to signal either) — both mean: do not signal."""
+    if not platform_id.startswith("linux"):
+        return True
+    cmdline = read_cmdline(pid)
+    if cmdline is None:
+        return False
+    return "voice-loop-speak" in cmdline or "speak.py" in cmdline
+
+
+def stop_speak_playback() -> None:
+    """Echo guard: never record our own speakers — stop any in-flight speak playback first
+    (windowsill#3).
+
+    Primary path (the cross-script contract, see _SPEAK_PID_PATH): read speak.py's playing.pid
+    and SIGTERM exactly the PIDs it records, each identity-checked — the same semantics as
+    speak.py's own take_over. Killing the python half of the chain also stops a tts.command
+    player: speak's SIGTERM handler terminates its child, whose own argv carries no marker.
+    The historical pkill pattern-kill runs ONLY when no pidfile exists (a pre-pidfile speak, or a
+    chain that died without cleanup): it misses tts.command players and can substring-match
+    innocent processes, so it is the fallback, never the rule."""
+    try:
+        with open(_SPEAK_PID_PATH, encoding="utf-8") as fh:
+            tokens = fh.read().split()
+    except OSError:
+        tokens = None
+    if tokens is None:
+        try:
+            subprocess.run(
+                ["pkill", "-u", str(os.getuid()), "-f", "voice-loop-speak"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+        except OSError:
+            pass
+        return
+    for token in tokens:
+        try:
+            pid = int(token)
+        except ValueError:
+            continue
+        if pid > 0 and pid != os.getpid() and pid_looks_like_speak(pid):
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except OSError:
+                pass
+
+
+def claim_pidfile() -> int | None:
+    """Atomically claim the single recording slot.
+
+    O_CREAT|O_EXCL is the whole mutex: of two near-simultaneous hotkey invocations exactly one
+    creates the pidfile (and goes on to start a recorder); the loser gets FileExistsError and
+    exits with a note instead of spawning a second recorder onto the same WAV — which used to
+    leak one recorder forever. Returns the open fd (the winner writes the recorder pid into it)
+    or None when the slot is held. Any other OSError also yields None: a recorder whose pid we
+    could not record could never be stopped, which is exactly the leak this claim prevents."""
+    try:
+        return os.open(_PID_PATH, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError:
+        return None
+    except OSError as err:
+        log(f"pidfile claim failed: {err}")
+        return None
+
+
+def _release_claim(pidfile_fd: int) -> None:
+    """Undo a successful claim on a failed start: close the fd, remove the pidfile."""
+    try:
+        os.close(pidfile_fd)
     except OSError:
         pass
+    try:
+        os.unlink(_PID_PATH)
+    except OSError:
+        pass
+
+
+def start_recording(s: dict, system: str, pidfile_fd: int) -> int:
+    """Start the recorder into the already-claimed pidfile (see claim_pidfile); every failure
+    path releases the claim so the next toggle starts clean."""
+    stop_speak_playback()
 
     recorder = resolve_recorder(s["recorder"], system, shutil.which)
     argv = recorder_argv(recorder, system, _WAV_PATH)
     if not argv:
         note("no recorder found — install pw-record/arecord (Linux) or sox/ffmpeg (macOS)", system)
         log("no recorder available")
+        _release_claim(pidfile_fd)
         return 1
     try:
         with open(_LOG_PATH, "a", encoding="utf-8") as errlog:
@@ -427,12 +551,17 @@ def start_recording(s: dict, system: str) -> int:
     except OSError as err:
         note("recorder failed to start", system)
         log(f"recorder failed: {err}")
+        _release_claim(pidfile_fd)
         return 1
     try:
-        with open(_PID_PATH, "w", encoding="utf-8") as fh:
-            fh.write(str(proc.pid))
+        os.write(pidfile_fd, str(proc.pid).encode("ascii"))
     except OSError:
         pass
+    finally:
+        try:
+            os.close(pidfile_fd)
+        except OSError:
+            pass
     log(f"recording via {recorder} pid={proc.pid}")
     sound(s["start_sound"], s["player"])
     note("recording…", system)
@@ -448,6 +577,8 @@ def _wait_gone(pid: int) -> bool:
 
 
 def stop_and_transcribe(s: dict, system: str, mode: str, recorder_pid: int) -> int:
+    # Remove the pidfile BEFORE signalling: from this point the recording slot is free, so a
+    # racing start claims a FRESH pidfile instead of adopting (and re-stopping) a dying recorder.
     try:
         os.unlink(_PID_PATH)
     except OSError:
@@ -571,11 +702,32 @@ def main(argv: list[str]) -> int:
 
     if _pid_alive(recorder_pid):
         return stop_and_transcribe(s, system, mode, recorder_pid)
-    try:
-        os.unlink(_PID_PATH)  # a stale pidfile is removed, never obeyed
-    except OSError:
-        pass
-    return start_recording(s, system)
+    if recorder_pid > 0:
+        # a stale pidfile (parsed pid, dead process) is removed, never obeyed — but only after
+        # re-checking it still holds the SAME stale pid, so a racing invocation's fresh claim
+        # (empty until its recorder spawns) is never swept away by this unlink
+        try:
+            with open(_PID_PATH, encoding="utf-8") as fh:
+                still_stale = fh.read().strip() == str(recorder_pid)
+            if still_stale:
+                os.unlink(_PID_PATH)
+        except OSError:
+            pass
+    else:
+        # A pidfile that exists but holds no parseable pid is either a claim being written RIGHT
+        # NOW by a racing invocation (leave it — the claim below loses politely) or dead garbage
+        # from a crashed one (older than the grace window — remove it, or the toggle wedges).
+        try:
+            if time.time() - os.path.getmtime(_PID_PATH) > _CLAIM_GRACE_SECONDS:
+                os.unlink(_PID_PATH)
+        except OSError:
+            pass
+    pidfile_fd = claim_pidfile()
+    if pidfile_fd is None:
+        note("another dictation toggle is already starting", system)
+        log("pidfile already claimed — a concurrent invocation won the race; exiting")
+        return 0
+    return start_recording(s, system, pidfile_fd)
 
 
 if __name__ == "__main__":
