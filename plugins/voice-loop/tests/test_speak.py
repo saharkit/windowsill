@@ -1,7 +1,8 @@
-"""The Stop hook's pure functions: chunking, extraction, config precedence, key reading — plus the
-audit-hardening seams: the identity-checked takeover (PID-reuse guard, with a real-child
-integration case), the urllib-level cloud synthesis request shapes, and the bare-marker fast path
-that must never burn the flush-race backoff.
+"""The speaking hook's pure functions: chunking, extraction, config precedence, key reading — plus
+the audit-hardening seams: the identity-checked takeover (PID-reuse guard, with a real-child
+integration case), the urllib-level cloud synthesis request shapes, the bare-marker fast path
+that must never burn the flush-race backoff, and eager mode's spoken-ledger, first-run seeding and
+inter-firing queue.
 
 speak.py is glue around subprocess players and an HTTP synthesis call, so its full runtime
 contract is proven by the REAL Stop-hook invocation in CI (see TESTING.md). What is tested here
@@ -13,6 +14,7 @@ short-lived pythons owned by the tests themselves.
 from __future__ import annotations
 
 import base64
+import hashlib
 import importlib.util
 import io
 import json
@@ -38,6 +40,8 @@ def state(monkeypatch, tmp_path):
     monkeypatch.setattr(speak, "_LOG_PATH", str(tmp_path / "speak.log"))
     monkeypatch.setattr(speak, "_LAST_PATH", str(tmp_path / "last-spoken"))
     monkeypatch.setattr(speak, "_PID_PATH", str(tmp_path / "playing.pid"))
+    monkeypatch.setattr(speak, "_LEDGER_PATH", str(tmp_path / "spoken.ledger"))
+    monkeypatch.setattr(speak, "_LOCK_PATH", str(tmp_path / "speaking.lock"))
     return tmp_path
 
 
@@ -554,9 +558,11 @@ def _run_hook_on_a_driven_clock(state, monkeypatch, *, streaming: bool):
 
     real_extract = speak.extract
 
-    def slow_extract(path, marker, limit):
+    def slow_extract(path, marker, limit, **scope):
+        # **scope carries the event's reading scope (all_messages) and the ledger's veto (accept)
+        # through to the real extractor untouched — this seam only charges the clock.
         clock.advance(EXTRACT_SECONDS)  # the transcript read, incl. any flush-race retries
-        return real_extract(path, marker, limit)
+        return real_extract(path, marker, limit, **scope)
 
     def slow_health(url, timeout):
         clock.advance(HEALTH_SECONDS)
@@ -829,3 +835,567 @@ def test_openai_compatible_defaults_to_the_local_server_and_alloy(opener):
     payload = json.loads(request.data)
     assert payload["voice"] == "alloy"
     assert payload["model"] == "tts-1"
+
+
+# === eager mode ================================================================================
+#
+# The Stop hook only fires when a turn ENDS, so a 🔊 line printed early in a long tool-heavy turn is
+# heard minutes late. Eager mode adds a PostToolUse path that speaks it as it appears — which turns
+# "have I said this already?" from one last-spoken string into a real question, since two event
+# paths now read the same transcript. The answer is the spoken-ledger, and the tests below pin its
+# three consequences: a line is spoken exactly once whichever hook saw it first, a transcript nobody
+# has spoken for yet is history rather than news, and firings within one turn QUEUE instead of
+# talking over each other.
+
+
+# --- the ledger itself --------------------------------------------------------------------------
+
+
+def test_ledger_key_is_per_line_per_message_and_per_transcript():
+    key = speak.ledger_key("/t/one.jsonl", 3, "the line")
+    assert key == speak.ledger_key("/t/one.jsonl", 3, "the line")  # stable: it IS the identity
+    assert key != speak.ledger_key("/t/one.jsonl", 3, "another line")
+    # the same sentence in a different session is a different line, and deserves to be heard
+    assert key != speak.ledger_key("/t/two.jsonl", 3, "the line")
+    # and so is the same sentence in a LATER message of the same session: «Done.» said again is a
+    # new «Done.», not the old one echoing. Keyed by text alone it would go permanently silent.
+    assert key != speak.ledger_key("/t/one.jsonl", 4, "the line")
+    assert len(key) == 16
+
+
+def test_seed_marker_is_per_transcript_and_never_looks_like_a_line():
+    marker = speak.seed_marker("/t/one.jsonl")
+    assert marker.startswith(speak.SEED_PREFIX)
+    assert marker != speak.seed_marker("/t/two.jsonl")
+    assert marker != speak.ledger_key("/t/one.jsonl", 0, "/t/one.jsonl")
+
+
+def test_ledger_claims_append_and_read_back_in_order(state):
+    assert speak.read_ledger() == []  # an absent ledger is an empty one, never an error
+    speak.append_ledger(["aaaa", "bbbb"])
+    speak.append_ledger([])  # nothing to claim writes nothing
+    speak.append_ledger(["cccc"])
+    assert speak.read_ledger() == ["aaaa", "bbbb", "cccc"]
+
+
+def test_an_unwritable_ledger_is_logged_and_never_raises(state, monkeypatch):
+    monkeypatch.setattr(speak, "_LEDGER_PATH", str(state / "no-such-dir" / "spoken.ledger"))
+    speak.append_ledger(["aaaa"])  # must not raise: a dedup we cannot record is not a failed turn
+    assert "ledger unwritable" in (state / "speak.log").read_text(encoding="utf-8")
+    assert speak.read_ledger() == []
+
+
+def test_ledger_trim_keeps_the_last_lines_and_the_seed_markers(state):
+    seeds = [f"{speak.SEED_PREFIX}{n:016d}" for n in range(speak.LEDGER_SEEDS + 5)]
+    lines = [f"{n:016d}" for n in range(speak.LEDGER_LINES + 50)]
+    speak.append_ledger(seeds + lines)
+    speak.trim_ledger()
+
+    kept = speak.read_ledger()
+    kept_seeds = [e for e in kept if e.startswith(speak.SEED_PREFIX)]
+    kept_lines = [e for e in kept if not e.startswith(speak.SEED_PREFIX)]
+    assert kept_lines == lines[-speak.LEDGER_LINES:]  # the rolling window, newest end kept
+    assert kept_seeds == seeds[-speak.LEDGER_SEEDS:]  # markers survive the line churn separately
+    assert len(kept) == speak.LEDGER_LINES + speak.LEDGER_SEEDS
+
+
+def test_ledger_trim_under_the_limit_rewrites_nothing(state):
+    speak.append_ledger(["aaaa", "bbbb"])
+    before = (state / "spoken.ledger").stat().st_mtime_ns
+    speak.trim_ledger()
+    assert (state / "spoken.ledger").stat().st_mtime_ns == before
+    assert speak.read_ledger() == ["aaaa", "bbbb"]
+
+
+# --- the two reading scopes, and the ledger's veto ----------------------------------------------
+
+
+def test_eager_reads_every_message_where_stop_reads_only_the_last():
+    lines = [_assistant("🔊 the first line"), _assistant("plain detail\n🔊 the second line")]
+    # Stop: the turn it was called to speak
+    assert speak.extract_from_lines(lines, "🔊", 600) == "the second line"
+    # PostToolUse: by the time a tool returns, the line worth hearing can be several messages back
+    assert speak.extract_from_lines(lines, "🔊", 600, all_messages=True) == "the first line the second line"
+
+
+def test_already_spoken_lines_read_as_nothing_new_not_as_nothing_to_say():
+    lines = [_assistant("🔊 alpha"), _assistant("🔊 beta")]
+    spoken = {"alpha"}
+    # 'beta' is new -> speak it alone, oldest-first order preserved among what is left
+    assert (
+        speak.extract_from_lines(lines, "🔊", 600, all_messages=True, accept=lambda i, x: x not in spoken) == "beta"
+    )
+    # everything claimed -> None, the SAME answer an unflushed message gives: nothing new YET.
+    # '' would mean "decided: nothing to say" and would end the Stop path's flush-race retry early.
+    assert speak.extract_from_lines(lines, "🔊", 600, all_messages=True, accept=lambda i, x: False) is None
+    assert speak.extract_from_lines([_assistant("no marker here")], "🔊", 600, accept=lambda i, x: False) == ""
+
+
+def test_the_veto_sees_which_message_each_line_came_from():
+    """The index the ledger keys on: the veto is asked about (message, line), so a repeated sentence
+    in a later message is a question it can answer differently."""
+    lines = [_assistant("🔊 Done."), _assistant("working"), _assistant("🔊 Done.")]
+    seen: list[tuple[int, str]] = []
+
+    def accept(index: int, line: str) -> bool:
+        seen.append((index, line))
+        return index != 0  # the first «Done.» is claimed; the later one is not
+
+    assert speak.extract_from_lines(lines, "🔊", 600, all_messages=True, accept=accept) == "Done."
+    assert seen == [(0, "Done."), (2, "Done.")]  # message 1 has no marked line, so index 2 it is
+
+
+def test_marked_history_is_scoped_by_the_event(state):
+    transcript = state / "transcript.jsonl"
+    transcript.write_text("\n".join([_assistant("🔊 alpha"), _assistant("🔊 beta")]) + "\n", encoding="utf-8")
+    # history comes back in the shape the ledger keys on: (message index, line)
+    # eager owns none of it: never recite a session back at its user
+    assert speak.marked_history(str(transcript), "🔊", include_last=True) == [(0, "alpha"), (1, "beta")]
+    # Stop is entitled to the last message — that is the turn it was invoked to speak
+    assert speak.marked_history(str(transcript), "🔊", include_last=False) == [(0, "alpha")]
+    assert speak.marked_history(str(state / "absent.jsonl"), "🔊", include_last=True) == []
+
+
+# --- driving the real main() through both event paths -------------------------------------------
+
+
+class _Stdin:
+    """A stdin any number of invocations can read — including two of them, concurrently."""
+
+    def __init__(self, payload: str) -> None:
+        self._payload = payload
+
+    def read(self) -> str:
+        return self._payload
+
+
+class _NullPlayer:
+    """A player process that plays nothing, instantly."""
+
+    def __init__(self) -> None:
+        self.pid = os.getpid()  # a pid the pidfile writer can render; never signalled here
+        self.returncode: int | None = None
+
+    def wait(self) -> int:
+        self.returncode = 0
+        return 0
+
+    def poll(self) -> int | None:
+        return self.returncode
+
+
+def _record_speech(monkeypatch, on_synthesize=None) -> list[str]:
+    """Install the whole audio half as a recorder: what the hook decides to SAY, in order.
+
+    Every line these tests speak is far shorter than MIN_CHUNK_CHARS, so chunk_sentences yields
+    exactly one chunk per utterance and one recorded entry IS one spoken utterance.
+    """
+    spoken: list[str] = []
+    monkeypatch.setattr(speak, "_get", lambda url, timeout: None)  # no /health answer -> blob path
+
+    def fake_synthesize(text, s, key):
+        spoken.append(text)
+        if on_synthesize is not None:
+            on_synthesize(text)
+        return WAV_A
+
+    monkeypatch.setattr(speak, "synthesize", fake_synthesize)
+    monkeypatch.setattr(speak.subprocess, "Popen", lambda argv, **kwargs: _NullPlayer())
+    return spoken
+
+
+def _write_config(state, monkeypatch, **speak_keys) -> None:
+    config = state / "config.json"
+    config.write_text(json.dumps({"speak": speak_keys}), encoding="utf-8")
+    monkeypatch.setenv("VOICE_LOOP_CONFIG", str(config))
+
+
+def _fire(state, monkeypatch, transcript, event: str) -> tuple[int, list[float]]:
+    """One hook invocation, as the harness makes it: the event named on stdin, nothing else."""
+    payload = json.dumps({"transcript_path": str(transcript), "hook_event_name": event})
+    monkeypatch.setattr(speak.sys, "stdin", _Stdin(payload))
+    sleeps: list[float] = []
+    monkeypatch.setattr(speak.time, "sleep", lambda seconds: sleeps.append(seconds))
+    return speak.main(), sleeps
+
+
+def _append_message(transcript, text: str) -> None:
+    with transcript.open("a", encoding="utf-8") as fh:
+        fh.write(_assistant(text) + "\n")
+
+
+def test_eager_stays_a_no_op_until_it_is_opted_into(state, monkeypatch):
+    """hooks.json registers PostToolUse unconditionally, so with speak.eager off the firing must
+    cost one stdin read and stop there — before the transcript, before the ledger, before anything
+    that touches the disk on every single tool call."""
+    transcript = state / "transcript.jsonl"
+    transcript.write_text(_assistant("🔊 a line nobody has opted into hearing yet") + "\n", encoding="utf-8")
+
+    def never(*args, **kwargs):
+        raise AssertionError("eager is off: nothing may be read")
+
+    monkeypatch.setattr(speak, "extract", never)
+    monkeypatch.setattr(speak, "read_ledger", never)
+    _write_config(state, monkeypatch)  # a config with no speak.eager key at all: the default
+
+    rc, sleeps = _fire(state, monkeypatch, transcript, "PostToolUse")
+    assert (rc, sleeps) == (0, [])
+    assert not (state / "spoken.ledger").exists()
+    assert not (state / "last-spoken").exists()
+
+
+def _speak_turns(state, monkeypatch, lines: list[str]) -> list[str]:
+    """Play a whole session down the Stop path: one assistant message per turn, one Stop firing
+    after each. Returns what was actually spoken, in order."""
+    transcript = state / "transcript.jsonl"
+    transcript.write_text("", encoding="utf-8")
+    spoken = _record_speech(monkeypatch)
+    for line in lines:
+        _append_message(transcript, f"🔊 {line}")
+        assert _fire(state, monkeypatch, transcript, "Stop")[0] == 0
+    return spoken
+
+
+def test_eager_off_keeps_exactly_the_pre_ledger_stop_dedup(state, monkeypatch):
+    """DEFAULT-OFF REGRESSION — the ledger must not reach a user who never opted in.
+
+    With `speak.eager` unset, Stop dedups against the IMMEDIATELY previous utterance and nothing
+    else: a verbatim repeat of the line just spoken is dropped (turn 2), and the same line said
+    again LATER, after something else came in between, is spoken again (turn 4). A per-session
+    ledger keyed by text would mute that fourth «Done.» for the rest of the session — a silent
+    regression for every default-off user, which is what this pins.
+
+    Mutation proof: make the ledger unconditional in main() (drop the `if ledger_on:` gate and the
+    `if not ledger_on` branch inside read_fresh) and BOTH halves fail — the preloaded ledger vetoes
+    turn 1, and the claims it writes change a file that must not be touched at all.
+    """
+    transcript = state / "transcript.jsonl"
+    turns = ["Done.", "Done.", "Working.", "Done."]
+    # A ledger that already accounts for every one of those lines, in both the current
+    # (transcript, message, line) keying and the per-session (transcript, line) keying the blocker
+    # was reported against: eager being off means NEITHER is ever consulted.
+    preloaded = [speak.seed_marker(str(transcript))]
+    for index, line in enumerate(turns):
+        preloaded.append(speak.ledger_key(str(transcript), index, line))
+        preloaded.append(hashlib.sha1(f"{transcript}\n{line}".encode()).hexdigest()[:16])
+    ledger = state / "spoken.ledger"
+    ledger.write_text("".join(f"{e}\n" for e in preloaded), encoding="utf-8")
+    before = ledger.read_bytes()
+
+    _write_config(state, monkeypatch)  # a config with no speak.eager key at all: the default
+    spoken = _speak_turns(state, monkeypatch, turns)
+
+    assert spoken == ["Done.", "Working.", "Done."]  # every turn but the immediate repeat
+    assert ledger.read_bytes() == before  # not read, not claimed, not trimmed, not seeded
+
+
+def test_eager_speaks_a_repeated_line_again_in_a_later_message(state, monkeypatch):
+    """The message index in the ledger key, end to end. With eager ON the ledger replaces the
+    prev-dedup, so it has to be at least as good: «Done.» in message 1 and «Done.» in message 0 are
+    two lines, and both are heard. Keyed by text alone the session would go quiet after the first
+    one — the regression the default-off test above pins from the other side."""
+    _write_config(state, monkeypatch, eager=True)
+    spoken = _speak_turns(state, monkeypatch, ["Done.", "Done.", "Working.", "Done."])
+    assert spoken == ["Done.", "Done.", "Working.", "Done."]  # every one of them, repeats included
+
+
+def test_first_run_seeding_writes_history_off_instead_of_reciting_it(state, monkeypatch):
+    """The live deployment's own trip: eager switched on mid-session, and the first firing read a
+    transcript full of marked lines it had never spoken. They are HISTORY — ledgered silently — and
+    only what appears AFTER is news."""
+    transcript = state / "transcript.jsonl"
+    transcript.write_text("\n".join([_assistant("🔊 an old line"), _assistant("🔊 an older line")]) + "\n", "utf-8")
+    _write_config(state, monkeypatch, eager=True)
+    spoken = _record_speech(monkeypatch)
+
+    rc, sleeps = _fire(state, monkeypatch, transcript, "PostToolUse")
+
+    assert (rc, sleeps) == (0, [])
+    assert spoken == []  # the whole point: the session is not read back to its user
+    assert speak.seed_marker(str(transcript)) in speak.read_ledger()
+    assert speak.ledger_key(str(transcript), 0, "an old line") in speak.read_ledger()
+    assert "seeded 2 line(s) of history" in (state / "speak.log").read_text(encoding="utf-8")
+
+    # and seeding is a starting line, not a gag: the next line to appear IS spoken
+    _append_message(transcript, "🔊 a fresh line")
+    assert _fire(state, monkeypatch, transcript, "PostToolUse") == (0, [])
+    assert spoken == ["a fresh line"]
+
+
+def test_stop_seeds_history_but_never_the_turn_it_was_called_to_speak(state, monkeypatch):
+    """The same first run down the Stop path. Seeding must not swallow the last message — that is
+    the turn Stop exists to speak, and the pre-ledger behaviour it has to keep."""
+    transcript = state / "transcript.jsonl"
+    transcript.write_text("\n".join([_assistant("🔊 an old line"), _assistant("🔊 this turn")]) + "\n", "utf-8")
+    _write_config(state, monkeypatch, eager=True)
+    spoken = _record_speech(monkeypatch)
+
+    assert _fire(state, monkeypatch, transcript, "Stop") == (0, [])
+    assert spoken == ["this turn"]
+    assert speak.ledger_key(str(transcript), 0, "an old line") in speak.read_ledger()  # history, silent
+
+
+def test_eager_speaks_the_lines_of_every_message_oldest_first_then_nothing_twice(state, monkeypatch):
+    """Two marked lines land in two messages while the turn is still running: one firing after them
+    speaks both, oldest first — and a firing with nothing new to say says nothing."""
+    transcript = state / "transcript.jsonl"
+    transcript.write_text(_assistant("a turn with no marked line yet") + "\n", encoding="utf-8")
+    _write_config(state, monkeypatch, eager=True)
+    spoken = _record_speech(monkeypatch)
+    assert _fire(state, monkeypatch, transcript, "PostToolUse") == (0, [])  # seeds the transcript
+
+    _append_message(transcript, "🔊 alpha line")
+    _append_message(transcript, "detail nobody hears\n🔊 beta line")
+    assert _fire(state, monkeypatch, transcript, "PostToolUse") == (0, [])
+    assert spoken == ["alpha line beta line"]  # both, in transcript order, as one utterance
+
+    # the next tool call fires the hook again with nothing new: silence, and no retry sleep either
+    assert _fire(state, monkeypatch, transcript, "PostToolUse") == (0, [])
+    assert spoken == ["alpha line beta line"]
+
+
+def test_stop_does_not_repeat_the_line_eager_already_spoke(state, monkeypatch):
+    """The idempotence that makes the two paths safe to run together: the assistant marks a line,
+    a tool call fires PostToolUse (spoken), the turn then ends with no further message, and Stop —
+    whose scope IS that same last message — must stay quiet."""
+    transcript = state / "transcript.jsonl"
+    transcript.write_text(_assistant("the turn opens") + "\n", encoding="utf-8")
+    _write_config(state, monkeypatch, eager=True)
+    spoken = _record_speech(monkeypatch)
+    _fire(state, monkeypatch, transcript, "PostToolUse")  # seeds
+
+    _append_message(transcript, "🔊 the only line of this turn")
+    assert _fire(state, monkeypatch, transcript, "PostToolUse") == (0, [])
+    assert spoken == ["the only line of this turn"]
+
+    rc, sleeps = _fire(state, monkeypatch, transcript, "Stop")
+    assert rc == 0
+    assert spoken == ["the only line of this turn"]  # said once, by whichever hook got there first
+    # "everything is claimed" reads as the flush-race signature, so Stop spends its backoff waiting
+    # for a message that never comes — deliberate: it cannot tell that case from an unflushed one,
+    # and it is the last thing in an async hook rather than something a turn waits on.
+    assert sleeps == list(speak.BACKOFF)
+
+
+def test_stop_still_speaks_a_line_eager_never_saw(state, monkeypatch):
+    """The mirror case: the last message lands after the final tool call, so no eager firing ever
+    read it. Stop speaks it exactly as it always has."""
+    transcript = state / "transcript.jsonl"
+    transcript.write_text(_assistant("🔊 spoken mid-turn") + "\n", encoding="utf-8")
+    _write_config(state, monkeypatch, eager=True)
+    spoken = _record_speech(monkeypatch)
+    _fire(state, monkeypatch, transcript, "PostToolUse")  # seeds this transcript, speaks nothing
+
+    _append_message(transcript, "🔊 the closing summary")
+    assert _fire(state, monkeypatch, transcript, "Stop") == (0, [])
+    assert spoken == ["the closing summary"]
+
+
+# --- the lock: one speaker at a time, and the loser never waits ---------------------------------
+
+
+def test_the_claim_keeps_the_previous_firings_line_out_of_this_ones_mouth(state, monkeypatch):
+    """The ledger claim, made under the lock, is what makes the two paths idempotent: a firing reads
+    every message, so without a claim it would re-speak everything it already said.
+
+    Mutation proof: delete the `append_ledger(claimed)` call from main() and the second firing
+    extracts BOTH lines — it speaks "alpha line beta line" and this assertion fails on the
+    double-speak.
+    """
+    transcript = state / "transcript.jsonl"
+    transcript.write_text(_assistant("🔊 alpha line") + "\n", encoding="utf-8")
+    # this session has been seen before — first-run seeding is a different test's subject
+    (state / "spoken.ledger").write_text(speak.seed_marker(str(transcript)) + "\n", encoding="utf-8")
+    _write_config(state, monkeypatch, eager=True)
+    spoken = _record_speech(monkeypatch)
+
+    assert _fire(state, monkeypatch, transcript, "PostToolUse") == (0, [])
+    _append_message(transcript, "🔊 beta line")  # the turn goes on
+    assert _fire(state, monkeypatch, transcript, "PostToolUse") == (0, [])
+
+    assert spoken == ["alpha line", "beta line"]  # in order, each exactly once
+    assert [e for e in speak.read_ledger() if not e.startswith(speak.SEED_PREFIX)] == [
+        speak.ledger_key(str(transcript), 0, "alpha line"),
+        speak.ledger_key(str(transcript), 1, "beta line"),
+    ]
+
+
+def test_one_line_written_twice_in_one_message_is_claimed_and_said_once(state, monkeypatch):
+    """The dedup INSIDE a single read, which the ledger alone cannot make: both copies of the line
+    are read before either is written, so the ledger's veto sees neither. `accept` closes that by
+    adding each key to `seen` as it takes it, and the second copy is refused by the same set that
+    just accepted the first.
+
+    Both halves matter and both are asserted: ONE utterance (not the sentence said twice in a single
+    breath) and ONE ledger key (a duplicate claim would survive into the next firing's `seen` set
+    harmlessly, but it is still a lie about what was spoken).
+
+    Mutation proof: delete the `seen.add(key)` line from main()'s `accept` and the utterance becomes
+    "twice over twice over" with two identical keys behind it.
+    """
+    transcript = state / "transcript.jsonl"
+    transcript.write_text(_assistant("the turn opens") + "\n", encoding="utf-8")
+    _write_config(state, monkeypatch, eager=True)
+    spoken = _record_speech(monkeypatch)
+    assert _fire(state, monkeypatch, transcript, "PostToolUse") == (0, [])  # seeds the transcript
+
+    # one message, the same marked line twice — an assistant that repeated itself, verbatim
+    _append_message(transcript, "🔊 twice over\na detail between them\n🔊 twice over")
+    assert _fire(state, monkeypatch, transcript, "PostToolUse") == (0, [])
+
+    assert spoken == ["twice over"]
+    assert [e for e in speak.read_ledger() if not e.startswith(speak.SEED_PREFIX)] == [
+        speak.ledger_key(str(transcript), 1, "twice over")
+    ]
+
+
+def test_the_lock_is_held_through_synthesis_and_playback_not_just_the_claim(state, monkeypatch):
+    """The lock's SCOPE, executed rather than asserted about: it covers read-claim-speak-PLAY, and
+    a rival firing is locked out of all of it — not just of the claim.
+
+    The probe runs from the deepest point of the speaking chain, as the synthesis callback, and
+    tries to take the lock exactly as a concurrent firing would. It fires TWICE because the audio
+    source is lazy: the second chunk is synthesized from inside the player loop, with the first
+    chunk's player process spawned and not yet reaped. So the second `None` is the one that says
+    the lock is still held WHILE SOUND IS PLAYING — which is the property that keeps two firings
+    from talking over each other, as opposed to merely from claiming the same line.
+
+    Mutation proof: move `release_lock(lock)` up to just after `append_ledger(claimed)` and both
+    probes come back with a lock in hand.
+    """
+    # both sentences clear MIN_CHUNK_CHARS, so neither is merged away and there really are two
+    line = "The first sentence is long enough to stand on its own. The second one stands on its own feet too."
+    transcript = state / "transcript.jsonl"
+    transcript.write_text(_assistant(f"🔊 {line}") + "\n", encoding="utf-8")
+    (state / "spoken.ledger").write_text(speak.seed_marker(str(transcript)) + "\n", encoding="utf-8")
+    _write_config(state, monkeypatch, eager=True)
+
+    locked_out: list[bool] = []
+
+    def probe(text: str) -> None:
+        rival = speak.acquire_lock()  # what a concurrent firing gets at this exact instant
+        locked_out.append(rival is None)
+        speak.release_lock(rival)
+
+    spoken = _record_speech(monkeypatch, on_synthesize=probe)
+
+    assert _fire(state, monkeypatch, transcript, "PostToolUse") == (0, [])
+    assert spoken == speak.chunk_sentences(line)  # two chunks: one synthesis per sentence
+    assert locked_out == [True, True]  # shut out during the first synthesis AND mid-playback
+    # and released on the way out, so the next firing gets straight in rather than losing a race
+    after = speak.acquire_lock()
+    assert after is not None
+    speak.release_lock(after)
+
+
+def test_an_eager_firing_that_loses_the_lock_exits_at_once_and_claims_nothing(state, monkeypatch):
+    """The whole point of a non-blocking acquire: the loser does not queue. It sleeps for nothing,
+    claims nothing, and returns — so the line stays available to the next firing (or to Stop)
+    instead of vanishing, and no python process piles up behind the speaker.
+
+    The lock here is the REAL flock, held by this test through a second file descriptor: flock
+    scopes to the open file description, so the hook's own open() genuinely cannot get in.
+    """
+    transcript = state / "transcript.jsonl"
+    transcript.write_text(_assistant("🔊 a line that lost the race") + "\n", encoding="utf-8")
+    (state / "spoken.ledger").write_text(speak.seed_marker(str(transcript)) + "\n", encoding="utf-8")
+    _write_config(state, monkeypatch, eager=True)
+    spoken = _record_speech(monkeypatch)
+
+    held = speak.acquire_lock()
+    assert held is not None and not isinstance(held, speak._NoLock)
+    try:
+        started = time.monotonic()
+        assert _fire(state, monkeypatch, transcript, "PostToolUse") == (0, [])  # no sleeps: no queue
+        assert time.monotonic() - started < 5  # it returned, it did not wait out anyone
+    finally:
+        speak.release_lock(held)
+
+    assert spoken == []
+    assert speak.read_ledger() == [speak.seed_marker(str(transcript))]  # nothing claimed
+    assert "line left unclaimed" in (state / "speak.log").read_text(encoding="utf-8")
+
+    # and the line really is still available — the next firing, once the lock is free, says it
+    assert _fire(state, monkeypatch, transcript, "PostToolUse") == (0, [])
+    assert spoken == ["a line that lost the race"]
+
+
+def test_stop_supersedes_a_holder_that_will_not_yield_the_lock(state, monkeypatch):
+    """Stop is the turn's last chance, so it is the one invocation allowed to wait — briefly. It
+    lets the holder finish within LOCK_GRACE, then takes over (the SIGTERM releases that chain's
+    flock with it) and takes one more shot."""
+    transcript = state / "transcript.jsonl"
+    transcript.write_text(_assistant("🔊 the closing line") + "\n", encoding="utf-8")
+    (state / "spoken.ledger").write_text(speak.seed_marker(str(transcript)) + "\n", encoding="utf-8")
+    _write_config(state, monkeypatch, eager=True)
+    spoken = _record_speech(monkeypatch)
+
+    held = speak.acquire_lock()
+    assert held is not None and not isinstance(held, speak._NoLock)
+    taken_over: list[bool] = []
+
+    def fake_take_over() -> None:
+        taken_over.append(True)
+        speak.release_lock(held)  # exactly what a SIGTERMed chain does on its way out
+
+    monkeypatch.setattr(speak, "take_over", fake_take_over)
+
+    rc, sleeps = _fire(state, monkeypatch, transcript, "Stop")
+    assert rc == 0
+    assert sleeps == list(speak.LOCK_GRACE)  # it waited the grace out FIRST, before signalling
+    assert taken_over == [True]
+    assert spoken == ["the closing line"]
+
+
+def test_a_stop_that_never_gets_the_lock_leaves_its_lines_unclaimed(state, monkeypatch):
+    """The last resort. Claiming outside the lock is the one thing that must not happen, so a Stop
+    that cannot get in says nothing and records nothing — the lines stay in the transcript for the
+    next turn's eager firing, which reads every message."""
+    transcript = state / "transcript.jsonl"
+    transcript.write_text(_assistant("🔊 the closing line") + "\n", encoding="utf-8")
+    (state / "spoken.ledger").write_text(speak.seed_marker(str(transcript)) + "\n", encoding="utf-8")
+    _write_config(state, monkeypatch, eager=True)
+    spoken = _record_speech(monkeypatch)
+    monkeypatch.setattr(speak, "take_over", lambda: None)  # the holder does not die
+
+    held = speak.acquire_lock()
+    try:
+        rc, sleeps = _fire(state, monkeypatch, transcript, "Stop")
+    finally:
+        speak.release_lock(held)
+
+    assert (rc, spoken) == (0, [])
+    assert sleeps == list(speak.LOCK_GRACE) * 2  # the grace before the takeover, and the one after
+    assert speak.read_ledger() == [speak.seed_marker(str(transcript))]  # nothing claimed
+    assert "lines left unclaimed" in (state / "speak.log").read_text(encoding="utf-8")
+
+
+def test_the_lock_is_exclusive_and_the_eager_acquire_never_waits(state):
+    """The real flock, not a test double: a second acquisition of the same state-dir lockfile cannot
+    get in while the first holds it, and with no grace it does not sleep at all on the way out."""
+    slept: list[float] = []
+    real_sleep = speak.time.sleep
+    speak.time.sleep = lambda seconds: slept.append(seconds)
+    held = speak.acquire_lock()
+    try:
+        assert held is not None
+        assert speak.acquire_lock() is None  # instant: it returns, it does not wedge
+        assert slept == []  # the eager path passes no grace, so nothing is waited out
+        assert speak.acquire_lock(speak.LOCK_GRACE) is None  # Stop's grace: bounded, then it gives up
+        assert slept == list(speak.LOCK_GRACE)
+    finally:
+        speak.time.sleep = real_sleep
+        speak.release_lock(held)
+    again = speak.acquire_lock()  # released with the file: the next firing gets straight in
+    assert again is not None
+    speak.release_lock(again)
+    speak.release_lock(None)  # a lock that was never taken releases to nothing
+
+
+def test_an_unlockable_state_dir_speaks_anyway(state, monkeypatch):
+    """No lock is better than no voice: when the lockfile itself cannot be opened, the firing goes
+    ahead unserialized rather than dropping the line."""
+    monkeypatch.setattr(speak, "_LOCK_PATH", str(state / "no-such-dir" / "speaking.lock"))
+    lock = speak.acquire_lock()
+    assert isinstance(lock, speak._NoLock)
+    speak.release_lock(lock)

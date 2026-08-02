@@ -55,6 +55,31 @@ alone.
    fails before its first chunk falls back once to the blob `/tts` path. A fresher line kills a
    still-playing older one — precisely, by the PIDs the speaking chain recorded.
 5. Every failure path exits 0. A voice problem must never fail a turn.
+6. **Eager mode** (opt-in, `speak.eager`) adds a second event to the same script: `hooks.json` also
+   registers **PostToolUse**, and `speak.py` branches on `hook_event_name`. The PostToolUse path
+   reads the marked lines of *all* assistant messages (not just the last) and does not retry the
+   flush race — the next tool call is a free retry. What keeps the two paths from saying the same
+   thing twice is the **spoken-ledger** (`~/.local/state/voice-loop/spoken.ledger`):
+   `sha1(transcript_path + message index + line)` per spoken line, consulted and appended by both,
+   plus one `seeded:<hash>` marker per transcript whose absence means "first run — write the history
+   in it off silently". The message index is half of that identity because a transcript is
+   append-only and repeats itself: without it, the second "Done." of a session would be mistaken for
+   the first and never spoken.
+   The ledger, the seeding and the lock are all **gated on `speak.eager`**. With it off there is one
+   event path and therefore nothing to be idempotent against, so `Stop` runs the step-1..5 logic
+   above unchanged — prev-utterance dedup, no shared state, no lock. Two paths are what create the
+   problem, so the machinery arrives with the second path and not before.
+7. **Concurrency in eager mode: one speaker, no queue.** The whole read-claim-speak sequence runs
+   under an exclusive flock (`speaking.lock`) — claiming outside it would let two firings claim the
+   same line — and the flock is taken **non-blocking**. A PostToolUse firing that loses simply
+   exits: it claimed nothing, and the next tool call retries for free. That is deliberately not a
+   queue. A waiting firing would be one blocked python process per tool call, and worse, it is
+   invisible to everything that reads `playing.pid` — neither step 4's takeover nor `dictate.py`'s
+   echo guard can stop a process that has not started speaking yet, so a queued firing wakes up and
+   speaks into a microphone that is already recording. Only `Stop` waits, and only for `LOCK_GRACE`
+   (a fraction of a second) before superseding the holder and trying once more; a `Stop` that still
+   cannot get in leaves its lines unclaimed for the next turn's eager firing rather than claiming
+   without the lock.
 
 ## The dictation path
 
