@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 import voice_server
 
 
@@ -19,6 +21,7 @@ def test_health_reports_capabilities(client, monkeypatch):
     body = client.get("/health").json()
 
     assert body["ok"] is True
+    assert body["version"] == voice_server.SERVER_VERSION == "0.4.0"
     assert body["device"] == "cpu"
     assert body["language"] == "ru"
     assert body["stt_model"] == "small"
@@ -132,3 +135,104 @@ def test_tts_language_is_case_insensitive(client, fake_silero):
     response = client.post("/tts", json={"text": "Hello.", "language": "EN"})
     assert response.status_code == 200
     assert fake_silero.calls[0]["speaker"] == "en_0"
+
+
+# --- request-level caps ----------------------------------------------------------------------------
+
+
+def test_tts_rejects_text_over_the_request_cap(client, fake_silero, monkeypatch):
+    monkeypatch.setattr(voice_server, "MAX_TTS_TEXT", 50)
+
+    response = client.post("/tts", json={"text": "Слово. " * 20})
+
+    assert response.status_code == 400
+    assert "the limit is 50" in response.json()["error"]
+    assert "VOICE_LOOP_MAX_TTS_TEXT" in response.json()["hint"]
+    assert fake_silero.calls == []
+
+
+def test_tts_stream_shares_the_text_cap(client, fake_silero, monkeypatch):
+    monkeypatch.setattr(voice_server, "MAX_TTS_TEXT", 50)
+
+    response = client.post("/tts/stream", json={"text": "Слово. " * 20})
+
+    assert response.status_code == 400
+    assert "the limit is 50" in response.json()["error"]
+    assert fake_silero.calls == []
+
+
+def test_tts_accepts_text_at_the_default_cap_boundary(client, fake_silero):
+    assert voice_server.MAX_TTS_TEXT == 20000  # the documented default
+    response = client.post("/tts", json={"text": "Ok."})
+    assert response.status_code == 200
+
+
+def test_stt_rejects_an_upload_over_the_size_cap(client, fake_whisper, monkeypatch):
+    monkeypatch.setattr(voice_server, "MAX_UPLOAD_BYTES", 16)
+
+    response = client.post("/stt", files={"audio": ("clip.wav", b"R" * 64, "audio/wav")})
+
+    assert response.status_code == 413
+    assert "16 byte limit" in response.json()["error"]
+    assert "VOICE_LOOP_MAX_UPLOAD_BYTES" in response.json()["hint"]
+    assert fake_whisper.calls == []
+
+
+def test_stt_accepts_an_upload_at_the_size_cap(client, fake_whisper, monkeypatch):
+    monkeypatch.setattr(voice_server, "MAX_UPLOAD_BYTES", 8)
+    response = client.post("/stt", files={"audio": ("clip.wav", b"RIFFfake", "audio/wav")})
+    assert response.status_code == 200
+    assert len(fake_whisper.calls) == 1
+
+
+# --- cross-site browser guard ----------------------------------------------------------------------
+# Multipart is a CORS-"simple" body, so a malicious page can fire real cross-origin POSTs at a
+# loopback server. Browser-labelled cross-site requests get a plain 403; header-less clients pass.
+
+
+@pytest.mark.parametrize("path", ["/stt", "/tts", "/tts/stream"])
+def test_post_endpoints_refuse_a_cross_site_browser_request(client, fake_whisper, fake_silero, path):
+    response = client.post(
+        path,
+        files={"audio": ("clip.wav", b"RIFFfake", "audio/wav")} if path == "/stt" else None,
+        json=None if path == "/stt" else {"text": "Привет."},
+        headers={"Sec-Fetch-Site": "cross-site"},
+    )
+
+    assert response.status_code == 403
+    assert response.json() == {"error": "cross-site browser requests are not accepted"}
+    assert fake_whisper.calls == [] and fake_silero.calls == []
+
+
+def test_stt_refuses_a_foreign_origin(client, fake_whisper):
+    response = client.post(
+        "/stt",
+        files={"audio": ("clip.wav", b"RIFFfake", "audio/wav")},
+        headers={"Origin": "https://evil.example"},
+    )
+
+    assert response.status_code == 403
+    assert response.json() == {"error": "cross-origin browser requests are not accepted"}
+    assert fake_whisper.calls == []
+
+
+@pytest.mark.parametrize(
+    "origin", ["http://127.0.0.1:8355", "http://localhost:3000", "http://[::1]:8355", "null"]
+)
+def test_stt_accepts_loopback_and_null_origins(client, fake_whisper, origin):
+    response = client.post(
+        "/stt", files={"audio": ("clip.wav", b"RIFFfake", "audio/wav")}, headers={"Origin": origin}
+    )
+    assert response.status_code == 200
+
+
+def test_stt_refuses_a_malformed_origin(client, fake_whisper):
+    response = client.post(
+        "/stt", files={"audio": ("clip.wav", b"RIFFfake", "audio/wav")}, headers={"Origin": "http://[::1"}
+    )
+    assert response.status_code == 403
+
+
+def test_same_origin_sec_fetch_site_passes(client, fake_silero):
+    response = client.post("/tts", json={"text": "Привет."}, headers={"Sec-Fetch-Site": "same-origin"})
+    assert response.status_code == 200

@@ -228,6 +228,39 @@ def test_chunk_of_empty_text_is_empty():
     assert voice_server.chunk("") == []
 
 
+def test_chunk_enforces_the_limit_on_an_unbroken_run():
+    """The MAX_TTS_CHARS regression: no sentence punctuation (CJK, URLs, code) must NOT mean no limit."""
+    text = "а" * 5000
+
+    chunks = voice_server.chunk(text, limit=800)
+
+    assert all(len(c) <= 800 for c in chunks)
+    assert "".join(chunks) == text
+
+
+def test_chunk_splits_an_oversized_sentence_at_word_boundaries():
+    """A long run of words with no sentence punctuation is cut between words, never inside one."""
+    text = " ".join(f"слово{i}" for i in range(200))
+
+    chunks = voice_server.chunk(text, limit=100)
+
+    assert all(len(c) <= 100 for c in chunks)
+    assert " ".join(chunks).split() == text.split()
+
+
+def test_chunk_hard_splits_an_oversized_word_between_normal_words():
+    text = "короткое " + "х" * 2500 + " хвост"
+
+    chunks = voice_server.chunk(text, limit=800)
+
+    assert all(len(c) <= 800 for c in chunks)
+    assert "".join(chunks).replace(" ", "") == text.replace(" ", "")
+
+
+def test_chunk_of_a_whitespace_run_yields_nothing():
+    assert voice_server.chunk(" " * 900, limit=800) == []
+
+
 # --- device / compute type ------------------------------------------------------------------------
 
 

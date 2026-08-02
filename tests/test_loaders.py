@@ -146,12 +146,37 @@ def test_require_python_rejects_an_old_interpreter():
     assert "3.9" in str(exc.value)
 
 
-def test_main_starts_uvicorn_on_the_configured_socket(monkeypatch):
+def test_main_starts_uvicorn_on_the_configured_socket(monkeypatch, caplog):
     started: list[dict[str, object]] = []
     monkeypatch.setattr(voice_server, "HOST", "127.0.0.1")
     monkeypatch.setattr(voice_server, "PORT", 8355)
     monkeypatch.setattr(voice_server.uvicorn, "run", lambda app, host, port: started.append({"host": host, "port": port, "app": app}))
 
-    voice_server.main()
+    with caplog.at_level("WARNING"):
+        voice_server.main()
 
     assert started == [{"host": "127.0.0.1", "port": 8355, "app": voice_server.app}]
+    assert "0.0.0.0" not in caplog.text  # a loopback bind earns no warning
+
+
+def test_main_warns_loudly_on_a_wildcard_bind(monkeypatch, caplog):
+    started: list[str] = []
+    monkeypatch.setattr(voice_server, "HOST", "0.0.0.0")
+    monkeypatch.setattr(voice_server.uvicorn, "run", lambda app, host, port: started.append(host))
+
+    with caplog.at_level("WARNING"):
+        voice_server.main()
+
+    assert started == ["0.0.0.0"]  # warned, not refused — the Docker default binds wide on purpose
+    assert "VOICE_LOOP_HOST=0.0.0.0" in caplog.text
+    assert "NO authentication" in caplog.text
+
+
+def test_default_language_is_english_when_the_env_does_not_choose(monkeypatch):
+    """English is a first-class language and the shipped default; setups always write an explicit
+    language, so this only shows on a bare `python voice_server.py`."""
+    import importlib
+
+    monkeypatch.delenv("VOICE_LOOP_LANGUAGE", raising=False)
+    module = importlib.reload(voice_server)
+    assert module.LANGUAGE == "en"

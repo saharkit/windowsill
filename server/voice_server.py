@@ -6,7 +6,7 @@ LAN or an ssh tunnel. Everything is configured through the environment — see R
     VOICE_LOOP_HOST          bind address                (default 127.0.0.1 — loopback only)
     VOICE_LOOP_PORT          port                        (default 8355)
     VOICE_LOOP_DEVICE        auto | cuda | cpu           (default auto)
-    VOICE_LOOP_LANGUAGE      default language code       (default ru; see SILERO_VOICES below)
+    VOICE_LOOP_LANGUAGE      default language code       (default en; see SILERO_VOICES below)
     VOICE_LOOP_STT_MODEL     faster-whisper model size   (default small)
     VOICE_LOOP_COMPUTE_TYPE  auto | float16 | int8 | ... (default auto: float16 on cuda, int8 on cpu)
     VOICE_LOOP_STT_HINT      optional lexicon hint biasing the recognizer toward your jargon
@@ -17,6 +17,8 @@ LAN or an ssh tunnel. Everything is configured through the environment — see R
     VOICE_LOOP_XTTS_MODEL_DIR  local XTTS-v2 model dir   (optional; default: coqui's own download cache)
     VOICE_LOOP_STRESS_FILE   stress overrides            (default ~/.config/voice-loop/stress.json)
     VOICE_LOOP_ACCENT        1 | 0 — enable automatic accentuation (default 1; ru and uk)
+    VOICE_LOOP_MAX_UPLOAD_BYTES  /stt upload size cap    (default 26214400 — 25 MB)
+    VOICE_LOOP_MAX_TTS_TEXT  /tts and /tts/stream text length cap (default 20000 characters)
 
 Language is a request-level field: /stt takes ?language=, /tts takes {"language": ...}. Both fall back
 to VOICE_LOOP_LANGUAGE. STT (whisper) is multilingual out of the box; TTS is limited to the languages
@@ -40,12 +42,16 @@ import sys
 import tempfile
 from pathlib import Path
 
+from urllib.parse import urlsplit
+
 import torch
 import uvicorn
-from fastapi import FastAPI, File, UploadFile
+from fastapi import FastAPI, File, Request, UploadFile
 from fastapi.responses import JSONResponse, Response, StreamingResponse
+from starlette.concurrency import run_in_threadpool
 
 MIN_PYTHON = (3, 10)
+SERVER_VERSION = "0.4.0"
 
 
 def require_python(version: tuple[int, int] | None = None) -> None:
@@ -84,7 +90,7 @@ XTTS_MODEL_ID = "tts_models/multilingual/multi-dataset/xtts_v2"
 HOST = os.environ.get("VOICE_LOOP_HOST", "127.0.0.1")
 PORT = int(os.environ.get("VOICE_LOOP_PORT", "8355"))
 DEVICE = os.environ.get("VOICE_LOOP_DEVICE", "auto")
-LANGUAGE = os.environ.get("VOICE_LOOP_LANGUAGE", "ru").lower()
+LANGUAGE = os.environ.get("VOICE_LOOP_LANGUAGE", "en").lower()
 STT_MODEL = os.environ.get("VOICE_LOOP_STT_MODEL", "small")
 COMPUTE_TYPE = os.environ.get("VOICE_LOOP_COMPUTE_TYPE", "auto")
 STT_HINT = os.environ.get("VOICE_LOOP_STT_HINT", "") or None
@@ -103,6 +109,8 @@ TTS_SR = 48000
 XTTS_SR = 24000  # XTTS-v2 always synthesizes at 24 kHz
 MAX_TTS_CHARS = 800  # Silero degrades past ~1000 characters per call
 PAUSE_SECONDS = 0.4
+MAX_UPLOAD_BYTES = int(os.environ.get("VOICE_LOOP_MAX_UPLOAD_BYTES", str(25 * 1024 * 1024)))
+MAX_TTS_TEXT = int(os.environ.get("VOICE_LOOP_MAX_TTS_TEXT", "20000"))
 
 # Whisper on near-silent clips hallucinates well-known junk ("Спасибо за просмотр", TV credits,
 # "Thank you for watching") instead of returning nothing. The blocklist lives next to the server,
@@ -124,8 +132,8 @@ _hallucinations_dropped = 0
 def reset_caches() -> None:
     """Drop every lazily loaded model, accentuator, stress rule set and hallucination blocklist.
 
-    Used by the tests between cases, and by anyone who edits stress.json or the hallucination
-    blocklist and wants it re-read without restarting the process.
+    Used by the tests between cases. Nothing in the running server calls it, so editing
+    stress.json or the hallucination blocklist requires a restart in the current server.
     """
     global _whisper, _xtts, _stress, _hallucinations, _hallucinations_dropped
     _whisper = None
@@ -416,19 +424,83 @@ def mark_stress(text: str, language: str) -> str:
     return text
 
 
+def hard_split(run: str, limit: int) -> list[str]:
+    """Length-slice one unbroken run — the last resort when there is no boundary to prefer."""
+    return [run[start : start + limit] for start in range(0, len(run), limit)]
+
+
+def word_split(sentence: str, limit: int) -> list[str]:
+    """Break ONE over-limit sentence into pieces no longer than the limit.
+
+    Word boundaries are preferred; a single word longer than the limit itself (an URL, a run of
+    CJK, pasted code) is sliced hard. The trailing slice of a hard-split word stays in the buffer
+    so following words can still pack onto it.
+    """
+    pieces: list[str] = []
+    buf = ""
+    for word in sentence.split():
+        if len(word) > limit:
+            if buf:
+                pieces.append(buf)
+            *whole, buf = hard_split(word, limit)
+            pieces.extend(whole)
+        elif len(buf) + len(word) + 1 > limit and buf:
+            pieces.append(buf)
+            buf = word
+        else:
+            buf = f"{buf} {word}".strip()
+    if buf:
+        pieces.append(buf)
+    return pieces
+
+
 def chunk(text: str, limit: int = MAX_TTS_CHARS) -> list[str]:
-    """Split on sentence boundaries so no single synthesis call exceeds the model's comfortable length."""
+    """Split on sentence boundaries so no single synthesis call exceeds the model's comfortable length.
+
+    A sentence with no boundary to cut at — no sentence punctuation at all is common for CJK text,
+    URLs and pasted code — is length-limited too (word_split above): every returned chunk is at
+    most `limit` characters, unconditionally. MAX_TTS_CHARS exists because the model degrades past
+    it, and that holds regardless of how the text is punctuated.
+    """
     chunks: list[str] = []
     buf = ""
     for sentence in re.split(r"(?<=[.!?…])\s+", text):
-        if len(buf) + len(sentence) + 1 > limit and buf:
-            chunks.append(buf)
-            buf = sentence
-        else:
-            buf = f"{buf} {sentence}".strip()
+        for piece in word_split(sentence, limit) if len(sentence) > limit else (sentence,):
+            if len(buf) + len(piece) + 1 > limit and buf:
+                chunks.append(buf)
+                buf = piece
+            else:
+                buf = f"{buf} {piece}".strip()
     if buf:
         chunks.append(buf)
     return chunks
+
+
+def is_local_origin(origin: str) -> bool:
+    """True for origins a same-machine page legitimately sends: loopback hosts and the opaque "null"."""
+    if origin == "null":
+        return True
+    try:
+        host = urlsplit(origin).hostname or ""
+    except ValueError:
+        return False
+    return host == "localhost" or host == "::1" or host.startswith("127.")
+
+
+def cross_site_error(request: Request) -> JSONResponse | None:
+    """Refuse browser-fired cross-site requests, or None when the request may proceed.
+
+    Multipart (and text/plain) bodies are CORS-"simple", so any web page can make a visitor's
+    browser POST them at this loopback server without a preflight — a drive-by way to burn CPU/GPU
+    on someone else's synthesis. Browsers label such requests (Sec-Fetch-Site and/or Origin);
+    non-browser clients — curl, the plugin scripts — send neither header and pass untouched.
+    """
+    if request.headers.get("sec-fetch-site", "").lower() == "cross-site":
+        return JSONResponse({"error": "cross-site browser requests are not accepted"}, status_code=403)
+    origin = request.headers.get("origin")
+    if origin is not None and not is_local_origin(origin):
+        return JSONResponse({"error": "cross-origin browser requests are not accepted"}, status_code=403)
+    return None
 
 
 def xtts_request_error(language: str) -> JSONResponse | None:
@@ -470,6 +542,15 @@ def tts_request_error(text: str, language: str) -> JSONResponse | None:
     """The shared /tts + /tts/stream refusal, or None when the request can be synthesized."""
     if not text:
         return JSONResponse({"error": "empty text"}, status_code=400)
+    if len(text) > MAX_TTS_TEXT:
+        return JSONResponse(
+            {
+                "error": f"text too long: {len(text)} characters, the limit is {MAX_TTS_TEXT}",
+                "hint": "split the text and send several requests, "
+                "or raise VOICE_LOOP_MAX_TTS_TEXT on the server",
+            },
+            status_code=400,
+        )
     if TTS_ENGINE == "xtts":
         return xtts_request_error(language)
     if TTS_ENGINE != "silero":
@@ -529,6 +610,7 @@ def synthesis_pieces(text: str, language: str, speaker: str = ""):
 def health() -> dict[str, object]:
     return {
         "ok": True,
+        "version": SERVER_VERSION,
         "device": resolve_device(),
         "cuda": torch.cuda.is_available(),
         "language": LANGUAGE,
@@ -544,10 +626,8 @@ def health() -> dict[str, object]:
     }
 
 
-@app.post("/stt")
-async def stt(audio: UploadFile = File(...), language: str = "") -> JSONResponse:
-    language = (language or LANGUAGE).lower()
-    data = await audio.read()
+def transcribe_upload(data: bytes, language: str) -> tuple[str, object]:
+    """The blocking body of /stt — runs in the threadpool so the event loop stays responsive."""
     with tempfile.NamedTemporaryFile(suffix=".wav") as handle:
         handle.write(data)
         handle.flush()
@@ -555,6 +635,25 @@ async def stt(audio: UploadFile = File(...), language: str = "") -> JSONResponse
             handle.name, language=language, vad_filter=True, initial_prompt=STT_HINT
         )
         text = " ".join(segment.text.strip() for segment in segments).strip()
+    return text, info
+
+
+@app.post("/stt")
+async def stt(request: Request, audio: UploadFile = File(...), language: str = "") -> JSONResponse:
+    refusal = cross_site_error(request)
+    if refusal is not None:
+        return refusal
+    language = (language or LANGUAGE).lower()
+    data = await audio.read(MAX_UPLOAD_BYTES + 1)
+    if len(data) > MAX_UPLOAD_BYTES:
+        return JSONResponse(
+            {
+                "error": f"audio upload larger than the {MAX_UPLOAD_BYTES} byte limit",
+                "hint": "send a shorter clip, or raise VOICE_LOOP_MAX_UPLOAD_BYTES on the server",
+            },
+            status_code=413,
+        )
+    text, info = await run_in_threadpool(transcribe_upload, data, language)
     pattern = matched_hallucination(text)
     if pattern is not None:
         global _hallucinations_dropped
@@ -564,18 +663,12 @@ async def stt(audio: UploadFile = File(...), language: str = "") -> JSONResponse
     return JSONResponse({"text": text, "language": info.language, "duration": info.duration})
 
 
-@app.post("/tts")
-async def tts_endpoint(payload: dict) -> Response:
-    text = (payload.get("text") or "").strip()
-    language = (payload.get("language") or LANGUAGE).lower()
-    error = tts_request_error(text, language)
-    if error is not None:
-        return error
-
+def render_tts(text: str, language: str, speaker: str) -> bytes:
+    """The blocking body of /tts — synthesis plus WAV encoding, run in the threadpool."""
     sample_rate = engine_sample_rate()
     pause = torch.zeros(int(sample_rate * PAUSE_SECONDS))
     pieces = []
-    for piece in synthesis_pieces(text, language, payload.get("speaker") or ""):
+    for piece in synthesis_pieces(text, language, speaker):
         pieces.append(piece)
         pieces.append(pause)
     wav = torch.cat(pieces) if pieces else torch.zeros(1)
@@ -584,11 +677,26 @@ async def tts_endpoint(payload: dict) -> Response:
 
     out = io.BytesIO()
     sf.write(out, wav.numpy(), sample_rate, format="WAV")
-    return Response(out.getvalue(), media_type="audio/wav")
+    return out.getvalue()
+
+
+@app.post("/tts")
+async def tts_endpoint(request: Request, payload: dict) -> Response:
+    refusal = cross_site_error(request)
+    if refusal is not None:
+        return refusal
+    text = (payload.get("text") or "").strip()
+    language = (payload.get("language") or LANGUAGE).lower()
+    error = tts_request_error(text, language)
+    if error is not None:
+        return error
+
+    wav = await run_in_threadpool(render_tts, text, language, payload.get("speaker") or "")
+    return Response(wav, media_type="audio/wav")
 
 
 @app.post("/tts/stream")
-async def tts_stream_endpoint(payload: dict) -> Response:
+async def tts_stream_endpoint(request: Request, payload: dict) -> Response:
     """Same JSON body as /tts, but the audio leaves as it is synthesized.
 
     Server-sent events (see README for the exact contract): one `chunk` event per sentence chunk
@@ -596,7 +704,15 @@ async def tts_stream_endpoint(payload: dict) -> Response:
     `error` if synthesis breaks mid-stream (the 200 status left with the first bytes, so a late
     failure cannot become a 500; it becomes the last event instead). Requests refused before
     synthesis starts return plain JSON errors, exactly like /tts.
+
+    Pacing parity with /tts: /tts inserts PAUSE_SECONDS of silence between sentence chunks, so
+    every chunk after the FIRST carries that silence at its head. Leading (not trailing) silence
+    keeps the first chunk's latency untouched and needs no lookahead — the audible result between
+    two chunks is the same either way.
     """
+    refusal = cross_site_error(request)
+    if refusal is not None:
+        return refusal
     text = (payload.get("text") or "").strip()
     language = (payload.get("language") or LANGUAGE).lower()
     error = tts_request_error(text, language)
@@ -604,6 +720,7 @@ async def tts_stream_endpoint(payload: dict) -> Response:
         return error
 
     sample_rate = engine_sample_rate()
+    pause = torch.zeros(int(sample_rate * PAUSE_SECONDS))
     pieces = synthesis_pieces(text, language, payload.get("speaker") or "")
 
     def event(name: str, data: dict[str, object]) -> str:
@@ -615,6 +732,8 @@ async def tts_stream_endpoint(payload: dict) -> Response:
         sent = 0
         try:
             for piece in pieces:
+                if sent:
+                    piece = torch.cat([pause, piece])
                 out = io.BytesIO()
                 sf.write(out, piece.numpy(), sample_rate, format="WAV")
                 audio = base64.b64encode(out.getvalue()).decode("ascii")
@@ -634,6 +753,12 @@ async def tts_stream_endpoint(payload: dict) -> Response:
 
 def main() -> None:
     logging.basicConfig(level=os.environ.get("VOICE_LOOP_LOG_LEVEL", "INFO"))
+    if HOST == "0.0.0.0":  # noqa: S104 — flagging the wide bind is the point
+        log.warning(
+            "VOICE_LOOP_HOST=0.0.0.0 — listening on EVERY network interface with NO authentication; "
+            "anyone who can reach the port can transcribe and synthesize on this hardware "
+            "(fine inside a container; on a bare host prefer the default 127.0.0.1 and an ssh tunnel)"
+        )
     log.info("voice-loop server on %s:%s (language=%s, device=%s)", HOST, PORT, LANGUAGE, resolve_device())
     uvicorn.run(app, host=HOST, port=PORT)
 
