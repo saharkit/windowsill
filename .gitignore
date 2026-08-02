@@ -1,0 +1,16 @@
+# Build and test artifacts. None of this belongs in a public repo: a .coverage file is a binary
+# SQLite carrying the ABSOLUTE paths of whoever ran the suite, and a .pyc is a machine- and
+# interpreter-version-specific build product. The plugin's suite is invoked from the plugin
+# directory (see plugins/voice-loop/pytest.ini), so these land in nested paths — the patterns are
+# deliberately unanchored so they match at any depth.
+__pycache__/
+*.py[cod]
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.pytest_cache/
+
+# Local environments — never shared; each machine builds its own.
+.venv/
+venv/
