@@ -1,0 +1,130 @@
+# windowsill — which review lenses a change must pass before merge.
+#
+# The rule this file encodes lives in CLAUDE.md ("The review bar"): a substantive code change gets
+# TWO lenses at minimum — architecture + QA — plus security where input parsing, keys or network
+# surfaces change, plus capacity where concurrency or resource limits change. CI green is NOT a
+# review; these lenses are read by a human or an agent looking at the diff.
+#
+# Only the four lenses actually used here are listed. Do not add one this repo does not run.
+#
+# Glob dialect: minimatch — every pattern is matched against the WHOLE repo-relative path (never
+# against a basename), `*` stays inside one path segment and does not cross `/`, and `**` matches
+# any number of segments including zero. So `README.md` is the root one only, `plugins/*/README.md`
+# would be a plugin's, and `**/*.md` reaches every depth. This is NOT gitignore's dialect, where a
+# slash-less pattern would match at any level. Nothing in the tree reads this file — a human or an
+# agent applies it by hand — so the dialect is stated rather than implied by an implementation.
+
+version: 1
+
+lenses:
+  architect: >-
+    Structure and boundaries: does the change belong where it was put, does the root stay the
+    shelf's and the plugin's subtree the plugin's, is the seam still fakeable without models,
+    network or hardware.
+  qa: >-
+    Coverage and failure modes: what is untested, which assertion is weaker than the claim it
+    backs, what breaks on the paths CI cannot reach.
+  security: >-
+    Untrusted input, secrets and exposure: request parsing and size/duration caps, what an error
+    message hands a client, what an installed script or hook is allowed to execute.
+  capacity: >-
+    Concurrency and resource limits: the model gate, semaphore and lock behaviour, chunk and
+    upload caps, timeouts, and what happens when they are reached.
+
+# First matching rule wins; later rules do not accumulate. `escalations` are applied on top.
+#
+# Every rule below carries the two-lens baseline [architect, qa]; a rule only ever ADDS to it. That
+# is deliberate: `escalations` can add security and capacity but has no way to add architect or qa
+# back, so a rule that dropped one would leave a hole nothing downstream could fill. The single
+# exception is the prose rule, which is an explicit exemption rather than a narrower selection.
+rules:
+  - paths: ["plugins/*/server/**"]
+    lenses: [architect, qa, security]
+    why: >-
+      The server subtree: an HTTP surface with no authentication that parses uploads and free text
+      from a client, plus everything that stands it up — its dependency pins, its container image
+      and its own README. Its 100% branch-coverage gate is a floor, not the review.
+
+  - paths: ["plugins/*/scripts/**"]
+    lenses: [architect, qa]
+    why: >-
+      Hook and hotkey code that runs on a user's machine and is NOT under the coverage gate; its
+      proof is the loopback job's real-invocation contracts.
+
+  - paths: ["plugins/*/hooks/**", "plugins/*/skills/**"]
+    lenses: [architect, qa, security]
+    why: >-
+      These declare what runs unattended and with which tools — a registration or allowed-tools
+      change is a privilege change, and it is equally a behavioural one: the hook contracts the
+      loopback job pins (the spoken-ledger, "spoken exactly once", the streaming path) are what a
+      registration change breaks first.
+
+  - paths: [".github/**"]
+    lenses: [architect, qa, security]
+    why: >-
+      The gates themselves, plus workflow permissions and anything a job installs or executes. A
+      lowered --cov-fail-under, a dropped matrix entry or a deleted assertion is a pure QA
+      question, so the gate definitions get the QA lens an unmatched file would already get.
+
+  - paths: ["plugins/*/tests/requirements.txt"]
+    lenses: [architect, qa, security]
+    why: >-
+      The test lane's dependency pins, installed by CI on every run. A pin change is a supply-chain
+      change, not a test-only one.
+
+  - paths: ["plugins/*/tests/**"]
+    lenses: [architect, qa]
+    why: >-
+      QA owns whether a test actually proves anything; architect owns whether the fake sits at the
+      seam it claims and the suite stays runnable without models, network or hardware.
+
+  - paths: ["plugins/*/pytest.ini", "plugins/*/.coveragerc"]
+    lenses: [architect, qa]
+    why: >-
+      The coverage gate's own knobs. `branch = True`, `source`, `exclude_lines`, `filterwarnings`
+      and the global `timeout` decide what the 100% number MEANS — one `omit =` line or a widened
+      exclusion guts the gate the whole review bar leans on, with CI still green.
+
+  - paths:
+      - ".claude-plugin/marketplace.json"
+      - "plugins/*/.claude-plugin/plugin.json"
+      - "README.md"
+    lenses: [architect, qa]
+    why: >-
+      Catalog and version wiring. A plugin's version is recorded in THREE places — plugin.json (the
+      source), marketplace.json (the mirror) and the catalog row in this README — and no CI job
+      checks that they agree, so the agreement is a review obligation. The catalog table is also
+      shelf state: a plugin that is not in it is not on the shelf.
+
+  - paths: ["CLAUDE.md", ".claude/**", "plugins/*/TESTING.md"]
+    lenses: [architect, qa]
+    why: >-
+      The documents that state the bar rather than merely describe a feature: the repo passport,
+      this map, and the file that says what the coverage number does and does not claim. Exempting
+      them as prose would mean the bar's own text is the one thing the bar never checks.
+
+  - paths: ["**/*.md", "tales/**", "LICENSE", ".gitignore"]
+    lenses: []
+    why: >-
+      Prose. No mandatory lens — accuracy against the tree is the author's job. This is the last
+      rule, so it only catches what nothing above claimed: `plugins/*/server/README.md` never
+      reaches it (`plugins/*/server/**` claims it first, at three lenses, and its XTTS pins are
+      mechanically checked by the xtts-install-probe workflow), and neither do README.md,
+      CLAUDE.md or TESTING.md.
+
+# Anything unmatched (a new top-level path, a new plugin shape) falls back to the two-lens minimum.
+default:
+  lenses: [architect, qa]
+
+# Added on top of whatever the matching rule gave, when the diff has one of these properties. These
+# only ever ADD security or capacity — there is no escalation that restores architect or qa, which
+# is why the baseline belongs in every rule above rather than here.
+escalations:
+  - add: [security]
+    when: >-
+      The change touches input parsing or validation, secret/key/token handling, or a network
+      surface (a new endpoint or field, a cap being raised, what an error returns to a client).
+  - add: [capacity]
+    when: >-
+      The change touches concurrency or a resource limit — the model-concurrency gate, a
+      semaphore or lock, a size/duration/length cap, a timeout, or a retry.
