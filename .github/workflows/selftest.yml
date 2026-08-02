@@ -25,6 +25,16 @@ jobs:
             python3 -c "import json,sys; json.load(open(sys.argv[1]))" "$f" || exit 1
           done
 
+      - name: selftest.sh argument branches (no server needed)
+        run: |
+          bash plugins/voice-loop/scripts/selftest.sh --help | grep -q "Usage:" \
+            || { echo "--help did not print the usage text"; exit 1; }
+          if bash plugins/voice-loop/scripts/selftest.sh --no-such-flag 2>/tmp/selftest-err.txt; then
+            echo "an unknown argument was accepted instead of rejected"; exit 1
+          fi
+          grep -q "unknown argument: --no-such-flag" /tmp/selftest-err.txt \
+            || { echo "unknown-arg rejection lost its diagnostic"; cat /tmp/selftest-err.txt; exit 1; }
+
   coverage:
     name: server unit tests (python ${{ matrix.python }})
     runs-on: ubuntu-latest
@@ -62,11 +72,11 @@ jobs:
           - os: ubuntu-latest
             accent: "1"
             language: ru
-            hook_phrase: Проверка озвучки.
+            hook_phrase: Проверка озвучки завершена. Потоковый синтез работает. Контур замкнут и отвечает.
           - os: macos-latest
             accent: "0"
             language: en
-            hook_phrase: Speech check complete.
+            hook_phrase: Speech check complete. The streaming path is live. The loop hears itself and answers.
     env:
       VOICE_LOOP_STT_MODEL: small
       VOICE_LOOP_LANGUAGE: ${{ matrix.language }}
@@ -149,16 +159,98 @@ jobs:
           {
             "language": "$LANGUAGE",
             "tts": { "backend": "lan", "endpoint": "http://127.0.0.1:8355" },
-            "speak": { "marker": "🔊", "player": "true", "timeout": 180 }
+            "speak": { "marker": "🔊", "player": "true", "timeout": 180, "max_chars": 4000 }
           }
           JSON
-          python3 -c 'import json, os; print(json.dumps({"type": "assistant", "message": {"content": [{"type": "text", "text": "a plain line that must NOT be spoken\n\U0001F50A " + os.environ["PHRASE"]}]}}))' > /tmp/transcript.jsonl
+          # The server merges sentence chunks up to MAX_TTS_CHARS (800) per SSE chunk, so a
+          # multi-chunk stream needs >800 chars of marked text: the phrase is repeated past that
+          # (and speak.max_chars raised above its 600 default) so chunks>1 below proves real
+          # multi-event SSE streaming, not a single-chunk degenerate stream.
+          LONG_PHRASE=$(python3 -c 'import os
+          p = os.environ["PHRASE"]
+          s = p
+          while len(s) <= 820:
+              s = s + " " + p
+          print(s)')
+          export LONG_PHRASE
+          python3 -c 'import json, os; print(json.dumps({"type": "assistant", "message": {"content": [{"type": "text", "text": "a plain line that must NOT be spoken\n\U0001F50A " + os.environ["LONG_PHRASE"]}]}}))' > /tmp/transcript.jsonl
           printf '%s' '{"transcript_path": "/tmp/transcript.jsonl"}' | bash plugins/voice-loop/scripts/speak.sh
           state="${XDG_STATE_HOME:-$HOME/.local/state}/voice-loop"
           echo "--- speak.log"; cat "$state/speak.log"
-          grep -q "$PHRASE" "$state/last-spoken" || { echo "marker extraction failed"; exit 1; }
+          grep -qF "$PHRASE" "$state/last-spoken" || { echo "marker extraction failed"; exit 1; }
           if grep -q "plain line" "$state/last-spoken"; then echo "an unmarked line was spoken"; exit 1; fi
           grep -q "played rc=0" "$state/speak.log" || { echo "synthesis/playback path failed"; exit 1; }
+          played_line=$(grep "played rc=" "$state/speak.log" | tail -n 1)
+          printf '%s\n' "$played_line" | grep -q "via=stream" \
+            || { echo "playback did not go via SSE streaming (via=stream missing) -- the stream silently regressed to the blob /tts fallback"; exit 1; }
+          chunks=$(printf '%s\n' "$played_line" | sed -n 's/.*chunks=\([0-9][0-9]*\).*/\1/p')
+          [ "${chunks:-0}" -gt 1 ] \
+            || { echo "expected a multi-chunk stream (chunks>1), got chunks=${chunks:-none} -- the marked text no longer spans multiple server chunks"; exit 1; }
+
+      - name: dictation contract (real invocation, no microphone)
+        env:
+          PHRASE: ${{ matrix.hook_phrase }}
+          LANGUAGE: ${{ matrix.language }}
+        run: |
+          # Exercises dictate.py's real record -> STT -> clipboard path headlessly, against the
+          # same live server. The microphone is faked through dictate's own config seams:
+          # dictate.recorder pins the recorder table's "pw-record" entry, whose executable is a
+          # PATH-shadowing script that "records" by copying a server-TTS-rendered clip of the
+          # phrase (real speech, so STT has something to hear) and then waits for dictate's
+          # stop signal; dictate.clipboard pins "wl-copy", shadowed by a script capturing stdin.
+          fake="$RUNNER_TEMP/dictate-fake"
+          mkdir -p "$fake"
+          export FAKE_RECORD_WAV="$RUNNER_TEMP/dictate-source.wav"
+          export FAKE_CLIP_FILE="$RUNNER_TEMP/dictate-clip.txt"
+          body=$(python3 -c 'import json, os; print(json.dumps({"text": os.environ["PHRASE"], "language": os.environ["LANGUAGE"]}))')
+          curl -fsS --noproxy '*' -m 180 -o "$FAKE_RECORD_WAV" -X POST http://127.0.0.1:8355/tts \
+            -H 'Content-Type: application/json' --data "$body"
+          [ "$(head -c 4 "$FAKE_RECORD_WAV")" = "RIFF" ] \
+            || { echo "TTS did not return a WAV for the fake microphone"; exit 1; }
+          cat > "$fake/pw-record" <<'SH'
+          #!/usr/bin/env bash
+          # fake microphone: "record" by copying pre-synthesized speech, then wait to be stopped
+          wav=""
+          for arg in "$@"; do wav="$arg"; done
+          cp "${FAKE_RECORD_WAV:?}" "${wav:?}"
+          exec sleep 60
+          SH
+          cat > "$fake/wl-copy" <<'SH'
+          #!/usr/bin/env bash
+          # fake clipboard: capture stdin (dictate fills both the clipboard and primary selections)
+          cat >> "${FAKE_CLIP_FILE:?}"
+          SH
+          chmod +x "$fake/pw-record" "$fake/wl-copy"
+          export VOICE_LOOP_CONFIG="$RUNNER_TEMP/dictate-config.json"
+          cat > "$VOICE_LOOP_CONFIG" <<JSON
+          {
+            "language": "$LANGUAGE",
+            "stt": { "backend": "lan", "endpoint": "http://127.0.0.1:8355" },
+            "dictate": { "recorder": "pw-record", "clipboard": "wl-copy" }
+          }
+          JSON
+          export PATH="$fake:$PATH"
+          python3 plugins/voice-loop/scripts/dictate.py paste   # toggle 1: start the fake recorder
+          sleep 1
+          python3 plugins/voice-loop/scripts/dictate.py paste   # toggle 2: stop -> STT -> clipboard
+          state="${XDG_STATE_HOME:-$HOME/.local/state}/voice-loop"
+          echo "--- dictate.log"; cat "$state/dictate.log"
+          echo "--- clipboard capture"; cat "$FAKE_CLIP_FILE" 2>/dev/null || true; echo
+          grep -q "recording via pw-record" "$state/dictate.log" \
+            || { echo "the fake recorder was never started"; exit 1; }
+          if grep -q "clip too short" "$state/dictate.log"; then
+            echo "the recorded clip was dropped by the min-clip guard"; exit 1
+          fi
+          if grep -q "empty transcription" "$state/dictate.log"; then
+            echo "STT returned no text for the recorded speech"; exit 1
+          fi
+          grep -q "transcript: " "$state/dictate.log" \
+            || { echo "no transcript was logged"; exit 1; }
+          if grep -q -e "unexpected error" -e "Traceback" "$state/dictate.log"; then
+            echo "dictate hit an error path"; exit 1
+          fi
+          [ -s "$FAKE_CLIP_FILE" ] \
+            || { echo "the transcript never reached the clipboard"; exit 1; }
 
       - name: server log on failure
         if: failure()
