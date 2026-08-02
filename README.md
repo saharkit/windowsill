@@ -58,7 +58,9 @@ plugins/<name>/
 The rules that follow from that:
 
 - **The version lives in `plugins/<name>/.claude-plugin/plugin.json`** and is mirrored into
-  `.claude-plugin/marketplace.json`. The two must agree; nothing else records a version.
+  `.claude-plugin/marketplace.json` and into the catalog row above. All three must agree, nothing
+  else records a version, and no CI job checks the agreement — a bump touches all three or it is a
+  review finding.
 - **Tests belong to the plugin.** Its runner configuration (`pytest.ini`, `.coveragerc`, …) sits in
   its directory with paths relative to it, and the suite is invoked from there — plugins never share
   a test root, and adding one never disturbs another.
@@ -70,7 +72,8 @@ The rules that follow from that:
   with the plugin name so two plugins' checks stay distinguishable on a PR.
 
 Root-level, and this is the whole list: this README (the catalog), `.claude-plugin/marketplace.json`
-(the manifest `marketplace add` reads), `.github/` (shared CI), `tales/`, `LICENSE`.
+(the manifest `marketplace add` reads), `.github/` (shared CI), `plugins/`, `tales/`, `LICENSE`,
+`.gitignore`, `CLAUDE.md` (the passport an agent reads first) and `.claude/` (its review-lens map).
 
 ## Conventions (every plugin here follows them)
 
