@@ -3,9 +3,13 @@
 The live case this exists for: XTTS down for hours while a client-side fallback quietly kept the
 speech going. Here it is a server option, so every client gets it. What the tests pin: WHO spoke is
 always on the response (`X-Voice-Loop-Engine`, or the stream's terminal `end` event), a fallback
-only ever happens when the ENGINE broke (never for a client error), the stream falls back only
-before its first chunk, and the failed primary's model slot is back in the gate before the fallback
-takes one — the one-slot gate is never held twice for a single request.
+only ever happens when the ENGINE broke (never for a client error) — though a language refusal does
+name the engine that could serve it — and the failed primary's model slot is back in the gate before
+the fallback takes one, on BOTH endpoints: the one-slot gate is never held twice for one request.
+The stream additionally falls back only before its first chunk.
+
+Those two gate tests are the ones that would hang rather than fail on a regression, so they run
+against `one_slot_gate` (which raises instead of blocking forever) under a timeout marker.
 """
 
 from __future__ import annotations
@@ -132,6 +136,30 @@ def test_reset_caches_zeroes_the_fallback_counter():
     assert voice_server._tts_fallbacks == 1
     voice_server.reset_caches()
     assert voice_server._tts_fallbacks == 0
+
+
+@pytest.mark.timeout(20)
+def test_the_fallback_counter_loses_nothing_to_concurrent_handovers():
+    """`+= 1` from several threads at once is a read-modify-write, and a broken primary is exactly
+    the situation that produces concurrent handovers: /tts counts on the event loop, every
+    /tts/stream restart counts from the worker thread its generator is iterated on. The number an
+    operator reads off /health has to be the number of handovers that happened."""
+    threads, per_thread = 8, 500
+    start = threading.Barrier(threads)
+
+    def hand_over() -> None:
+        start.wait(10)
+        for _ in range(per_thread):
+            voice_server.count_fallback()
+
+    workers = [threading.Thread(target=hand_over) for _ in range(threads)]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join(15)
+
+    assert not any(worker.is_alive() for worker in workers)
+    assert voice_server._tts_fallbacks == threads * per_thread
 
 
 # --- /tts: the engine header -----------------------------------------------------------------------
@@ -293,13 +321,69 @@ def test_tts_client_errors_never_reach_the_fallback(client, silero_fallback, fak
     assert voice_server._tts_fallbacks == 0
 
 
-def test_the_failed_primary_releases_its_slot_before_the_fallback_takes_one(client, monkeypatch, silero_fallback):
+# --- the refusal points at the engine that CAN speak -----------------------------------------------
+# A language 400 is final (fallback is not a router), but it should not be a dead end: when the OTHER
+# known engine has a voice for the requested language, the refusal names the setting that serves it.
+
+
+def test_a_language_refusal_names_the_engine_that_speaks_it(client, fake_silero):
+    """Silero has no Japanese and XTTS-v2 does — the box can speak this, one setting away."""
+    response = client.post("/tts", json={"text": "こんにちは。", "language": "ja"})
+
+    assert response.status_code == 400
+    body = response.json()
+    assert "switch VOICE_LOOP_TTS_ENGINE=xtts to serve 'ja'" in body["hint"]
+    assert "cloud TTS backend" in body["hint"]  # the standing advice survives alongside it
+    assert fake_silero.calls == []
+
+
+def test_the_xtts_language_refusal_names_silero(client, fake_xtts):
+    """The other direction — `uk` is the language an xtts box keeps Silero around for."""
+    response = client.post("/tts", json={"text": "Привіт.", "language": "uk"})
+
+    assert response.status_code == 400
+    body = response.json()
+    assert body["hint"] == "switch VOICE_LOOP_TTS_ENGINE=silero to serve 'uk'"
+    assert "uk" in body["error"] and "ru" in body["supported"]  # the refusal itself is unchanged
+    assert fake_xtts.calls == []
+
+
+def test_a_language_no_engine_speaks_gets_no_false_hint(client, fake_silero):
+    """Never a lead that goes nowhere: neither engine has a Kazakh voice, so none is suggested."""
+    body = client.post("/tts", json={"text": "Сәлем.", "language": "kk"}).json()
+
+    assert "VOICE_LOOP_TTS_ENGINE" not in body["hint"]
+    assert "cloud TTS backend" in body["hint"]
+
+
+def test_the_xtts_refusal_stays_hintless_when_no_engine_speaks_the_language(client, fake_xtts):
+    body = client.post("/tts", json={"text": "Сәлем.", "language": "kk"}).json()
+
+    assert "kk" in body["error"] and "hint" not in body
+
+
+def test_the_refusal_never_points_back_at_the_configured_engine(client, broken_xtts, fake_silero):
+    """The fallback's refusal is still the fallback's: `ja` is a language the BROKEN primary speaks,
+    and "switch to xtts" would be advice to switch to what is already configured and just failed."""
+    body = client.post("/tts", json={"text": "こんにちは。", "language": "ja"}).json()
+
+    assert "ja" in body["error"]
+    assert "VOICE_LOOP_TTS_ENGINE" not in body["hint"]
+
+
+# --- the one model slot ----------------------------------------------------------------------------
+
+
+@pytest.mark.timeout(15)
+def test_the_failed_primary_releases_its_slot_before_the_fallback_takes_one(
+    client, monkeypatch, silero_fallback, one_slot_gate
+):
     """A one-slot gate is never held twice for one request — the failed engine's slot goes back first.
 
-    (Held twice, this test would not fail — it would hang on the second acquire, which is exactly
-    why the sequential shape is worth pinning.)"""
-    gate = threading.BoundedSemaphore(1)
-    monkeypatch.setattr(voice_server, "_model_gate", gate)
+    Held twice, a plain BoundedSemaphore would not fail this test — it would HANG on the second
+    acquire. Two guards make the regression report itself instead: `one_slot_gate` raises
+    GateHeldTwice rather than blocking forever (the failure the endpoint would then surface), and
+    the timeout marker bounds the case even if a future shape finds another way to wedge."""
     in_flight: list[int] = []
     xtts_model, silero_model = BrokenXtts(in_flight), RecordingSilero(in_flight)
     monkeypatch.setattr(voice_server, "xtts", lambda: xtts_model)
@@ -310,8 +394,8 @@ def test_the_failed_primary_releases_its_slot_before_the_fallback_takes_one(clie
     assert response.status_code == 200
     assert in_flight == [1, 1]  # one slot during the primary, one during the fallback — never two
     assert voice_server._model_in_flight == 0
-    assert gate.acquire(blocking=False)  # and the gate is genuinely free afterwards
-    gate.release()
+    assert one_slot_gate.acquire(timeout=1)  # and the gate is genuinely free afterwards
+    one_slot_gate.release()
 
 
 # --- /tts/stream -----------------------------------------------------------------------------------
@@ -347,6 +431,32 @@ def test_stream_takes_the_fallback_over_before_it_starts_when_the_primary_is_unu
 
     assert response.status_code == 200
     assert events(response.text)[-1] == ("end", {"chunks": 1, "engine": "silero (fallback)"})
+
+
+@pytest.mark.timeout(15)
+def test_the_failed_stream_releases_its_slot_before_the_restart_takes_one(
+    client, monkeypatch, silero_fallback, one_slot_gate
+):
+    """The same property as on /tts, on the path that restarts INSIDE the response: the broken
+    generator is finished and its slot returned before the restart's first chunk acquires one.
+
+    The stream's shape makes this the easier one to get wrong — the restart happens in the middle
+    of a live response, from an exception handler that could plausibly still hold the gate. Held
+    twice, `one_slot_gate` raises instead of hanging, and the restart is then reported as a
+    terminal error event rather than the `end` this asserts."""
+    in_flight: list[int] = []
+    xtts_model, silero_model = BrokenXtts(in_flight), RecordingSilero(in_flight)
+    monkeypatch.setattr(voice_server, "xtts", lambda: xtts_model)
+    monkeypatch.setattr(voice_server, "tts", lambda language: silero_model)
+
+    response = client.post("/tts/stream", json={"text": "Привет."})
+
+    assert response.status_code == 200
+    assert events(response.text)[-1] == ("end", {"chunks": 1, "engine": "silero (fallback)"})
+    assert in_flight == [1, 1]  # one slot for the dead primary chunk, one for the restart — never two
+    assert voice_server._model_in_flight == 0
+    assert one_slot_gate.acquire(timeout=1)
+    one_slot_gate.release()
 
 
 def test_stream_never_falls_back_mid_stream(client, monkeypatch, silero_fallback, fake_silero, caplog):

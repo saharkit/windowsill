@@ -9,12 +9,66 @@ end to end against objects that answer instantly.
 from __future__ import annotations
 
 import sys
+import threading
 import types
 
 import pytest
 from fastapi.testclient import TestClient
 
 import voice_server
+
+
+class GateHeldTwice(RuntimeError):
+    """A second model slot was asked for while the first was still held — the regression, named."""
+
+
+class ImpatientGate:
+    """A capacity-1 model gate that refuses to wait forever.
+
+    `threading.BoundedSemaphore(1)` is the honest production shape, and it is exactly why the
+    property "the failed primary releases its slot before the fallback takes one" is awkward to
+    test: a regression does not FAIL the assertion below, it blocks on the second acquire and hangs
+    the run. This stands in for the gate in those tests — identical semantics right up to the point
+    where the real gate would block for good, where this one raises GateHeldTwice instead, which
+    surfaces as an ordinary named failure through the endpoint under test.
+
+    Only the unbounded acquire (`with _model_gate:`, what the server does) raises; a probe that
+    passes its own timeout gets an ordinary bool back, so a test can still ask "is it free?".
+    """
+
+    def __init__(self, patience: float = 2.0) -> None:
+        self._semaphore = threading.BoundedSemaphore(1)
+        self._patience = patience
+
+    def acquire(self, blocking: bool = True, timeout: float | None = None) -> bool:
+        if not blocking:
+            return self._semaphore.acquire(blocking=False)
+        if timeout is not None:
+            return self._semaphore.acquire(timeout=timeout)
+        if not self._semaphore.acquire(timeout=self._patience):
+            raise GateHeldTwice(
+                f"the one model slot was still held after {self._patience}s — a single request "
+                "acquired the gate twice instead of releasing before it retried"
+            )
+        return True
+
+    def release(self) -> None:
+        self._semaphore.release()
+
+    def __enter__(self) -> "ImpatientGate":
+        self.acquire()
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.release()
+
+
+@pytest.fixture
+def one_slot_gate(monkeypatch) -> ImpatientGate:
+    """The model gate narrowed to ONE slot for the duration of a test, and impatient about it."""
+    gate = ImpatientGate()
+    monkeypatch.setattr(voice_server, "_model_gate", gate)
+    return gate
 
 
 def fake_module(name: str, **attrs: object) -> types.ModuleType:

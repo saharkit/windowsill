@@ -98,6 +98,10 @@ XTTS_MODEL_ID = "tts_models/multilingual/multi-dataset/xtts_v2"
 ENGINES = ("silero", "xtts")
 ENGINE_HEADER = "X-Voice-Loop-Engine"  # every /tts response names the engine that actually spoke
 
+# What each engine can actually speak, addressed by engine name — the two tables above and nothing
+# else, so a refusal that points at the other engine cannot drift from what that engine speaks.
+ENGINE_LANGUAGES: dict[str, set[str]] = {"silero": set(SILERO_VOICES), "xtts": XTTS_LANGUAGES}
+
 HOST = os.environ.get("VOICE_LOOP_HOST", "127.0.0.1")
 PORT = int(os.environ.get("VOICE_LOOP_PORT", "8355"))
 DEVICE = os.environ.get("VOICE_LOOP_DEVICE", "auto")
@@ -146,6 +150,9 @@ _stress: list[tuple[re.Pattern[str], str]] | None = None
 _hallucinations: list[str] | None = None
 _hallucinations_dropped = 0
 _tts_fallbacks = 0
+# Its own lock rather than the model gate's `_in_flight_lock` below: this counter is bumped on the
+# request path from several threads, and it has nothing to do with how many model slots are held.
+_fallbacks_lock = threading.Lock()
 
 
 def reset_caches() -> None:
@@ -575,6 +582,27 @@ def cross_site_error(request: Request) -> JSONResponse | None:
     return None
 
 
+def switch_engine_hint(engine: str, language: str) -> str:
+    """The `switch VOICE_LOOP_TTS_ENGINE=...` hint when the OTHER engine speaks a refused language.
+
+    A refusal listing only the refusing engine's own languages is a dead end, and often a wrong one:
+    the box frequently HAS a voice for the request, one setting away (Silero speaks 'uk' and XTTS-v2
+    does not; XTTS-v2 speaks 'ja' and 'zh-cn' and Silero does not). Read off ENGINE_LANGUAGES, so the
+    hint states what the engines really speak — and stays empty when nothing here could serve it.
+
+    A hint, never a route: the request itself is still refused (see fallback_for), because switching
+    engines is the operator's decision about which voice this server has, not a per-request one.
+
+    The engine already CONFIGURED is never suggested. `engine` is the primary in the ordinary case,
+    but on the fallback path it is the fallback refusing a language the primary speaks — and telling
+    an operator to switch to the engine that just broke is worse than saying nothing.
+    """
+    for other in ENGINES:
+        if other != engine and other != TTS_ENGINE and language in ENGINE_LANGUAGES[other]:
+            return f"switch VOICE_LOOP_TTS_ENGINE={other} to serve {language!r}"
+    return ""
+
+
 def xtts_request_error(language: str) -> JSONResponse | None:
     """Why an xtts request cannot be served right now, or None.
 
@@ -603,10 +631,14 @@ def xtts_request_error(language: str) -> JSONResponse | None:
     if not Path(XTTS_REFERENCE).is_file():
         return JSONResponse({"error": f"XTTS reference wav not found: {XTTS_REFERENCE}"}, status_code=500)
     if language not in XTTS_LANGUAGES:
-        return JSONResponse(
-            {"error": f"XTTS-v2 does not speak language {language!r}", "supported": sorted(XTTS_LANGUAGES)},
-            status_code=400,
-        )
+        body: dict[str, object] = {
+            "error": f"XTTS-v2 does not speak language {language!r}",
+            "supported": sorted(XTTS_LANGUAGES),
+        }
+        hint = switch_engine_hint("xtts", language)
+        if hint:
+            body["hint"] = hint
+        return JSONResponse(body, status_code=400)
     return None
 
 
@@ -632,11 +664,13 @@ def tts_request_error(text: str, language: str, engine: str = "") -> JSONRespons
             status_code=500,
         )
     if language not in SILERO_VOICES:
+        hint = "use a cloud TTS backend for this language, or add its Silero model to SILERO_VOICES"
+        switch = switch_engine_hint("silero", language)
         return JSONResponse(
             {
                 "error": f"no local TTS model for language {language!r}",
                 "supported": sorted(SILERO_VOICES),
-                "hint": "use a cloud TTS backend for this language, or add its Silero model to SILERO_VOICES",
+                "hint": f"{switch}; {hint}" if switch else hint,
             },
             status_code=400,
         )
@@ -716,9 +750,16 @@ def fallback_for(text: str, language: str) -> tuple[str, JSONResponse | None]:
 
 
 def count_fallback() -> None:
-    """One more request a broken primary handed over — surfaced as /health `tts_fallbacks`."""
+    """One more request a broken primary handed over — surfaced as /health `tts_fallbacks`.
+
+    Locked because the handovers do NOT all happen on one thread: /tts counts from the event loop,
+    while the stream's restart counts from inside the generator, which Starlette iterates on a
+    worker thread. `+= 1` is a read-modify-write, so concurrent handovers — exactly what a primary
+    that is down produces — would undercount the number the operator reads off /health.
+    """
     global _tts_fallbacks
-    _tts_fallbacks += 1
+    with _fallbacks_lock:
+        _tts_fallbacks += 1
 
 
 def engine_label(engine: str, is_fallback: bool) -> str:
