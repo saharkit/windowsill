@@ -34,8 +34,14 @@ Deliberate behaviours, found by live debugging — do not "simplify" them away:
   client-side sentence splitter stays for the blob path and older servers.
 * keys — the cloud API key comes from ``key_file`` (wins) or the named env var, is used only as an
   in-process HTTP header, and NEVER appears in argv, in the config, or in the log.
-* timing — every spoken run logs ``timings extract_ms=… first_audio_ms=… total_ms=…`` so latency
-  changes are measurable from the state log, before vs after.
+* timing — every spoken run logs ``timings extract_ms=… first_audio_ms=… total_ms=…``, and ALL
+  THREE are measured from ONE monotonic t0 taken at hook start, so the three numbers compare.
+  **first_audio_ms is hook start -> the spawn of the FIRST player process**: the moment sound can
+  begin, counted from the moment the hook began. It therefore includes everything you wait through
+  before hearing anything — the transcript read (incl. flush-race retries), the /health probe,
+  opening the stream, and the first chunk's synthesis. It was previously measured from inside the
+  player loop, which started its clock AFTER the streaming source had already eagerly pulled (and
+  waited out) the first chunk; that under-reported a real 2308 ms wait as 3 ms.
 """
 
 from __future__ import annotations
@@ -488,13 +494,21 @@ def _synthesized_audio(chunks: list[str], s: dict, key: str):
         yield audio
 
 
-def _play_stream(audio_iter, s: dict) -> tuple[int, int, int, int | None]:
+def _play_stream(audio_iter, s: dict, t0: float) -> tuple[int, int, int, int | None]:
     """Produce chunk N+1 while chunk N plays. The source is ANY iterator of playable audio bytes —
     locally-synthesized sentence chunks and decoded SSE chunks enter the same queue. One player
     subprocess per chunk; the next Popen is issued the moment the previous .wait() returns, so the
     only gap is process spawn.
 
-    Returns (chunks_played, total_bytes, first_audio_ms_offset, last_rc)."""
+    ``t0`` is the hook's start instant (``time.monotonic()`` in main) — NOT a local clock started
+    here. That is deliberate: by the time this function is entered, the caller may already have
+    burned seconds the listener waited through (the /health probe, opening the stream, and the
+    first chunk pulled eagerly off ``audio_iter`` by stream_source). Measuring from t0 is what
+    makes the reported number the real time-to-first-sound instead of the player-loop's own
+    near-zero offset.
+
+    Returns (chunks_played, total_bytes, first_audio_ms, last_rc), where first_audio_ms is
+    t0 -> the spawn of the first player process, and -1 when nothing ever played."""
     player_argv = shlex.split(s["player"])
     proc: subprocess.Popen | None = None
     proc_wav: str | None = None
@@ -502,7 +516,6 @@ def _play_stream(audio_iter, s: dict) -> tuple[int, int, int, int | None]:
     total_bytes = 0
     first_audio_at: float | None = None
     rc: int | None = None
-    start = time.monotonic()
 
     def reap() -> None:
         nonlocal proc, proc_wav, rc
@@ -525,7 +538,7 @@ def _play_stream(audio_iter, s: dict) -> tuple[int, int, int, int | None]:
             _live["files"].add(wav)
             reap()  # let the previous chunk finish before starting this one
             if first_audio_at is None:
-                first_audio_at = time.monotonic()
+                first_audio_at = time.monotonic()  # sound starts at the spawn below
             try:
                 proc = subprocess.Popen(
                     player_argv + [wav], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
@@ -553,11 +566,13 @@ def _play_stream(audio_iter, s: dict) -> tuple[int, int, int, int | None]:
                 pass
             _live["files"].discard(path)
 
-    first_ms = -1 if first_audio_at is None else int((first_audio_at - start) * 1000)
+    first_ms = -1 if first_audio_at is None else int((first_audio_at - t0) * 1000)
     return played, total_bytes, first_ms, rc
 
 
 def main() -> int:
+    # THE clock: every logged timing (extract_ms, first_audio_ms, total_ms) is an offset from this
+    # one instant, so the three are directly comparable and none can hide a wait the other counted.
     t0 = time.monotonic()
     try:
         os.makedirs(_STATE_DIR, exist_ok=True)
@@ -617,7 +632,8 @@ def main() -> int:
             # tts.command: speak locally without any server (e.g. "say -v Milena" on macOS, or a
             # piper pipeline). The command receives the text on stdin and produces the sound itself
             # — synthesis and playback are one opaque step, so there is nothing to pipeline: the
-            # whole text goes in one call.
+            # whole text goes in one call. first_audio_ms keeps its definition here too: t0 -> the
+            # spawn of the process that makes the sound (this command IS the player).
             first_ms = int((time.monotonic() - t0) * 1000)
             try:
                 proc = subprocess.Popen(
@@ -660,9 +676,11 @@ def main() -> int:
                 if resp is not None:
                     _live["stream"] = resp
                     try:
+                        # stream_source pulls the first chunk eagerly: the whole first synthesis
+                        # is waited out HERE, which is exactly why _play_stream measures from t0.
                         source = stream_source(resp)
                         if source is not None:
-                            result = _play_stream(source, s)
+                            result = _play_stream(source, s, t0)
                             via = "stream"
                         else:
                             log("stream died before its first chunk — falling back to /tts")
@@ -674,10 +692,9 @@ def main() -> int:
                             pass
         if result is None:
             # blob path: the client does the sentence chunking (older server, cloud, or fallback)
-            result = _play_stream(_synthesized_audio(chunk_sentences(text), s, key), s)
-        played, total_bytes, first_offset_ms, rc = result
+            result = _play_stream(_synthesized_audio(chunk_sentences(text), s, key), s, t0)
+        played, total_bytes, first_ms, rc = result
         total_ms = int((time.monotonic() - t0) * 1000)
-        first_ms = -1 if first_offset_ms < 0 else extract_ms + first_offset_ms
         if played:
             log(f"played rc={rc} bytes={total_bytes} chunks={played} via={via}")
         log(f"timings extract_ms={extract_ms} first_audio_ms={first_ms} total_ms={total_ms}")
