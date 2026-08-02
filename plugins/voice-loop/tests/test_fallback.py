@@ -54,6 +54,30 @@ class RecordingSilero(FakeSilero):
         return super().apply_tts(text, speaker, sample_rate)
 
 
+class WatchedLock:
+    """`_fallbacks_lock`, instrumented so a test can hold its critical section OPEN.
+
+    Entering announces itself and then waits for `let_go` before the guarded code runs, which puts a
+    second caller where the property actually lives: queued on the real lock underneath. Counting
+    threads cannot see that — the GIL happens not to preempt a tight `+= 1`, so a thread-count test
+    passes with the lock removed (measured: 20/20 green against that mutation). This one does not.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.entered = threading.Event()
+        self.let_go = threading.Event()
+
+    def __enter__(self) -> "WatchedLock":
+        self._lock.acquire()
+        self.entered.set()
+        self.let_go.wait(10)
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self._lock.release()
+
+
 @pytest.fixture
 def silero_fallback(monkeypatch, xtts_engine):
     """The shipped pairing: an xtts primary (configured, reference on disk), silero behind it."""
@@ -138,12 +162,48 @@ def test_reset_caches_zeroes_the_fallback_counter():
     assert voice_server._tts_fallbacks == 0
 
 
+@pytest.mark.timeout(15)
+def test_a_second_handover_waits_for_the_counter_section(monkeypatch):
+    """The counter is bumped under mutual exclusion — forced here, not hoped for.
+
+    `+= 1` is a read-modify-write and the handovers do not share a thread: /tts counts on the event
+    loop, every /tts/stream restart counts from the worker thread its generator is iterated on. So
+    the section has to EXCLUDE, and the only way to see exclusion is to hold it open: while the
+    first count_fallback sits inside, the second is provably still blocked and nothing has been
+    counted yet; released, both land."""
+    watched = WatchedLock()
+    monkeypatch.setattr(voice_server, "_fallbacks_lock", watched)
+    first = threading.Thread(target=voice_server.count_fallback)
+    second = threading.Thread(target=voice_server.count_fallback)
+
+    try:
+        first.start()
+        assert watched.entered.wait(5), "count_fallback never entered the counter's lock"
+
+        second.start()
+        second.join(0.5)
+        assert second.is_alive(), "a second count_fallback ran while the section was held"
+        assert voice_server._tts_fallbacks == 0  # the first is inside, before its own increment
+    finally:
+        # Tolerant of a failed assertion above: `second` may never have been started, and the
+        # diagnostic that failed must reach the report instead of a join error on top of it.
+        watched.let_go.set()
+        for worker in (first, second):
+            if worker.is_alive():
+                worker.join(5)
+
+    assert not (first.is_alive() or second.is_alive())
+    assert voice_server._tts_fallbacks == 2  # both handovers, neither lost to the other
+
+
 @pytest.mark.timeout(20)
-def test_the_fallback_counter_loses_nothing_to_concurrent_handovers():
-    """`+= 1` from several threads at once is a read-modify-write, and a broken primary is exactly
-    the situation that produces concurrent handovers: /tts counts on the event loop, every
-    /tts/stream restart counts from the worker thread its generator is iterated on. The number an
-    operator reads off /health has to be the number of handovers that happened."""
+def test_the_fallback_counter_survives_a_crowd_of_handovers():
+    """A SMOKE, not the proof — the proof of exclusion is the test above.
+
+    What this still buys: the locked counter does not deadlock or lose its lock under real
+    concurrency, and the total is exact at a density no single-threaded run reaches. What it cannot
+    do is fail when the lock is gone (CPython does not preempt the tight loop), which is exactly why
+    it is not left to stand alone."""
     threads, per_thread = 8, 500
     start = threading.Barrier(threads)
 
