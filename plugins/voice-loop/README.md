@@ -15,6 +15,8 @@ A Claude Code plugin that closes the voice loop in both directions:
 
 - **out** — a `Stop` hook speaks the lines your assistant marks with `🔊`. Only marked lines are
   voiced, so you hear the summary and read the detail. Nothing else about your session changes.
+  (In a long tool-heavy turn, [eager mode](#eager-mode--hear-a-line-when-it-is-written-not-when-the-turn-ends)
+  speaks them as they are written instead of at the end.)
 - **in** — a push-to-talk script: press a hotkey, speak, press again. The audio is transcribed and
   lands in the focused window (or on your clipboard, which is the default no-permissions path).
 
@@ -131,6 +133,48 @@ through before hearing anything: the transcript read, the `/health` probe, openi
 the first chunk's synthesis. `total_ms` is the whole run. On a multi-sentence line, `first_audio_ms`
 sitting far below `total_ms` *is* the streaming, visible in numbers.
 
+## Eager mode — hear a line when it is written, not when the turn ends
+
+The `Stop` hook fires **when a turn ends**. In a short turn that is the same moment; in a long
+tool-heavy one it is minutes later, and the 🔊 line you were meant to hear at the top of the work
+arrives after all of it. Eager mode fixes that by also listening to `PostToolUse`: every tool call
+becomes a chance to speak the marked lines that have appeared so far, so a long turn narrates itself
+as it goes.
+
+It is **opt-in and off by default** — it speaks during the turn rather than after it, which is a
+different feel, and nobody should get it without asking:
+
+```json
+{ "speak": { "eager": true } }
+```
+
+in `~/.config/voice-loop/config.json`. With it off, **nothing on this page happens to you**: the
+`PostToolUse` registration exits before it reads anything (no transcript, no state, nothing per tool
+call), and the `Stop` hook keeps exactly the behaviour it has always had — it dedups against the
+line it spoke immediately before, and nothing else. Everything below is machinery that switches on
+with `speak.eager`, ledger included.
+
+What makes it safe to have two hooks reading the same transcript is a small **spoken-ledger** at
+`~/.local/state/voice-loop/spoken.ledger`: `sha1(transcript_path + message index + line)` of every
+line either path speaks, consulted by both before speaking. So a line is voiced **exactly once**,
+whichever hook reached it first — `Stop` stays silent about what was already narrated, and says
+whatever landed after the last tool call. The message index is in the key because a session says
+"Done." many times, and the fifth one is a new line rather than an echo of the first. The ledger is
+a rolling window (the last few hundred lines), not a journal.
+
+Two more behaviours worth knowing:
+
+- **A session is never recited back at you.** The first time either hook sees a transcript, every
+  marked line already in it is written off as history — silently. Turning eager on mid-session
+  therefore starts speaking from that point, instead of replaying the whole conversation.
+- **One speaker at a time, and nobody waits in line.** Reading the ledger, claiming a line and
+  speaking it all happen under one exclusive lock (`speaking.lock`), so two firings can neither
+  claim the same line nor talk over each other. The lock is taken **without blocking**: an eager
+  firing that loses the race exits immediately rather than queueing behind the speaker — it claimed
+  nothing, so its line is simply picked up by the next tool call. Only `Stop` waits, and only for a
+  fraction of a second, because it is the turn's last chance; after that it takes over (the
+  supersede from the *Latency* section) and tries once more.
+
 ## What is in here
 
 Everything this plugin is lives under its own directory — the repository root belongs to the shelf,
@@ -139,9 +183,9 @@ not to any one plugin.
 ```
 plugins/voice-loop/
   .claude-plugin/plugin.json  the plugin manifest (name, version, description)
-  hooks/hooks.json            registers the Stop hook
-  scripts/speak.sh            the Stop hook's launcher (stable entry point; never fails a turn)
-  scripts/speak.py            the Stop hook: extract marked lines -> chunk -> synthesize -> stream-play
+  hooks/hooks.json            registers the Stop hook (and the opt-in eager PostToolUse one)
+  scripts/speak.sh            the speaking hook's launcher (stable entry point; never fails a turn)
+  scripts/speak.py            the speaking hook: extract marked lines -> chunk -> synthesize -> stream-play
   scripts/dictate-toggle.sh   push-to-talk launcher (stable hotkey entry point)
   scripts/dictate.py          the toggle: record -> transcribe -> clipboard/paste-into-prompt
   scripts/selftest.sh         hardware-free loopback proof (TTS -> STT -> compare)

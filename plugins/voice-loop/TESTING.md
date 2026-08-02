@@ -53,11 +53,31 @@ the real runtime. So the guarantee is layered differently:
    itself is Python (stdlib-only `scripts/speak.py`, launched by a thin `speak.sh`);
 2. **`tests/test_speak.py`** unit-tests the parts of `speak.py` with no I/O in them at all — the
    sentence chunker that drives streaming, the transcript extractor, the config-precedence table,
-   key-file handling — stdlib + pytest, no network, no player, no state dir;
+   key-file handling — stdlib + pytest, no network, no player, no state dir. Eager mode's own
+   invariants are driven through the real `main()` there too, with every I/O seam faked into
+   `tmp_path`: the spoken-ledger (a line is spoken once, whichever event path reached it first — and
+   the test fails on a double-speak if the ledger claim is removed, and a line the assistant wrote
+   twice in one message is one claim and one utterance), first-run seeding (a session is never
+   recited back), the non-blocking lock (a firing that loses the race speaks nothing, claims
+   nothing, and waits for nobody; a rival is still locked out mid-playback, not merely during the
+   claim; `Stop` supersedes a holder it cannot wait out), and — pinned from
+   both sides — that **none of that machinery exists with `speak.eager` off**, where `Stop` keeps
+   exactly its pre-eager prev-utterance dedup and never touches the ledger;
 3. a **real invocation of the Stop hook in CI**: a synthetic transcript, the actual `speak.sh`, the
    actual speech server, a no-op player — asserting that the marked line was extracted, that an
    unmarked line was *not* spoken, and that synthesis and playback returned success;
-4. the **loopback selftest** (`selftest.sh`), which is itself one of the scripts, exercised against a
+4. a **real invocation of eager mode in CI** — the step beside it, on the same live server, because
+   a subsystem that only ever ran under fakes is a subsystem nobody has run. A second config turns
+   `speak.eager` on (the first one, and the step above, stay default-off) and a second state dir
+   keeps the run countable, so "spoken exactly once" is a number rather than a hopeful grep. Real
+   `speak.sh` processes then walk the whole thing: first-run **seeding** (the line already in the
+   transcript is ledgered, never spoken), a **`PostToolUse`** firing that speaks a marked line the
+   moment it appears, a **`Stop`** firing over that same last message that stays quiet because the
+   **ledger** already accounts for it — and a later one that does speak the closing line no eager
+   firing ever saw — and finally two firings launched back to back over one fresh line, asserting
+   that exactly ONE of them played it while the other logged its line *unclaimed* instead of
+   queueing behind the speaker (the **lock**, non-blocking, in real processes);
+5. the **loopback selftest** (`selftest.sh`), which is itself one of the scripts, exercised against a
    live server on both Linux and macOS.
 
 Real invocation is the guarantee for the runtime path. Every spoken run also logs
@@ -131,6 +151,10 @@ prompt the setup causes.
 | 3.9 | Stress/pronunciation of your own proper names (ru/uk) | acceptable after adding them to `stress.json` | | |
 | 3.10 | **Streaming**: a 🔊 line of three or more full sentences | playback starts after roughly one sentence's worth of synthesis, not after the whole line; no audible gap between chunks | | |
 | 3.11 | The timing log after 3.10 | `speak.log` shows `played … chunks=N` with N > 1, and a `timings` line whose `first_audio_ms` is well below `total_ms` | | |
+| 3.12 | **Eager mode** (`speak.eager: true`): ask for a long tool-heavy turn whose assistant writes two 🔊 lines mid-turn, several tool calls apart | both are narrated **before the turn ends**, in the order written, one after the other (never overlapping) — and each is spoken **once**: the `Stop` hook at the end of the turn adds nothing they already said | | |
+| 3.13 | Turn eager on **mid-session**, then let one tool call fire | the session so far is NOT recited; only lines written from that point on are spoken (`speak.log` shows `seeded N line(s) of history`) | | |
+| 3.14 | With eager **off** (the default), three turns whose 🔊 line is `Done.`, then `Working.`, then `Done.` again | all three are spoken — the repeat is not swallowed. `spoken.ledger` is never created: eager-off behaviour is unchanged from before eager mode existed | | |
+| 3.15 | With eager **on**, the same three turns | all three are spoken here too — the ledger keys on the message, not just the text | | |
 
 ## 4. Negative cases — failures must be legible, never hangs
 

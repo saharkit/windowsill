@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
-"""voice-loop — Stop hook: speak the assistant's marker-tagged lines.
+"""voice-loop — the speaking hook: speak the assistant's marker-tagged lines.
 
 This is the hook's whole logic; ``scripts/speak.sh`` is only a thin launcher (hooks.json keeps
 invoking the .sh so the registration surface never changes). Stdlib only, Python 3.10+.
+
+Two events reach it, and ``hook_event_name`` on stdin is what tells them apart: **Stop** (always
+registered) at the end of a turn, and **PostToolUse** (opt-in, ``speak.eager``) after every tool
+call — see "eager speaking" below.
 
 Convention: only lines whose first non-space character is the marker (default 🔊) are voiced;
 everything else stays text. The model decides what is worth hearing.
@@ -16,6 +20,44 @@ Deliberate behaviours, found by live debugging — do not "simplify" them away:
   EMPTY extract, or an extract IDENTICAL to the previously spoken line — with adaptive backoff
   (0.15 → 1.0 s), so an already-flushed transcript costs zero sleep.
 * dedup — a same-as-last read IS the stale previous turn, so it is dropped, not spoken twice.
+* eager speaking (opt-in, ``speak.eager``) — Stop fires only at the END of a turn, so a 🔊 line
+  printed early in a long tool-heavy turn is heard minutes late. With eager on, hooks.json also
+  registers PostToolUse, and every tool call becomes a chance to narrate what has appeared so far.
+  The two paths differ in scope and in retries, in nothing else: PostToolUse reads the marked lines
+  of ALL assistant messages (by the time a tool returns, the line can be several messages old) and
+  never retries the flush race — a half-written line is caught by the NEXT firing, which is free;
+  Stop reads the last message and keeps the retry, because for it there is no next firing.
+* spoken-ledger, AND IT EXISTS ONLY FOR EAGER — with two event paths racing to say the same line,
+  "have I said this already?" can no longer be one last-spoken string.
+  ``sha1(transcript_path + message_index + line)[:16]`` of every line either path speaks is appended
+  to ``spoken.ledger`` (trimmed to the last LEDGER_LINES on entry), and both paths consult it before
+  speaking, so a line is voiced exactly once whichever hook saw it first. The MESSAGE INDEX is part
+  of that identity on purpose: a session says «Done.» many times, and the ninth one is a different
+  line in a different message — not the first one echoing. A ledger keyed by text alone would mute
+  it forever.
+  The whole mechanism is gated on ``speak.eager``. With eager OFF there is only ever ONE event path,
+  so there is nothing to be idempotent WITH: the Stop hook runs EXACTLY its pre-0.3.2 logic — dedup
+  against the immediately previous utterance and nothing else, no ledger read, no ledger write, no
+  seeding, no lock. A → B → A speaks three times, as it always did.
+  With eager on, a line is claimed BEFORE playback: a line whose synthesis then fails is lost rather
+  than repeated — for something that talks out loud, idempotence beats completeness.
+* first-run seeding (eager only, with the ledger) — a transcript nobody has spoken for yet (no
+  ``seeded:<sha1(path)[:16]>`` marker in the ledger) is HISTORY, not news: every marked line already
+  in it is written to the ledger WITHOUT being spoken. Turning eager on mid-session otherwise
+  recites the entire session back at you, which is exactly what the live deployment did. The Stop
+  path seeds everything EXCEPT the last message's lines — those are the turn it was called to speak.
+* one speaker at a time, and NOBODY WAITS — the whole read-claim-speak sequence runs under an
+  exclusive flock on ``speaking.lock``, so the ledger cannot be read by one firing while another is
+  half-way through claiming it, and two firings cannot talk over each other. The acquire is
+  NON-BLOCKING: an eager firing that loses the race exits at once. It never claimed anything, so its
+  line stays available to the next firing — and the next firing is free, one tool call away. Waiting
+  would cost far more than it buys: one blocked python per tool call piles up through a heavy turn,
+  and a waiter is invisible to everything that looks at ``playing.pid`` — the takeover cannot
+  supersede it and dictate.py's echo guard cannot stop it, so it wakes up and speaks into an open
+  microphone. Only Stop waits, and only briefly (LOCK_GRACE): it is the turn's last chance, so it
+  lets the holder finish, then supersedes it (SIGTERM releases that chain's lock with it) and takes
+  one more shot. A Stop that still cannot get in leaves its lines UNCLAIMED rather than claiming
+  outside the lock — the next turn's eager firing, which reads every message, still says them.
 * takeover — a fresher hook invocation supersedes a still-playing older one. Scoped precisely:
   the speaking chain records its PIDs (this process + the current player/command child) in a
   pidfile, and a new invocation SIGTERMs exactly those — nothing pattern-matched, nothing else —
@@ -47,6 +89,7 @@ Deliberate behaviours, found by live debugging — do not "simplify" them away:
 from __future__ import annotations
 
 import base64
+import hashlib
 import itertools
 import json
 import os
@@ -61,9 +104,27 @@ import time
 import urllib.error
 import urllib.request
 
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - POSIX-only; Linux and macOS are the supported platforms
+    fcntl = None  # type: ignore[assignment]
+
 # Retry backoff for the flush race: adaptive, front-loaded — most races resolve within the first
 # fraction of a second, so we probe early instead of sleeping a flat 5 x 0.7 s tail.
 BACKOFF = (0.15, 0.3, 0.5, 0.7, 1.0)
+
+# The spoken-ledger is a rolling window, not a journal: it only has to answer "did we already say
+# this line?" for the transcript currently in front of us. LEDGER_LINES is roughly a long session's
+# worth of marked lines; the per-transcript seed markers are kept separately (and far longer) —
+# dropping a live session's marker would re-seed it and swallow its next line.
+LEDGER_LINES = 400
+LEDGER_SEEDS = 40
+SEED_PREFIX = "seeded:"
+
+# The ONLY wait left in the lock path, and it belongs to Stop alone: having let the current speaker
+# have its moment, Stop SIGTERMs it and needs a beat for that chain to die and drop the flock.
+# Bounded and tiny — an eager firing passes no grace at all and loses instantly.
+LOCK_GRACE = (0.05, 0.1, 0.2)
 
 # Streaming chunks below this length gain nothing (player spawn overhead dominates), so tiny
 # sentences are merged up to at least this many characters.
@@ -78,6 +139,14 @@ _SENTENCE_END = re.compile(r"(?<=[.!?…])\s+")
 _STATE_DIR = os.path.join(os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state")), "voice-loop")
 _LOG_PATH = os.path.join(_STATE_DIR, "speak.log")
 _LAST_PATH = os.path.join(_STATE_DIR, "last-spoken")
+
+# One line per line ever spoken (plus one seed marker per transcript) — the cross-event memory that
+# makes Stop and PostToolUse idempotent with respect to each other.
+_LEDGER_PATH = os.path.join(_STATE_DIR, "spoken.ledger")
+
+# The inter-firing lock: held for the whole read-claim-speak sequence, so two firings can neither
+# claim the same line nor talk over each other. Taken non-blocking — see acquire_lock.
+_LOCK_PATH = os.path.join(_STATE_DIR, "speaking.lock")
 
 # CROSS-SCRIPT CONTRACT (keep in sync with dictate.py): playing.pid holds the space-separated
 # PIDs of the live speaking chain — this python process first, then the current player/command
@@ -136,6 +205,9 @@ def resolve_settings(config: dict, system: str) -> dict:
     voice_settings = cfg(config, "tts.cloud.voice_settings", None)
     return {
         "enabled": cfg(config, "speak.enabled", True) not in (False, "false"),
+        # eager is opt-in and OFF by default: with it off the PostToolUse registration is a no-op
+        # that costs one stdin read per tool call and never touches the transcript.
+        "eager": cfg(config, "speak.eager", False) not in (False, "false"),
         "marker": str(cfg(config, "speak.marker", "🔊")),
         "player": str(cfg(config, "speak.player", "afplay" if system == "Darwin" else "aplay -q")),
         "max_chars": int(cfg(config, "speak.max_chars", 600)),
@@ -174,14 +246,10 @@ def read_key(key_file: str, key_env: str, environ) -> str:
     return environ.get(key_env, "")
 
 
-def extract_from_lines(lines, marker: str, limit: int) -> str | None:
-    """Marker-tagged text of the LAST assistant message, joined and clipped.
-
-    Returns None when NO assistant message has reached the transcript yet — the flush-race
-    signature the caller retries on — and '' when the last assistant message IS present and
-    parsed but yields no spoken text (no marker line, or a bare marker with nothing after it):
-    a re-read cannot change a parsed message, so '' means exit at once, never backoff."""
-    last = None
+def assistant_texts(lines) -> list[str]:
+    """The text of every assistant message in the transcript, oldest first — messages carrying no
+    text part at all (a pure tool call) are not messages we could ever speak, so they are skipped."""
+    texts: list[str] = []
     for line in lines:
         try:
             rec = json.loads(line)
@@ -192,22 +260,191 @@ def extract_from_lines(lines, marker: str, limit: int) -> str | None:
         msg = rec.get("message") or {}
         parts = [c.get("text", "") for c in (msg.get("content") or []) if c.get("type") == "text"]
         if any(parts):
-            last = "\n".join(parts)
-    if not last:
+            texts.append("\n".join(parts))
+    return texts
+
+
+def marked_bodies(text: str, marker: str) -> list[str]:
+    """One message's marker-tagged lines, marker and surrounding space stripped. A bare marker
+    yields '' and is KEPT here: the caller needs to tell "marked nothing" from "marked nothing at
+    all"."""
+    return [ln.lstrip()[len(marker):].strip() for ln in text.splitlines() if ln.lstrip().startswith(marker)]
+
+
+def extract_from_lines(lines, marker: str, limit: int, *, all_messages: bool = False, accept=None) -> str | None:
+    """Marker-tagged text joined into one utterance and clipped to ``limit``.
+
+    Scope is the event's: the LAST assistant message for Stop, and with ``all_messages`` every
+    assistant message (the PostToolUse path — the line worth hearing may be several messages back
+    by the time a tool returns).
+
+    ``accept`` is the ledger's veto: a predicate over ``(message_index, line)`` that returns False
+    for a line already spoken. The index is passed because that pair — not the text alone — is what
+    the ledger keys on: a repeated sentence in a later message is a new line. Lines it rejects are
+    dropped, and a scope whose every marked line is rejected reads as None — "nothing NEW yet",
+    which is the same answer a not-yet-flushed message gives, and the same answer the pre-ledger
+    code gave when the extract equalled the last spoken line. Absent (the eager-off Stop path),
+    every marked line is taken — the pre-ledger behaviour, unchanged.
+
+    Returns None when NO assistant message has reached the transcript yet — the flush-race
+    signature the caller retries on — and '' when the message IS present and parsed but yields no
+    spoken text (no marker line, or a bare marker with nothing after it): a re-read cannot change a
+    parsed message, so '' means exit at once, never backoff."""
+    texts = assistant_texts(lines)
+    if not texts:
         return None
-    marked = [ln.lstrip()[len(marker):].strip() for ln in last.splitlines() if ln.lstrip().startswith(marker)]
-    out = [x for x in marked if x]
-    if marked and not out:
+    scope = list(enumerate(texts))
+    marked = [(i, body) for i, text in (scope if all_messages else scope[-1:]) for body in marked_bodies(text, marker)]
+    speakable = [(i, body) for i, body in marked if body]
+    if marked and not speakable:
         log("marker with no text")  # a bare marker is a decided "nothing to say", not a race
-    return " ".join(out)[:limit]
+    if not speakable:
+        return ""
+    fresh = [body for i, body in speakable if accept is None or accept(i, body)]
+    if not fresh:
+        return None  # every marked line is already in the ledger: nothing new to say YET
+    return " ".join(fresh)[:limit]
 
 
-def extract(path: str, marker: str, limit: int) -> str | None:
+def extract(path: str, marker: str, limit: int, *, all_messages: bool = False, accept=None) -> str | None:
     try:
         with open(path, encoding="utf-8") as fh:
-            return extract_from_lines(fh, marker, limit)
+            return extract_from_lines(fh, marker, limit, all_messages=all_messages, accept=accept)
     except OSError:
         return None  # an unreadable transcript is "nothing extracted yet", retried like a race
+
+
+def marked_history(path: str, marker: str, *, include_last: bool) -> list[tuple[int, str]]:
+    """Every marked line already in the transcript as ``(message_index, line)`` — what first-run
+    seeding writes off as history, in the shape the ledger keys on.
+
+    ``include_last`` is the event's scope again, inverted: the PostToolUse path has no claim on any
+    of it (include_last=True — never recite a session back at its user), while the Stop path is
+    entitled to the last message, which is the turn it was invoked to speak (include_last=False)."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            texts = assistant_texts(fh)
+    except OSError:
+        return []
+    scope = list(enumerate(texts))
+    if not include_last:
+        scope = scope[:-1]
+    return [(i, body) for i, text in scope for body in marked_bodies(text, marker) if body]
+
+
+# --- the spoken-ledger: one memory, both event paths -------------------------------------------
+
+
+def ledger_key(transcript_path: str, index: int, line: str) -> str:
+    """The identity of one spoken line: which session, which assistant message, which text.
+
+    Both coordinates matter. The transcript path, because the same sentence in two different
+    sessions is two different lines and each deserves to be heard. The message index, because a
+    session says «Done.» over and over: keyed by text alone the second one would be mistaken for
+    the first and go permanently silent, which is precisely what a rolling per-session ledger must
+    not do. An index is safe as an identity because a transcript is append-only — message N stays
+    message N for as long as the session lives."""
+    return hashlib.sha1(f"{transcript_path}\n{index}\n{line}".encode()).hexdigest()[:16]
+
+
+def seed_marker(transcript_path: str) -> str:
+    """The per-transcript "I have seen this one before" record. Its absence — not an empty ledger,
+    which any trim can produce — is what makes a transcript first-run."""
+    return SEED_PREFIX + hashlib.sha1(transcript_path.encode()).hexdigest()[:16]
+
+
+def read_ledger() -> list[str]:
+    """The ledger's entries, oldest first. An absent or unreadable ledger is an empty one — the
+    cost of being wrong here is a line spoken twice, never a turn that fails."""
+    try:
+        with open(_LEDGER_PATH, encoding="utf-8") as fh:
+            return [line.strip() for line in fh if line.strip()]
+    except OSError:
+        return []
+
+
+def append_ledger(entries) -> None:
+    """Claim entries. Append-only and one write, so a concurrent firing's claim cannot be lost to a
+    read-modify-write of ours."""
+    entries = [e for e in entries if e]
+    if not entries:
+        return
+    try:
+        with open(_LEDGER_PATH, "a", encoding="utf-8") as fh:
+            fh.write("".join(f"{e}\n" for e in entries))
+    except OSError as err:
+        # a ledger we cannot write is a ledger that cannot dedup: say so once, keep speaking
+        log(f"ledger unwritable: {type(err).__name__}: {err}")
+
+
+def trim_ledger() -> None:
+    """Keep the ledger a rolling window: the last LEDGER_LINES line entries, plus the last
+    LEDGER_SEEDS seed markers. Seed markers survive separately because a session that outlives its
+    own marker would be re-seeded — and re-seeding writes off the line it was about to speak."""
+    entries = read_ledger()
+    seeds = [e for e in entries if e.startswith(SEED_PREFIX)]
+    spoken = [e for e in entries if not e.startswith(SEED_PREFIX)]
+    if len(seeds) <= LEDGER_SEEDS and len(spoken) <= LEDGER_LINES:
+        return
+    kept = seeds[-LEDGER_SEEDS:] + spoken[-LEDGER_LINES:]
+    try:
+        fd, tmp = tempfile.mkstemp(prefix="voice-loop-ledger-", dir=os.path.dirname(_LEDGER_PATH))
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write("".join(f"{e}\n" for e in kept))
+        os.replace(tmp, _LEDGER_PATH)
+    except OSError as err:
+        log(f"ledger trim failed: {type(err).__name__}: {err}")
+
+
+# --- the inter-firing lock: one speaker at a time, and the loser never waits ---------------------
+
+
+class _NoLock:
+    """What acquire_lock returns when the platform or the filesystem cannot give us a real lock:
+    speaking proceeds unserialized rather than going silent. Closing it is a no-op."""
+
+    def close(self) -> None:
+        pass
+
+
+def acquire_lock(grace=()):
+    """Take the exclusive speaking lock WITHOUT blocking.
+
+    Returns the open lockfile (the flock lives as long as it stays open — and dies with the process,
+    which is what lets a taken-over chain release it by exiting), a _NoLock when locking is not
+    available at all, or None when another firing holds it.
+
+    ``grace`` is a short sequence of pauses to re-try over, and only the Stop path passes one. An
+    eager firing passes nothing and loses instantly: a firing that waits is a firing that piles up
+    (one blocked python per tool call), that no takeover can supersede and no echo guard can stop —
+    it holds no entry in ``playing.pid`` while it waits. Losing costs it nothing, because it has
+    claimed nothing and the next firing is one tool call away."""
+    try:
+        fh = open(_LOCK_PATH, "w", encoding="utf-8")
+    except OSError:
+        return _NoLock()
+    if fcntl is None:  # pragma: no cover - POSIX-only; Linux and macOS both have fcntl
+        return fh
+    for pause in (None, *grace):
+        if pause is not None:
+            time.sleep(pause)
+        try:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return fh
+        except OSError:
+            continue
+    fh.close()
+    return None
+
+
+def release_lock(lock) -> None:
+    """Closing the file releases the flock; a _NoLock closes to nothing."""
+    if lock is None:
+        return
+    try:
+        lock.close()
+    except OSError:
+        pass
 
 
 def chunk_sentences(text: str, min_chars: int = MIN_CHUNK_CHARS) -> list[str]:
@@ -591,43 +828,122 @@ def main() -> int:
         payload = json.loads(sys.stdin.read())
     except ValueError:
         return 0
-    transcript = payload.get("transcript_path") if isinstance(payload, dict) else None
+    if not isinstance(payload, dict):
+        payload = {}
+    # Stop is the default for a payload that names no event: the hook has always been a Stop hook,
+    # and an unknown event is treated as one rather than as the eager path it did not ask for.
+    eager = str(payload.get("hook_event_name") or "Stop") == "PostToolUse"
+    if eager and not s["eager"]:
+        return 0  # the opt-in no-op: one stdin read per tool call, and the transcript untouched
+    transcript = payload.get("transcript_path")
     if not transcript or not os.path.isfile(transcript):
         return 0
 
+    # The ledger, the lock and the seeding are eager mode's machinery, and they exist ONLY when the
+    # user has opted in. With eager off there is one event path, no race to be idempotent against,
+    # and therefore nothing to gate on: everything below reduces to the pre-0.3.2 Stop hook.
+    ledger_on = s["eager"]
+
+    lock = None
+    superseded = False  # a turn supersedes the chain before it exactly once, wherever it had to
     try:
-        with open(_LAST_PATH, encoding="utf-8") as fh:
-            prev = fh.read()
-    except OSError:
-        prev = ""
+        if ledger_on:
+            # Everything from reading the ledger to finishing playback happens under this lock, so a
+            # line cannot be claimed twice or spoken over. The acquire never blocks.
+            if eager:
+                lock = acquire_lock()
+                if lock is None:
+                    log("eager: another firing is speaking — line left unclaimed for the next firing")
+                    return 0
+            else:
+                # Stop: give the holder its beat, then supersede it — the SIGTERM releases that
+                # chain's flock with it — and take one more shot.
+                lock = acquire_lock(LOCK_GRACE)
+                if lock is None:
+                    take_over()
+                    superseded = True
+                    lock = acquire_lock(LOCK_GRACE)
+                if lock is None:
+                    log("stop: the speaking lock is still held — lines left unclaimed")
+                    return 0
 
-    # Flush race: read immediately; retry ONLY on the race signatures — nothing extracted yet
-    # (None), or an extract identical to the previously spoken line. A parsed last message that
-    # yields '' (no marker, or a marker with no text) is FINAL: exit at once, zero backoff.
-    text = extract(transcript, s["marker"], s["max_chars"])
-    for pause in BACKOFF:
-        if text == "" or (text and text != prev):
-            break
-        time.sleep(pause)
-        text = extract(transcript, s["marker"], s["max_chars"])
-    if not text:
-        return 0
-    if text == prev:  # dedup: the stale previous turn, dropped, not spoken twice
-        return 0
-    extract_ms = int((time.monotonic() - t0) * 1000)
+            trim_ledger()
+            # First run for this transcript: everything already in it is history. Write it off
+            # without speaking it, so enabling eager mid-session cannot recite the session back.
+            if seed_marker(transcript) not in read_ledger():
+                history = marked_history(transcript, s["marker"], include_last=eager)
+                append_ledger([ledger_key(transcript, i, line) for i, line in history] + [seed_marker(transcript)])
+                log(f"seeded {len(history)} line(s) of history for this transcript — not spoken")
 
-    try:
-        with open(_LAST_PATH, "w", encoding="utf-8") as fh:
-            fh.write(text)
-    except OSError:
-        pass
-    log(f"text: {text[:80]}")
+        try:
+            with open(_LAST_PATH, encoding="utf-8") as fh:
+                prev = fh.read()
+        except OSError:
+            prev = ""
 
-    signal.signal(signal.SIGTERM, _on_sigterm)
-    take_over()
-    _write_pidfile(os.getpid())
+        claimed: list[str] = []
 
-    try:
+        def read_fresh() -> str | None:
+            """One transcript read: the marked lines this event owns, minus everything the ledger
+            already accounts for. The ledger is re-read every time — a firing that ran between our
+            rounds may have claimed a line since. With eager off there is no ledger and no veto:
+            the read is exactly the pre-0.3.2 one, the last message's marked lines, all of them."""
+            if not ledger_on:
+                return extract(transcript, s["marker"], s["max_chars"])
+            claimed.clear()
+            seen = set(read_ledger())
+
+            def accept(index: int, line: str) -> bool:
+                key = ledger_key(transcript, index, line)
+                if key in seen:
+                    return False
+                seen.add(key)  # a line repeated within one read is still one line
+                claimed.append(key)
+                return True
+
+            return extract(transcript, s["marker"], s["max_chars"], all_messages=eager, accept=accept)
+
+        # Flush race: read immediately; retry ONLY on the race signatures — nothing new extracted
+        # (None: no assistant message yet, or nothing but lines already spoken), or, with the ledger
+        # off, an extract identical to the previously spoken line. A parsed message that yields ''
+        # (no marker, or a marker with no text) is FINAL: exit at once, zero backoff. The eager path
+        # never retries — a line half-written now is caught by the next firing, which costs nothing.
+        text = read_fresh()
+        if not eager:
+            for pause in BACKOFF:
+                if text == "" or (text and (ledger_on or text != prev)):
+                    break
+                time.sleep(pause)
+                text = read_fresh()
+        if not text:
+            return 0
+        # dedup: the stale previous turn, dropped, not spoken twice. This is the WHOLE of the
+        # eager-off memory — deliberately shallow, so a line repeated later in a session is heard
+        # again. With the ledger on, the ledger has already answered the question more precisely,
+        # and re-asking it here would silence exactly the repeat the message index exists to keep.
+        if not ledger_on and text == prev:
+            return 0
+        extract_ms = int((time.monotonic() - t0) * 1000)
+
+        try:
+            with open(_LAST_PATH, "w", encoding="utf-8") as fh:
+                fh.write(text)
+        except OSError:
+            pass
+        # Claimed BEFORE a single byte is synthesized: a line lost to a failing server is silence
+        # once, where an unclaimed line is the same sentence said twice by the next firing.
+        append_ledger(claimed)
+        log(f"text: {text[:80]}")
+
+        signal.signal(signal.SIGTERM, _on_sigterm)
+        if not eager and not superseded:
+            # TAKEOVER: a fresher turn supersedes a still-playing older one. Unless the lock ladder
+            # above already had to do it, this is where it happens — and it still has work to do
+            # when the lock came free at once, because a chain running without a lock at all
+            # (_NoLock, an unwritable state dir) is invisible to the flock and audible to the user.
+            take_over()
+        _write_pidfile(os.getpid())
+
         if s["command"]:
             # tts.command: speak locally without any server (e.g. "say -v Milena" on macOS, or a
             # piper pipeline). The command receives the text on stdin and produces the sound itself
@@ -706,6 +1022,9 @@ def main() -> int:
                     os.unlink(_PID_PATH)
         except (OSError, IndexError):
             pass
+        # last, and always: the lock is free the moment this returns, so the next firing to try
+        # gets straight in rather than losing a race it did not have to lose
+        release_lock(lock)
 
 
 if __name__ == "__main__":

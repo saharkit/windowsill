@@ -1,8 +1,21 @@
 {
-  "description": "voice-loop: speak the assistant's marker-tagged lines when a turn ends",
+  "description": "voice-loop: speak the assistant's marker-tagged lines when a turn ends — and, with speak.eager on, as soon as they appear mid-turn",
   "hooks": {
     "Stop": [
       {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/scripts/speak.sh\"",
+            "async": true,
+            "timeout": 90
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "*",
         "hooks": [
           {
             "type": "command",
