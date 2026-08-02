@@ -1,14 +1,7 @@
 # windowsill
 
 [![selftest](https://github.com/saharkit/windowsill/actions/workflows/selftest.yml/badge.svg)](https://github.com/saharkit/windowsill/actions/workflows/selftest.yml)
-[![coverage: 100% (gated)](https://img.shields.io/badge/coverage-100%25%20%28gated%29-brightgreen)](plugins/voice-loop/TESTING.md)
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
-[![python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)](server/README.md#requirements)
-
-> The coverage badge is a **`--cov-fail-under=100` gate on the server's Python**, not a measured
-> float that drifts — and shell scripts are guaranteed differently (shellcheck + a real Stop-hook
-> invocation in CI), because line coverage is not a meaningful metric for glue. The badge links to
-> the page that says exactly that.
 
 Plugins and skills the **saharkit agent school** shares with everyone.
 
@@ -30,38 +23,54 @@ saharkit/windowsill`.)
 Then install what you want — this one is typed **inside a session**, not in your shell:
 
 ```text
-/plugin install voice-loop@windowsill
+/plugin install <plugin>@windowsill
 ```
 
-## Plugins
+## What is on the sill
 
-| plugin | what it does | status |
-|---|---|---|
-| [**voice-loop**](plugins/voice-loop) | Talk to Claude Code and hear it answer — a `Stop` hook speaks marked lines, a push-to-talk script dictates into the prompt, and `/voice-setup` installs the whole contour (local, LAN, or cloud speech). Ships its own self-hostable speech server. | v0.3.1 |
+| plugin | version | what it does | |
+|---|---|---|---|
+| **voice-loop** | 0.3.1 | Talk to Claude Code and hear it answer — a `Stop` hook speaks marked lines, a push-to-talk script dictates into the prompt, and `/voice-setup` installs the whole contour (local, LAN, or cloud speech). Ships its own self-hostable speech server. | [README](plugins/voice-loop/README.md) |
 
-More will land on the sill over time; each plugin owns its own README, its own tests, and its own
-version.
+Every plugin owns its own README, its own tests, its own docs and its own version — open its README
+for anything about it. More will land on the sill over time.
 
-## Docs
+Not a plugin, but on the sill too:
 
-- [docs/architecture.md](docs/architecture.md) — the loop: both paths, the three backends, where
-  config and state live.
-- [docs/troubleshooting.md](docs/troubleshooting.md) — by failure class: paste modes, recorder and
-  transcript races, robotic-sounding voices, firewalled servers, selftest messages.
-- [docs/faq.md](docs/faq.md) — resources, privacy per backend, languages, custom voices, permissions.
+| | what it is |
+|---|---|
+| [tales/](tales/README.md) | the shelf's story content — bedtime tales from the school, in Russian, some with a voiced edition. They never explain the machinery they came from: a tale hands you a fishing rod, not a fish. |
 
-## What is in this repo
+## What a plugin brings to the shelf
+
+Everything a plugin *is* lives under `plugins/<name>/`. **The root belongs to the shelf**, so a new
+plugin adds one directory and nothing else at the top level:
 
 ```
-.claude-plugin/marketplace.json   the marketplace manifest — what `marketplace add` reads
-plugins/<name>/                   one directory per plugin (manifest, hooks, scripts, skills, docs)
-server/                           companion services a plugin needs (currently the voice-loop speech server)
-tests/                            server unit tests (no models, no network) — 100% gated in CI
-docs/                             architecture, troubleshooting, FAQ
-.github/workflows/                CI: every plugin's automated checks
+plugins/<name>/
+  .claude-plugin/plugin.json   the manifest: name, description — and the version, which lives HERE
+  README.md                    the plugin's own front page (the table above links to it)
+  hooks/ scripts/ skills/      whatever the plugin actually ships
+  tests/ + its runner config   its own suite, invoked from its own directory
+  docs/                        its own deeper reading, if it needs any
 ```
 
-## Conventions
+The rules that follow from that:
+
+- **The version lives in `plugins/<name>/.claude-plugin/plugin.json`** and is mirrored into
+  `.claude-plugin/marketplace.json`. The two must agree; nothing else records a version.
+- **Tests belong to the plugin.** Its runner configuration (`pytest.ini`, `.coveragerc`, …) sits in
+  its directory with paths relative to it, and the suite is invoked from there — plugins never share
+  a test root, and adding one never disturbs another.
+- **The catalog row above is part of the plugin's own PR**, together with its `marketplace.json`
+  entry. A plugin that is not in the table is not on the shelf.
+- **CI is shared, per-plugin.** One workflow in `.github/workflows/` runs every plugin's checks; a
+  new plugin adds its own jobs (or its own matrix entry) there rather than a second workflow.
+
+Root-level, and this is the whole list: this README (the catalog), `.claude-plugin/marketplace.json`
+(the manifest `marketplace add` reads), `.github/` (shared CI), `tales/`, `LICENSE`.
+
+## Conventions (every plugin here follows them)
 
 - **Every plugin is testable without hardware.** If a plugin talks to the world, it ships a loopback
   or contract test that CI can run on Linux and macOS.

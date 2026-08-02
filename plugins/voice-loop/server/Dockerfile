@@ -1,6 +1,6 @@
 # voice-loop speech server — CPU-only image.
 #
-#   docker build -t voice-loop-server server/
+#   docker build -t voice-loop-server plugins/voice-loop/server/
 #   docker run --rm -p 127.0.0.1:8355:8355 voice-loop-server
 #
 # Models are baked in at build time, so the container starts warm and needs no network at runtime.

@@ -25,7 +25,7 @@ from pathlib import Path
 
 import pytest
 
-_SPEAK_PATH = Path(__file__).resolve().parents[1] / "plugins" / "voice-loop" / "scripts" / "speak.py"
+_SPEAK_PATH = Path(__file__).resolve().parents[1] / "scripts" / "speak.py"
 _spec = importlib.util.spec_from_file_location("speak", _SPEAK_PATH)
 speak = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(speak)

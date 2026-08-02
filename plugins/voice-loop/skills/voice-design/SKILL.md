@@ -217,8 +217,8 @@ confirm with the user that it sounded right.
 The local clone path **exists**: the bundled server ships an XTTS-v2 engine
 (`VOICE_LOOP_TTS_ENGINE=xtts`) that clones from a short reference wav — setup, the licensing
 caveats (the XTTS-v2 weights are non-commercial), and the reference contract are in
-`server/README.md` → *XTTS engine (voice cloning)* in the repo
-(<https://github.com/saharkit/windowsill/blob/main/server/README.md#xtts-engine-voice-cloning>).
+the plugin's own `server/README.md` → *XTTS engine (voice cloning)*
+(<https://github.com/saharkit/windowsill/blob/main/plugins/voice-loop/server/README.md#xtts-engine-voice-cloning>).
 
 This skill designs **cloud** voices; it does not set up XTTS. If the user wants the full arc —
 design the voice here, mint a reference recording from the chosen voice, run XTTS-v2 on their own

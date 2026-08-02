@@ -55,8 +55,12 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install --index-url https://download.pytorch.org/whl/cpu torch
-          pip install -r tests/requirements.txt
+          pip install -r plugins/voice-loop/tests/requirements.txt
+      # Each plugin owns its test run: pytest.ini and .coveragerc live in the plugin directory and
+      # their paths (testpaths, pythonpath, coverage source) are relative to it, so the suite is
+      # invoked from there rather than from the repo root.
       - name: pytest with a hard 100% coverage gate
+        working-directory: plugins/voice-loop
         run: pytest --cov=voice_server --cov-report=term-missing --cov-fail-under=100
 
   loopback:
@@ -111,13 +115,13 @@ jobs:
           if [ "$RUNNER_OS" = "Linux" ]; then
             pip install --index-url https://download.pytorch.org/whl/cpu torch
           fi
-          pip install -r server/requirements.txt
+          pip install -r plugins/voice-loop/server/requirements.txt
 
       - name: prefetch models for this lane's language (cached across runs)
         run: |
           python - <<'PY'
           import os, sys, torch
-          sys.path.insert(0, "server")
+          sys.path.insert(0, "plugins/voice-loop/server")
           from voice_server import SILERO_VOICES
           from faster_whisper import WhisperModel
 
@@ -133,7 +137,7 @@ jobs:
 
       - name: start the server
         run: |
-          python server/voice_server.py &
+          python plugins/voice-loop/server/voice_server.py &
           echo $! > /tmp/voice-loop.pid
           # `if` keeps a failing poll from tripping the step's `set -e` while the server warms up
           for _ in $(seq 1 60); do

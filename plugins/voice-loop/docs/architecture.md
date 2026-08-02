@@ -74,7 +74,7 @@ synthesis is a normal setup.
 
 | | how it is reached | notes |
 |---|---|---|
-| `local` | HTTP on `127.0.0.1`, or a direct command | `server/` run on this machine; or `stt.command` / `tts.command` for engines that are not servers (`say`, whisper.cpp) |
+| `local` | HTTP on `127.0.0.1`, or a direct command | [`server/`](../server/README.md) run on this machine; or `stt.command` / `tts.command` for engines that are not servers (`say`, whisper.cpp) |
 | `lan` | HTTP to another host, or through an ssh tunnel | `ssh -N -L 8355:127.0.0.1:8355 user@host` keeps the endpoint `127.0.0.1` and the server unexposed |
 | `cloud` | HTTPS to a provider | OpenAI-compatible or ElevenLabs; the key lives in a `key_file` or a named env var, never in the config |
 
@@ -83,7 +83,8 @@ the provider's. Nothing else in the system changes when you switch backends.
 
 ## The server
 
-`server/voice_server.py` is a single FastAPI file: `POST /stt` (faster-whisper), `POST /tts` (Silero
+`server/voice_server.py` (this plugin's own, one directory up) is a single FastAPI file: `POST /stt`
+(faster-whisper), `POST /tts` (Silero
 + per-language accentuation by default, or XTTS-v2 voice cloning via `VOICE_LOOP_TTS_ENGINE=xtts`),
 `POST /tts/stream` (the same synthesis as server-sent events, one WAV segment per sentence chunk),
 `GET /health`. Models load lazily on first use, through seams that the unit tests replace with
@@ -100,7 +101,7 @@ stack trace.
 |---|---|
 | `~/.config/voice-loop/config.json` | the only configuration; written by `/voice-setup` |
 | `~/.config/voice-loop/stress.json` | optional stress overrides for the synthesizer |
-| `server/stt_hallucinations.txt` | known Whisper silence hallucinations `/stt` drops (user-extendable) |
+| `stt_hallucinations.txt` (next to `voice_server.py`) | known Whisper silence hallucinations `/stt` drops (user-extendable) |
 | `~/.config/voice-loop/*.key` | optional cloud key files (mode 600) |
 | `~/.local/state/voice-loop/` | logs, the last spoken line, the recorder PID, the last WAV |
 | `~/.local/share/voice-loop/` | optional: the venv, models, voice previews |

@@ -97,26 +97,39 @@ This is the one place a `sudo` line may appear — **printed for the user to run
 Server (only for `local`) — needs **Python >= 3.10**; check `python3 --version` from the probe first
 and, if the system python is older, use a newer interpreter explicitly (`python3.12 -m venv …`).
 
-The server is **not part of the installed plugin** — a marketplace install ships only the plugin
-directory, so fetch the two server files first. Either clone the repo:
+The server lives **inside the plugin directory** (`plugins/voice-loop/server/`), so on a marketplace
+install its files are already on this machine — copy them, no download:
+
+```sh
+mkdir -p ~/.local/share/voice-loop && \
+cp "${CLAUDE_PLUGIN_ROOT}/server/voice_server.py" \
+   "${CLAUDE_PLUGIN_ROOT}/server/requirements.txt" \
+   "${CLAUDE_PLUGIN_ROOT}/server/stt_hallucinations.txt" ~/.local/share/voice-loop/
+```
+
+If that path is not there (no plugin root — e.g. you are working from a bare checkout), take the
+files from the repo instead. Either clone it:
 
 ```sh
 git clone --depth 1 https://github.com/saharkit/windowsill ~/.local/share/voice-loop/src && \
-cp ~/.local/share/voice-loop/src/server/voice_server.py ~/.local/share/voice-loop/
+cp ~/.local/share/voice-loop/src/plugins/voice-loop/server/voice_server.py ~/.local/share/voice-loop/
 ```
 
-or fetch just the two files at a pinned ref (this one is the v0.3.0 server):
+or fetch just the two files by raw URL:
 
 ```sh
-REF=b1286710b66086fb2bd1ef13db437d5fba31c6bd
+# REF=main — this repo's layout is plugin-scoped and stable; substitute a tag or a commit sha here
+# if you want a byte-exact pin of the server you install.
+REF=main
 mkdir -p ~/.local/share/voice-loop && \
-curl -fsSL "https://raw.githubusercontent.com/saharkit/windowsill/$REF/server/voice_server.py" \
+curl -fsSL "https://raw.githubusercontent.com/saharkit/windowsill/$REF/plugins/voice-loop/server/voice_server.py" \
   -o ~/.local/share/voice-loop/voice_server.py && \
-curl -fsSL "https://raw.githubusercontent.com/saharkit/windowsill/$REF/server/requirements.txt" \
+curl -fsSL "https://raw.githubusercontent.com/saharkit/windowsill/$REF/plugins/voice-loop/server/requirements.txt" \
   -o ~/.local/share/voice-loop/requirements.txt
 ```
 
-Then build the venv (with the clone, `-r ~/.local/share/voice-loop/src/server/requirements.txt`):
+Then build the venv (with the clone,
+`-r ~/.local/share/voice-loop/src/plugins/voice-loop/server/requirements.txt`):
 
 ```sh
 python3 -m venv ~/.local/share/voice-loop/venv && \

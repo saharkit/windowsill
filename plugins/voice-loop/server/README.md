@@ -142,10 +142,10 @@ can also just type a combining acute in the text you send (`робо́та`); it
 
 Whisper on a near-silent clip sometimes invents a well-known junk transcript instead of returning
 nothing — TV end-credits, «Спасибо за просмотр», "Thank you for watching". `/stt` drops a transcript
-whose **full** normalized text equals (or extends, at a word boundary) an entry in
-`server/stt_hallucinations.txt` — one pattern per line, `#` comments allowed; genuine speech that
-merely contains a phrase is never touched. Extend the file freely; every drop is logged and counted
-in `GET /health` → `stt_hallucinations_dropped`.
+whose **full** normalized text equals (or extends, at a word boundary) an entry in the
+`stt_hallucinations.txt` sitting next to `voice_server.py` — one pattern per line, `#` comments
+allowed; genuine speech that merely contains a phrase is never touched. Extend the file freely;
+every drop is logged and counted in `GET /health` → `stt_hallucinations_dropped`.
 
 ## XTTS engine (voice cloning)
 
@@ -280,6 +280,9 @@ with urllib.request.urlopen(req) as response:
 
 ## Tests
 
+The suite lives next door in `../tests/` and runs from the plugin directory (that is where
+`pytest.ini` and `.coveragerc` are). From here:
+
 ```sh
 pip install --index-url https://download.pytorch.org/whl/cpu torch
 pip install -r ../tests/requirements.txt
@@ -288,7 +291,7 @@ cd .. && pytest --cov=voice_server --cov-fail-under=100
 
 No models, no network, no audio hardware: the recognizer, the voices and the accentuators are loaded
 through seams the tests replace with fakes. Coverage is gated at 100% — see
-[`../plugins/voice-loop/TESTING.md`](../plugins/voice-loop/TESTING.md) for what that claim covers.
+[`../TESTING.md`](../TESTING.md) for what that claim covers.
 
 ## Reaching it from another machine
 

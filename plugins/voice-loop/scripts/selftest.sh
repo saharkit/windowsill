@@ -44,10 +44,12 @@ while [ $# -gt 0 ]; do
 voice-loop selftest --local
   There is no configured backend yet. To get one on this machine:
 
+    (paths below are from a checkout of the repo root)
     1. python3 -m venv ~/.local/share/voice-loop/venv
-    2. ~/.local/share/voice-loop/venv/bin/pip install -r server/requirements.txt
-    3. VOICE_LOOP_STT_MODEL=small ~/.local/share/voice-loop/venv/bin/python server/voice_server.py
-    4. scripts/selftest.sh --endpoint http://127.0.0.1:8355
+    2. ~/.local/share/voice-loop/venv/bin/pip install -r plugins/voice-loop/server/requirements.txt
+    3. VOICE_LOOP_STT_MODEL=small ~/.local/share/voice-loop/venv/bin/python \
+         plugins/voice-loop/server/voice_server.py
+    4. plugins/voice-loop/scripts/selftest.sh --endpoint http://127.0.0.1:8355
 
   Or let the agent do it: /voice-setup
 TXT
