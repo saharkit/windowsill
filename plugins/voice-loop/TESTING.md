@@ -24,7 +24,11 @@ What makes 100% honest rather than decorative:
   `ACCENTUATORS`. The tests install fakes and then run the **real function bodies**.
 - **The parts whose behaviour is the contract are real**: real torch tensors, real WAV encoding by
   `soundfile`, real FastAPI request handling. A `/tts` test asserts an actual `RIFF` file comes back —
-  the same thing `selftest.sh` checks before feeding those bytes to recognition.
+  the same thing `selftest.sh` checks before feeding those bytes to recognition. The Ukrainian
+  accentuator's **output format** belongs to that list too: a fake can only pin what we already
+  believe about it, so one test runs the real `ukrainian-word-stress` (dictionary-only mode, the trie
+  ships inside the wheel — still no model, still no network) and asserts the acute it emits is the one
+  `acute_to_plus()` normalizes. It skips, alone, where the package is not installed.
 - **One exclusion, declared:** the `if __name__ == "__main__":` guard, whose entire body is a call to
   `main()` — and `main()` itself is tested (with `uvicorn.run` patched). Nothing else is excluded.
 - Accentuation is **off by default in the fixtures**, so a language package that happens to be

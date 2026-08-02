@@ -122,7 +122,7 @@ Then build the venv (with the clone, `-r ~/.local/share/voice-loop/src/server/re
 python3 -m venv ~/.local/share/voice-loop/venv && \
 ~/.local/share/voice-loop/venv/bin/pip install --quiet --index-url https://download.pytorch.org/whl/cpu torch && \
 ~/.local/share/voice-loop/venv/bin/pip install --quiet -r ~/.local/share/voice-loop/requirements.txt
-# Ukrainian only: ~/.local/share/voice-loop/venv/bin/pip install "ukrainian-word-stress>=1.0"
+# Ukrainian only: ~/.local/share/voice-loop/venv/bin/pip install "ukrainian-word-stress>=2.0"
 ```
 
 Start it as a user service (no root):

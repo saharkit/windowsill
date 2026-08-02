@@ -28,7 +28,7 @@ The unit tests run on 3.10, 3.11, 3.12 and 3.13 in CI; the loopback lanes run 3.
 python3 -m venv .venv && . .venv/bin/activate
 pip install --index-url https://download.pytorch.org/whl/cpu torch   # CPU-only torch, much smaller
 pip install -r requirements.txt
-pip install "ukrainian-word-stress>=1.0"                             # only if you want Ukrainian
+pip install "ukrainian-word-stress>=2.0"                             # only if you want Ukrainian
 
 python voice_server.py            # http://127.0.0.1:8355
 curl -s http://127.0.0.1:8355/health

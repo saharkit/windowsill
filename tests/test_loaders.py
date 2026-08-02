@@ -56,14 +56,72 @@ def test_ru_accentuator_loads_and_marks(import_fake):
     assert process("это тест") == "это т+ест"
 
 
+class FakeStressSymbol:
+    """Mirrors ukrainian_word_stress.StressSymbol — the real values, pinned by the format test below."""
+
+    AcuteAccent = "´"  # U+00B4, the package's DEFAULT and not something Silero can read
+    CombiningAcuteAccent = ACUTE
+
+
+class FakeDisambiguation:
+    """Mirrors ukrainian_word_stress.Disambiguation (its Stanza backend downloads ~500 MB of models)."""
+
+    Auto = "auto"
+    Stanza = "stanza"
+    Dictionary = "dictionary"
+
+
 def test_uk_accentuator_normalizes_the_acute_it_emits(import_fake):
+    built: list[dict[str, object]] = []
+
     class FakeStressifier:
+        def __init__(self, **options: object) -> None:
+            built.append(options)
+
         def __call__(self, text: str) -> str:
             return text.replace("робота", f"робо{ACUTE}та")
 
-    import_fake("ukrainian_word_stress", Stressifier=FakeStressifier)
+    import_fake(
+        "ukrainian_word_stress",
+        Stressifier=FakeStressifier,
+        StressSymbol=FakeStressSymbol,
+        Disambiguation=FakeDisambiguation,
+    )
     process = voice_server._load_uk_accentuator()
+
     assert process("робота") == "роб+ота"
+    # The two arguments carry the whole contract: ask for the acute we parse, and stay off Stanza.
+    assert built == [{"stress_symbol": ACUTE, "disambiguation": "dictionary"}]
+
+
+def test_real_ukrainian_word_stress_output_matches_what_acute_to_plus_expects():
+    """The same contract against the REAL package — a fake can only pin what we already believe.
+
+    Still no network and no model: the loader asks for the dictionary-only backend, which reads the
+    trie shipped inside the wheel. Assertions are about the FORMAT (which character, on which side
+    of which vowel), never about the syllable the dictionary picks.
+    """
+    uws = pytest.importorskip("ukrainian_word_stress")
+
+    assert uws.StressSymbol.CombiningAcuteAccent == ACUTE
+    assert uws.Disambiguation.Dictionary == FakeDisambiguation.Dictionary
+
+    stressify = uws.Stressifier(
+        stress_symbol=uws.StressSymbol.CombiningAcuteAccent,
+        disambiguation=uws.Disambiguation.Dictionary,
+    )
+    process = voice_server._load_uk_accentuator()
+
+    for word in ("привіт", "мова"):  # both are unambiguous dictionary entries
+        raw = stressify(word)
+        assert ACUTE in raw, f"the package stopped marking {word!r}: {raw!r}"
+        assert raw.replace(ACUTE, "") == word, f"the mark is not the only edit to {word!r}: {raw!r}"
+        assert raw[raw.index(ACUTE) - 1] in voice_server.STRESSED_VOWELS  # acute FOLLOWS its vowel
+
+        marked = process(word)
+        assert ACUTE not in marked, f"an acute survived normalization of {word!r}: {marked!r}"
+        assert marked.replace("+", "") == word, f"normalization mangled {word!r}: {marked!r}"
+        assert marked[marked.index("+") + 1] in voice_server.STRESSED_VOWELS  # '+' PRECEDES its vowel
 
 
 def test_accentuator_registry_wires_the_real_loaders():
