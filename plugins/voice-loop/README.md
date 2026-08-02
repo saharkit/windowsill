@@ -3,7 +3,7 @@
 [![selftest](https://github.com/saharkit/windowsill/actions/workflows/selftest.yml/badge.svg)](https://github.com/saharkit/windowsill/actions/workflows/selftest.yml)
 [![coverage: 100% (gated)](https://img.shields.io/badge/coverage-100%25%20%28gated%29-brightgreen)](TESTING.md)
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue)](../../LICENSE)
-[![python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)](../../server/README.md#requirements)
+[![python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)](server/README.md#requirements)
 
 > The coverage badge is a **gate** (`--cov-fail-under=100` on the server's Python, statements and
 > branches, on 3.10–3.13), not a drifting number; the shell scripts are held to shellcheck plus a
@@ -81,7 +81,7 @@ first-class language, not a fallback** — it has its own selftest phrase and it
 | `fr` French | `v3_fr` | `fr_0` | — |
 
 Any other language: recognition still works; for synthesis use a cloud backend or the macOS built-in
-`say` voice. Details in [`server/README.md`](../../server/README.md).
+`say` voice. Details in [`server/README.md`](server/README.md).
 
 ## A voice of your own
 
@@ -102,7 +102,7 @@ above, mint a reference recording from the voice you chose, and run **XTTS-v2 on
 LAN GPU** with that reference (`VOICE_LOOP_TTS_ENGINE=xtts` on the bundled server) — after which the
 cloud key is no longer needed and synthesis is local again. Setup, licensing caveats and the
 reference-wav contract are in
-[`server/README.md` — XTTS engine](../../server/README.md#xtts-engine-voice-cloning). Same ethics
+[`server/README.md` — XTTS engine](server/README.md#xtts-engine-voice-cloning). Same ethics
 rule applies to the reference: your own voice, or one you have explicit rights to.
 
 ## Latency — speak-back streams
@@ -130,18 +130,25 @@ sitting far below `total_ms` *is* the streaming, visible in numbers.
 
 ## What is in here
 
+Everything this plugin is lives under its own directory — the repository root belongs to the shelf,
+not to any one plugin.
+
 ```
 plugins/voice-loop/
-  hooks/hooks.json        registers the Stop hook
-  scripts/speak.sh        the Stop hook's launcher (stable entry point; never fails a turn)
-  scripts/speak.py        the Stop hook: extract marked lines -> chunk -> synthesize -> stream-play
+  .claude-plugin/plugin.json  the plugin manifest (name, version, description)
+  hooks/hooks.json            registers the Stop hook
+  scripts/speak.sh            the Stop hook's launcher (stable entry point; never fails a turn)
+  scripts/speak.py            the Stop hook: extract marked lines -> chunk -> synthesize -> stream-play
   scripts/dictate-toggle.sh   push-to-talk launcher (stable hotkey entry point)
-  scripts/dictate.py      the toggle: record -> transcribe -> clipboard/paste-into-prompt
-  scripts/selftest.sh     hardware-free loopback proof (TTS -> STT -> compare)
-  skills/voice-setup/     the agent installer
-  skills/voice-design/    voice casting
-  TESTING.md              the human acceptance checklist
-server/                   the self-hostable speech server (FastAPI + faster-whisper + Silero), Dockerfile
+  scripts/dictate.py          the toggle: record -> transcribe -> clipboard/paste-into-prompt
+  scripts/selftest.sh         hardware-free loopback proof (TTS -> STT -> compare)
+  skills/voice-setup/         the agent installer
+  skills/voice-design/        voice casting
+  server/                     the self-hostable speech server (FastAPI + faster-whisper + Silero), Dockerfile
+  tests/                      the server's unit tests (no models, no network) — 100% gated in CI
+  docs/                       architecture, troubleshooting, FAQ
+  pytest.ini, .coveragerc     this plugin's own test run (invoked from this directory)
+  TESTING.md                  the human acceptance checklist
 ```
 
 ## Permissions — the ladder, and why the default rung is the low one
@@ -189,8 +196,8 @@ config/state dirs (`~/.config/voice-loop/`, `~/.local/state/voice-loop/`), downl
 `~/.local/share/voice-loop/`, or a local server service you enabled — a proper uninstall story is
 tracked in [issue #17](https://github.com/saharkit/windowsill/issues/17).
 
-Deeper reading: [architecture](../../docs/architecture.md) ·
-[troubleshooting](../../docs/troubleshooting.md) · [FAQ](../../docs/faq.md).
+Deeper reading: [architecture](docs/architecture.md) ·
+[troubleshooting](docs/troubleshooting.md) · [FAQ](docs/faq.md).
 
 ## Author
 

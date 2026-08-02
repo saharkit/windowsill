@@ -1,0 +1,12 @@
+# Coverage of the server is a hard gate at 100% (statements AND branches) — see TESTING.md (next to
+# this file) for what that number does and does not claim. Read from this directory: the suite runs
+# as `cd plugins/voice-loop && pytest …`, and `source` resolves through pytest.ini's `pythonpath`.
+[run]
+branch = True
+source = voice_server
+
+[report]
+show_missing = True
+skip_covered = False
+exclude_lines =
+    pragma: no cover

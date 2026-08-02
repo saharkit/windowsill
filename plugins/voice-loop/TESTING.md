@@ -10,8 +10,9 @@ The code in this plugin is two different materials, and they get two different g
 
 ### Python (`server/voice_server.py`) — 100%, gated
 
-`pytest --cov=voice_server --cov-fail-under=100` runs on **every commit**, on **Python 3.10, 3.11,
-3.12 and 3.13**, and the build fails below 100% — statements *and* branches (`branch = True` in
+`pytest --cov=voice_server --cov-fail-under=100` — run from this directory, `plugins/voice-loop`,
+where this plugin's `pytest.ini` and `.coveragerc` live — runs on **every commit**, on **Python 3.10,
+3.11, 3.12 and 3.13**, and the build fails below 100% — statements *and* branches (`branch = True` in
 `.coveragerc`). It is a **gate, not a score**: it does not drift, and it is not a claim that the
 server is bug-free. It is a claim that no line and no branch of that file is unexercised, so a change
 cannot quietly add an untested path.

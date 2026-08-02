@@ -24,7 +24,7 @@ from pathlib import Path
 
 import pytest
 
-_DICTATE_PATH = Path(__file__).resolve().parents[1] / "plugins" / "voice-loop" / "scripts" / "dictate.py"
+_DICTATE_PATH = Path(__file__).resolve().parents[1] / "scripts" / "dictate.py"
 _spec = importlib.util.spec_from_file_location("dictate", _DICTATE_PATH)
 dictate = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(dictate)
