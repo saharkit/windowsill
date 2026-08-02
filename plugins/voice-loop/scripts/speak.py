@@ -23,6 +23,13 @@ Deliberate behaviours, found by live debugging — do not "simplify" them away:
   at least ~MIN_CHUNK_CHARS chars); chunk 1 starts playing as soon as IT is synthesized, and the
   next chunk synthesizes while the previous one plays. Perceived latency is one small synthesis,
   not the whole message.
+* server-side streaming — when GET /health says ``"streaming": true`` (checked once per
+  invocation), the LAN path POSTs the WHOLE text to /tts/stream and plays SSE chunks as they
+  arrive: the server does the sentence chunking, each ``chunk`` event is one complete standalone
+  WAV, and every decoded chunk enters the SAME player queue a locally-synthesized sentence chunk
+  would. A stream that fails BEFORE its first chunk falls back to the blob /tts path once; after
+  the first chunk we play what arrived and stop on the terminal ``error`` event (logged). The
+  client-side sentence splitter stays for the blob path and older servers.
 * keys — the cloud API key comes from ``key_file`` (wins) or the named env var, is used only as an
   in-process HTTP header, and NEVER appears in argv, in the config, or in the log.
 * timing — every spoken run logs ``timings extract_ms=… first_audio_ms=… total_ms=…`` so latency
@@ -31,6 +38,8 @@ Deliberate behaviours, found by live debugging — do not "simplify" them away:
 
 from __future__ import annotations
 
+import base64
+import itertools
 import json
 import os
 import platform
@@ -52,6 +61,10 @@ BACKOFF = (0.15, 0.3, 0.5, 0.7, 1.0)
 # sentences are merged up to at least this many characters.
 MIN_CHUNK_CHARS = 40
 
+# The /health probe is a tiny GET against a server we are about to POST to anyway — it must never
+# stall a turn longer than this, whatever speak.timeout says about synthesis itself.
+HEALTH_TIMEOUT = 5.0
+
 _SENTENCE_END = re.compile(r"(?<=[.!?…])\s+")
 
 _STATE_DIR = os.path.join(os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state")), "voice-loop")
@@ -59,8 +72,10 @@ _LOG_PATH = os.path.join(_STATE_DIR, "speak.log")
 _LAST_PATH = os.path.join(_STATE_DIR, "last-spoken")
 _PID_PATH = os.path.join(_STATE_DIR, "playing.pid")
 
-# state the SIGTERM handler (takeover by a fresher invocation) must be able to reach
-_live: dict = {"proc": None, "files": set()}
+# state the SIGTERM handler (takeover by a fresher invocation) must be able to reach:
+# the current player child, the temp WAVs on disk, and the open SSE response (its socket
+# must close mid-stream on takeover, not linger until the server finishes synthesizing)
+_live: dict = {"proc": None, "files": set(), "stream": None}
 
 
 def log(message: str) -> None:
@@ -213,6 +228,112 @@ def _post(url: str, headers: dict, payload: dict, timeout: float) -> bytes | Non
         return None
 
 
+def _get(url: str, timeout: float) -> bytes | None:
+    """GET a URL, return the body — None on any failure. Proxies bypassed like _post."""
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        with opener.open(url, timeout=timeout) as resp:
+            return resp.read()
+    except (urllib.error.URLError, TimeoutError, OSError):
+        return None
+
+
+def server_offers_streaming(health_body: bytes | None) -> bool:
+    """True only when GET /health answered valid JSON with ``"streaming": true`` — an older server
+    (no such key), garbage, or an unreachable server all mean the blob path."""
+    if not health_body:
+        return False
+    try:
+        health = json.loads(health_body)
+    except ValueError:
+        return False
+    return isinstance(health, dict) and health.get("streaming") is True
+
+
+def parse_sse(lines):
+    """(event, data) pairs off a raw SSE line stream (bytes or str), per the server's strict
+    framing: ``event: <name>`` then ``data: <one line of JSON>`` then a blank line. A data line
+    with no preceding event, or undecodable JSON, is skipped — never fatal."""
+    event = None
+    for raw in lines:
+        line = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else raw
+        line = line.rstrip("\r\n")
+        if line.startswith("event: "):
+            event = line[len("event: "):]
+        elif line.startswith("data: ") and event is not None:
+            try:
+                data = json.loads(line[len("data: "):])
+            except ValueError:
+                continue
+            if isinstance(data, dict):
+                yield event, data
+            event = None
+
+
+def iter_stream_audio(lines):
+    """Decoded WAV bytes per ``chunk`` event, stopping at the terminal ``end``/``error`` event.
+
+    Per the contract, chunks already received stay valid when an ``error`` arrives — the caller
+    plays what it got; the error is logged here. A dropped connection mid-read is the same shape:
+    log, stop, keep what arrived."""
+    count = 0
+    try:
+        for event, data in parse_sse(lines):
+            if event == "chunk":
+                try:
+                    audio = base64.b64decode(str(data.get("audio", "")))
+                except (ValueError, TypeError):
+                    log(f"stream chunk {data.get('index')} had undecodable base64 — stopping")
+                    return
+                if audio:
+                    count += 1
+                    yield audio
+            elif event == "end":
+                return
+            elif event == "error":
+                log(f"stream error after {data.get('chunks')} chunk(s): {str(data.get('error'))[:200]}")
+                return
+    except (OSError, ValueError) as err:
+        log(f"stream read failed after {count} chunk(s): {getattr(err, 'reason', err)}")
+        return
+
+
+def stream_source(lines):
+    """The fallback decision, made in one place: pull the FIRST chunk eagerly; a stream that dies
+    before it (refused, error event first, connection dropped) returns None so the caller can fall
+    back to the blob endpoint once. After the first chunk there is no fallback — the returned
+    iterator replays it and continues live."""
+    audio = iter_stream_audio(lines)
+    first = next(audio, None)
+    if first is None:
+        return None
+    return itertools.chain([first], audio)
+
+
+def _open_stream(endpoint: str, payload: dict, timeout: float):
+    """POST /tts/stream and return the live response (iterable line by line), or None on any
+    failure before the response starts — HTTP errors are the pre-synthesis JSON refusals."""
+    request = urllib.request.Request(
+        f"{endpoint}/tts/stream",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        return opener.open(request, timeout=timeout)
+    except urllib.error.HTTPError as err:
+        try:
+            body = err.read()[:200].decode("utf-8", "replace")
+        except OSError:
+            body = ""
+        log(f"stream refused ({err.code}): {body}")
+        return None
+    except (urllib.error.URLError, TimeoutError, OSError) as err:
+        log(f"stream unreachable: {getattr(err, 'reason', err)}")
+        return None
+
+
 def synthesize(text: str, s: dict, key: str) -> bytes | None:
     """One chunk -> audio bytes, or None (with the reason logged). Mirrors speak.sh's checks:
     empty body and JSON-error-document responses are dropped, not played."""
@@ -279,11 +400,18 @@ def take_over() -> None:
 
 
 def _on_sigterm(signum, frame):  # noqa: ARG001 — signal-handler signature
-    """We were superseded (or the harness timed us out): stop the player, drop temp files, exit 0."""
+    """We were superseded (or the harness timed us out): stop the player, close the stream socket,
+    drop temp files, exit 0."""
     proc = _live.get("proc")
     if proc is not None and proc.poll() is None:
         try:
             proc.terminate()
+        except OSError:
+            pass
+    stream = _live.get("stream")
+    if stream is not None:
+        try:
+            stream.close()
         except OSError:
             pass
     for path in list(_live["files"]):
@@ -294,9 +422,21 @@ def _on_sigterm(signum, frame):  # noqa: ARG001 — signal-handler signature
     os._exit(0)
 
 
-def _play_stream(chunks: list[str], s: dict, key: str) -> tuple[int, int, int, int | None]:
-    """Synthesize chunk N+1 while chunk N plays. One player subprocess per chunk; the next Popen is
-    issued the moment the previous .wait() returns, so the only gap is process spawn.
+def _synthesized_audio(chunks: list[str], s: dict, key: str):
+    """The blob path's audio source: one /tts (or cloud) call per sentence chunk. Stops at the
+    first failed synthesis, exactly like the pre-stream loop did."""
+    for part in chunks:
+        audio = synthesize(part, s, key)
+        if audio is None:
+            return
+        yield audio
+
+
+def _play_stream(audio_iter, s: dict) -> tuple[int, int, int, int | None]:
+    """Produce chunk N+1 while chunk N plays. The source is ANY iterator of playable audio bytes —
+    locally-synthesized sentence chunks and decoded SSE chunks enter the same queue. One player
+    subprocess per chunk; the next Popen is issued the moment the previous .wait() returns, so the
+    only gap is process spawn.
 
     Returns (chunks_played, total_bytes, first_audio_ms_offset, last_rc)."""
     player_argv = shlex.split(s["player"])
@@ -322,10 +462,7 @@ def _play_stream(chunks: list[str], s: dict, key: str) -> tuple[int, int, int, i
             proc_wav = None
 
     try:
-        for part in chunks:
-            audio = synthesize(part, s, key)  # overlaps with the previous chunk's playback
-            if audio is None:
-                break
+        for audio in audio_iter:  # the pull overlaps with the previous chunk's playback
             fd, wav = tempfile.mkstemp(prefix="voice-loop-speak-")
             with os.fdopen(fd, "wb") as fh:
                 fh.write(audio)
@@ -450,11 +587,41 @@ def main() -> int:
                 log(f"cloud tts: no key (key_file unset/unreadable and ${s['key_env']} empty)")
                 return 0
 
-        played, total_bytes, first_offset_ms, rc = _play_stream(chunk_sentences(text), s, key)
+        result = None
+        via = "tts"
+        if s["backend"] != "cloud":
+            # Server-side streaming: one cheap /health probe per invocation decides the path. Only
+            # a stream that dies BEFORE its first chunk falls back to the blob endpoint (once);
+            # after the first chunk we play what arrives and stop where the stream stops.
+            endpoint = s["endpoint"] or "http://127.0.0.1:8355"
+            if server_offers_streaming(_get(f"{endpoint}/health", min(s["timeout"], HEALTH_TIMEOUT))):
+                payload = {
+                    k: v for k, v in (("text", text), ("speaker", s["speaker"]), ("language", s["language"])) if v
+                }
+                resp = _open_stream(endpoint, payload, s["timeout"])
+                if resp is not None:
+                    _live["stream"] = resp
+                    try:
+                        source = stream_source(resp)
+                        if source is not None:
+                            result = _play_stream(source, s)
+                            via = "stream"
+                        else:
+                            log("stream died before its first chunk — falling back to /tts")
+                    finally:
+                        _live["stream"] = None
+                        try:
+                            resp.close()
+                        except OSError:
+                            pass
+        if result is None:
+            # blob path: the client does the sentence chunking (older server, cloud, or fallback)
+            result = _play_stream(_synthesized_audio(chunk_sentences(text), s, key), s)
+        played, total_bytes, first_offset_ms, rc = result
         total_ms = int((time.monotonic() - t0) * 1000)
         first_ms = -1 if first_offset_ms < 0 else extract_ms + first_offset_ms
         if played:
-            log(f"played rc={rc} bytes={total_bytes} chunks={played}")
+            log(f"played rc={rc} bytes={total_bytes} chunks={played} via={via}")
         log(f"timings extract_ms={extract_ms} first_audio_ms={first_ms} total_ms={total_ms}")
         return 0
     finally:
