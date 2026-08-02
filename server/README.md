@@ -5,9 +5,9 @@ One small FastAPI app:
 | endpoint | what it does |
 |---|---|
 | `POST /stt` | multipart `audio=@file.wav`, query `?language=ru` → `{"text": ..., "language": ..., "duration": ...}` |
-| `POST /tts` | JSON `{"text": ..., "language": "ru", "speaker": "baya"}` → `audio/wav` (one blob) |
+| `POST /tts` | JSON `{"text": ..., "language": "ru", "speaker": "baya"}` → `audio/wav` (one blob), `X-Voice-Loop-Engine` naming the engine that spoke |
 | `POST /tts/stream` | same JSON → `text/event-stream` of WAV segments as they are synthesized — see [Streaming synthesis](#streaming-synthesis-ttsstream) |
-| `GET /health` | device, models, engine, what is loaded, server `version` |
+| `GET /health` | device, models, engine (and its fallback), what is loaded, server `version` |
 
 STT is [faster-whisper](https://github.com/SYSTRAN/faster-whisper) (multilingual). TTS is
 [Silero](https://github.com/snakers4/silero-models) by default, with automatic stress marking for
@@ -15,7 +15,8 @@ Russian ([RUAccent](https://github.com/Den4ikAI/ruaccent)) and Ukrainian
 ([ukrainian-word-stress](https://github.com/lang-uk/ukrainian-word-stress)) — that stress pass is the
 difference between a voice that reads and a voice that stumbles. An optional second engine,
 [XTTS-v2](https://huggingface.co/coqui/XTTS_v2) voice cloning, is one environment variable away — see
-[XTTS engine](#xtts-engine-voice-cloning).
+[XTTS engine](#xtts-engine-voice-cloning). When an engine breaks, synthesis degrades to the other
+one instead of failing — see [Engine fallback](#engine-fallback).
 
 ## Requirements
 
@@ -92,6 +93,7 @@ Two caps keep any single request from monopolizing that executor:
 | `VOICE_LOOP_COMPUTE_TYPE` | `auto` | faster-whisper compute type |
 | `VOICE_LOOP_STT_HINT` | — | lexicon hint: a comma-separated list of names/jargon you want recognized |
 | `VOICE_LOOP_TTS_ENGINE` | `silero` | `silero` or `xtts` (XTTS-v2 voice cloning, optional dependency) |
+| `VOICE_LOOP_TTS_FALLBACK_ENGINE` | `silero` when the engine is `xtts`, else `none` | `silero` / `xtts` / `none` — engine a failed synthesis retries on, see [Engine fallback](#engine-fallback) |
 | `VOICE_LOOP_TTS_MODEL` | per language | override the Silero model for the default language |
 | `VOICE_LOOP_TTS_SPEAKER` | per language | override the default speaker |
 | `VOICE_LOOP_XTTS_REFERENCE` | — | wav of the voice to clone — the `xtts` engine refuses requests without it |
@@ -172,6 +174,9 @@ What to know:
   clear `500`; the server still boots and `/stt` keeps working regardless.
 - **Missing package**: if `coqui-tts` is not installed, an `xtts` request gets a `500` telling you
   to `pip install coqui-tts`. The import is lazy — nothing else pays for the dependency.
+- Both of those `500`s are what you see with `VOICE_LOOP_TTS_FALLBACK_ENGINE=none`. With a fallback
+  configured — and on the `xtts` engine there is one **by default** — the request is served by the
+  fallback voice instead and marked as such; see [Engine fallback](#engine-fallback).
 - **Hardware**: on an RTX-class GPU expect **~2–2.5 GB of VRAM**; if the model does not fit, the
   load falls back to CPU automatically (it works, just slower than real time). Output is 24 kHz.
 - **Languages**: XTTS-v2 is multilingual on its own (`en ru de es fr it pt pl tr nl cs ar hu ko ja
@@ -180,6 +185,40 @@ What to know:
   any `+` markers or combining acutes already in the text are stripped before synthesis.
 - **Model dir** (`VOICE_LOOP_XTTS_MODEL_DIR`): point at a directory containing the downloaded model
   (`config.json` next to the weights) to load from disk instead of coqui's cache.
+
+## Engine fallback
+
+A down engine should degrade a voice, not silence it. When the primary engine cannot speak —
+`coqui-tts` missing, weights that will not load, a synthesis call that raises — the **same request**
+is retried on `VOICE_LOOP_TTS_FALLBACK_ENGINE`, and the response says who spoke:
+
+| response | header / event | meaning |
+|---|---|---|
+| `/tts` normal | `X-Voice-Loop-Engine: xtts` | the configured engine synthesized it |
+| `/tts` fallback | `X-Voice-Loop-Engine: silero (fallback)` | the primary failed; you are hearing the other voice |
+| `/tts/stream` | terminal `end` event: `{"chunks": N, "engine": "silero (fallback)"}` | same, in the stream's own contract |
+
+The default is `silero` when the engine is `xtts`, and `none` otherwise — a Silero-primary server
+has nothing lighter to fall to, and a fallback that is the primary engine, or an unrecognized name,
+means `none` as well. `GET /health` reports the **effective** setting as `tts_fallback_engine` plus
+a per-process `tts_fallbacks` counter (how many requests a broken primary handed over).
+
+What it is deliberately *not*: a router. A `400` refusal is the request's problem and no engine can
+fix it, so it is never retried — including an unsupported language, even when the other engine
+happens to speak it (`uk` on the `xtts` engine stays a `400`, though Silero has a voice for it).
+Only an engine-level failure hands over. And if the fallback cannot serve that particular request
+either — `ja` and `zh-cn` are XTTS-v2 languages Silero has no model for — you get that engine's
+ordinary refusal, so it is clear why nothing here could speak. The primary's failure, with its
+traceback, always stays in the server log.
+
+**On the stream, a fallback only happens before the first chunk.** Once a chunk is on the wire the
+`200` and the first audio have left, and a client mid-playback is not handed a different voice in
+the middle of a sentence: a later failure ends the stream with today's terminal `error` event,
+exactly as before. A restart re-synthesizes the whole text from chunk `0`, so one stream is always
+one engine end to end — and its chunks carry that engine's sample rate (48 kHz Silero, 24 kHz XTTS).
+
+Fallback synthesis takes the same one model slot the primary took — sequentially, after the failed
+attempt released it (see [Capacity](#capacity)). A retry never doubles the concurrency.
 
 ## Streaming synthesis (`/tts/stream`)
 
@@ -201,7 +240,7 @@ Three event types, in this order:
 | event | data | meaning |
 |---|---|---|
 | `chunk` | `{"index": 0, "audio": "<base64>"}` | one **complete, standalone WAV file** (own header, engine sample rate: 48 kHz Silero / 24 kHz XTTS). Decode base64, play, done. `index` counts from 0 in order. |
-| `end` | `{"chunks": N}` | terminal success — N `chunk` events were sent |
+| `end` | `{"chunks": N, "engine": "silero"}` | terminal success — N `chunk` events were sent. `engine` names who synthesized them, `"<engine> (fallback)"` when the primary was broken (see [Engine fallback](#engine-fallback)); it is reported here rather than in a header because the headers leave before the first chunk |
 | `error` | `{"error": "synthesis failed (<ExceptionClass>)", "chunks": N}` | terminal failure **mid-stream** (the `200` already left with the first bytes, so a late failure becomes the last event, never a 500). N chunks were already sent and are valid. The message is deliberately generic — the exception class name at most; the full detail stays in the server log. |
 
 A stream always ends with exactly one `end` **or** one `error` event. Requests refused *before*

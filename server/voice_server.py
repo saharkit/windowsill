@@ -11,6 +11,8 @@ LAN or an ssh tunnel. Everything is configured through the environment — see R
     VOICE_LOOP_COMPUTE_TYPE  auto | float16 | int8 | ... (default auto: float16 on cuda, int8 on cpu)
     VOICE_LOOP_STT_HINT      optional lexicon hint biasing the recognizer toward your jargon
     VOICE_LOOP_TTS_ENGINE    silero | xtts               (default silero; xtts = XTTS-v2 voice cloning)
+    VOICE_LOOP_TTS_FALLBACK_ENGINE  silero | xtts | none — engine a failed synthesis retries on
+                             (default: silero when the engine is xtts, none otherwise)
     VOICE_LOOP_TTS_MODEL     override the Silero model for the default language
     VOICE_LOOP_TTS_SPEAKER   override the default speaker
     VOICE_LOOP_XTTS_REFERENCE  wav of the voice to clone (the xtts engine refuses requests without it)
@@ -93,6 +95,9 @@ XTTS_LANGUAGES = {
 }
 XTTS_MODEL_ID = "tts_models/multilingual/multi-dataset/xtts_v2"
 
+ENGINES = ("silero", "xtts")
+ENGINE_HEADER = "X-Voice-Loop-Engine"  # every /tts response names the engine that actually spoke
+
 HOST = os.environ.get("VOICE_LOOP_HOST", "127.0.0.1")
 PORT = int(os.environ.get("VOICE_LOOP_PORT", "8355"))
 DEVICE = os.environ.get("VOICE_LOOP_DEVICE", "auto")
@@ -101,6 +106,11 @@ STT_MODEL = os.environ.get("VOICE_LOOP_STT_MODEL", "small")
 COMPUTE_TYPE = os.environ.get("VOICE_LOOP_COMPUTE_TYPE", "auto")
 STT_HINT = os.environ.get("VOICE_LOOP_STT_HINT", "") or None
 TTS_ENGINE = os.environ.get("VOICE_LOOP_TTS_ENGINE", "silero").lower()
+# A down engine should degrade the voice, not silence it. The default pairs the heavy optional
+# engine with the one that is always here; a silero-primary setup has nothing lighter to fall to.
+TTS_FALLBACK_ENGINE = (
+    os.environ.get("VOICE_LOOP_TTS_FALLBACK_ENGINE", "") or ("silero" if TTS_ENGINE == "xtts" else "none")
+).lower()
 TTS_MODEL_OVERRIDE = os.environ.get("VOICE_LOOP_TTS_MODEL", "")
 TTS_SPEAKER_OVERRIDE = os.environ.get("VOICE_LOOP_TTS_SPEAKER", "")
 XTTS_REFERENCE = os.environ.get("VOICE_LOOP_XTTS_REFERENCE", "")
@@ -135,6 +145,7 @@ _accent: dict[str, object] = {}
 _stress: list[tuple[re.Pattern[str], str]] | None = None
 _hallucinations: list[str] | None = None
 _hallucinations_dropped = 0
+_tts_fallbacks = 0
 
 
 def reset_caches() -> None:
@@ -143,12 +154,13 @@ def reset_caches() -> None:
     Used by the tests between cases. Nothing in the running server calls it, so editing
     stress.json or the hallucination blocklist requires a restart in the current server.
     """
-    global _whisper, _xtts, _stress, _hallucinations, _hallucinations_dropped
+    global _whisper, _xtts, _stress, _hallucinations, _hallucinations_dropped, _tts_fallbacks
     _whisper = None
     _xtts = None
     _stress = None
     _hallucinations = None
     _hallucinations_dropped = 0
+    _tts_fallbacks = 0
     _tts.clear()
     _accent.clear()
 
@@ -598,20 +610,25 @@ def xtts_request_error(language: str) -> JSONResponse | None:
     return None
 
 
-def tts_request_error(text: str, language: str) -> JSONResponse | None:
+def tts_request_error(text: str, language: str, engine: str = "") -> JSONResponse | None:
     """The shared /tts + /tts/stream refusal, or None when the request can be synthesized.
+
+    The engine is a parameter (empty = the configured primary) because the fallback path asks the
+    very same question of a DIFFERENT engine before it takes the request over — the two engines'
+    language sets and prerequisites are not the same.
 
     The length caps live at the call sites, not here — the two endpoints hold the model executor
     very differently (one blob call vs. a released-and-reacquired slot per chunk), so they carry
     different limits.
     """
+    engine = engine or TTS_ENGINE
     if not text:
         return JSONResponse({"error": "empty text"}, status_code=400)
-    if TTS_ENGINE == "xtts":
+    if engine == "xtts":
         return xtts_request_error(language)
-    if TTS_ENGINE != "silero":
+    if engine != "silero":
         return JSONResponse(
-            {"error": f"unknown TTS engine {TTS_ENGINE!r} (VOICE_LOOP_TTS_ENGINE)", "supported": ["silero", "xtts"]},
+            {"error": f"unknown TTS engine {engine!r} (VOICE_LOOP_TTS_ENGINE)", "supported": list(ENGINES)},
             status_code=500,
         )
     if language not in SILERO_VOICES:
@@ -626,8 +643,8 @@ def tts_request_error(text: str, language: str) -> JSONResponse | None:
     return None
 
 
-def engine_sample_rate() -> int:
-    if TTS_ENGINE == "xtts":
+def engine_sample_rate(engine: str = "") -> int:
+    if (engine or TTS_ENGINE) == "xtts":
         return XTTS_SR
     return TTS_SR
 
@@ -654,12 +671,81 @@ def xtts_pieces(text: str, language: str):
         yield torch.as_tensor(wav, dtype=torch.float32)
 
 
-def synthesis_pieces(text: str, language: str, speaker: str = ""):
-    """One synthesized tensor per sentence chunk from the configured engine — the shared core of
-    /tts (which concatenates them) and /tts/stream (which ships each one as it appears)."""
-    if TTS_ENGINE == "xtts":
+def synthesis_pieces(text: str, language: str, speaker: str = "", engine: str = ""):
+    """One synthesized tensor per sentence chunk from ONE engine (empty = the configured primary) —
+    the shared core of /tts (which concatenates them) and /tts/stream (which ships each one as it
+    appears), and the seam the fallback re-enters with the other engine's name."""
+    if (engine or TTS_ENGINE) == "xtts":
         return xtts_pieces(text, language)
     return silero_pieces(text, language, speaker)
+
+
+# --- engine fallback ------------------------------------------------------------------------------
+# A primary engine that cannot speak — coqui-tts missing, weights that will not load, a synthesis
+# that raises — degrades to the configured fallback instead of silencing the voice. Everything
+# below decides WHO speaks; the endpoints below that carry it out and say so on the way back.
+
+
+def fallback_engine() -> str:
+    """The engine a broken primary retries on, or "" when there is nothing to fall to.
+
+    Deliberately quiet about nonsense: "none", an unknown value, and the primary engine itself all
+    mean the same thing here. A fallback is a safety net — misconfiguring it must never turn a
+    working primary into an error.
+    """
+    if TTS_FALLBACK_ENGINE == TTS_ENGINE or TTS_FALLBACK_ENGINE not in ENGINES:
+        return ""
+    return TTS_FALLBACK_ENGINE
+
+
+def fallback_for(text: str, language: str) -> tuple[str, JSONResponse | None]:
+    """(engine, refusal) for a broken primary — at most one of the two is ever set.
+
+    A configured fallback still has to be able to serve THIS request: the two engines' language
+    sets differ (XTTS-v2 speaks ja and zh-cn, Silero does not; Silero speaks uk, XTTS-v2 does not).
+    When it cannot, the caller gets that engine's ordinary refusal to hand back, so the client
+    learns why nothing here could speak instead of receiving a bare 500.
+    """
+    engine = fallback_engine()
+    if not engine:
+        return "", None
+    refusal = tts_request_error(text, language, engine)
+    if refusal is not None:
+        return "", refusal
+    return engine, None
+
+
+def count_fallback() -> None:
+    """One more request a broken primary handed over — surfaced as /health `tts_fallbacks`."""
+    global _tts_fallbacks
+    _tts_fallbacks += 1
+
+
+def engine_label(engine: str, is_fallback: bool) -> str:
+    """How a response names the engine that actually spoke: "silero" or "silero (fallback)"."""
+    return f"{engine} (fallback)" if is_fallback else engine
+
+
+def resolve_engine(text: str, language: str) -> tuple[str, bool, JSONResponse | None]:
+    """Who serves this request BEFORE any synthesis runs: (engine, is_fallback, refusal).
+
+    The primary's own check comes first, and its STATUS decides whether a fallback may help. A 400
+    is the client's problem — no engine fixes an empty text — and is returned untouched. A 500 says
+    the ENGINE is unusable (coqui-tts not installed, no reference wav, a typo in the engine name),
+    which is exactly what the fallback exists for, so the fallback is asked the same question and
+    takes the request over if it can.
+    """
+    refusal = tts_request_error(text, language)
+    if refusal is None:
+        return TTS_ENGINE, False, None
+    if refusal.status_code != 500:
+        return "", False, refusal
+    engine, refused = fallback_for(text, language)
+    if not engine:
+        return "", False, refused or refusal
+    log.warning("the %s engine cannot serve requests — falling back to %s", TTS_ENGINE, engine)
+    count_fallback()
+    return engine, True, None
 
 
 @app.get("/health")
@@ -674,6 +760,8 @@ def health() -> dict[str, object]:
         "language": LANGUAGE,
         "stt_model": STT_MODEL,
         "tts_engine": TTS_ENGINE,
+        "tts_fallback_engine": fallback_engine() or "none",  # the EFFECTIVE one, not the raw setting
+        "tts_fallbacks": _tts_fallbacks,
         "tts_languages": sorted(SILERO_VOICES),
         "accentuated_languages": sorted(ACCENTUATORS),
         "streaming": True,
@@ -750,17 +838,19 @@ async def stt(request: Request, audio: UploadFile = File(...), language: str = "
     return JSONResponse({"text": text, "language": info.language, "duration": info.duration})
 
 
-def render_tts(text: str, language: str, speaker: str) -> bytes:
+def render_tts(text: str, language: str, speaker: str, engine: str = "") -> bytes:
     """The blocking body of /tts — synthesis plus WAV encoding, run in the threadpool.
 
     Holds ONE model slot for the whole blob — which is why /tts carries the small
-    MAX_TTS_TEXT_BLOB cap while /tts/stream (a slot per chunk) carries the big one.
+    MAX_TTS_TEXT_BLOB cap while /tts/stream (a slot per chunk) carries the big one. The slot is
+    taken and released INSIDE one call, so a fallback retry (which is a second call) acquires only
+    after the failed primary's slot is back: a one-slot gate is never held twice for one request.
     """
-    sample_rate = engine_sample_rate()
+    sample_rate = engine_sample_rate(engine)
     pause = torch.zeros(int(sample_rate * PAUSE_SECONDS))
     pieces = []
     with model_slot():
-        for piece in synthesis_pieces(text, language, speaker):
+        for piece in synthesis_pieces(text, language, speaker, engine):
             pieces.append(piece)
             pieces.append(pause)
     wav = torch.cat(pieces) if pieces else torch.zeros(1)
@@ -774,6 +864,12 @@ def render_tts(text: str, language: str, speaker: str) -> bytes:
 
 @app.post("/tts")
 async def tts_endpoint(request: Request, payload: dict) -> Response:
+    """One WAV blob, and a header naming the engine that produced it.
+
+    `X-Voice-Loop-Engine: <engine>` on every success — `<engine> (fallback)` when the primary was
+    broken and the configured fallback spoke instead. The failure itself stays in the server log:
+    a client that asked for speech gets speech, and can see who gave it.
+    """
     refusal = cross_site_error(request)
     if refusal is not None:
         return refusal
@@ -790,12 +886,29 @@ async def tts_endpoint(request: Request, payload: dict) -> Response:
             },
             status_code=400,
         )
-    error = tts_request_error(text, language)
+    engine, is_fallback, error = resolve_engine(text, language)
     if error is not None:
         return error
 
-    wav = await run_in_threadpool(render_tts, text, language, payload.get("speaker") or "")
-    return Response(wav, media_type="audio/wav")
+    speaker = payload.get("speaker") or ""
+    try:
+        wav = await run_in_threadpool(render_tts, text, language, speaker, engine)
+    except Exception:
+        if is_fallback:
+            raise  # already the fallback: the ordinary error path, nothing left to try
+        alternative, refused = fallback_for(text, language)
+        if refused is not None:
+            log.exception(
+                "the %s engine failed and %s cannot serve this request either", engine, fallback_engine()
+            )
+            return refused
+        if not alternative:
+            raise
+        log.exception("the %s engine failed — retrying this request on %s", engine, alternative)
+        count_fallback()
+        wav = await run_in_threadpool(render_tts, text, language, speaker, alternative)
+        engine, is_fallback = alternative, True
+    return Response(wav, media_type="audio/wav", headers={ENGINE_HEADER: engine_label(engine, is_fallback)})
 
 
 def gated_pieces(pieces):
@@ -815,6 +928,21 @@ def gated_pieces(pieces):
         yield piece
 
 
+def stream_fallback(text: str, language: str, sent: int, is_fallback: bool) -> str:
+    """The engine a BROKEN stream may restart on, or "" — and after the first chunk, never.
+
+    A client that already played chunk 0 cannot be handed a different voice mid-sentence, and the
+    200 left with those first bytes anyway: from there today's terminal error event stands
+    unchanged. Before the first chunk nothing has been committed, so the whole stream can simply be
+    synthesized again on the other engine. A fallback that refuses the request is no restart
+    either — a stream has no way left to say 400, so the error event says it.
+    """
+    if sent or is_fallback:
+        return ""
+    engine, _refused = fallback_for(text, language)
+    return engine
+
+
 @app.post("/tts/stream")
 async def tts_stream_endpoint(request: Request, payload: dict) -> Response:
     """Same JSON body as /tts, but the audio leaves as it is synthesized.
@@ -824,6 +952,11 @@ async def tts_stream_endpoint(request: Request, payload: dict) -> Response:
     `error` if synthesis breaks mid-stream (the 200 status left with the first bytes, so a late
     failure cannot become a 500; it becomes the last event instead). Requests refused before
     synthesis starts return plain JSON errors, exactly like /tts.
+
+    Who spoke is reported in the terminal `end` event (`"engine": "silero (fallback)"`) rather than
+    in a header: the headers leave before the first chunk, i.e. before a mid-flight fallback could
+    change the answer, and a new event type would break every existing reader. No engine header is
+    set on this endpoint for exactly that reason — the `end` event is the honest place.
 
     Pacing parity with /tts: /tts inserts PAUSE_SECONDS of silence between sentence chunks, so
     every chunk after the FIRST carries that silence at its head. Leading (not trailing) silence
@@ -844,13 +977,11 @@ async def tts_stream_endpoint(request: Request, payload: dict) -> Response:
             },
             status_code=400,
         )
-    error = tts_request_error(text, language)
+    engine, is_fallback, error = resolve_engine(text, language)
     if error is not None:
         return error
 
-    sample_rate = engine_sample_rate()
-    pause = torch.zeros(int(sample_rate * PAUSE_SECONDS))
-    pieces = gated_pieces(synthesis_pieces(text, language, payload.get("speaker") or ""))
+    speaker = payload.get("speaker") or ""
 
     def event(name: str, data: dict[str, object]) -> str:
         return f"event: {name}\ndata: {json.dumps(data)}\n\n"
@@ -858,24 +989,38 @@ async def tts_stream_endpoint(request: Request, payload: dict) -> Response:
     def stream():
         import soundfile as sf
 
-        sent = 0
-        try:
-            for piece in pieces:
-                if sent:
-                    piece = torch.cat([pause, piece])
-                out = io.BytesIO()
-                sf.write(out, piece.numpy(), sample_rate, format="WAV")
-                audio = base64.b64encode(out.getvalue()).decode("ascii")
-                yield event("chunk", {"index": sent, "audio": audio})
-                sent += 1
-        except Exception as exc:
-            # The full exception stays in the server log; the client gets the class name at most —
-            # str(exc) can carry paths, config values and other internals (CodeQL: information
-            # exposure through an exception).
-            log.exception("streaming synthesis failed after %d chunk(s)", sent)
-            yield event("error", {"error": f"synthesis failed ({type(exc).__name__})", "chunks": sent})
+        current, fell_back, sent = engine, is_fallback, 0
+        while True:
+            sample_rate = engine_sample_rate(current)  # 48 kHz Silero / 24 kHz XTTS — per ENGINE
+            pause = torch.zeros(int(sample_rate * PAUSE_SECONDS))
+            try:
+                for piece in gated_pieces(synthesis_pieces(text, language, speaker, current)):
+                    if sent:
+                        piece = torch.cat([pause, piece])
+                    out = io.BytesIO()
+                    sf.write(out, piece.numpy(), sample_rate, format="WAV")
+                    audio = base64.b64encode(out.getvalue()).decode("ascii")
+                    yield event("chunk", {"index": sent, "audio": audio})
+                    sent += 1
+            except Exception as exc:
+                # The failed generator is done and its model slot released with it, so restarting
+                # here acquires the gate fresh instead of holding it twice for one request.
+                alternative = stream_fallback(text, language, sent, fell_back)
+                if alternative:
+                    log.exception(
+                        "the %s engine failed before the first chunk — restarting on %s", current, alternative
+                    )
+                    count_fallback()
+                    current, fell_back = alternative, True
+                    continue
+                # The full exception stays in the server log; the client gets the class name at
+                # most — str(exc) can carry paths, config values and other internals (CodeQL:
+                # information exposure through an exception).
+                log.exception("streaming synthesis failed after %d chunk(s)", sent)
+                yield event("error", {"error": f"synthesis failed ({type(exc).__name__})", "chunks": sent})
+                return
+            yield event("end", {"chunks": sent, "engine": engine_label(current, fell_back)})
             return
-        yield event("end", {"chunks": sent})
 
     return StreamingResponse(stream(), media_type="text/event-stream")
 

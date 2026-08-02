@@ -43,7 +43,7 @@ def test_stream_emits_ordered_chunks_and_a_terminal_end(client, fake_silero):
     assert len(chunks) > 1
     assert [name for name, _ in chunks] == ["chunk"] * len(chunks)
     assert [data["index"] for _, data in chunks] == list(range(len(chunks)))
-    assert terminal == ("end", {"chunks": len(chunks)})
+    assert terminal == ("end", {"chunks": len(chunks), "engine": "silero"})
     assert len(fake_silero.calls) == len(chunks)
 
 
@@ -82,7 +82,7 @@ def test_stream_xtts_streams_per_sentence_chunk_at_its_own_rate(client, fake_xtt
     parsed = events(response.text)
     chunks, terminal = parsed[:-1], parsed[-1]
     assert len(chunks) > 1
-    assert terminal == ("end", {"chunks": len(chunks)})
+    assert terminal == ("end", {"chunks": len(chunks), "engine": "xtts"})
     _wav, sample_rate = wav_of(chunks[0][1])
     assert sample_rate == voice_server.XTTS_SR
     assert len(fake_xtts.calls) == len(chunks)
