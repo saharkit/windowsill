@@ -23,6 +23,10 @@ cfg() { # cfg <jq-path> <default>
   if [ -n "$v" ] && [ "$v" != "null" ]; then printf '%s' "$v"; else printf '%s' "$2"; fi
 }
 
+if [ -f "$CFG" ] && ! command -v jq >/dev/null 2>&1; then
+  echo "note: jq not found -- config at $CFG is ignored" >&2
+fi
+
 TTS_EP=""; STT_EP=""; PHRASE=""; LANG_=""; SPEAKER=""; THRESHOLD="0.75"; KEEP="no"; STRICT="no"
 while [ $# -gt 0 ]; do
   case "$1" in
