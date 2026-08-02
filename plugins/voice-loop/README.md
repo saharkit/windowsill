@@ -24,19 +24,29 @@ what is missing, writes your config, wires a hotkey, and proves the result with 
 
 ## Quickstart
 
+In your shell:
+
+```sh
+claude plugin marketplace add saharkit/windowsill
 ```
-claude marketplace add saharkit/windowsill
+
+then, **inside a Claude Code session** (these are slash commands, not shell commands):
+
+```text
 /plugin install voice-loop@windowsill
-```
-
-then, in a session:
-
-```
 /voice-setup
 ```
 
-Answer two or three questions (language, where speech should run) and it finishes with a green
-selftest. To pick a custom synthetic voice afterwards: `/voice-design`.
+(If you skipped the shell step, `/plugin marketplace add saharkit/windowsill` in the session does
+the same thing.)
+
+Answer two or three questions (language, where speech should run) and the install ends with its
+proof: with HTTP speech endpoints (local server, LAN, cloud) that is the green **loopback selftest**;
+with a direct-command backend (e.g. macOS `tts.command: "say …"`, which has no endpoint to loop
+through) it is the **ear-check** — the agent speaks a line and you confirm you heard it. To pick a
+custom synthetic voice afterwards: `/voice-design`.
+
+Supported platforms: Linux and macOS. Windows/WSL is untested — we would rather say so than guess.
 
 To hear something, the model must be *asked* to speak — one line in your `CLAUDE.md` is enough, and
 `/voice-setup` now offers to add it for you (globally or per-project). If you skipped that offer,
@@ -87,10 +97,13 @@ what sounds robotic is nearly always **wrong stress** — install the accentuati
 language and add proper names to `stress.json` (or type a combining acute, `Ка́тя`, and the server
 converts it). The full recipe lives in the `voice-design` skill.
 
-**v0.2 roadmap — design in the cloud, then drop the key.** The planned path is: design the voice in the
-cloud as above, mint a reference recording from the voice you chose, and run **XTTS-v2 on your own LAN
-GPU** with that reference — after which the cloud key is no longer needed and synthesis is local
-again. Same ethics rule applies to the reference: your own voice, or one you have explicit rights to.
+**Design in the cloud, then drop the key — this path is live.** Design the voice in the cloud as
+above, mint a reference recording from the voice you chose, and run **XTTS-v2 on your own machine or
+LAN GPU** with that reference (`VOICE_LOOP_TTS_ENGINE=xtts` on the bundled server) — after which the
+cloud key is no longer needed and synthesis is local again. Setup, licensing caveats and the
+reference-wav contract are in
+[`server/README.md` — XTTS engine](../../server/README.md#xtts-engine-voice-cloning). Same ethics
+rule applies to the reference: your own voice, or one you have explicit rights to.
 
 ## Latency — speak-back streams
 
@@ -149,7 +162,16 @@ few coarse actions, and never hides a `sudo`.
 
 ## Verify it yourself
 
+Inside a Claude Code session (where `${CLAUDE_PLUGIN_ROOT}` points at the installed plugin):
+
+```text
+bash "${CLAUDE_PLUGIN_ROOT}/scripts/selftest.sh" --endpoint http://127.0.0.1:8355
+```
+
+From a manual checkout it is the repo-relative path instead:
+
 ```sh
+git clone https://github.com/saharkit/windowsill && cd windowsill
 bash plugins/voice-loop/scripts/selftest.sh --endpoint http://127.0.0.1:8355
 ```
 
@@ -161,6 +183,11 @@ The server's own Python is unit-tested with a hard 100% coverage gate on Python 
 Stop hook is invoked for real in CI. The parts a machine cannot check for you — the hotkey, a real
 microphone, whether you actually hear it — are a written checklist. Both halves, and what the
 coverage number honestly claims, are in [TESTING.md](TESTING.md).
+
+**Uninstalling:** removing the plugin does not remove the 🔊 line from your `CLAUDE.md`, the
+config/state dirs (`~/.config/voice-loop/`, `~/.local/state/voice-loop/`), downloaded models under
+`~/.local/share/voice-loop/`, or a local server service you enabled — a proper uninstall story is
+tracked in [issue #17](https://github.com/saharkit/windowsill/issues/17).
 
 Deeper reading: [architecture](../../docs/architecture.md) ·
 [troubleshooting](../../docs/troubleshooting.md) · [FAQ](../../docs/faq.md).

@@ -95,12 +95,33 @@ models. Say this **before** installing, not after.
 This is the one place a `sudo` line may appear — **printed for the user to run**, never executed by you.
 
 Server (only for `local`) — needs **Python >= 3.10**; check `python3 --version` from the probe first
-and, if the system python is older, use a newer interpreter explicitly (`python3.12 -m venv …`):
+and, if the system python is older, use a newer interpreter explicitly (`python3.12 -m venv …`).
+
+The server is **not part of the installed plugin** — a marketplace install ships only the plugin
+directory, so fetch the two server files first. Either clone the repo:
+
+```sh
+git clone --depth 1 https://github.com/saharkit/windowsill ~/.local/share/voice-loop/src && \
+cp ~/.local/share/voice-loop/src/server/voice_server.py ~/.local/share/voice-loop/
+```
+
+or fetch just the two files at a pinned ref (this one is the v0.3.0 server):
+
+```sh
+REF=b1286710b66086fb2bd1ef13db437d5fba31c6bd
+mkdir -p ~/.local/share/voice-loop && \
+curl -fsSL "https://raw.githubusercontent.com/saharkit/windowsill/$REF/server/voice_server.py" \
+  -o ~/.local/share/voice-loop/voice_server.py && \
+curl -fsSL "https://raw.githubusercontent.com/saharkit/windowsill/$REF/server/requirements.txt" \
+  -o ~/.local/share/voice-loop/requirements.txt
+```
+
+Then build the venv (with the clone, `-r ~/.local/share/voice-loop/src/server/requirements.txt`):
 
 ```sh
 python3 -m venv ~/.local/share/voice-loop/venv && \
 ~/.local/share/voice-loop/venv/bin/pip install --quiet --index-url https://download.pytorch.org/whl/cpu torch && \
-~/.local/share/voice-loop/venv/bin/pip install --quiet -r "<repo>/server/requirements.txt"
+~/.local/share/voice-loop/venv/bin/pip install --quiet -r ~/.local/share/voice-loop/requirements.txt
 # Ukrainian only: ~/.local/share/voice-loop/venv/bin/pip install "ukrainian-word-stress>=1.0"
 ```
 
@@ -112,7 +133,7 @@ mkdir -p ~/.config/systemd/user && cat > ~/.config/systemd/user/voice-loop.servi
 Description=voice-loop speech server
 [Service]
 Environment=VOICE_LOOP_STT_MODEL=small
-Environment=VOICE_LOOP_LANGUAGE=ru
+Environment=VOICE_LOOP_LANGUAGE=<language>
 ExecStart=%h/.local/share/voice-loop/venv/bin/python %h/.local/share/voice-loop/voice_server.py
 Restart=on-failure
 [Install]
@@ -121,7 +142,8 @@ EOF
 systemctl --user daemon-reload && systemctl --user enable --now voice-loop.service
 ```
 
-(Copy `server/voice_server.py` to `~/.local/share/voice-loop/` first. `systemctl --user` is not root.)
+Substitute `<language>` with the code the user chose in Step 1 (it sets the server's default;
+requests can still override per call). `systemctl --user` is not root.
 
 ### macOS
 
@@ -246,14 +268,21 @@ which is exactly why the scripts paste from the clipboard instead of typing the 
 
 ```sh
 KEY=/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/voice-loop/
-gsettings set org.gnome.settings-daemon.plugins.media-keys custom-keybindings "['$KEY']"
+# read the existing list and APPEND — a plain `set` would clobber the user's other custom keybindings
+CUR=$(gsettings get org.gnome.settings-daemon.plugins.media-keys custom-keybindings)
+NEW=$(python3 -c "
+import ast, sys
+cur, key = sys.argv[1], sys.argv[2]
+lst = [] if cur.strip() in ('@as []', '[]') else ast.literal_eval(cur)
+if key not in lst: lst.append(key)
+print(lst)" "$CUR" "$KEY")
+gsettings set org.gnome.settings-daemon.plugins.media-keys custom-keybindings "$NEW"
 gsettings set org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:$KEY name 'voice-loop dictate'
 gsettings set org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:$KEY command '<PLUGIN_ROOT>/scripts/dictate-toggle.sh send'
 gsettings set org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:$KEY binding 'F9'
 ```
 
-Read the existing `custom-keybindings` list first and **append** rather than overwrite it. Substitute
-the real absolute path — `${CLAUDE_PLUGIN_ROOT}` is not expanded by the desktop.
+Substitute the real absolute path — `${CLAUDE_PLUGIN_ROOT}` is not expanded by the desktop.
 
 ### Other environments — print instructions, do not guess
 
@@ -289,18 +318,26 @@ loop — convention included, not just the plumbing.
 
 ## Step 8 — verify (mandatory, this is how the install ends)
 
-```sh
-bash "${CLAUDE_PLUGIN_ROOT}/scripts/selftest.sh"
-```
+How the install ends depends on the backend shape — say which proof applies **before** running it:
 
-It renders a phrase through TTS, feeds the audio straight back into STT, and compares the transcript —
-no microphone, no speakers, no display. On failure, read its message: it distinguishes "server not
-reachable", "not a WAV", "no text", and "transcript does not match".
+- **HTTP endpoints configured (local server / lan / cloud):** the ending is the loopback selftest —
 
-Then verify the two interactive halves with the user:
+  ```sh
+  bash "${CLAUDE_PLUGIN_ROOT}/scripts/selftest.sh"
+  ```
+
+  It renders a phrase through TTS, feeds the audio straight back into STT, and compares the
+  transcript — no microphone, no speakers, no display. On failure, read its message: it
+  distinguishes "server not reachable", "not a WAV", "no text", and "transcript does not match".
+- **Direct-command backends only (e.g. macOS `tts.command: "say …"`, no HTTP endpoint):** there is
+  nothing for the loopback to loop through — `selftest.sh` will say so and exit without testing.
+  The install ends with the **ear-check** below instead; do not promise a green selftest here.
+
+Then verify the two interactive halves with the user (for a command-only setup this IS the proof):
 1. **speak-back** — end your next reply with a line starting with the marker and ask if they heard it.
 2. **dictation** — ask them to press the hotkey, say a sentence, press again, and confirm the text
    arrived (pasted, or on the clipboard in tier 1).
 
-Report at the end: language, both backends, paste tier, hotkey, selftest result. If anything is left
+Report at the end: language, both backends, paste tier, hotkey, and the verification result
+(loopback selftest or ear-check, whichever applied). If anything is left
 undone (e.g. the user declined the ydotool step), say exactly what and how to finish it later.

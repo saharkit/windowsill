@@ -5,7 +5,10 @@ Seeded from the failures that actually happened while building this, grouped by 
 ```sh
 tail -n 40 ~/.local/state/voice-loop/speak.log      # speak-back
 tail -n 40 ~/.local/state/voice-loop/dictate.log    # dictation
-bash plugins/voice-loop/scripts/selftest.sh         # is the speech path alive at all?
+# is the speech path alive at all? in a Claude Code session (marketplace install):
+bash "${CLAUDE_PLUGIN_ROOT}/scripts/selftest.sh"
+# from a manual checkout of the repo it is the repo-relative path instead:
+#   bash plugins/voice-loop/scripts/selftest.sh
 ```
 
 ## Nothing is pasted, only copied
@@ -49,8 +52,9 @@ dead PID and starts fresh.
 **Cause:** the Stop hook can fire *before* the final assistant message reaches the transcript file.
 Reading it naively gets the previous turn.
 
-Handled by design: `speak.sh` retries until the extracted line **differs** from the last spoken one,
-and drops a read identical to the previous turn. If you see repeats anyway:
+Handled by design: the hook (`speak.py`) retries only on a flush-race read — an empty extract, or
+one identical to the last spoken line — and drops a read identical to the previous turn. If you see
+repeats anyway:
 
 - check `~/.local/state/voice-loop/last-spoken` — it is the dedup memory; delete it to reset;
 - if you genuinely want the same sentence spoken twice in a row, vary it by a word;
@@ -88,8 +92,9 @@ ssh -N -L 8355:127.0.0.1:8355 user@gpu-host
 If you really must expose it, `VOICE_LOOP_HOST=0.0.0.0` behind a firewall you control — anyone who
 can reach the port can transcribe and synthesize on your hardware.
 
-**Corporate proxy swallowing the request:** the scripts already pass `curl --noproxy '*'`; if you
-call the API by hand, do the same.
+**Corporate proxy swallowing the request:** the Python scripts already bypass proxies (urllib with
+an empty `ProxyHandler`), and `selftest.sh` passes `curl --noproxy '*'`; if you call the API by hand
+with curl, do the same.
 
 ## selftest fails
 

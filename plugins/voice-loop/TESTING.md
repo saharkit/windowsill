@@ -60,10 +60,6 @@ whether you can actually *hear* it. That is the checklist below, and it needs a 
 
 ## Human acceptance checklist
 
-Run it on a machine that has never had voice-loop on it (a clean container or a fresh VM for Linux; a
-teammate's untouched Mac for the macOS branch). "Works on the machine it was built on" is not a
-result.
-
 Run this before every release, on a machine that has never had voice-loop on it (a clean container or a
 fresh VM for Linux; a teammate's untouched Mac for the macOS branch). "Works on the machine it was
 built on" is not a result.
@@ -87,7 +83,7 @@ Environment under test:
 
 | # | check | expected | observed | pass |
 |---|---|---|---|---|
-| 1.1 | `claude marketplace add saharkit/windowsill` | marketplace added, no errors | | |
+| 1.1 | `claude plugin marketplace add saharkit/windowsill` (shell), or `/plugin marketplace add saharkit/windowsill` in a session | marketplace added, no errors | | |
 | 1.2 | `/plugin install voice-loop@windowsill` | plugin installs; it appears in `/plugin` | | |
 | 1.3 | Start a fresh session | no hook errors in the session; the Stop hook is registered | | |
 | 1.4 | `/voice-setup` is offered / discoverable by name | the skill is listed | | |
@@ -100,7 +96,7 @@ prompt the setup causes.
 | # | check | expected | observed | pass |
 |---|---|---|---|---|
 | 2.1 | The agent states its plan before acting | a short plan, then work | | |
-| 2.2 | **Permission prompt count for the whole install** | **≤ 3** (more = FAIL, this is the #1656 acceptance bar) | count: | |
+| 2.2 | **Permission prompt count for the whole install** | **≤ 3** (more = FAIL — that is the acceptance bar) | count: | |
 | 2.3 | Language question comes first and is pre-answered from the environment | one confirm for the common case | | |
 | 2.4 | Backend choice is offered per direction with the cost/privacy tradeoff stated | user makes an informed choice | | |
 | 2.5 | No `sudo` is ever executed silently | any root step is PRINTED for the user to run | | |
