@@ -43,6 +43,20 @@ def test_acute_to_plus_leaves_unmarked_text_alone():
     assert voice_server.acute_to_plus("обычный текст") == "обычный текст"
 
 
+def test_strip_stress_markers_removes_plus_before_a_vowel_in_both_alphabets():
+    assert voice_server.strip_stress_markers("Сах+ар и раб+ота") == "Сахар и работа"
+    assert voice_server.strip_stress_markers("t+Esto and s+odium") == "tEsto and sodium"
+
+
+def test_strip_stress_markers_removes_a_combining_acute_after_a_letter():
+    assert voice_server.strip_stress_markers(f"робо{ACUTE}та") == "робота"
+
+
+def test_strip_stress_markers_is_vowel_anchored():
+    """'+' not in stress position survives: C++, arithmetic, a stray trailing mark."""
+    assert voice_server.strip_stress_markers("C++ и 2+2=4 и х+") == "C++ и 2+2=4 и х+"
+
+
 def test_language_without_an_accentuator_passes_through_untouched():
     text = f"Plain english with a stray acute{ACUTE} mark"
     assert voice_server.mark_stress(text, "en") == text

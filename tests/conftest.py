@@ -65,6 +65,22 @@ class FakeSilero:
         return torch.zeros(int(sample_rate * 0.05))
 
 
+class FakeXtts:
+    """Stands in for a loaded coqui TTS wrapper: returns silence and records how it was called."""
+
+    def __init__(self) -> None:
+        self.device: object = None
+        self.calls: list[dict[str, object]] = []
+
+    def to(self, device: object) -> "FakeXtts":
+        self.device = device
+        return self
+
+    def tts(self, text: str, speaker_wav: str, language: str) -> list[float]:
+        self.calls.append({"text": text, "speaker_wav": speaker_wav, "language": language})
+        return [0.0] * 1200  # the real model returns a plain list of floats at 24 kHz
+
+
 @pytest.fixture(autouse=True)
 def clean_state(monkeypatch, tmp_path):
     """Every test starts with empty caches, its own (absent) stress file, and accentuation OFF.
@@ -79,6 +95,9 @@ def clean_state(monkeypatch, tmp_path):
     monkeypatch.setattr(voice_server, "USE_ACCENT", False)
     monkeypatch.setattr(voice_server, "TTS_MODEL_OVERRIDE", "")
     monkeypatch.setattr(voice_server, "TTS_SPEAKER_OVERRIDE", "")
+    monkeypatch.setattr(voice_server, "TTS_ENGINE", "silero")
+    monkeypatch.setattr(voice_server, "XTTS_REFERENCE", "")
+    monkeypatch.setattr(voice_server, "XTTS_MODEL_DIR", "")
     monkeypatch.setattr(voice_server, "LANGUAGE", "ru")
     yield
     voice_server.reset_caches()
@@ -115,6 +134,40 @@ def fake_whisper(monkeypatch):
 def fake_silero(monkeypatch):
     model = FakeSilero()
     monkeypatch.setattr(voice_server, "tts", lambda language: model)
+    return model
+
+
+@pytest.fixture
+def coqui_installed(import_fake):
+    """A fake importable coqui-tts (`from TTS.api import TTS`), enough for the probe and the loader."""
+    instances: list[FakeXtts] = []
+
+    class FakeTTS(FakeXtts):
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            super().__init__()
+            self.args, self.kwargs = args, kwargs
+            instances.append(self)
+
+    FakeTTS.instances = instances
+    api = import_fake("TTS.api", TTS=FakeTTS)
+    import_fake("TTS", api=api)
+    return FakeTTS
+
+
+@pytest.fixture
+def xtts_engine(monkeypatch, tmp_path, coqui_installed):
+    """The xtts engine selected with a reference wav on disk — the endpoint-level happy setup."""
+    reference = tmp_path / "reference.wav"
+    reference.write_bytes(b"RIFFfake")
+    monkeypatch.setattr(voice_server, "TTS_ENGINE", "xtts")
+    monkeypatch.setattr(voice_server, "XTTS_REFERENCE", str(reference))
+    return reference
+
+
+@pytest.fixture
+def fake_xtts(monkeypatch, xtts_engine):
+    model = FakeXtts()
+    monkeypatch.setattr(voice_server, "xtts", lambda: model)
     return model
 
 
