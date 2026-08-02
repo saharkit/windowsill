@@ -37,7 +37,7 @@ Then install what you want — this one is typed **inside a session**, not in yo
 
 | plugin | what it does | status |
 |---|---|---|
-| [**voice-loop**](plugins/voice-loop) | Talk to Claude Code and hear it answer — a `Stop` hook speaks marked lines, a push-to-talk script dictates into the prompt, and `/voice-setup` installs the whole contour (local, LAN, or cloud speech). Ships its own self-hostable speech server. | v0.3.0 |
+| [**voice-loop**](plugins/voice-loop) | Talk to Claude Code and hear it answer — a `Stop` hook speaks marked lines, a push-to-talk script dictates into the prompt, and `/voice-setup` installs the whole contour (local, LAN, or cloud speech). Ships its own self-hostable speech server. | v0.3.1 |
 
 More will land on the sill over time; each plugin owns its own README, its own tests, and its own
 version.

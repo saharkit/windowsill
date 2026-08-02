@@ -10,7 +10,7 @@
     {
       "name": "voice-loop",
       "description": "Talk to Claude Code and hear it answer: a Stop hook speaks marker-tagged lines, a push-to-talk script dictates into the prompt, and /voice-setup installs it all. Local, LAN, or cloud speech backends.",
-      "version": "0.3.0",
+      "version": "0.3.1",
       "author": {
         "name": "Sahar"
       },
