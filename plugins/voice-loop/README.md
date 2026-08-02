@@ -122,7 +122,8 @@ plugins/voice-loop/
   hooks/hooks.json        registers the Stop hook
   scripts/speak.sh        the Stop hook's launcher (stable entry point; never fails a turn)
   scripts/speak.py        the Stop hook: extract marked lines -> chunk -> synthesize -> stream-play
-  scripts/dictate-toggle.sh   push-to-talk toggle: record -> transcribe -> clipboard/paste
+  scripts/dictate-toggle.sh   push-to-talk launcher (stable hotkey entry point)
+  scripts/dictate.py      the toggle: record -> transcribe -> clipboard/paste-into-prompt
   scripts/selftest.sh     hardware-free loopback proof (TTS -> STT -> compare)
   skills/voice-setup/     the agent installer
   skills/voice-design/    voice casting
