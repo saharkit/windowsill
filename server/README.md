@@ -58,6 +58,28 @@ VOICE_LOOP_DEVICE=cuda VOICE_LOOP_STT_MODEL=large-v3-turbo python voice_server.p
 Only STT moves to the GPU; Silero stays on CPU, where it is already faster than real time — that keeps
 the GPU free for recognition. `compute_type` defaults to `float16` on CUDA and `int8` on CPU.
 
+## Capacity
+
+All models share one machine — and on CUDA, one card. Every model call (an `/stt` transcription, a
+`/tts` blob, each `/tts/stream` chunk) therefore goes through a single bounded executor: at most
+`VOICE_LOOP_MODEL_CONCURRENCY` calls run at once. The default is **1** on CUDA — the resident models
+already hold most of the VRAM, and concurrent calls stack per-call activation memory into an OOM —
+and up to **2** on CPU (by core count), where the models release the GIL in native code and a second
+slot buys real parallelism. Excess requests queue. `/health` reports the limit and the live count as
+`model_concurrency` / `model_in_flight`.
+
+Two caps keep any single request from monopolizing that executor:
+
+- **`/tts` renders its whole blob in one executor hold**, so it carries the small cap
+  (`VOICE_LOOP_MAX_TTS_TEXT_BLOB`, 3000 characters). Longer texts belong on `/tts/stream`, which
+  takes and **releases** the executor per sentence chunk and keeps the big cap
+  (`VOICE_LOOP_MAX_TTS_TEXT`, 20 000).
+- **`/stt` uploads are byte-capped at 25 MB — but bytes are not time**: 25 MB of compressed audio
+  can decode to hours of transcription in one executor hold. Uploads whose WAV header is cheaply
+  parseable are additionally duration-capped at `VOICE_LOOP_MAX_STT_SECONDS` (600 s). Compressed
+  codecs reveal their duration only by decoding — the very work the cap exists to avoid — so they
+  pass through on the byte cap alone; be aware of that holding-time reality if you raise the caps.
+
 ## Configuration (all environment variables)
 
 | variable | default | meaning |
@@ -77,7 +99,10 @@ the GPU free for recognition. `compute_type` defaults to `float16` on CUDA and `
 | `VOICE_LOOP_STRESS_FILE` | `~/.config/voice-loop/stress.json` | your stress overrides |
 | `VOICE_LOOP_ACCENT` | `1` | set `0` to skip automatic accentuation |
 | `VOICE_LOOP_MAX_UPLOAD_BYTES` | `26214400` (25 MB) | `/stt` upload size cap — a larger clip gets `413` |
-| `VOICE_LOOP_MAX_TTS_TEXT` | `20000` | `/tts` and `/tts/stream` text length cap — longer text gets `400` |
+| `VOICE_LOOP_MAX_STT_SECONDS` | `600` | `/stt` duration cap when the WAV header is parseable — see [Capacity](#capacity) |
+| `VOICE_LOOP_MAX_TTS_TEXT` | `20000` | `/tts/stream` text length cap — longer text gets `400` |
+| `VOICE_LOOP_MAX_TTS_TEXT_BLOB` | `3000` | `/tts` single-blob text cap — longer text gets `400` pointing at `/tts/stream` |
+| `VOICE_LOOP_MODEL_CONCURRENCY` | `1` on CUDA, else up to `2` | concurrent model calls — see [Capacity](#capacity) |
 
 `GET /health` also reports a `version` field (`"0.4.0"`). It is for diagnostics and bug reports;
 clients should detect features through the capability flags (`"streaming": true` and friends), not
@@ -248,5 +273,7 @@ CORS-"simple" request, so any web page you visit could quietly fire real request
 to any request a browser labels as coming from another site — `Sec-Fetch-Site: cross-site`, or an
 `Origin` header naming anything other than a loopback host (`127.x`, `localhost`, `[::1]`) or
 `null`. Non-browser clients (curl, the plugin scripts) send neither header and are unaffected.
-Related request caps: `/stt` uploads are limited by `VOICE_LOOP_MAX_UPLOAD_BYTES` (25 MB default),
-`/tts` text by `VOICE_LOOP_MAX_TTS_TEXT` (20 000 characters default) — see the configuration table.
+Related request caps: `/stt` uploads are limited by `VOICE_LOOP_MAX_UPLOAD_BYTES` (25 MB default)
+and, for parseable WAV, `VOICE_LOOP_MAX_STT_SECONDS`; `/tts` text by `VOICE_LOOP_MAX_TTS_TEXT_BLOB`
+(3000 default) and `/tts/stream` text by `VOICE_LOOP_MAX_TTS_TEXT` (20 000 default) — see
+[Capacity](#capacity) for why the two TTS paths differ.

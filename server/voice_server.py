@@ -18,7 +18,11 @@ LAN or an ssh tunnel. Everything is configured through the environment — see R
     VOICE_LOOP_STRESS_FILE   stress overrides            (default ~/.config/voice-loop/stress.json)
     VOICE_LOOP_ACCENT        1 | 0 — enable automatic accentuation (default 1; ru and uk)
     VOICE_LOOP_MAX_UPLOAD_BYTES  /stt upload size cap    (default 26214400 — 25 MB)
-    VOICE_LOOP_MAX_TTS_TEXT  /tts and /tts/stream text length cap (default 20000 characters)
+    VOICE_LOOP_MAX_STT_SECONDS   /stt duration cap for parseable WAV uploads (default 600)
+    VOICE_LOOP_MAX_TTS_TEXT  /tts/stream text length cap (default 20000 characters)
+    VOICE_LOOP_MAX_TTS_TEXT_BLOB /tts (single blob) text length cap (default 3000 characters)
+    VOICE_LOOP_MODEL_CONCURRENCY how many model calls may run at once (default: 1 on cuda,
+                             else up to 2 depending on core count — see model_slot below)
 
 Language is a request-level field: /stt takes ?language=, /tts takes {"language": ...}. Both fall back
 to VOICE_LOOP_LANGUAGE. STT (whisper) is multilingual out of the box; TTS is limited to the languages
@@ -40,8 +44,10 @@ import os
 import re
 import sys
 import tempfile
+import threading
+import wave
+from contextlib import contextmanager
 from pathlib import Path
-
 from urllib.parse import urlsplit
 
 import torch
@@ -110,7 +116,9 @@ XTTS_SR = 24000  # XTTS-v2 always synthesizes at 24 kHz
 MAX_TTS_CHARS = 800  # Silero degrades past ~1000 characters per call
 PAUSE_SECONDS = 0.4
 MAX_UPLOAD_BYTES = int(os.environ.get("VOICE_LOOP_MAX_UPLOAD_BYTES", str(25 * 1024 * 1024)))
+MAX_STT_SECONDS = float(os.environ.get("VOICE_LOOP_MAX_STT_SECONDS", "600"))
 MAX_TTS_TEXT = int(os.environ.get("VOICE_LOOP_MAX_TTS_TEXT", "20000"))
+MAX_TTS_TEXT_BLOB = int(os.environ.get("VOICE_LOOP_MAX_TTS_TEXT_BLOB", "3000"))
 
 # Whisper on near-silent clips hallucinates well-known junk ("Спасибо за просмотр", TV credits,
 # "Thank you for watching") instead of returning nothing. The blocklist lives next to the server,
@@ -155,6 +163,47 @@ def resolve_compute_type(device: str) -> str:
     if COMPUTE_TYPE != "auto":
         return COMPUTE_TYPE
     return "float16" if device == "cuda" else "int8"
+
+
+def default_model_concurrency() -> int:
+    """How many model calls may run at once when VOICE_LOOP_MODEL_CONCURRENCY does not say.
+
+    The device split: the models release the GIL inside native code, so on CPU a second slot buys
+    real multicore speedup — but on CUDA every concurrent call stacks its per-call activation
+    memory on the ONE shared VRAM budget (whisper + the voices are already resident), and the only
+    thing a second slot buys is an OOM. The floor of 1 keeps a single-core box from deadlocking.
+    """
+    if resolve_device() == "cuda":
+        return 1
+    return max(1, min(2, (os.cpu_count() or 2) // 2))
+
+
+MODEL_CONCURRENCY = int(os.environ.get("VOICE_LOOP_MODEL_CONCURRENCY", "0")) or default_model_concurrency()
+
+# The one queue in front of every model call — /stt transcription, /tts blob rendering, and each
+# /tts/stream chunk synthesis. A plain threading semaphore ON PURPOSE, and one mechanism for all
+# three sites: every model call already runs on a worker thread (run_in_threadpool for the
+# endpoints, Starlette's iterate_in_threadpool for the stream generator), so a sync gate reaches
+# all of them — an async CapacityLimiter could not guard the inside of the sync generator. Global
+# rather than per-engine because whisper and TTS share one VRAM budget. anyio's ~40-thread default
+# pool is what queues behind it; the gate bounds MODEL work, not thread occupancy.
+_model_gate = threading.BoundedSemaphore(MODEL_CONCURRENCY)
+_model_in_flight = 0
+_in_flight_lock = threading.Lock()
+
+
+@contextmanager
+def model_slot():
+    """Hold one of the MODEL_CONCURRENCY slots for the duration of one model call."""
+    global _model_in_flight
+    with _model_gate:
+        with _in_flight_lock:
+            _model_in_flight += 1
+        try:
+            yield
+        finally:
+            with _in_flight_lock:
+                _model_in_flight -= 1
 
 
 def whisper():
@@ -539,18 +588,14 @@ def xtts_request_error(language: str) -> JSONResponse | None:
 
 
 def tts_request_error(text: str, language: str) -> JSONResponse | None:
-    """The shared /tts + /tts/stream refusal, or None when the request can be synthesized."""
+    """The shared /tts + /tts/stream refusal, or None when the request can be synthesized.
+
+    The length caps live at the call sites, not here — the two endpoints hold the model executor
+    very differently (one blob call vs. a released-and-reacquired slot per chunk), so they carry
+    different limits.
+    """
     if not text:
         return JSONResponse({"error": "empty text"}, status_code=400)
-    if len(text) > MAX_TTS_TEXT:
-        return JSONResponse(
-            {
-                "error": f"text too long: {len(text)} characters, the limit is {MAX_TTS_TEXT}",
-                "hint": "split the text and send several requests, "
-                "or raise VOICE_LOOP_MAX_TTS_TEXT on the server",
-            },
-            status_code=400,
-        )
     if TTS_ENGINE == "xtts":
         return xtts_request_error(language)
     if TTS_ENGINE != "silero":
@@ -611,6 +656,8 @@ def health() -> dict[str, object]:
     return {
         "ok": True,
         "version": SERVER_VERSION,
+        "model_concurrency": MODEL_CONCURRENCY,
+        "model_in_flight": _model_in_flight,
         "device": resolve_device(),
         "cuda": torch.cuda.is_available(),
         "language": LANGUAGE,
@@ -626,15 +673,35 @@ def health() -> dict[str, object]:
     }
 
 
+def wav_duration_seconds(data: bytes) -> float | None:
+    """Duration of an upload IF it is a parseable PCM RIFF/WAV container, else None.
+
+    Deliberately WAV-only and header-cheap: WAV is what the plugin scripts record, and its header
+    states frame count and rate up front. Compressed codecs (whisper accepts many) reveal duration
+    only by decoding — exactly the expensive work the duration cap exists to avoid — so those pass
+    through on the byte cap alone, honestly unmeasured. Anything the stdlib parser rejects
+    (non-PCM subtypes, truncated or crafted headers) is also passed through rather than refused.
+    """
+    if not data.startswith(b"RIFF"):
+        return None
+    try:
+        with wave.open(io.BytesIO(data)) as handle:
+            rate = handle.getframerate()
+            return handle.getnframes() / rate if rate else None
+    except (wave.Error, EOFError):
+        return None
+
+
 def transcribe_upload(data: bytes, language: str) -> tuple[str, object]:
     """The blocking body of /stt — runs in the threadpool so the event loop stays responsive."""
     with tempfile.NamedTemporaryFile(suffix=".wav") as handle:
         handle.write(data)
         handle.flush()
-        segments, info = whisper().transcribe(
-            handle.name, language=language, vad_filter=True, initial_prompt=STT_HINT
-        )
-        text = " ".join(segment.text.strip() for segment in segments).strip()
+        with model_slot():
+            segments, info = whisper().transcribe(
+                handle.name, language=language, vad_filter=True, initial_prompt=STT_HINT
+            )
+            text = " ".join(segment.text.strip() for segment in segments).strip()
     return text, info
 
 
@@ -653,6 +720,15 @@ async def stt(request: Request, audio: UploadFile = File(...), language: str = "
             },
             status_code=413,
         )
+    duration = wav_duration_seconds(data)
+    if duration is not None and duration > MAX_STT_SECONDS:
+        return JSONResponse(
+            {
+                "error": f"audio too long: {duration:.0f} seconds, the limit is {MAX_STT_SECONDS:.0f}",
+                "hint": "send a shorter clip, or raise VOICE_LOOP_MAX_STT_SECONDS on the server",
+            },
+            status_code=413,
+        )
     text, info = await run_in_threadpool(transcribe_upload, data, language)
     pattern = matched_hallucination(text)
     if pattern is not None:
@@ -664,13 +740,18 @@ async def stt(request: Request, audio: UploadFile = File(...), language: str = "
 
 
 def render_tts(text: str, language: str, speaker: str) -> bytes:
-    """The blocking body of /tts — synthesis plus WAV encoding, run in the threadpool."""
+    """The blocking body of /tts — synthesis plus WAV encoding, run in the threadpool.
+
+    Holds ONE model slot for the whole blob — which is why /tts carries the small
+    MAX_TTS_TEXT_BLOB cap while /tts/stream (a slot per chunk) carries the big one.
+    """
     sample_rate = engine_sample_rate()
     pause = torch.zeros(int(sample_rate * PAUSE_SECONDS))
     pieces = []
-    for piece in synthesis_pieces(text, language, speaker):
-        pieces.append(piece)
-        pieces.append(pause)
+    with model_slot():
+        for piece in synthesis_pieces(text, language, speaker):
+            pieces.append(piece)
+            pieces.append(pause)
     wav = torch.cat(pieces) if pieces else torch.zeros(1)
 
     import soundfile as sf
@@ -687,12 +768,40 @@ async def tts_endpoint(request: Request, payload: dict) -> Response:
         return refusal
     text = (payload.get("text") or "").strip()
     language = (payload.get("language") or LANGUAGE).lower()
+    if len(text) > MAX_TTS_TEXT_BLOB:
+        return JSONResponse(
+            {
+                "error": f"text too long for a single blob: {len(text)} characters, "
+                f"the limit is {MAX_TTS_TEXT_BLOB}",
+                "hint": "long texts belong on /tts/stream, which synthesizes chunk by chunk instead "
+                "of holding the synthesis slot for the whole blob; "
+                "or raise VOICE_LOOP_MAX_TTS_TEXT_BLOB on the server",
+            },
+            status_code=400,
+        )
     error = tts_request_error(text, language)
     if error is not None:
         return error
 
     wav = await run_in_threadpool(render_tts, text, language, payload.get("speaker") or "")
     return Response(wav, media_type="audio/wav")
+
+
+def gated_pieces(pieces):
+    """Wrap a synthesis generator so each chunk takes — and RELEASES — one model slot.
+
+    The release between chunks is the point: a long stream queues fairly behind other requests
+    instead of holding the executor for its whole duration, which is what lets /tts/stream carry a
+    much larger text cap than the /tts blob path.
+    """
+    iterator = iter(pieces)
+    while True:
+        with model_slot():
+            try:
+                piece = next(iterator)
+            except StopIteration:
+                return
+        yield piece
 
 
 @app.post("/tts/stream")
@@ -715,13 +824,22 @@ async def tts_stream_endpoint(request: Request, payload: dict) -> Response:
         return refusal
     text = (payload.get("text") or "").strip()
     language = (payload.get("language") or LANGUAGE).lower()
+    if len(text) > MAX_TTS_TEXT:
+        return JSONResponse(
+            {
+                "error": f"text too long: {len(text)} characters, the limit is {MAX_TTS_TEXT}",
+                "hint": "split the text and send several requests, "
+                "or raise VOICE_LOOP_MAX_TTS_TEXT on the server",
+            },
+            status_code=400,
+        )
     error = tts_request_error(text, language)
     if error is not None:
         return error
 
     sample_rate = engine_sample_rate()
     pause = torch.zeros(int(sample_rate * PAUSE_SECONDS))
-    pieces = synthesis_pieces(text, language, payload.get("speaker") or "")
+    pieces = gated_pieces(synthesis_pieces(text, language, payload.get("speaker") or ""))
 
     def event(name: str, data: dict[str, object]) -> str:
         return f"event: {name}\ndata: {json.dumps(data)}\n\n"
