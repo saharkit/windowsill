@@ -95,6 +95,17 @@ Language is a **request field** (`?language=` / `{"language": ...}`), defaulting
 selected engine speaks, and an unsupported code returns `400` with the supported list rather than a
 stack trace.
 
+**Two fallbacks compose, and neither knows about the other.** The client falls back from
+`/tts/stream` to the blob `/tts` when a stream dies before its first chunk (the speak path, step 4);
+the server falls back from the primary engine to `VOICE_LOOP_TTS_FALLBACK_ENGINE` when synthesis
+breaks ([Engine fallback](../server/README.md#engine-fallback)). Stacked, one piece of marked text
+can therefore cost up to ~4 synthesis attempts before it is given up on: stream on the primary,
+stream restarted on the fallback engine, then the blob request repeating the same pair. Each layer
+is bounded on its own —
+the server restarts a stream at most once and never after the first chunk, the client drops to the
+blob path at most once — so the composition terminates instead of looping; what it costs on a
+broken engine is latency, and the `tts_fallbacks` counter says how often it is being paid.
+
 ## Where state lives
 
 | path | what |

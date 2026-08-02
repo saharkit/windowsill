@@ -206,6 +206,9 @@ a per-process `tts_fallbacks` counter (how many requests a broken primary handed
 What it is deliberately *not*: a router. A `400` refusal is the request's problem and no engine can
 fix it, so it is never retried — including an unsupported language, even when the other engine
 happens to speak it (`uk` on the `xtts` engine stays a `400`, though Silero has a voice for it).
+Such a refusal does point at the fix, though: when the other engine speaks the requested language,
+the `400` carries `"hint": "switch VOICE_LOOP_TTS_ENGINE=silero to serve 'uk'"` — which voices this
+server has is the operator's setting, not a per-request decision. No engine speaks it, no hint.
 Only an engine-level failure hands over. And if the fallback cannot serve that particular request
 either — `ja` and `zh-cn` are XTTS-v2 languages Silero has no model for — you get that engine's
 ordinary refusal, so it is clear why nothing here could speak. The primary's failure, with its
@@ -219,6 +222,14 @@ one engine end to end — and its chunks carry that engine's sample rate (48 kHz
 
 Fallback synthesis takes the same one model slot the primary took — sequentially, after the failed
 attempt released it (see [Capacity](#capacity)). A retry never doubles the concurrency.
+
+**A persistently broken primary is paid for on every request.** There is no circuit breaker: each
+request tries the primary, fails, and only then synthesizes on the fallback — so an engine that
+stays down for hours costs every request that failed attempt (a synthesis that raises, or a model
+load that dies) on top of the real one. That is the deliberate trade — no state to reset, so an
+engine that comes back is used again immediately — but it is not free, and it is not a substitute
+for fixing the primary. `tts_fallbacks` on `GET /health` climbing request-for-request is the
+signal: fix the engine, or set `VOICE_LOOP_TTS_ENGINE` to the one that works.
 
 ## Streaming synthesis (`/tts/stream`)
 
