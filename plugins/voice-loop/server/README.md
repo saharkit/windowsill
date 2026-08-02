@@ -193,11 +193,12 @@ What to know:
   clone. Required — a request on the `xtts` engine without it (or with the file missing) gets a
   clear `500`; the server still boots and `/stt` keeps working regardless.
 - **Import failures**: the import is lazy — nothing else pays for the dependency — and an `xtts`
-  request whose import fails gets a `500` that names the real cause (exception class + message, one
-  sanitized line). A genuinely absent package says so and hands you the install hint; a coqui-tts
-  that is installed but cannot import (a broken torchaudio, a `transformers` that moved) reads as
-  exactly that instead, and points at the pinned set above rather than at a reinstall that will not
-  help.
+  request whose import fails gets a `500` naming the **shape** of the failure: the exception class,
+  plus the module that was not found when there is one (`xtts import failed: ModuleNotFoundError in
+  dependency 'torchaudio'`). A genuinely absent coqui-tts says so and hands you the install hint; a
+  coqui-tts that is installed but cannot import points at the pinned set above instead of at a
+  reinstall that will not help. The exception's own **message stays in the server log** (one line,
+  no traceback) — it can carry local paths and config, which have no business on the wire.
 - Both of those `500`s are what you see with `VOICE_LOOP_TTS_FALLBACK_ENGINE=none`. With a fallback
   configured — and on the `xtts` engine there is one **by default** — the request is served by the
   fallback voice instead and marked as such; see [Engine fallback](#engine-fallback).

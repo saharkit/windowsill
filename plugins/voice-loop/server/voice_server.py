@@ -609,24 +609,34 @@ def xtts_import_error(err: ImportError) -> JSONResponse:
     "coqui-tts is not installed" is the right answer to exactly one of these and a lie about the
     rest: coqui-tts declares neither torch nor torchaudio yet imports torchaudio, and an unpinned
     transformers takes an API out from under it — so the usual real failure is a package that IS
-    installed and cannot import. Sending that person to reinstall it wastes their evening. The cause
-    is reported as ONE sanitized line (exception class + message, never a traceback), and the
-    install hint rides along ONLY when the top-level `TTS` package itself is the thing missing.
+    installed and cannot import. Sending that person to reinstall it wastes their evening.
+
+    So the client is told the SHAPE of the failure, never the exception's text: the class name plus,
+    for a ModuleNotFoundError, the module that was not found — a module name is a fact about the
+    dependency graph, while `str(err)` carries paths, config values and other internals (CodeQL:
+    information exposure through an exception; the streaming error event resolved the same rule the
+    same way). The full message stays where it is useful and unexposed — the server log. The install
+    hint rides along ONLY when the top-level `TTS` package itself is the thing missing.
     """
-    cause = " ".join(f"{type(err).__name__}: {err}".split())[:300]
-    log.warning("the xtts engine could not import coqui-tts — %s", cause)
-    if isinstance(err, ModuleNotFoundError) and err.name == "TTS":
+    log.warning(
+        "the xtts engine could not import coqui-tts — %s",
+        " ".join(f"{type(err).__name__}: {err}".split())[:300],
+    )
+    module = err.name if isinstance(err, ModuleNotFoundError) else None
+    if module == "TTS":
         return JSONResponse(
             {
-                "error": f"the xtts engine needs the optional coqui-tts package, which is not installed ({cause})",
+                "error": "xtts import failed: ModuleNotFoundError for 'TTS' — the optional coqui-tts "
+                "package is not installed",
                 "hint": "pip install coqui-tts — its XTTS-v2 weights are CPML-licensed (non-commercial) "
                 "and download on first use; set COQUI_TOS_AGREED=1 to accept",
             },
             status_code=500,
         )
+    where = f" in dependency {module!r}" if module else ""
     return JSONResponse(
         {
-            "error": f"the xtts engine could not import coqui-tts: {cause}",
+            "error": f"xtts import failed: {type(err).__name__}{where} — the message is in the server log",
             "hint": "coqui-tts is installed but something it imports is not — reinstalling it alone will "
             "not help. The pinned set that works is torch==2.8.0 torchaudio==2.8.0 'transformers<5'; "
             "see server/README.md → XTTS engine",
