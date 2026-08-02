@@ -22,3 +22,11 @@ numpy>=1.26
 #   [ru]  ruaccent — context-aware stress + yo-fication (installed by default below)
 #   [uk]  pip install "ukrainian-word-stress>=1.0"   # dictionary-based Ukrainian accentuation
 ruaccent>=1.5
+
+# --- optional TTS engines ----------------------------------------------------------------------
+# XTTS-v2 voice cloning (VOICE_LOOP_TTS_ENGINE=xtts) — deliberately NOT installed here:
+#
+#   [xtts]  pip install coqui-tts
+#
+# The XTTS-v2 WEIGHTS are CPML-licensed (personal/non-commercial use) and are downloaded by YOU on
+# first request (set COQUI_TOS_AGREED=1) — never bundled. See README.md → "XTTS engine".

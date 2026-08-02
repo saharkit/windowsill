@@ -75,12 +75,14 @@ the provider's. Nothing else in the system changes when you switch backends.
 ## The server
 
 `server/voice_server.py` is a single FastAPI file: `POST /stt` (faster-whisper), `POST /tts` (Silero
-+ per-language accentuation), `GET /health`. Models load lazily on first use, through seams that the
-unit tests replace with fakes — which is why the whole file is testable without a model on disk.
++ per-language accentuation by default, or XTTS-v2 voice cloning via `VOICE_LOOP_TTS_ENGINE=xtts`),
+`POST /tts/stream` (the same synthesis as server-sent events, one WAV segment per sentence chunk),
+`GET /health`. Models load lazily on first use, through seams that the unit tests replace with
+fakes — which is why the whole file is testable without a model on disk.
 
 Language is a **request field** (`?language=` / `{"language": ...}`), defaulting to the server's
-`VOICE_LOOP_LANGUAGE`. Recognition is multilingual; synthesis is limited to the languages Silero
-ships a voice for, and an unsupported code returns `400` with the supported list rather than a
+`VOICE_LOOP_LANGUAGE`. Recognition is multilingual; synthesis is limited to the languages the
+selected engine speaks, and an unsupported code returns `400` with the supported list rather than a
 stack trace.
 
 ## Where state lives

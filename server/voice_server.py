@@ -1,4 +1,4 @@
-"""voice-loop speech server: POST /stt (faster-whisper) + POST /tts (Silero, RUAccent for Russian).
+"""voice-loop speech server: POST /stt (faster-whisper) + POST /tts and /tts/stream (Silero or XTTS).
 
 A single small FastAPI app you can run on a laptop (CPU) or on a box with a GPU and reach over your
 LAN or an ssh tunnel. Everything is configured through the environment — see README.md:
@@ -10,8 +10,11 @@ LAN or an ssh tunnel. Everything is configured through the environment — see R
     VOICE_LOOP_STT_MODEL     faster-whisper model size   (default small)
     VOICE_LOOP_COMPUTE_TYPE  auto | float16 | int8 | ... (default auto: float16 on cuda, int8 on cpu)
     VOICE_LOOP_STT_HINT      optional lexicon hint biasing the recognizer toward your jargon
+    VOICE_LOOP_TTS_ENGINE    silero | xtts               (default silero; xtts = XTTS-v2 voice cloning)
     VOICE_LOOP_TTS_MODEL     override the Silero model for the default language
     VOICE_LOOP_TTS_SPEAKER   override the default speaker
+    VOICE_LOOP_XTTS_REFERENCE  wav of the voice to clone (the xtts engine refuses requests without it)
+    VOICE_LOOP_XTTS_MODEL_DIR  local XTTS-v2 model dir   (optional; default: coqui's own download cache)
     VOICE_LOOP_STRESS_FILE   stress overrides            (default ~/.config/voice-loop/stress.json)
     VOICE_LOOP_ACCENT        1 | 0 — enable automatic accentuation (default 1; ru and uk)
 
@@ -27,6 +30,7 @@ Requires Python >= 3.10.
 
 from __future__ import annotations
 
+import base64
 import io
 import json
 import logging
@@ -39,7 +43,7 @@ from pathlib import Path
 import torch
 import uvicorn
 from fastapi import FastAPI, File, UploadFile
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 MIN_PYTHON = (3, 10)
 
@@ -70,6 +74,13 @@ SILERO_VOICES: dict[str, tuple[str, str, str]] = {
     "fr": ("fr", "v3_fr", "fr_0"),
 }
 
+# XTTS-v2 (coqui-tts, an OPTIONAL dependency) is multilingual on its own — this is its fixed
+# language set, not SILERO_VOICES. The voice comes from a reference wav, not a speaker name.
+XTTS_LANGUAGES = {
+    "ar", "cs", "de", "en", "es", "fr", "hi", "hu", "it", "ja", "ko", "nl", "pl", "pt", "ru", "tr", "zh-cn",
+}
+XTTS_MODEL_ID = "tts_models/multilingual/multi-dataset/xtts_v2"
+
 HOST = os.environ.get("VOICE_LOOP_HOST", "127.0.0.1")
 PORT = int(os.environ.get("VOICE_LOOP_PORT", "8355"))
 DEVICE = os.environ.get("VOICE_LOOP_DEVICE", "auto")
@@ -77,8 +88,11 @@ LANGUAGE = os.environ.get("VOICE_LOOP_LANGUAGE", "ru").lower()
 STT_MODEL = os.environ.get("VOICE_LOOP_STT_MODEL", "small")
 COMPUTE_TYPE = os.environ.get("VOICE_LOOP_COMPUTE_TYPE", "auto")
 STT_HINT = os.environ.get("VOICE_LOOP_STT_HINT", "") or None
+TTS_ENGINE = os.environ.get("VOICE_LOOP_TTS_ENGINE", "silero").lower()
 TTS_MODEL_OVERRIDE = os.environ.get("VOICE_LOOP_TTS_MODEL", "")
 TTS_SPEAKER_OVERRIDE = os.environ.get("VOICE_LOOP_TTS_SPEAKER", "")
+XTTS_REFERENCE = os.environ.get("VOICE_LOOP_XTTS_REFERENCE", "")
+XTTS_MODEL_DIR = os.environ.get("VOICE_LOOP_XTTS_MODEL_DIR", "")
 USE_ACCENT = os.environ.get("VOICE_LOOP_ACCENT", "1") not in ("0", "false", "no")
 STRESS_FILE = Path(
     os.environ.get("VOICE_LOOP_STRESS_FILE", "")
@@ -86,6 +100,7 @@ STRESS_FILE = Path(
 )
 
 TTS_SR = 48000
+XTTS_SR = 24000  # XTTS-v2 always synthesizes at 24 kHz
 MAX_TTS_CHARS = 800  # Silero degrades past ~1000 characters per call
 PAUSE_SECONDS = 0.4
 
@@ -99,6 +114,7 @@ HALLUCINATIONS_FILE = Path(__file__).with_name("stt_hallucinations.txt")
 # patchable, so the whole file is exercisable without a single model on disk.
 _whisper = None
 _tts: dict[str, object] = {}
+_xtts = None
 _accent: dict[str, object] = {}
 _stress: list[tuple[re.Pattern[str], str]] | None = None
 _hallucinations: list[str] | None = None
@@ -111,8 +127,9 @@ def reset_caches() -> None:
     Used by the tests between cases, and by anyone who edits stress.json or the hallucination
     blocklist and wants it re-read without restarting the process.
     """
-    global _whisper, _stress, _hallucinations, _hallucinations_dropped
+    global _whisper, _xtts, _stress, _hallucinations, _hallucinations_dropped
     _whisper = None
+    _xtts = None
     _stress = None
     _hallucinations = None
     _hallucinations_dropped = 0
@@ -228,6 +245,20 @@ def acute_to_plus(text: str) -> str:
     return re.sub(r"([^\W\d_])́", r"+\1", text, flags=re.UNICODE)
 
 
+STRESSED_VOWELS = "аеёиоуыэюяіїєaeiouy"  # everything Silero's '+' can precede, both alphabets
+
+
+def strip_stress_markers(text: str) -> str:
+    """Remove Silero-oriented stress marks for an engine with its own prosody (XTTS).
+
+    Anchored on purpose, mirroring where the notation actually puts the mark: a '+' is removed only
+    immediately before a vowel, so "C++" and "2+2" survive; a combining acute is removed only after
+    a letter — the same anchor acute_to_plus() matches.
+    """
+    text = re.sub(f"\\+(?=[{STRESSED_VOWELS}])", "", text, flags=re.IGNORECASE)
+    return re.sub(r"([^\W\d_])́", r"\1", text, flags=re.UNICODE)
+
+
 def _load_ru_accentuator():
     """RUAccent (COLING-2025): context-aware stress + yo-fication, already in '+' notation."""
     from ruaccent import RUAccent
@@ -294,6 +325,35 @@ def default_speaker(language: str) -> str:
     if TTS_SPEAKER_OVERRIDE and language == LANGUAGE:
         return TTS_SPEAKER_OVERRIDE
     return SILERO_VOICES[language][2]
+
+
+def _load_xtts(device: str):
+    """Build the coqui TTS wrapper on a device — split out so the OOM fallback can retry it."""
+    from TTS.api import TTS
+
+    if XTTS_MODEL_DIR:
+        return TTS(model_path=XTTS_MODEL_DIR, config_path=str(Path(XTTS_MODEL_DIR) / "config.json")).to(device)
+    return TTS(XTTS_MODEL_ID).to(device)
+
+
+def xtts():
+    """Lazily loaded XTTS-v2 voice cloner, cached; reset_caches() drops it like every other model.
+
+    The weights are downloaded by coqui-tts on the USER's first request (they are CPML-licensed —
+    set COQUI_TOS_AGREED=1 to accept), never bundled with this repo. A GPU too small for the model
+    (~2-2.5 GB of VRAM) degrades to CPU instead of failing the request.
+    """
+    global _xtts
+    if _xtts is None:
+        device = resolve_device()
+        try:
+            _xtts = _load_xtts(device)
+        except torch.cuda.OutOfMemoryError:
+            log.warning("XTTS-v2 does not fit on the GPU — retrying on CPU")
+            device = "cpu"
+            _xtts = _load_xtts(device)
+        log.info("loaded XTTS-v2 on %s", device)
+    return _xtts
 
 
 def protected_segments(text: str) -> list[tuple[str, bool]]:
@@ -371,6 +431,100 @@ def chunk(text: str, limit: int = MAX_TTS_CHARS) -> list[str]:
     return chunks
 
 
+def xtts_request_error(language: str) -> JSONResponse | None:
+    """Why an xtts request cannot be served right now, or None.
+
+    Checked per request ON PURPOSE: the server must still boot and serve /stt with coqui-tts absent
+    or the reference unset — a broken TTS engine is a request-level 500, never a startup failure.
+    """
+    try:
+        from TTS.api import TTS  # noqa: F401 — availability probe only; xtts() does the real import
+    except ImportError:
+        return JSONResponse(
+            {
+                "error": "the xtts engine needs the optional coqui-tts package, which is not installed",
+                "hint": "pip install coqui-tts — its XTTS-v2 weights are CPML-licensed (non-commercial) "
+                "and download on first use; set COQUI_TOS_AGREED=1 to accept",
+            },
+            status_code=500,
+        )
+    if not XTTS_REFERENCE:
+        return JSONResponse(
+            {
+                "error": "VOICE_LOOP_XTTS_REFERENCE is not set — the xtts engine clones a voice from a reference wav",
+                "hint": "point it at a clean 6-30 second wav recording of the voice to clone",
+            },
+            status_code=500,
+        )
+    if not Path(XTTS_REFERENCE).is_file():
+        return JSONResponse({"error": f"XTTS reference wav not found: {XTTS_REFERENCE}"}, status_code=500)
+    if language not in XTTS_LANGUAGES:
+        return JSONResponse(
+            {"error": f"XTTS-v2 does not speak language {language!r}", "supported": sorted(XTTS_LANGUAGES)},
+            status_code=400,
+        )
+    return None
+
+
+def tts_request_error(text: str, language: str) -> JSONResponse | None:
+    """The shared /tts + /tts/stream refusal, or None when the request can be synthesized."""
+    if not text:
+        return JSONResponse({"error": "empty text"}, status_code=400)
+    if TTS_ENGINE == "xtts":
+        return xtts_request_error(language)
+    if TTS_ENGINE != "silero":
+        return JSONResponse(
+            {"error": f"unknown TTS engine {TTS_ENGINE!r} (VOICE_LOOP_TTS_ENGINE)", "supported": ["silero", "xtts"]},
+            status_code=500,
+        )
+    if language not in SILERO_VOICES:
+        return JSONResponse(
+            {
+                "error": f"no local TTS model for language {language!r}",
+                "supported": sorted(SILERO_VOICES),
+                "hint": "use a cloud TTS backend for this language, or add its Silero model to SILERO_VOICES",
+            },
+            status_code=400,
+        )
+    return None
+
+
+def engine_sample_rate() -> int:
+    if TTS_ENGINE == "xtts":
+        return XTTS_SR
+    return TTS_SR
+
+
+def silero_pieces(text: str, language: str, speaker: str = ""):
+    """Silero synthesis: the stress pipeline, then one tensor per sentence chunk."""
+    speaker = speaker or default_speaker(language)
+    text = mark_stress(text, language)
+    for part in chunk(text):
+        yield tts(language).apply_tts(text=part, speaker=speaker, sample_rate=TTS_SR)
+
+
+def xtts_pieces(text: str, language: str):
+    """XTTS synthesis, one tensor per sentence chunk.
+
+    XTTS brings its own prosody, so the Silero stress pipeline is SKIPPED — markers already in the
+    text are stripped instead of applied. The model's true streaming generator (inference_stream)
+    lives below coqui's public api and needs the speaker latents plumbed by hand, so both engines
+    stream at the same granularity: the sentence chunker.
+    """
+    model = xtts()
+    for part in chunk(strip_stress_markers(text)):
+        wav = model.tts(text=part, speaker_wav=XTTS_REFERENCE, language=language)
+        yield torch.as_tensor(wav, dtype=torch.float32)
+
+
+def synthesis_pieces(text: str, language: str, speaker: str = ""):
+    """One synthesized tensor per sentence chunk from the configured engine — the shared core of
+    /tts (which concatenates them) and /tts/stream (which ships each one as it appears)."""
+    if TTS_ENGINE == "xtts":
+        return xtts_pieces(text, language)
+    return silero_pieces(text, language, speaker)
+
+
 @app.get("/health")
 def health() -> dict[str, object]:
     return {
@@ -379,10 +533,13 @@ def health() -> dict[str, object]:
         "cuda": torch.cuda.is_available(),
         "language": LANGUAGE,
         "stt_model": STT_MODEL,
+        "tts_engine": TTS_ENGINE,
         "tts_languages": sorted(SILERO_VOICES),
         "accentuated_languages": sorted(ACCENTUATORS),
+        "streaming": True,
         "stt_loaded": _whisper is not None,
         "tts_loaded": sorted(_tts),
+        "xtts_loaded": _xtts is not None,
         "stt_hallucinations_dropped": _hallucinations_dropped,
     }
 
@@ -411,32 +568,65 @@ async def stt(audio: UploadFile = File(...), language: str = "") -> JSONResponse
 async def tts_endpoint(payload: dict) -> Response:
     text = (payload.get("text") or "").strip()
     language = (payload.get("language") or LANGUAGE).lower()
-    if not text:
-        return JSONResponse({"error": "empty text"}, status_code=400)
-    if language not in SILERO_VOICES:
-        return JSONResponse(
-            {
-                "error": f"no local TTS model for language {language!r}",
-                "supported": sorted(SILERO_VOICES),
-                "hint": "use a cloud TTS backend for this language, or add its Silero model to SILERO_VOICES",
-            },
-            status_code=400,
-        )
-    speaker = payload.get("speaker") or default_speaker(language)
-    text = mark_stress(text, language)
+    error = tts_request_error(text, language)
+    if error is not None:
+        return error
 
-    pause = torch.zeros(int(TTS_SR * PAUSE_SECONDS))
+    sample_rate = engine_sample_rate()
+    pause = torch.zeros(int(sample_rate * PAUSE_SECONDS))
     pieces = []
-    for part in chunk(text):
-        pieces.append(tts(language).apply_tts(text=part, speaker=speaker, sample_rate=TTS_SR))
+    for piece in synthesis_pieces(text, language, payload.get("speaker") or ""):
+        pieces.append(piece)
         pieces.append(pause)
     wav = torch.cat(pieces) if pieces else torch.zeros(1)
 
     import soundfile as sf
 
     out = io.BytesIO()
-    sf.write(out, wav.numpy(), TTS_SR, format="WAV")
+    sf.write(out, wav.numpy(), sample_rate, format="WAV")
     return Response(out.getvalue(), media_type="audio/wav")
+
+
+@app.post("/tts/stream")
+async def tts_stream_endpoint(payload: dict) -> Response:
+    """Same JSON body as /tts, but the audio leaves as it is synthesized.
+
+    Server-sent events (see README for the exact contract): one `chunk` event per sentence chunk
+    carrying a complete standalone WAV segment in base64, then a terminal `end` — or a terminal
+    `error` if synthesis breaks mid-stream (the 200 status left with the first bytes, so a late
+    failure cannot become a 500; it becomes the last event instead). Requests refused before
+    synthesis starts return plain JSON errors, exactly like /tts.
+    """
+    text = (payload.get("text") or "").strip()
+    language = (payload.get("language") or LANGUAGE).lower()
+    error = tts_request_error(text, language)
+    if error is not None:
+        return error
+
+    sample_rate = engine_sample_rate()
+    pieces = synthesis_pieces(text, language, payload.get("speaker") or "")
+
+    def event(name: str, data: dict[str, object]) -> str:
+        return f"event: {name}\ndata: {json.dumps(data)}\n\n"
+
+    def stream():
+        import soundfile as sf
+
+        sent = 0
+        try:
+            for piece in pieces:
+                out = io.BytesIO()
+                sf.write(out, piece.numpy(), sample_rate, format="WAV")
+                audio = base64.b64encode(out.getvalue()).decode("ascii")
+                yield event("chunk", {"index": sent, "audio": audio})
+                sent += 1
+        except Exception as exc:
+            log.exception("streaming synthesis failed after %d chunk(s)", sent)
+            yield event("error", {"error": str(exc), "chunks": sent})
+            return
+        yield event("end", {"chunks": sent})
+
+    return StreamingResponse(stream(), media_type="text/event-stream")
 
 
 def main() -> None:
