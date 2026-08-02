@@ -34,8 +34,10 @@ mkdir -p ~/.config/voice-loop && install -m 600 /dev/null ~/.config/voice-loop/e
 #   printf '%s' 'YOUR_KEY' > ~/.config/voice-loop/elevenlabs.key
 ```
 
-Then `tts.cloud.key_file: "~/.config/voice-loop/elevenlabs.key"` in the config. Read the key inside a
-command (`KEY=$(cat ~/.config/voice-loop/elevenlabs.key)`) — never echo it, never put it in a message.
+Then `tts.cloud.key_file: "~/.config/voice-loop/elevenlabs.key"` in the config. Read the key
+**inside the process that uses it** — the python snippets below do exactly that, the same way
+`speak.py` does. Never echo it, never put it in a message, and never pass it on a command line
+(argv is visible to every process on the machine).
 
 You also need the language (from `language` in the config) and a way to play audio
 (`speak.player` — `afplay` on macOS, `mpg123 -q` or `ffplay -autoexit -nodisp -loglevel quiet` on
@@ -63,25 +65,28 @@ Author a sample text **in the user's language**, roughly 300–500 characters (t
 ~100 and this length is what makes a timbre judgeable). Make it neutral and relevant — a few sentences
 of the kind of thing the assistant actually says, not a poem.
 
-```sh
-KEY=$(cat ~/.config/voice-loop/elevenlabs.key)
-curl -s -X POST "https://api.elevenlabs.io/v1/text-to-voice/create-previews" \
-  -H "xi-api-key: $KEY" -H 'Content-Type: application/json' \
-  --data @/tmp/voice-design-request.json -o /tmp/voice-design-previews.json
-```
-
-with `/tmp/voice-design-request.json` = `{"voice_description": "<english prompt>", "text": "<sample>"}`.
-
-The response carries three candidates, each with `generated_voice_id` and base64 audio. Save them as
-files and keep the id next to each:
+One in-process call does the whole round trip — the key is read inside the process (never argv,
+mirroring `speak.py`), the raw response lands in a private `mktemp -d` scratch dir, and the decoded
+previews are saved with the id next to each:
 
 ```sh
-python3 - <<'PY'
-import base64, json, pathlib
-data = json.loads(pathlib.Path("/tmp/voice-design-previews.json").read_text())
+python3 - "$(mktemp -d)" <<'PY'
+import base64, json, pathlib, sys, urllib.request
+key = (pathlib.Path.home() / ".config/voice-loop/elevenlabs.key").read_text().strip()
+body = json.dumps({
+    "voice_description": "<english prompt>",
+    "text": "<sample text in the user's language>",
+}).encode()
+req = urllib.request.Request(
+    "https://api.elevenlabs.io/v1/text-to-voice/create-previews",
+    data=body, headers={"xi-api-key": key, "Content-Type": "application/json"})
+opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+raw = opener.open(req, timeout=120).read()
+scratch = pathlib.Path(sys.argv[1])           # mktemp -d — private, unpredictable
+(scratch / "previews.json").write_bytes(raw)  # kept for debugging this run only
 out = pathlib.Path.home() / ".local/share/voice-loop/previews"
 out.mkdir(parents=True, exist_ok=True)
-for i, p in enumerate(data.get("previews", []), 1):
+for i, p in enumerate(json.loads(raw).get("previews", []), 1):
     f = out / f"preview-{i}.mp3"
     f.write_bytes(base64.b64decode(p["audio_base_64"]))
     print(i, f, p["generated_voice_id"])
@@ -112,14 +117,23 @@ sample text across rounds so comparison is honest. Stop when they say "this one"
 ## Step 4 — mint the voice and wire it in
 
 ```sh
-KEY=$(cat ~/.config/voice-loop/elevenlabs.key)
-curl -s -X POST "https://api.elevenlabs.io/v1/text-to-voice/create-voice-from-preview" \
-  -H "xi-api-key: $KEY" -H 'Content-Type: application/json' \
-  --data '{"voice_name":"<name the user chose>","voice_description":"<the english prompt>","generated_voice_id":"<picked id>"}' \
-  -o /tmp/voice-design-voice.json
+python3 - <<'PY'
+import json, pathlib, urllib.request
+key = (pathlib.Path.home() / ".config/voice-loop/elevenlabs.key").read_text().strip()
+body = json.dumps({
+    "voice_name": "<name the user chose>",
+    "voice_description": "<the english prompt>",
+    "generated_voice_id": "<picked id>",
+}).encode()
+req = urllib.request.Request(
+    "https://api.elevenlabs.io/v1/text-to-voice/create-voice-from-preview",
+    data=body, headers={"xi-api-key": key, "Content-Type": "application/json"})
+opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+print("voice_id:", json.loads(opener.open(req, timeout=120).read())["voice_id"])
+PY
 ```
 
-Take `voice_id` from the response and write it into the config:
+Take the printed `voice_id` and write it into the config:
 
 ```jsonc
 "tts": {
@@ -198,17 +212,17 @@ charming for ten seconds can be tiring at length — better to find out now than
 Finish by ending your next reply with a marker line so the Stop hook speaks in the new voice, and
 confirm with the user that it sounded right.
 
-## v0.2 roadmap — design in the cloud, then drop the key (do NOT implement here)
+## Design in the cloud, then drop the key — hand off to the XTTS engine
 
-The intended end state is that the cloud is used **once**, for design, and then goes away:
+The local clone path **exists**: the bundled server ships an XTTS-v2 engine
+(`VOICE_LOOP_TTS_ENGINE=xtts`) that clones from a short reference wav — setup, the licensing
+caveats (the XTTS-v2 weights are non-commercial), and the reference contract are in
+`server/README.md` → *XTTS engine (voice cloning)* in the repo
+(<https://github.com/saharkit/windowsill/blob/main/server/README.md#xtts-engine-voice-cloning>).
 
-1. design and pick the voice as above (cloud);
-2. **mint a reference recording** from the chosen voice — a couple of minutes of clean audio;
-3. run **XTTS-v2 on your own LAN GPU** with that reference as the speaker;
-4. point `tts` at that server, `backend: lan`, and **delete the cloud key** — synthesis is local,
-   per-line cost goes to zero, and no text leaves the machine again.
-
-That is v0.2, not v0.1: it needs a second server image and a reference-management step. If the user
-asks about it, describe it as planned and say why it is worth waiting for. The ethics rule travels
-with it unchanged — a reference must be **a voice they minted themselves or have explicit rights to**,
-never a third party's.
+This skill designs **cloud** voices; it does not set up XTTS. If the user wants the full arc —
+design the voice here, mint a reference recording from the chosen voice, run XTTS-v2 on their own
+GPU with that reference, then point `tts` at it (`backend: lan`) and **delete the cloud key** —
+finish the cloud design, then hand them to that server doc for the local half. The ethics rule
+travels with it unchanged: a reference must be **a voice they minted themselves or have explicit
+rights to**, never a third party's.
