@@ -7,7 +7,7 @@ One small FastAPI app:
 | `POST /stt` | multipart `audio=@file.wav`, query `?language=ru` → `{"text": ..., "language": ..., "duration": ...}` |
 | `POST /tts` | JSON `{"text": ..., "language": "ru", "speaker": "baya"}` → `audio/wav` (one blob) |
 | `POST /tts/stream` | same JSON → `text/event-stream` of WAV segments as they are synthesized — see [Streaming synthesis](#streaming-synthesis-ttsstream) |
-| `GET /health` | device, models, engine, what is loaded |
+| `GET /health` | device, models, engine, what is loaded, server `version` |
 
 STT is [faster-whisper](https://github.com/SYSTRAN/faster-whisper) (multilingual). TTS is
 [Silero](https://github.com/snakers4/silero-models) by default, with automatic stress marking for
@@ -28,7 +28,7 @@ The unit tests run on 3.10, 3.11, 3.12 and 3.13 in CI; the loopback lanes run 3.
 python3 -m venv .venv && . .venv/bin/activate
 pip install --index-url https://download.pytorch.org/whl/cpu torch   # CPU-only torch, much smaller
 pip install -r requirements.txt
-pip install "ukrainian-word-stress>=1.0"                             # only if you want Ukrainian
+pip install "ukrainian-word-stress>=2.0"                             # only if you want Ukrainian
 
 python voice_server.py            # http://127.0.0.1:8355
 curl -s http://127.0.0.1:8355/health
@@ -58,6 +58,28 @@ VOICE_LOOP_DEVICE=cuda VOICE_LOOP_STT_MODEL=large-v3-turbo python voice_server.p
 Only STT moves to the GPU; Silero stays on CPU, where it is already faster than real time — that keeps
 the GPU free for recognition. `compute_type` defaults to `float16` on CUDA and `int8` on CPU.
 
+## Capacity
+
+All models share one machine — and on CUDA, one card. Every model call (an `/stt` transcription, a
+`/tts` blob, each `/tts/stream` chunk) therefore goes through a single bounded executor: at most
+`VOICE_LOOP_MODEL_CONCURRENCY` calls run at once. The default is **1** on CUDA — the resident models
+already hold most of the VRAM, and concurrent calls stack per-call activation memory into an OOM —
+and up to **2** on CPU (by core count), where the models release the GIL in native code and a second
+slot buys real parallelism. Excess requests queue. `/health` reports the limit and the live count as
+`model_concurrency` / `model_in_flight`.
+
+Two caps keep any single request from monopolizing that executor:
+
+- **`/tts` renders its whole blob in one executor hold**, so it carries the small cap
+  (`VOICE_LOOP_MAX_TTS_TEXT_BLOB`, 3000 characters). Longer texts belong on `/tts/stream`, which
+  takes and **releases** the executor per sentence chunk and keeps the big cap
+  (`VOICE_LOOP_MAX_TTS_TEXT`, 20 000).
+- **`/stt` uploads are byte-capped at 25 MB — but bytes are not time**: 25 MB of compressed audio
+  can decode to hours of transcription in one executor hold. Uploads whose WAV header is cheaply
+  parseable are additionally duration-capped at `VOICE_LOOP_MAX_STT_SECONDS` (600 s). Compressed
+  codecs reveal their duration only by decoding — the very work the cap exists to avoid — so they
+  pass through on the byte cap alone; be aware of that holding-time reality if you raise the caps.
+
 ## Configuration (all environment variables)
 
 | variable | default | meaning |
@@ -65,7 +87,7 @@ the GPU free for recognition. `compute_type` defaults to `float16` on CUDA and `
 | `VOICE_LOOP_HOST` | `127.0.0.1` | bind address. **Loopback by default** — see below |
 | `VOICE_LOOP_PORT` | `8355` | port |
 | `VOICE_LOOP_DEVICE` | `auto` | `auto` / `cuda` / `cpu` |
-| `VOICE_LOOP_LANGUAGE` | `ru` | default language when a request does not name one |
+| `VOICE_LOOP_LANGUAGE` | `en` | default language when a request does not name one |
 | `VOICE_LOOP_STT_MODEL` | `small` | `tiny` / `base` / `small` / `medium` / `large-v3-turbo` … |
 | `VOICE_LOOP_COMPUTE_TYPE` | `auto` | faster-whisper compute type |
 | `VOICE_LOOP_STT_HINT` | — | lexicon hint: a comma-separated list of names/jargon you want recognized |
@@ -76,6 +98,15 @@ the GPU free for recognition. `compute_type` defaults to `float16` on CUDA and `
 | `VOICE_LOOP_XTTS_MODEL_DIR` | coqui's cache | load XTTS-v2 from a local directory instead of downloading |
 | `VOICE_LOOP_STRESS_FILE` | `~/.config/voice-loop/stress.json` | your stress overrides |
 | `VOICE_LOOP_ACCENT` | `1` | set `0` to skip automatic accentuation |
+| `VOICE_LOOP_MAX_UPLOAD_BYTES` | `26214400` (25 MB) | `/stt` upload size cap — a larger clip gets `413` |
+| `VOICE_LOOP_MAX_STT_SECONDS` | `600` | `/stt` duration cap when the WAV header is parseable — see [Capacity](#capacity) |
+| `VOICE_LOOP_MAX_TTS_TEXT` | `20000` | `/tts/stream` text length cap — longer text gets `400` |
+| `VOICE_LOOP_MAX_TTS_TEXT_BLOB` | `3000` | `/tts` single-blob text cap — longer text gets `400` pointing at `/tts/stream` |
+| `VOICE_LOOP_MODEL_CONCURRENCY` | `1` on CUDA, else up to `2` | concurrent model calls — see [Capacity](#capacity) |
+
+`GET /health` also reports a `version` field (`"0.4.0"`). It is for diagnostics and bug reports;
+clients should detect features through the capability flags (`"streaming": true` and friends), not
+by comparing version strings.
 
 ### Languages
 
@@ -178,6 +209,12 @@ synthesis starts (empty text, unsupported language, misconfigured xtts) return p
 exactly like `/tts`. Chunk granularity is the sentence chunker for **both** engines (XTTS-v2's
 internal `inference_stream` generator sits below coqui's public API, so it is not used).
 
+**Pacing.** `/tts` inserts a short silence (0.4 s) between sentence chunks; the stream carries the
+**same** silence so back-to-back playback of the chunks sounds identical, not rushed. It is placed
+at the **head** of every chunk after the first — leading rather than trailing silence keeps the
+first chunk's latency untouched and needs no lookahead for "is this the last chunk". Play the
+chunks back to back and the pacing matches `/tts`.
+
 Minimal stdlib consumer:
 
 ```python
@@ -225,4 +262,18 @@ ssh -N -L 8355:127.0.0.1:8355 user@gpu-host
 
 If you really want it on your network, set `VOICE_LOOP_HOST=0.0.0.0`, keep it behind a firewall you
 control, and be aware that anyone who can reach the port can transcribe and synthesize on your
-hardware.
+hardware. Binding to `0.0.0.0` logs a loud startup warning (expected inside Docker, where it is the
+image default — the container's port mapping is the real boundary).
+
+### Cross-site browser requests are refused
+
+A loopback bind protects you from the network, not from your own browser: a multipart POST is a
+CORS-"simple" request, so any web page you visit could quietly fire real requests at
+`http://127.0.0.1:8355` and burn your CPU/GPU on transcription. The server therefore returns `403`
+to any request a browser labels as coming from another site — `Sec-Fetch-Site: cross-site`, or an
+`Origin` header naming anything other than a loopback host (`127.x`, `localhost`, `[::1]`) or
+`null`. Non-browser clients (curl, the plugin scripts) send neither header and are unaffected.
+Related request caps: `/stt` uploads are limited by `VOICE_LOOP_MAX_UPLOAD_BYTES` (25 MB default)
+and, for parseable WAV, `VOICE_LOOP_MAX_STT_SECONDS`; `/tts` text by `VOICE_LOOP_MAX_TTS_TEXT_BLOB`
+(3000 default) and `/tts/stream` text by `VOICE_LOOP_MAX_TTS_TEXT` (20 000 default) — see
+[Capacity](#capacity) for why the two TTS paths differ.

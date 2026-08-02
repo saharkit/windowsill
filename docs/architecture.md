@@ -15,8 +15,8 @@ alone.
                 │                                              │         (hooks.json)
                 │ 1. toggle: start recorder                     │ 1. read transcript_path
                 │    (pw-record/arecord | sox/ffmpeg)           │ 2. take lines starting with 🔊
-                │ 2. toggle again: stop, settle, read WAV       │ 3. retry until the line differs
-                ▼                                               ▼    from the last spoken one
+                │ 2. toggle again: stop, settle, read WAV       │ 3. retry only on a flush-race
+                ▼                                               ▼    read (empty / same-as-last)
           ┌───────────┐                                   ┌───────────┐
           │  STT      │                                   │   TTS     │
           │ local/lan │                                   │ local/lan │
@@ -34,17 +34,26 @@ alone.
 ## The speak path
 
 1. Claude Code fires the **Stop** hook (registered by `hooks/hooks.json`, `async: true`,
-   `timeout: 90`) and passes JSON on stdin containing `transcript_path`.
-2. `speak.sh` reads the transcript, takes the **last assistant message**, and keeps only the lines
-   whose first non-space character is the marker (default `🔊`). Everything else stays text — the
-   model decides what is worth hearing.
+   `timeout: 90`) and passes JSON on stdin containing `transcript_path`. The registered entry point
+   is `speak.sh` — a thin launcher whose only job is a stable registration surface; the logic is
+   `scripts/speak.py` (stdlib-only Python).
+2. `speak.py` reads the transcript **immediately**, takes the **last assistant message**, and keeps
+   only the lines whose first non-space character is the marker (default `🔊`). Everything else
+   stays text — the model decides what is worth hearing.
 3. Two behaviours exist because of a real race, not out of caution:
-   - **retry**: Stop can fire *before* the final assistant message is flushed to the transcript, so
-     the script retries (6 × 0.7 s) until it sees a line **different** from the last one spoken;
+   - **retry**: Stop can fire *before* the final assistant message is flushed to the transcript. A
+     retry happens only on the two real race signatures — an **empty** extract, or one **identical
+     to the last spoken line** — with adaptive backoff (0.15 → 1.0 s), so an already-flushed
+     transcript costs zero sleep;
    - **dedup**: a read identical to the previous turn's *is* the stale previous turn, so it is
      dropped rather than spoken twice.
-4. The text goes to the configured TTS backend; the audio goes to the configured player. A fresher
-   line kills a still-playing older one.
+4. Playback **streams**. The marked text is split into sentence chunks (tiny sentences merged so a
+   chunk is at least ~40 characters); the first chunk plays as soon as *it* is synthesized while the
+   next one synthesizes. When the server's `/health` reports `"streaming": true`, the whole text
+   goes to `POST /tts/stream` instead and the SSE chunks — each a complete standalone WAV — feed
+   the same player queue as they arrive (the server does the sentence chunking); a stream that
+   fails before its first chunk falls back once to the blob `/tts` path. A fresher line kills a
+   still-playing older one — precisely, by the PIDs the speaking chain recorded.
 5. Every failure path exits 0. A voice problem must never fail a turn.
 
 ## The dictation path

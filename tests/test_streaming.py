@@ -57,6 +57,25 @@ def test_stream_chunks_are_self_contained_wavs(client, fake_silero):
     assert len(wav) > 0
 
 
+def test_stream_paces_like_tts_with_leading_silence_from_the_second_chunk(client, fake_silero):
+    """Pacing parity with /tts: every chunk after the FIRST carries PAUSE_SECONDS of silence at its
+    head — the same audible gap /tts inserts between sentence chunks. The first chunk stays bare so
+    streamed playback starts as early as before."""
+    response = client.post("/tts/stream", json={"text": LONG_TEXT})
+
+    parsed = events(response.text)
+    chunks = parsed[:-1]
+    assert len(chunks) > 1
+    piece_frames = int(voice_server.TTS_SR * 0.05)  # what FakeSilero synthesizes per call
+    pause_frames = int(voice_server.TTS_SR * voice_server.PAUSE_SECONDS)
+    first, _ = wav_of(chunks[0][1])
+    assert len(first) == piece_frames
+    for _, data in chunks[1:]:
+        wav, _ = wav_of(data)
+        assert len(wav) == pause_frames + piece_frames
+        assert not wav[:pause_frames].any()  # the head really is silence
+
+
 def test_stream_xtts_streams_per_sentence_chunk_at_its_own_rate(client, fake_xtts):
     response = client.post("/tts/stream", json={"text": LONG_TEXT, "language": "en"})
 

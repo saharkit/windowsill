@@ -29,8 +29,9 @@ language: recognition still works, and for synthesis use a cloud voice or the ma
 **Can I have my own voice?**
 `/voice-design` casts one: you describe the timbre you want, it auditions candidates, and the one you
 pick is written into your config. It will **not** imitate a real, identifiable person — describe a
-voice, not a human. Running that designed voice locally (mint a reference, serve it with XTTS on your
-own GPU, drop the cloud key) is the v0.2 plan.
+voice, not a human. Running that designed voice locally is live too: mint a reference recording,
+serve it with the server's XTTS-v2 engine (`VOICE_LOOP_TTS_ENGINE=xtts`) on your own GPU, and drop
+the cloud key — see [server/README.md — XTTS engine](../server/README.md#xtts-engine-voice-cloning).
 
 **Why only lines with a marker?**
 Because hearing an entire answer read aloud is exhausting and slow. The model marks the one line

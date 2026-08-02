@@ -24,7 +24,11 @@ What makes 100% honest rather than decorative:
   `ACCENTUATORS`. The tests install fakes and then run the **real function bodies**.
 - **The parts whose behaviour is the contract are real**: real torch tensors, real WAV encoding by
   `soundfile`, real FastAPI request handling. A `/tts` test asserts an actual `RIFF` file comes back —
-  the same thing `selftest.sh` checks before feeding those bytes to recognition.
+  the same thing `selftest.sh` checks before feeding those bytes to recognition. The Ukrainian
+  accentuator's **output format** belongs to that list too: a fake can only pin what we already
+  believe about it, so one test runs the real `ukrainian-word-stress` (dictionary-only mode, the trie
+  ships inside the wheel — still no model, still no network) and asserts the acute it emits is the one
+  `acute_to_plus()` normalizes. It skips, alone, where the package is not installed.
 - **One exclusion, declared:** the `if __name__ == "__main__":` guard, whose entire body is a call to
   `main()` — and `main()` itself is tested (with `uvicorn.run` patched). Nothing else is excluded.
 - Accentuation is **off by default in the fixtures**, so a language package that happens to be
@@ -60,10 +64,6 @@ whether you can actually *hear* it. That is the checklist below, and it needs a 
 
 ## Human acceptance checklist
 
-Run it on a machine that has never had voice-loop on it (a clean container or a fresh VM for Linux; a
-teammate's untouched Mac for the macOS branch). "Works on the machine it was built on" is not a
-result.
-
 Run this before every release, on a machine that has never had voice-loop on it (a clean container or a
 fresh VM for Linux; a teammate's untouched Mac for the macOS branch). "Works on the machine it was
 built on" is not a result.
@@ -87,7 +87,7 @@ Environment under test:
 
 | # | check | expected | observed | pass |
 |---|---|---|---|---|
-| 1.1 | `claude marketplace add saharkit/windowsill` | marketplace added, no errors | | |
+| 1.1 | `claude plugin marketplace add saharkit/windowsill` (shell), or `/plugin marketplace add saharkit/windowsill` in a session | marketplace added, no errors | | |
 | 1.2 | `/plugin install voice-loop@windowsill` | plugin installs; it appears in `/plugin` | | |
 | 1.3 | Start a fresh session | no hook errors in the session; the Stop hook is registered | | |
 | 1.4 | `/voice-setup` is offered / discoverable by name | the skill is listed | | |
@@ -100,7 +100,7 @@ prompt the setup causes.
 | # | check | expected | observed | pass |
 |---|---|---|---|---|
 | 2.1 | The agent states its plan before acting | a short plan, then work | | |
-| 2.2 | **Permission prompt count for the whole install** | **≤ 3** (more = FAIL, this is the #1656 acceptance bar) | count: | |
+| 2.2 | **Permission prompt count for the whole install** | **≤ 3** (more = FAIL — that is the acceptance bar) | count: | |
 | 2.3 | Language question comes first and is pre-answered from the environment | one confirm for the common case | | |
 | 2.4 | Backend choice is offered per direction with the cost/privacy tradeoff stated | user makes an informed choice | | |
 | 2.5 | No `sudo` is ever executed silently | any root step is PRINTED for the user to run | | |

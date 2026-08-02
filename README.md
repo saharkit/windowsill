@@ -18,13 +18,18 @@ Code plugin, installs in a couple of commands, and is meant to be read as well a
 
 ## Add the marketplace
 
-```
-claude marketplace add saharkit/windowsill
+In your shell:
+
+```sh
+claude plugin marketplace add saharkit/windowsill
 ```
 
-then install what you want:
+(or, from inside a running Claude Code session, the slash-command form: `/plugin marketplace add
+saharkit/windowsill`.)
 
-```
+Then install what you want — this one is typed **inside a session**, not in your shell:
+
+```text
 /plugin install voice-loop@windowsill
 ```
 
