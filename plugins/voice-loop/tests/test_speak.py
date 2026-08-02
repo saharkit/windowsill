@@ -318,6 +318,122 @@ def test_streaming_not_detected_on_garbage_or_no_answer():
     assert speak.server_offers_streaming(b'["not", "a", "dict"]') is False
 
 
+# --- the timing contract: first_audio_ms is hook start -> first player spawn --------------------
+#
+# The number the log prints must be the real time-to-first-sound. It once was not: _play_stream
+# started its own clock, which begins AFTER stream_source has eagerly pulled (and waited out) the
+# first chunk, so a measured 2308 ms wait was logged as 3 ms. These two cases pin the definition on
+# both audio paths, with a clock the test drives — no sleeping, no real player, no synthesis.
+
+# Durations are binary-exact (quarters and halves) so the assertions can be on an exact ms — the
+# production code truncates with int(), and 0.3 s would land on 2299 instead of 2300.
+EXTRACT_SECONDS = 0.25  # the transcript read, before any audio path is entered
+PRE_AUDIO_SECONDS = 2.0  # /health + stream open + the first synthesis: the wait that was invisible
+FIRST_AUDIO_MS = 2250  # what the two paths below must BOTH report
+
+
+class FakeClock:
+    """A monotonic clock the test owns: reading it is free, `advance` is the only way time passes."""
+
+    def __init__(self, now: float = 1000.0) -> None:
+        self.now = now
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+
+class FakePlayerProcess:
+    """One player subprocess, with playback as clock time instead of sound."""
+
+    def __init__(self, clock: FakeClock, playback: float) -> None:
+        self._clock = clock
+        self._playback = playback
+        self.pid = os.getpid()  # a pid the pidfile writer can render; never signalled here
+        self.returncode: int | None = None
+
+    def wait(self) -> int:
+        self._clock.advance(self._playback)
+        self.returncode = 0
+        return 0
+
+    def poll(self) -> int | None:
+        return self.returncode
+
+
+def _measure_first_audio_ms(monkeypatch, build_source, playback: float = 0.5):
+    """Run one audio path under a driven clock and return (_play_stream result, spawn instants).
+
+    The shape is the same for both paths: t0 at hook start, EXTRACT_SECONDS for the transcript
+    read, then a source that burns PRE_AUDIO_SECONDS before the first playable bytes exist.
+    """
+    clock = FakeClock()
+    monkeypatch.setattr(speak.time, "monotonic", clock)
+    spawns: list[float] = []
+
+    def fake_popen(argv, **kwargs):
+        spawns.append(clock())
+        return FakePlayerProcess(clock, playback)
+
+    monkeypatch.setattr(speak.subprocess, "Popen", fake_popen)
+
+    s = speak.resolve_settings({}, "Linux")
+    t0 = clock()  # the hook starts here — the one clock every timing is measured from
+    clock.advance(EXTRACT_SECONDS)
+    source = build_source(clock, s)  # eager for the stream path, lazy for the blob path
+    return speak._play_stream(source, s, t0), [round((at - t0) * 1000) for at in spawns]
+
+
+def test_first_audio_ms_includes_the_wait_before_the_first_chunk(state, monkeypatch):
+    """The regression, named: the delay is injected BEFORE the first chunk is yielded — i.e. inside
+    stream_source's eager pull, before _play_stream is even entered — and must still be counted."""
+
+    def build_source(clock, s):
+        def sse_lines():
+            clock.advance(PRE_AUDIO_SECONDS)  # the first synthesis, waited out by the eager pull
+            yield from _chunk(0, WAV_A)
+            clock.advance(0.125)
+            yield from _chunk(1, WAV_B)
+            yield from _event("end", {"chunks": 2})
+
+        source = speak.stream_source(sse_lines())
+        assert source is not None
+        return source
+
+    (played, total_bytes, first_ms, rc), spawns = _measure_first_audio_ms(monkeypatch, build_source)
+
+    assert (played, total_bytes, rc) == (2, len(WAV_A) + len(WAV_B), 0)
+    assert first_ms == FIRST_AUDIO_MS  # extract + the wait before the first chunk — NOT the old ~0
+    assert spawns[0] == first_ms  # the definition itself: first sound == the first player spawn
+
+
+def test_blob_path_measures_first_audio_from_the_same_hook_start(state, monkeypatch):
+    """Same definition on the blob path: its wait is one /tts synthesis pulled lazily inside
+    _play_stream rather than an eager stream pull, and the same shape must report the same ms."""
+
+    def build_source(clock, s):
+        def slow_synthesis(text, settings, key):
+            clock.advance(PRE_AUDIO_SECONDS)
+            return WAV_A
+
+        monkeypatch.setattr(speak, "synthesize", slow_synthesis)
+        return speak._synthesized_audio(["one chunk of prose"], s, "")
+
+    (played, total_bytes, first_ms, rc), spawns = _measure_first_audio_ms(monkeypatch, build_source)
+
+    assert (played, total_bytes, rc) == (1, len(WAV_A), 0)
+    assert first_ms == FIRST_AUDIO_MS  # identical to the streaming path: one definition, both paths
+    assert spawns == [first_ms]
+
+
+def test_first_audio_ms_is_minus_one_when_nothing_ever_played(state, monkeypatch):
+    result, spawns = _measure_first_audio_ms(monkeypatch, lambda clock, s: iter(()))
+    assert result == (0, 0, -1, None)
+    assert spawns == []
+
+
 # --- corrupt config / key files: ignored loudly, never a crash ----------------------------------
 
 

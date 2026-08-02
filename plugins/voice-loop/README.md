@@ -124,8 +124,11 @@ Every spoken run logs its own before/after evidence to `~/.local/state/voice-loo
 timings extract_ms=450 first_audio_ms=583 total_ms=1581
 ```
 
-`extract_ms` is the transcript read including any flush-race retries, `first_audio_ms` is when
-sound actually started, `total_ms` is the whole run. On a multi-sentence line, `first_audio_ms`
+All three are measured from one clock started when the hook begins. `extract_ms` is the transcript
+read including any flush-race retries; **`first_audio_ms` is from hook start to the moment the
+first player process is spawned** — the real time-to-first-sound, so it counts everything you wait
+through before hearing anything: the transcript read, the `/health` probe, opening the stream and
+the first chunk's synthesis. `total_ms` is the whole run. On a multi-sentence line, `first_audio_ms`
 sitting far below `total_ms` *is* the streaming, visible in numbers.
 
 ## What is in here
