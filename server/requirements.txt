@@ -19,9 +19,11 @@ numpy>=1.26
 # Stress marking is what makes a synthetic voice stop sounding drunk. Install only your language;
 # each one is optional and the server degrades to your stress.json (or to nothing) without it.
 #
-#   [ru]  ruaccent — context-aware stress + yo-fication (installed by default below)
-#   [uk]  pip install "ukrainian-word-stress>=1.0"   # dictionary-based Ukrainian accentuation
+#   [ru]  ruaccent — context-aware stress + yo-fication
+#   [uk]  ukrainian-word-stress — dictionary-based Ukrainian accentuation
+# Both are small and installed by default; remove the one you don't speak if you care to.
 ruaccent>=1.5
+ukrainian-word-stress>=1.0
 
 # --- optional TTS engines ----------------------------------------------------------------------
 # XTTS-v2 voice cloning (VOICE_LOOP_TTS_ENGINE=xtts) — deliberately NOT installed here:
