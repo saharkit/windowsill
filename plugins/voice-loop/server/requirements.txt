@@ -28,9 +28,24 @@ ruaccent>=1.5
 ukrainian-word-stress>=2.0       # 2.0 added the dictionary-only mode the server asks for
 
 # --- optional TTS engines ----------------------------------------------------------------------
-# XTTS-v2 voice cloning (VOICE_LOOP_TTS_ENGINE=xtts) — deliberately NOT installed here:
+# XTTS-v2 voice cloning (VOICE_LOOP_TTS_ENGINE=xtts) — deliberately NOT installed here.
 #
-#   [xtts]  pip install coqui-tts
+# `pip install coqui-tts` on its own is BROKEN as of coqui-tts 0.27.5, and loudly so: it declares
+# neither torch nor torchaudio yet imports torchaudio; an unresolved transformers resolves to 5.x,
+# which dropped `isin_mps_friendly`; and torch>=2.9 wants torchcodec, whose wheels need the CUDA
+# libraries or a system ffmpeg. Pin the whole stack — this set is verified end to end in a clean
+# venv, and re-verified weekly by the xtts-install-probe workflow:
+#
+#   [xtts]  CPU:
+#             pip install --index-url https://download.pytorch.org/whl/cpu torch==2.8.0 torchaudio==2.8.0
+#             pip install 'transformers<5' coqui-tts
+#
+#           CUDA (swap in the cu variant matching your driver — see pytorch.org):
+#             pip install --index-url https://download.pytorch.org/whl/cu128 torch==2.8.0 torchaudio==2.8.0
+#             pip install 'transformers<5' coqui-tts
+#
+# Install torch/torchaudio FIRST, from the index you want them from: the second command must find
+# torch already satisfied, or pip resolves its own (default-index, CUDA-flavoured) wheel.
 #
 # The XTTS-v2 WEIGHTS are CPML-licensed (personal/non-commercial use) and are downloaded by YOU on
 # first request (set COQUI_TOS_AGREED=1) — never bundled. See README.md → "XTTS engine".

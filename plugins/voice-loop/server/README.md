@@ -29,7 +29,6 @@ The unit tests run on 3.10, 3.11, 3.12 and 3.13 in CI; the loopback lanes run 3.
 python3 -m venv .venv && . .venv/bin/activate
 pip install --index-url https://download.pytorch.org/whl/cpu torch   # CPU-only torch, much smaller
 pip install -r requirements.txt
-pip install "ukrainian-word-stress>=2.0"                             # only if you want Ukrainian
 
 python voice_server.py            # http://127.0.0.1:8355
 curl -s http://127.0.0.1:8355/health
@@ -153,13 +152,34 @@ every drop is logged and counted in `GET /health` → `stt_hallucinations_droppe
 [XTTS-v2](https://huggingface.co/coqui/XTTS_v2) — zero-shot voice cloning from a short reference
 recording, fully local. Silero **remains the default**; nothing changes unless you opt in.
 
-```sh
-pip install coqui-tts                      # optional dependency, NOT in requirements.txt
+**Install the pinned set, not `pip install coqui-tts`.** A bare install of coqui-tts (0.27.5) does
+not work: it declares neither torch nor torchaudio yet imports torchaudio, an unresolved
+`transformers` lands on 5.x — which removed `isin_mps_friendly` — and `torch>=2.9` pulls in
+torchcodec, whose wheels want the CUDA libraries or a system ffmpeg. This is the set verified end to
+end in a clean venv (and re-verified weekly by the `xtts-install-probe` workflow):
 
+```sh
+# CPU
+pip install --index-url https://download.pytorch.org/whl/cpu torch==2.8.0 torchaudio==2.8.0
+pip install 'transformers<5' coqui-tts
+
+# CUDA — same thing from the cu index matching your driver (see pytorch.org for the variant)
+pip install --index-url https://download.pytorch.org/whl/cu128 torch==2.8.0 torchaudio==2.8.0
+pip install 'transformers<5' coqui-tts
+```
+
+Order matters: torch and torchaudio go in **first**, from the index you want them from, so the
+second command finds them satisfied instead of resolving its own wheel. Then:
+
+```sh
 VOICE_LOOP_TTS_ENGINE=xtts \
 VOICE_LOOP_XTTS_REFERENCE=~/voice/reference.wav \
 COQUI_TOS_AGREED=1 python voice_server.py
 ```
+
+The XTTS-v2 weights land in `~/.local/share/tts/` (coqui's own cache) no matter what `HF_HOME` or
+`TORCH_HOME` say — those steer whisper and Silero, not this download; `VOICE_LOOP_XTTS_MODEL_DIR`
+is what points the server somewhere else.
 
 **Licensing — read this before you opt in.** The server code stays MIT, but the XTTS-v2 **weights
 are licensed under the [Coqui Public Model License](https://coqui.ai/cpml)** (personal /
@@ -172,8 +192,13 @@ What to know:
 - **Reference wav** (`VOICE_LOOP_XTTS_REFERENCE`): a clean 6–30 second recording of the voice to
   clone. Required — a request on the `xtts` engine without it (or with the file missing) gets a
   clear `500`; the server still boots and `/stt` keeps working regardless.
-- **Missing package**: if `coqui-tts` is not installed, an `xtts` request gets a `500` telling you
-  to `pip install coqui-tts`. The import is lazy — nothing else pays for the dependency.
+- **Import failures**: the import is lazy — nothing else pays for the dependency — and an `xtts`
+  request whose import fails gets a `500` naming the **shape** of the failure: the exception class,
+  plus the module that was not found when there is one (`xtts import failed: ModuleNotFoundError in
+  dependency 'torchaudio'`). A genuinely absent coqui-tts says so and hands you the install hint; a
+  coqui-tts that is installed but cannot import points at the pinned set above instead of at a
+  reinstall that will not help. The exception's own **message stays in the server log** (one line,
+  no traceback) — it can carry local paths and config, which have no business on the wire.
 - Both of those `500`s are what you see with `VOICE_LOOP_TTS_FALLBACK_ENGINE=none`. With a fallback
   configured — and on the `xtts` engine there is one **by default** — the request is served by the
   fallback voice instead and marked as such; see [Engine fallback](#engine-fallback).

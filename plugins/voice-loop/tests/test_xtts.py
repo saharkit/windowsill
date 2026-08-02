@@ -8,8 +8,8 @@ boot and serve /stt no matter how broken the TTS configuration is.
 from __future__ import annotations
 
 import io
-import sys
 
+import pytest
 import soundfile as sf
 
 import voice_server
@@ -58,20 +58,112 @@ def test_tts_xtts_rejects_a_language_xtts_lacks(client, fake_xtts):
 # --- request-level refusals (the server still boots for /stt) -------------------------------------
 
 
-def test_tts_xtts_without_coqui_tts_is_a_clear_500(client, monkeypatch, tmp_path):
+SECRET_PATH = "/home/user/.secret/venvs/xtts/lib/python3.12/site-packages/transformers/__init__.py"
+
+
+@pytest.fixture
+def xtts_engine_bare(monkeypatch, tmp_path):
+    """The xtts engine with a reference on disk and NO import seam installed.
+
+    `xtts_engine` cannot serve these tests: it installs the fake `TTS.api`, which the import probe
+    would then find. The caller plants the import failure it wants with `import_raises`.
+    """
     reference = tmp_path / "reference.wav"
     reference.write_bytes(b"RIFFfake")
     monkeypatch.setattr(voice_server, "TTS_ENGINE", "xtts")
     monkeypatch.setattr(voice_server, "XTTS_REFERENCE", str(reference))
-    monkeypatch.setitem(sys.modules, "TTS", None)  # importing None raises ImportError
+    return reference
+
+
+def test_tts_xtts_without_coqui_tts_is_a_clear_500(client, xtts_engine_bare, import_raises, caplog):
+    """The one case that really IS a missing package: it says so, and hands over the install hint."""
+    import_raises("TTS", ModuleNotFoundError(f"No module named 'TTS' (searched {SECRET_PATH})", name="TTS"))
+
+    with caplog.at_level("WARNING"):
+        response = client.post("/tts", json={"text": "Привет."})
+
+    assert response.status_code == 500
+    body = response.json()
+    assert body["error"] == (
+        "xtts import failed: ModuleNotFoundError for 'TTS' — the optional coqui-tts package is not installed"
+    )
+    assert "pip install coqui-tts" in body["hint"]
+    assert "COQUI_TOS_AGREED" in body["hint"]
+    assert SECRET_PATH not in response.text  # the exception's own text never reaches the client
+    assert SECRET_PATH in caplog.text  # it reaches the operator, where it belongs
+
+
+def test_tts_xtts_with_a_broken_dependency_stack_names_the_class_not_the_message(
+    client, xtts_engine_bare, import_raises, caplog
+):
+    """coqui-tts installed but unimportable is NOT "not installed" — and the wire gets the SHAPE.
+
+    This is the failure people actually hit (#34/#35): coqui-tts pins neither torch nor torchaudio,
+    an unpinned transformers moves to 5.x and takes `isin_mps_friendly` away, and the import dies
+    inside a dependency. Reported as "coqui-tts is not installed", it sends you to reinstall a
+    package that is already there. Reported with `str(err)` attached, it ships paths and config to
+    an external client (CodeQL: information exposure through an exception) — so the client is told
+    the exception class, and the message stays in the log.
+    """
+    import_raises(
+        "TTS",
+        ImportError(f"cannot import name 'isin_mps_friendly' from 'transformers'\n({SECRET_PATH})"),
+    )
+
+    with caplog.at_level("WARNING"):
+        response = client.post("/tts", json={"text": "Привет."})
+
+    assert response.status_code == 500
+    body = response.json()
+    assert body["error"] == "xtts import failed: ImportError — the message is in the server log"
+    assert "not installed" not in body["error"]
+    assert "pip install coqui-tts" not in body["hint"]  # the misleading hint stays away
+    assert "transformers<5" in body["hint"] and "torch==2.8.0" in body["hint"]
+    assert SECRET_PATH not in response.text
+    assert "isin_mps_friendly" not in response.text
+    # the operator's copy keeps the truth, on one line, with no traceback
+    assert "ImportError: cannot import name 'isin_mps_friendly'" in caplog.text
+    assert SECRET_PATH in caplog.text
+    assert "Traceback" not in caplog.text
+
+
+def test_tts_xtts_with_a_missing_transitive_dependency_names_that_module(
+    client, xtts_engine_bare, import_raises, caplog
+):
+    """A ModuleNotFoundError for something else is not a missing coqui-tts (torchaudio, #34).
+
+    The failing module's NAME is safe to ship — it is a fact about the dependency graph, not about
+    this machine — and it is the single most useful word in the refusal, so it goes on the wire.
+    """
+    import_raises("TTS", ModuleNotFoundError(f"No module named 'torchaudio' ({SECRET_PATH})", name="torchaudio"))
+
+    with caplog.at_level("WARNING"):
+        response = client.post("/tts", json={"text": "Привет."})
+
+    assert response.status_code == 500
+    body = response.json()
+    assert body["error"] == (
+        "xtts import failed: ModuleNotFoundError in dependency 'torchaudio' — the message is in the server log"
+    )
+    assert "not installed" not in body["error"]
+    assert "pip install coqui-tts" not in body["hint"]
+    assert SECRET_PATH not in response.text
+    assert SECRET_PATH in caplog.text
+
+
+def test_tts_xtts_import_failure_without_a_module_name_still_refuses_cleanly(
+    client, xtts_engine_bare, import_raises
+):
+    """`ModuleNotFoundError` carries no `name` when raised by hand — no `'None'` on the wire."""
+    import_raises("TTS", ModuleNotFoundError(f"something went wrong in {SECRET_PATH}"))
 
     response = client.post("/tts", json={"text": "Привет."})
 
     assert response.status_code == 500
     body = response.json()
-    assert "coqui-tts" in body["error"]
-    assert "pip install coqui-tts" in body["hint"]
-    assert "COQUI_TOS_AGREED" in body["hint"]
+    assert body["error"] == "xtts import failed: ModuleNotFoundError — the message is in the server log"
+    assert "None" not in body["error"]
+    assert SECRET_PATH not in response.text
 
 
 def test_tts_xtts_without_a_reference_is_a_clear_500(client, monkeypatch, coqui_installed):
@@ -104,9 +196,9 @@ def test_tts_unknown_engine_is_a_clear_500(client, monkeypatch):
     assert body["supported"] == ["silero", "xtts"]
 
 
-def test_stt_works_with_the_xtts_engine_misconfigured(client, fake_whisper, monkeypatch):
+def test_stt_works_with_the_xtts_engine_misconfigured(client, fake_whisper, monkeypatch, import_raises):
     monkeypatch.setattr(voice_server, "TTS_ENGINE", "xtts")
-    monkeypatch.setitem(sys.modules, "TTS", None)
+    import_raises("TTS", ModuleNotFoundError("No module named 'TTS'", name="TTS"))
 
     response = client.post("/stt", files={"audio": ("clip.wav", b"RIFFfake", "audio/wav")})
 

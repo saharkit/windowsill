@@ -1,0 +1,63 @@
+# The one thing the unit suite structurally cannot check.
+#
+# `tests/` fakes the `from TTS.api import TTS` seam on purpose — no models, no network, no 2 GB of
+# wheels — so a 100% green suite says nothing about whether the XTTS install we DOCUMENT still
+# works. It stopped working upstream without a line of this repo changing (#34): coqui-tts declares
+# neither torch nor torchaudio yet imports torchaudio, an unresolved transformers moved to 5.x and
+# dropped `isin_mps_friendly`, and torch>=2.9 wants torchcodec wheels that need CUDA libraries or a
+# system ffmpeg. This job installs the pinned recipe from server/README.md into a clean venv and
+# imports it for real, once a week, so the next upstream break is a red run instead of a stranger's
+# ruined evening.
+#
+# Deliberately NOT on every push/PR: ~3 minutes of wheel downloads is worth paying weekly, not per
+# commit. Deliberately NO model download either — COQUI_TOS_AGREED is unset and nothing calls the
+# model, so the CPML-licensed weights are never fetched. The import is the whole contract.
+#
+# When this goes red: the recipe drifted. Fix the pins in BOTH server/requirements.txt (the [xtts]
+# comment block) and server/README.md → "XTTS engine", and here.
+name: xtts install probe
+
+on:
+  schedule:
+    - cron: "17 5 * * 1" # Mondays, 05:17 UTC
+  workflow_dispatch:
+
+jobs:
+  install:
+    name: the documented XTTS install still installs and imports
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: the pins here and the ones we document are the same pins
+        run: |
+          # Three places quote this recipe: the requirements comment block, the README section, and
+          # the refusal the server hands a user whose coqui-tts cannot import (#35). All three drift
+          # together or not at all.
+          for f in plugins/voice-loop/server/requirements.txt \
+                   plugins/voice-loop/server/README.md \
+                   plugins/voice-loop/server/voice_server.py; do
+            grep -q "torch==2.8.0 torchaudio==2.8.0" "$f" \
+              || { echo "$f no longer documents the torch/torchaudio pins this probe installs"; exit 1; }
+            grep -q "transformers<5" "$f" \
+              || { echo "$f no longer documents the transformers pin this probe installs"; exit 1; }
+          done
+
+      - name: install the documented recipe into a clean venv (CPU index)
+        run: |
+          python3 -m venv /tmp/xtts-probe
+          /tmp/xtts-probe/bin/pip install --upgrade pip
+          /tmp/xtts-probe/bin/pip install --index-url https://download.pytorch.org/whl/cpu \
+            torch==2.8.0 torchaudio==2.8.0
+          /tmp/xtts-probe/bin/pip install 'transformers<5' coqui-tts
+
+      - name: what actually resolved
+        run: /tmp/xtts-probe/bin/pip list | grep -Ei "^(torch|torchaudio|torchcodec|transformers|coqui-tts|TTS) "
+
+      - name: import it for real (no model download — the weights stay untouched)
+        run: /tmp/xtts-probe/bin/python -c "from TTS.api import TTS; print('xtts import ok')"
