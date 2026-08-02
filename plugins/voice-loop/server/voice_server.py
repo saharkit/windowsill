@@ -603,6 +603,38 @@ def switch_engine_hint(engine: str, language: str) -> str:
     return ""
 
 
+def xtts_import_error(err: ImportError) -> JSONResponse:
+    """The refusal for an xtts import that failed — naming WHICH failure it was.
+
+    "coqui-tts is not installed" is the right answer to exactly one of these and a lie about the
+    rest: coqui-tts declares neither torch nor torchaudio yet imports torchaudio, and an unpinned
+    transformers takes an API out from under it — so the usual real failure is a package that IS
+    installed and cannot import. Sending that person to reinstall it wastes their evening. The cause
+    is reported as ONE sanitized line (exception class + message, never a traceback), and the
+    install hint rides along ONLY when the top-level `TTS` package itself is the thing missing.
+    """
+    cause = " ".join(f"{type(err).__name__}: {err}".split())[:300]
+    log.warning("the xtts engine could not import coqui-tts — %s", cause)
+    if isinstance(err, ModuleNotFoundError) and err.name == "TTS":
+        return JSONResponse(
+            {
+                "error": f"the xtts engine needs the optional coqui-tts package, which is not installed ({cause})",
+                "hint": "pip install coqui-tts — its XTTS-v2 weights are CPML-licensed (non-commercial) "
+                "and download on first use; set COQUI_TOS_AGREED=1 to accept",
+            },
+            status_code=500,
+        )
+    return JSONResponse(
+        {
+            "error": f"the xtts engine could not import coqui-tts: {cause}",
+            "hint": "coqui-tts is installed but something it imports is not — reinstalling it alone will "
+            "not help. The pinned set that works is torch==2.8.0 torchaudio==2.8.0 'transformers<5'; "
+            "see server/README.md → XTTS engine",
+        },
+        status_code=500,
+    )
+
+
 def xtts_request_error(language: str) -> JSONResponse | None:
     """Why an xtts request cannot be served right now, or None.
 
@@ -611,15 +643,8 @@ def xtts_request_error(language: str) -> JSONResponse | None:
     """
     try:
         from TTS.api import TTS  # noqa: F401 — availability probe only; xtts() does the real import
-    except ImportError:
-        return JSONResponse(
-            {
-                "error": "the xtts engine needs the optional coqui-tts package, which is not installed",
-                "hint": "pip install coqui-tts — its XTTS-v2 weights are CPML-licensed (non-commercial) "
-                "and download on first use; set COQUI_TOS_AGREED=1 to accept",
-            },
-            status_code=500,
-        )
+    except ImportError as err:
+        return xtts_import_error(err)
     if not XTTS_REFERENCE:
         return JSONResponse(
             {

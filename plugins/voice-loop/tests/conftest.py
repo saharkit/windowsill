@@ -242,3 +242,36 @@ def import_fake(monkeypatch):
         return module
 
     return install
+
+
+class RaisingFinder:
+    """A meta-path finder that fails one package's import with a chosen exception.
+
+    `sys.modules[name] = None` can raise exactly one flavour of ImportError, and the server's refusal
+    now DISTINGUISHES flavours: a package that is genuinely absent (`ModuleNotFoundError` naming the
+    top-level package) reads differently from one that is installed and cannot import because its own
+    dependency stack is broken. Testing that difference needs a seam that raises the real thing.
+    """
+
+    def __init__(self, name: str, error: BaseException) -> None:
+        self.name = name
+        self.error = error
+
+    def find_spec(self, fullname: str, path: object = None, target: object = None) -> None:
+        if fullname == self.name:
+            raise self.error
+        return None
+
+
+@pytest.fixture
+def import_raises(monkeypatch):
+    """Make importing `name` (and anything under it) fail with `error` for the duration of a test."""
+
+    def install(name: str, error: BaseException) -> RaisingFinder:
+        for loaded in [module for module in sys.modules if module == name or module.startswith(f"{name}.")]:
+            monkeypatch.delitem(sys.modules, loaded)
+        finder = RaisingFinder(name, error)
+        monkeypatch.setattr(sys, "meta_path", [finder, *sys.meta_path])
+        return finder
+
+    return install

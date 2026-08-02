@@ -8,7 +8,6 @@ boot and serve /stt no matter how broken the TTS configuration is.
 from __future__ import annotations
 
 import io
-import sys
 
 import soundfile as sf
 
@@ -58,20 +57,69 @@ def test_tts_xtts_rejects_a_language_xtts_lacks(client, fake_xtts):
 # --- request-level refusals (the server still boots for /stt) -------------------------------------
 
 
-def test_tts_xtts_without_coqui_tts_is_a_clear_500(client, monkeypatch, tmp_path):
+def test_tts_xtts_without_coqui_tts_is_a_clear_500(client, monkeypatch, tmp_path, import_raises):
     reference = tmp_path / "reference.wav"
     reference.write_bytes(b"RIFFfake")
     monkeypatch.setattr(voice_server, "TTS_ENGINE", "xtts")
     monkeypatch.setattr(voice_server, "XTTS_REFERENCE", str(reference))
-    monkeypatch.setitem(sys.modules, "TTS", None)  # importing None raises ImportError
+    import_raises("TTS", ModuleNotFoundError("No module named 'TTS'", name="TTS"))
 
     response = client.post("/tts", json={"text": "Привет."})
 
     assert response.status_code == 500
     body = response.json()
     assert "coqui-tts" in body["error"]
+    assert "not installed" in body["error"]
+    assert "No module named 'TTS'" in body["error"]  # the cause, verbatim, not a paraphrase
     assert "pip install coqui-tts" in body["hint"]
     assert "COQUI_TOS_AGREED" in body["hint"]
+
+
+def test_tts_xtts_with_a_broken_dependency_stack_reports_the_real_cause(client, monkeypatch, tmp_path, import_raises):
+    """coqui-tts installed but unimportable is NOT "not installed" — the refusal must say so.
+
+    This is the failure people actually hit (#34/#35): coqui-tts pins neither torch nor torchaudio,
+    an unpinned transformers moves to 5.x and takes `isin_mps_friendly` away, and the import dies
+    inside a dependency. Reported as "coqui-tts is not installed", it sends you to reinstall a
+    package that is already there.
+    """
+    reference = tmp_path / "reference.wav"
+    reference.write_bytes(b"RIFFfake")
+    monkeypatch.setattr(voice_server, "TTS_ENGINE", "xtts")
+    monkeypatch.setattr(voice_server, "XTTS_REFERENCE", str(reference))
+    import_raises(
+        "TTS",
+        ImportError("cannot import name 'isin_mps_friendly' from 'transformers'\n(.venv/…/transformers/__init__.py)"),
+    )
+
+    response = client.post("/tts", json={"text": "Привет."})
+
+    assert response.status_code == 500
+    body = response.json()
+    assert "ImportError: cannot import name 'isin_mps_friendly'" in body["error"]
+    assert "not installed" not in body["error"]
+    assert "\n" not in body["error"]  # one sanitized line, never a traceback or a wrapped message
+    assert "pip install coqui-tts" not in body["hint"]  # the misleading hint stays away
+    assert "transformers<5" in body["hint"] and "torch==2.8.0" in body["hint"]
+
+
+def test_tts_xtts_with_a_missing_transitive_dependency_is_not_reported_as_a_missing_coqui(
+    client, monkeypatch, tmp_path, import_raises
+):
+    """A ModuleNotFoundError for something else is still not a missing coqui-tts (torchaudio, #34)."""
+    reference = tmp_path / "reference.wav"
+    reference.write_bytes(b"RIFFfake")
+    monkeypatch.setattr(voice_server, "TTS_ENGINE", "xtts")
+    monkeypatch.setattr(voice_server, "XTTS_REFERENCE", str(reference))
+    import_raises("TTS", ModuleNotFoundError("No module named 'torchaudio'", name="torchaudio"))
+
+    response = client.post("/tts", json={"text": "Привет."})
+
+    assert response.status_code == 500
+    body = response.json()
+    assert "torchaudio" in body["error"]
+    assert "not installed" not in body["error"]
+    assert "pip install coqui-tts" not in body["hint"]
 
 
 def test_tts_xtts_without_a_reference_is_a_clear_500(client, monkeypatch, coqui_installed):
@@ -104,9 +152,9 @@ def test_tts_unknown_engine_is_a_clear_500(client, monkeypatch):
     assert body["supported"] == ["silero", "xtts"]
 
 
-def test_stt_works_with_the_xtts_engine_misconfigured(client, fake_whisper, monkeypatch):
+def test_stt_works_with_the_xtts_engine_misconfigured(client, fake_whisper, monkeypatch, import_raises):
     monkeypatch.setattr(voice_server, "TTS_ENGINE", "xtts")
-    monkeypatch.setitem(sys.modules, "TTS", None)
+    import_raises("TTS", ModuleNotFoundError("No module named 'TTS'", name="TTS"))
 
     response = client.post("/stt", files={"audio": ("clip.wav", b"RIFFfake", "audio/wav")})
 

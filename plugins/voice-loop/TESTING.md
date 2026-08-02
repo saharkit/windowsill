@@ -34,6 +34,12 @@ What makes 100% honest rather than decorative:
   `main()` — and `main()` itself is tested (with `uvicorn.run` patched). Nothing else is excluded.
 - Accentuation is **off by default in the fixtures**, so a language package that happens to be
   installed in someone's environment can never make the tests reach for a model over the network.
+- **What a faked seam structurally cannot check, a separate job does.** Faking `from TTS.api import
+  TTS` is what keeps the suite model-free — and it means a green 100% says nothing about whether the
+  XTTS install we document still works. It stopped working upstream with no change in this repo
+  (#34). So `.github/workflows/xtts-install-probe.yml` installs the pinned recipe into a clean venv
+  weekly and imports it for real (no model download, no license prompt). Coverage cannot substitute
+  for that probe, and nothing else in CI would notice the break.
 
 ### The hook scripts — shellcheck, a pytest for the pure parts, and a real invocation
 

@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import importlib
 import io
-import sys
 import threading
 
 import pytest
@@ -93,18 +92,18 @@ def broken_xtts(monkeypatch, silero_fallback):
 
 
 @pytest.fixture
-def missing_coqui(monkeypatch, tmp_path):
+def missing_coqui(monkeypatch, tmp_path, import_raises):
     """The same pairing with coqui-tts ABSENT — the primary is refused by its own request check.
 
     Deliberately not built on `xtts_engine`: that fixture installs the fake `TTS.api`, which the
-    import probe would then find no matter what `TTS` is set to.
+    import probe would then find no matter what the import seam says.
     """
     reference = tmp_path / "reference.wav"
     reference.write_bytes(b"RIFFfake")
     monkeypatch.setattr(voice_server, "TTS_ENGINE", "xtts")
     monkeypatch.setattr(voice_server, "XTTS_REFERENCE", str(reference))
     monkeypatch.setattr(voice_server, "TTS_FALLBACK_ENGINE", "silero")
-    monkeypatch.setitem(sys.modules, "TTS", None)  # importing None raises ImportError
+    import_raises("TTS", ModuleNotFoundError("No module named 'TTS'", name="TTS"))
     return reference
 
 
