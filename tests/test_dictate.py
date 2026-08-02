@@ -1,16 +1,25 @@
 """The dictation toggle's pure functions: config precedence, the recorder/clipboard/paste tables,
-the min-clip guard, multipart building, response parsing.
+the min-clip guard, multipart building, response parsing — plus the audit-hardening seams: the
+atomic pidfile claim (concurrent-toggle race), the pidfile-driven echo guard with its PID-reuse
+identity check, the urllib-level cloud/LAN STT request shapes, and a real multipart round-trip
+through the server's /stt.
 
-dictate.py is glue around a recorder subprocess, an HTTP STT call and desktop paste tools, so —
-like speak.py — its runtime contract is proven by real invocation, not by mocks (see TESTING.md).
-What IS unit-tested here is the part with no I/O in it at all: the decision tables the shell
-version kept in case-statements, now importable functions. Stdlib + pytest only; nothing here
-touches the network, a microphone, or the state dir.
+dictate.py is glue around a recorder subprocess, an HTTP STT call and desktop paste tools, so its
+full runtime contract is proven by real invocation (see TESTING.md). What is tested here never
+reaches the network, a microphone, or the live state dir: every state path is monkeypatched into
+tmp_path, every HTTP opener is faked at the urllib seam, and the only real subprocesses are
+short-lived pythons owned by the tests themselves.
 """
 
 from __future__ import annotations
 
 import importlib.util
+import json
+import os
+import subprocess
+import sys
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -29,6 +38,18 @@ def have(*names: str):
     return lambda name: name in names
 
 
+@pytest.fixture
+def state(monkeypatch, tmp_path):
+    """Every state-dir path the script writes, owned by the test — never the live ~/.local/state."""
+    monkeypatch.setattr(dictate, "_STATE_DIR", str(tmp_path))
+    monkeypatch.setattr(dictate, "_LOG_PATH", str(tmp_path / "dictate.log"))
+    monkeypatch.setattr(dictate, "_PID_PATH", str(tmp_path / "dictate.pid"))
+    monkeypatch.setattr(dictate, "_WAV_PATH", str(tmp_path / "dictate.wav"))
+    monkeypatch.setattr(dictate, "_LAST_WAV_PATH", str(tmp_path / "dictate-last.wav"))
+    monkeypatch.setattr(dictate, "_SPEAK_PID_PATH", str(tmp_path / "playing.pid"))
+    return tmp_path
+
+
 # --- resolve_settings: the config-precedence table ----------------------------------------------
 
 
@@ -42,7 +63,7 @@ def test_defaults_with_empty_config_linux():
     assert s["player"] == "aplay -q"
     assert s["backend"] == "lan"
     assert s["endpoint"] == "http://127.0.0.1:8355"
-    assert s["language"] == "ru"
+    assert s["language"] == "en"  # explicit-language setups always write the key; the default is English
     assert s["stt_model"] == "whisper-1"
     assert s["stt_command"] == ""
     assert s["key_env"] == "VOICE_LOOP_STT_API_KEY"
@@ -66,8 +87,8 @@ def test_auto_paste_stays_off_for_anything_else(value):
 
 
 def test_stt_language_beats_top_level_language_beats_default():
-    assert dictate.resolve_settings({"language": "en"}, "Linux")["language"] == "en"
-    both = {"language": "en", "stt": {"language": "de"}}
+    assert dictate.resolve_settings({"language": "ru"}, "Linux")["language"] == "ru"
+    both = {"language": "ru", "stt": {"language": "de"}}
     assert dictate.resolve_settings(both, "Linux")["language"] == "de"
 
 
@@ -273,3 +294,344 @@ def test_transcript_from_response_is_empty_on_anything_malformed():
     assert dictate.transcript_from_response(b"<html>bad gateway</html>") == ""
     assert dictate.transcript_from_response(b'{"detail": "no text key"}') == ""
     assert dictate.transcript_from_response(b'["not", "a", "dict"]') == ""
+
+
+# --- corrupt config / key files: ignored loudly, never a crash ----------------------------------
+
+
+def test_corrupt_json_config_is_ignored_and_logged(state):
+    bad = state / "config.json"
+    bad.write_text("{not json", encoding="utf-8")
+    assert dictate.load_config(str(bad)) == {}
+    logged = (state / "dictate.log").read_text(encoding="utf-8")
+    assert "config ignored" in logged and "JSONDecodeError" in logged
+
+
+def test_non_utf8_config_is_ignored_and_logged(state):
+    bad = state / "config.json"
+    bad.write_bytes(b'\xff\xfe{"a": 1}')
+    assert dictate.load_config(str(bad)) == {}
+    assert "UnicodeDecodeError" in (state / "dictate.log").read_text(encoding="utf-8")
+
+
+def test_absent_config_stays_silent(state):
+    assert dictate.load_config(str(state / "absent.json")) == {}
+    assert not (state / "dictate.log").exists()
+
+
+def test_non_utf8_key_file_falls_back_to_env_and_never_logs_content(state):
+    key_file = state / "k"
+    key_file.write_bytes(b"\xff\xfe topsecretbytes")
+    assert dictate.read_key(str(key_file), "K_ENV", {"K_ENV": "sk-fromenv"}) == "sk-fromenv"
+    logged = (state / "dictate.log").read_text(encoding="utf-8")
+    assert "UnicodeDecodeError" in logged
+    assert "topsecret" not in logged
+
+
+# --- applescript_escape: config-controlled text cannot break out of the literal -----------------
+
+
+def test_applescript_escape_handles_quotes_and_backslashes():
+    assert dictate.applescript_escape('press "ctrl+v" to paste') == 'press \\"ctrl+v\\" to paste'
+    assert dictate.applescript_escape("back\\slash") == "back\\\\slash"
+    # backslash first, then the quote — the other order would double-escape
+    assert dictate.applescript_escape('mix\\"ed') == 'mix\\\\\\"ed'
+    assert dictate.applescript_escape("plain text") == "plain text"
+
+
+def test_note_interpolates_the_escaped_message_on_darwin(monkeypatch):
+    runs = []
+    monkeypatch.setattr(dictate.subprocess, "run", lambda argv, **kw: runs.append(argv))
+    dictate.note('copied — press "ctrl+v" to paste', "Darwin")
+    assert runs[0][:2] == ["osascript", "-e"]
+    assert 'display notification "copied — press \\"ctrl+v\\" to paste" with title "voice-loop"' == runs[0][2]
+
+
+# --- the PID-reuse identity check (duplicated helper — kept in sync with speak.py) --------------
+
+
+def test_pid_identity_accepts_the_voice_loop_chain_on_linux():
+    player = "aplay -q /tmp/voice-loop-speak-abc123"
+    assert dictate.pid_looks_like_speak(9, read_cmdline=lambda pid: player, platform_id="linux") is True
+    python_half = "python3 /repo/plugins/voice-loop/scripts/speak.py"
+    assert dictate.pid_looks_like_speak(9, read_cmdline=lambda pid: python_half, platform_id="linux") is True
+
+
+def test_pid_identity_rejects_a_reused_or_gone_pid_on_linux():
+    assert dictate.pid_looks_like_speak(9, read_cmdline=lambda pid: "sshd: user@pts/0", platform_id="linux") is False
+    assert dictate.pid_looks_like_speak(9, read_cmdline=lambda pid: None, platform_id="linux") is False
+
+
+def test_pid_identity_check_is_skipped_off_linux():
+    def never(pid):
+        raise AssertionError("cmdline must not be read off Linux")
+
+    assert dictate.pid_looks_like_speak(9, read_cmdline=never, platform_id="darwin") is True
+
+
+# --- the echo guard: pidfile-scoped kills, pkill only as the no-pidfile fallback ----------------
+
+
+def test_echo_guard_kills_exactly_the_pids_speak_recorded(state, monkeypatch):
+    (state / "playing.pid").write_text("100 200", encoding="utf-8")
+    monkeypatch.setattr(dictate, "pid_looks_like_speak", lambda pid: True)
+    kills = []
+    monkeypatch.setattr(dictate.os, "kill", lambda pid, sig: kills.append((pid, sig)))
+
+    def no_pkill(*args, **kwargs):
+        raise AssertionError("the pkill fallback must not run when the pidfile exists")
+
+    monkeypatch.setattr(dictate.subprocess, "run", no_pkill)
+    dictate.stop_speak_playback()
+    assert kills == [(100, dictate.signal.SIGTERM), (200, dictate.signal.SIGTERM)]
+
+
+def test_echo_guard_skips_unverified_pids_and_garbage_tokens(state, monkeypatch):
+    (state / "playing.pid").write_text(f"abc -5 0 {os.getpid()} 300 400", encoding="utf-8")
+    monkeypatch.setattr(dictate, "pid_looks_like_speak", lambda pid: pid == 300)
+    kills = []
+    monkeypatch.setattr(dictate.os, "kill", lambda pid, sig: kills.append((pid, sig)))
+    dictate.stop_speak_playback()
+    assert kills == [(300, dictate.signal.SIGTERM)]  # never itself, never an unverified pid
+
+
+def test_echo_guard_falls_back_to_pkill_only_without_a_pidfile(state, monkeypatch):
+    runs = []
+    monkeypatch.setattr(dictate.subprocess, "run", lambda argv, **kw: runs.append(argv))
+
+    def no_kill(pid, sig):
+        raise AssertionError("nothing to signal without a pidfile")
+
+    monkeypatch.setattr(dictate.os, "kill", no_kill)
+    dictate.stop_speak_playback()
+    assert runs == [["pkill", "-u", str(os.getuid()), "-f", "voice-loop-speak"]]
+
+
+# --- the concurrent-invocation race: one claim, one recorder ------------------------------------
+
+
+class FakeProc:
+    pid = 4242
+
+
+def _write_config(monkeypatch, tmp_path, config: dict) -> None:
+    cfg_file = tmp_path / "config.json"
+    cfg_file.write_text(json.dumps(config), encoding="utf-8")
+    monkeypatch.setenv("VOICE_LOOP_CONFIG", str(cfg_file))
+
+
+def test_claim_pidfile_admits_exactly_one_winner(state):
+    barrier = threading.Barrier(8)
+    results: list[int | None] = []
+
+    def contend():
+        barrier.wait(timeout=5)
+        results.append(dictate.claim_pidfile())
+
+    threads = [threading.Thread(target=contend) for _ in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+    winners = [fd for fd in results if fd is not None]
+    assert len(results) == 8
+    assert len(winners) == 1
+    os.close(winners[0])
+
+
+def test_concurrent_toggles_start_exactly_one_recorder(state, monkeypatch):
+    """The injected race window: both invocations pass the pidfile-liveness check and reach the
+    claim together — the O_EXCL create is the only arbiter, and it must pick exactly one."""
+    barrier = threading.Barrier(2)
+    real_claim = dictate.claim_pidfile
+
+    def racing_claim():
+        barrier.wait(timeout=5)
+        return real_claim()
+
+    monkeypatch.setattr(dictate, "claim_pidfile", racing_claim)
+    spawned: list[list[str]] = []
+    monkeypatch.setattr(dictate.subprocess, "Popen", lambda argv, **kw: spawned.append(argv) or FakeProc())
+    monkeypatch.setattr(dictate, "stop_speak_playback", lambda: None)
+    notes: list[str] = []
+    monkeypatch.setattr(dictate, "note", lambda message, system: notes.append(message))
+    _write_config(monkeypatch, state, {"dictate": {"recorder": "arecord"}})
+
+    rcs: list[int] = []
+    threads = [threading.Thread(target=lambda: rcs.append(dictate.main(["dictate.py"]))) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+
+    assert sorted(rcs) == [0, 0]
+    assert len(spawned) == 1  # the loser spawned NOTHING onto the shared WAV
+    assert (state / "dictate.pid").read_text(encoding="utf-8") == "4242"
+    assert sum("already starting" in message for message in notes) == 1
+    assert notes.count("recording…") == 1
+
+
+def test_a_claim_in_progress_is_not_adopted_or_cleared(state, monkeypatch):
+    # a freshly created, still-empty pidfile IS another invocation mid-claim: lose politely
+    (state / "dictate.pid").write_text("", encoding="utf-8")
+
+    def no_spawn(*args, **kwargs):
+        raise AssertionError("the losing invocation must not start a recorder")
+
+    monkeypatch.setattr(dictate.subprocess, "Popen", no_spawn)
+    notes: list[str] = []
+    monkeypatch.setattr(dictate, "note", lambda message, system: notes.append(message))
+    monkeypatch.setenv("VOICE_LOOP_CONFIG", str(state / "absent.json"))
+    assert dictate.main(["dictate.py"]) == 0
+    assert (state / "dictate.pid").exists()  # the winner's claim was left alone
+    assert any("already starting" in message for message in notes)
+
+
+def test_dead_garbage_claim_older_than_the_grace_window_is_cleared(state, monkeypatch):
+    pidfile = state / "dictate.pid"
+    pidfile.write_text("not-a-pid", encoding="utf-8")
+    stale = time.time() - 60
+    os.utime(pidfile, (stale, stale))
+    spawned: list[list[str]] = []
+    monkeypatch.setattr(dictate.subprocess, "Popen", lambda argv, **kw: spawned.append(argv) or FakeProc())
+    monkeypatch.setattr(dictate, "stop_speak_playback", lambda: None)
+    monkeypatch.setattr(dictate, "note", lambda message, system: None)
+    _write_config(monkeypatch, state, {"dictate": {"recorder": "arecord"}})
+    assert dictate.main(["dictate.py"]) == 0
+    assert len(spawned) == 1
+    assert pidfile.read_text(encoding="utf-8") == "4242"
+
+
+def test_a_stale_dead_pid_is_removed_and_the_start_proceeds(state, monkeypatch):
+    dead = subprocess.Popen([sys.executable, "-c", "pass"])  # real child, before Popen is faked
+    dead.wait()
+    (state / "dictate.pid").write_text(str(dead.pid), encoding="utf-8")
+    spawned: list[list[str]] = []
+    monkeypatch.setattr(dictate.subprocess, "Popen", lambda argv, **kw: spawned.append(argv) or FakeProc())
+    monkeypatch.setattr(dictate, "stop_speak_playback", lambda: None)
+    monkeypatch.setattr(dictate, "note", lambda message, system: None)
+    _write_config(monkeypatch, state, {"dictate": {"recorder": "arecord"}})
+    assert dictate.main(["dictate.py"]) == 0
+    assert len(spawned) == 1
+    assert (state / "dictate.pid").read_text(encoding="utf-8") == "4242"
+
+
+def test_start_failure_releases_the_claim(state, monkeypatch):
+    monkeypatch.setattr(dictate, "stop_speak_playback", lambda: None)
+    monkeypatch.setattr(dictate, "note", lambda message, system: None)
+    fd = dictate.claim_pidfile()
+    assert fd is not None
+    s = dictate.resolve_settings({"dictate": {"recorder": "no-such-recorder"}}, "Linux")
+    assert dictate.start_recording(s, "Linux", fd) == 1  # unknown recorder -> no argv
+    assert not (state / "dictate.pid").exists()  # the claim was released, the toggle is not wedged
+
+
+def test_stop_removes_the_pidfile_before_signalling(state, monkeypatch):
+    pidfile = state / "dictate.pid"
+    pidfile.write_text("12345", encoding="utf-8")
+    seen: list[tuple[int, int, bool]] = []
+
+    def fake_kill(pid, sig):
+        if sig == 0:
+            raise ProcessLookupError  # _pid_alive: the recorder is already gone
+        seen.append((pid, sig, pidfile.exists()))
+
+    monkeypatch.setattr(dictate.os, "kill", fake_kill)
+    monkeypatch.setattr(dictate.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(dictate, "note", lambda message, system: None)
+    s = dictate.resolve_settings({}, "Linux")
+    assert dictate.stop_and_transcribe(s, "Linux", "send", 12345) == 0
+    # the slot was freed BEFORE the signal: a racing start claims fresh, never adopts a dying recorder
+    assert seen == [(12345, dictate.signal.SIGINT, False)]
+
+
+# --- the cloud/LAN STT request shapes, mocked at the urllib seam --------------------------------
+
+
+class FakeResponse:
+    def __init__(self, body: bytes) -> None:
+        self._body = body
+
+    def read(self) -> bytes:
+        return self._body
+
+    def close(self) -> None:
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        return False
+
+
+class FakeOpener:
+    def __init__(self, body: bytes) -> None:
+        self.body = body
+        self.requests: list[tuple[object, float | None]] = []
+
+    def open(self, request, timeout=None):
+        self.requests.append((request, timeout))
+        return FakeResponse(self.body)
+
+
+@pytest.fixture
+def opener(monkeypatch):
+    holder: dict[str, FakeOpener] = {}
+    monkeypatch.setattr(dictate.urllib.request, "build_opener", lambda *handlers: holder["opener"])
+
+    def install(body: bytes) -> FakeOpener:
+        holder["opener"] = FakeOpener(body)
+        return holder["opener"]
+
+    return install
+
+
+def test_cloud_stt_posts_the_documented_openai_transcription_shape(state, monkeypatch, opener):
+    (state / "dictate.wav").write_bytes(b"RIFFfakewav")
+    fake = opener(b'{"text": " hello "}')
+    monkeypatch.setenv("VOICE_LOOP_STT_API_KEY", "sk-secret")
+    s = dictate.resolve_settings({"stt": {"backend": "cloud", "endpoint": "https://api.example.com"}}, "Linux")
+    assert dictate.transcribe(s) == "hello"
+
+    request, timeout = fake.requests[0]
+    assert request.full_url == "https://api.example.com/v1/audio/transcriptions"
+    assert request.get_method() == "POST"
+    assert request.get_header("Authorization") == "Bearer sk-secret"
+    assert timeout == 60.0
+    content_type = request.get_header("Content-type")
+    assert content_type.startswith("multipart/form-data; boundary=")
+    boundary = content_type.split("boundary=", 1)[1].encode("ascii")
+    body = request.data
+    assert body.count(b"--" + boundary + b"\r\n") == 3  # model, language, file
+    assert b'name="model"\r\n\r\nwhisper-1\r\n' in body
+    assert b'name="language"\r\n\r\nen\r\n' in body
+    assert b'name="file"; filename="dictate.wav"\r\nContent-Type: audio/wav\r\n\r\nRIFFfakewav' in body
+    assert body.endswith(b"\r\n--" + boundary + b"--\r\n")
+
+
+def test_lan_stt_posts_the_audio_field_with_a_language_query(state, opener):
+    (state / "dictate.wav").write_bytes(b"RIFFfakewav")
+    fake = opener(b'{"text": "ok"}')
+    s = dictate.resolve_settings({}, "Linux")
+    assert dictate.transcribe(s) == "ok"
+    request, _ = fake.requests[0]
+    assert request.full_url == "http://127.0.0.1:8355/stt?language=en"
+    assert request.get_header("Authorization") is None  # the LAN server never sees a key
+    assert b'name="audio"; filename="dictate.wav"' in request.data
+
+
+# --- the cross-module framing loop: dictate's multipart through the real /stt -------------------
+
+
+def test_multipart_round_trip_through_the_server_stt(client, fake_whisper):
+    boundary = "roundtripboundary"
+    body = dictate.multipart_form({}, "audio", "dictate.wav", b"RIFF-not-really-wav", boundary)
+    response = client.post(
+        "/stt?language=en",
+        content=body,
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+    )
+    assert response.status_code == 200
+    assert response.json()["text"] == "hello world"
+    assert fake_whisper.calls[0]["language"] == "en"

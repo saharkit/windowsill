@@ -1,17 +1,26 @@
-"""The Stop hook's pure functions: chunking, extraction, config precedence, key reading.
+"""The Stop hook's pure functions: chunking, extraction, config precedence, key reading — plus the
+audit-hardening seams: the identity-checked takeover (PID-reuse guard, with a real-child
+integration case), the urllib-level cloud synthesis request shapes, and the bare-marker fast path
+that must never burn the flush-race backoff.
 
-speak.py is glue around subprocess players and an HTTP synthesis call, so — like the shell scripts —
-its runtime contract is proven by the REAL Stop-hook invocation in CI, not by mocks (see
-TESTING.md). What IS unit-tested here is the part with no I/O in it at all: the sentence chunker
-that drives streaming, the transcript extractor, and the config-precedence table that every
-backend reads. Stdlib + pytest only; nothing here touches the network, a player, or the state dir.
+speak.py is glue around subprocess players and an HTTP synthesis call, so its full runtime
+contract is proven by the REAL Stop-hook invocation in CI (see TESTING.md). What is tested here
+never reaches the network, a player, or the live state dir: state paths are monkeypatched into
+tmp_path, HTTP openers are faked at the urllib seam, and the only real subprocesses are
+short-lived pythons owned by the tests themselves.
 """
 
 from __future__ import annotations
 
 import base64
 import importlib.util
+import io
 import json
+import os
+import signal
+import subprocess
+import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -20,6 +29,16 @@ _SPEAK_PATH = Path(__file__).resolve().parents[1] / "plugins" / "voice-loop" / "
 _spec = importlib.util.spec_from_file_location("speak", _SPEAK_PATH)
 speak = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(speak)
+
+
+@pytest.fixture
+def state(monkeypatch, tmp_path):
+    """Every state-dir path the script writes, owned by the test — never the live ~/.local/state."""
+    monkeypatch.setattr(speak, "_STATE_DIR", str(tmp_path))
+    monkeypatch.setattr(speak, "_LOG_PATH", str(tmp_path / "speak.log"))
+    monkeypatch.setattr(speak, "_LAST_PATH", str(tmp_path / "last-spoken"))
+    monkeypatch.setattr(speak, "_PID_PATH", str(tmp_path / "playing.pid"))
+    return tmp_path
 
 
 # --- chunk_sentences: the streaming plan -------------------------------------------------------
@@ -84,6 +103,7 @@ def test_extract_takes_the_last_assistant_message():
 
 def test_extract_skips_malformed_lines_and_unmarked_messages():
     lines = ["{not json", _assistant("no marker anywhere")]
+    # '' (not None): the message IS present and parsed — it just marks nothing to speak
     assert speak.extract_from_lines(lines, "🔊", 600) == ""
 
 
@@ -98,8 +118,16 @@ def test_extract_honours_a_custom_marker_and_leading_space():
     assert speak.extract_from_lines(lines, ">>", 600) == "spoken with a custom marker"
 
 
-def test_extract_empty_transcript():
-    assert speak.extract_from_lines([], "🔊", 600) == ""
+def test_extract_is_none_before_any_assistant_message_flushes():
+    # None is the flush-race signature the caller retries on; '' is a decided "nothing to say"
+    assert speak.extract_from_lines([], "🔊", 600) is None
+    assert speak.extract_from_lines(["{not json"], "🔊", 600) is None
+
+
+def test_bare_marker_yields_empty_and_logs(state):
+    assert speak.extract_from_lines([_assistant("🔊")], "🔊", 600) == ""
+    assert speak.extract_from_lines([_assistant("🔊  \n🔊\t")], "🔊", 600) == ""
+    assert "marker with no text" in (state / "speak.log").read_text(encoding="utf-8")
 
 
 # --- resolve_settings: the config-precedence table ----------------------------------------------
@@ -113,7 +141,7 @@ def test_defaults_with_empty_config_linux():
     assert s["max_chars"] == 600
     assert s["timeout"] == 60.0
     assert s["backend"] == "lan"
-    assert s["language"] == "ru"
+    assert s["language"] == "en"  # explicit-language setups always write the key; the default is English
     assert s["key_env"] == "VOICE_LOOP_TTS_API_KEY"
 
 
@@ -132,8 +160,8 @@ def test_empty_string_falls_back_to_default():
 
 
 def test_tts_language_beats_top_level_language_beats_default():
-    assert speak.resolve_settings({"language": "en"}, "Linux")["language"] == "en"
-    both = {"language": "en", "tts": {"language": "de"}}
+    assert speak.resolve_settings({"language": "ru"}, "Linux")["language"] == "ru"
+    both = {"language": "ru", "tts": {"language": "de"}}
     assert speak.resolve_settings(both, "Linux")["language"] == "de"
 
 
@@ -288,3 +316,269 @@ def test_streaming_not_detected_on_garbage_or_no_answer():
     assert speak.server_offers_streaming(b"") is False
     assert speak.server_offers_streaming(b"<html>proxy error</html>") is False
     assert speak.server_offers_streaming(b'["not", "a", "dict"]') is False
+
+
+# --- corrupt config / key files: ignored loudly, never a crash ----------------------------------
+
+
+def test_corrupt_json_config_is_ignored_and_logged(state):
+    bad = state / "config.json"
+    bad.write_text("{not json", encoding="utf-8")
+    assert speak.load_config(str(bad)) == {}
+    logged = (state / "speak.log").read_text(encoding="utf-8")
+    assert "config ignored" in logged and "JSONDecodeError" in logged
+
+
+def test_non_utf8_config_is_ignored_and_logged(state):
+    bad = state / "config.json"
+    bad.write_bytes(b'\xff\xfe{"a": 1}')
+    assert speak.load_config(str(bad)) == {}
+    assert "UnicodeDecodeError" in (state / "speak.log").read_text(encoding="utf-8")
+
+
+def test_absent_config_stays_silent(state):
+    assert speak.load_config(str(state / "absent.json")) == {}
+    assert not (state / "speak.log").exists()
+
+
+def test_non_utf8_key_file_falls_back_to_env_and_never_logs_content(state):
+    key_file = state / "k"
+    key_file.write_bytes(b"\xff\xfe topsecretbytes")
+    assert speak.read_key(str(key_file), "K_ENV", {"K_ENV": "sk-fromenv"}) == "sk-fromenv"
+    logged = (state / "speak.log").read_text(encoding="utf-8")
+    assert "UnicodeDecodeError" in logged
+    assert "topsecret" not in logged
+
+
+# --- the bare-marker fast path: a decided "nothing to say" burns zero backoff -------------------
+
+
+def _run_main_against(transcript_text: str, state, monkeypatch) -> tuple[int, list[float]]:
+    transcript = state / "transcript.jsonl"
+    transcript.write_text(transcript_text + "\n", encoding="utf-8")
+    monkeypatch.setenv("VOICE_LOOP_CONFIG", str(state / "absent.json"))
+    monkeypatch.setattr(speak.sys, "stdin", io.StringIO(json.dumps({"transcript_path": str(transcript)})))
+    sleeps: list[float] = []
+    monkeypatch.setattr(speak.time, "sleep", lambda seconds: sleeps.append(seconds))
+    return speak.main(), sleeps
+
+
+def test_bare_marker_exits_immediately_without_backoff(state, monkeypatch):
+    rc, sleeps = _run_main_against(_assistant("🔊"), state, monkeypatch)
+    assert rc == 0
+    assert sleeps == []  # the old behaviour burned the full 2.65 s schedule here
+    assert "marker with no text" in (state / "speak.log").read_text(encoding="utf-8")
+
+
+def test_unmarked_final_message_exits_immediately_without_backoff(state, monkeypatch):
+    rc, sleeps = _run_main_against(_assistant("plain prose, nothing marked"), state, monkeypatch)
+    assert rc == 0
+    assert sleeps == []
+
+
+def test_a_still_unflushed_transcript_does_retry(state, monkeypatch):
+    rc, sleeps = _run_main_against("{not json yet", state, monkeypatch)
+    assert rc == 0
+    assert sleeps == list(speak.BACKOFF)  # None IS the race signature — the backoff still applies
+
+
+# --- the PID-reuse identity check (duplicated helper — kept in sync with dictate.py) ------------
+
+
+def test_pid_identity_accepts_the_voice_loop_chain_on_linux():
+    player = "aplay -q /tmp/voice-loop-speak-abc123"
+    assert speak.pid_looks_like_speak(9, read_cmdline=lambda pid: player, platform_id="linux") is True
+    python_half = "python3 /repo/plugins/voice-loop/scripts/speak.py"
+    assert speak.pid_looks_like_speak(9, read_cmdline=lambda pid: python_half, platform_id="linux") is True
+
+
+def test_pid_identity_rejects_a_reused_or_gone_pid_on_linux():
+    assert speak.pid_looks_like_speak(9, read_cmdline=lambda pid: "sshd: user@pts/0", platform_id="linux") is False
+    assert speak.pid_looks_like_speak(9, read_cmdline=lambda pid: None, platform_id="linux") is False
+
+
+def test_pid_identity_check_is_skipped_off_linux():
+    def never(pid):
+        raise AssertionError("cmdline must not be read off Linux")
+
+    assert speak.pid_looks_like_speak(9, read_cmdline=never, platform_id="darwin") is True
+
+
+def test_cmdline_of_reads_our_own_process():
+    if not sys.platform.startswith("linux"):
+        pytest.skip("/proc/<pid>/cmdline is Linux-only")
+    cmdline = speak._cmdline_of(os.getpid())
+    assert cmdline is not None and "py" in cmdline  # the pytest python chain
+    assert speak._cmdline_of(2**31 - 2) is None  # unreadable: not a process we can inspect
+
+
+# --- take_over: exactly the recorded pids, each identity-verified -------------------------------
+
+
+def test_take_over_signals_only_identity_verified_pids(state, monkeypatch):
+    (state / "playing.pid").write_text("111 222", encoding="utf-8")
+    monkeypatch.setattr(speak, "pid_looks_like_speak", lambda pid: pid == 111)
+    kills: list[tuple[int, int]] = []
+    monkeypatch.setattr(speak.os, "kill", lambda pid, sig: kills.append((pid, sig)))
+    speak.take_over()
+    assert kills == [(111, speak.signal.SIGTERM)]
+
+
+def test_take_over_never_signals_itself_or_without_a_pidfile(state, monkeypatch):
+    monkeypatch.setattr(speak, "pid_looks_like_speak", lambda pid: True)
+
+    def no_kill(pid, sig):
+        raise AssertionError("nothing may be signalled")
+
+    monkeypatch.setattr(speak.os, "kill", no_kill)
+    speak.take_over()  # no pidfile at all
+    (state / "playing.pid").write_text(f"{os.getpid()} 0", encoding="utf-8")
+    speak.take_over()  # own pid and pid 0 are both skipped
+
+
+def test_take_over_sigterms_a_real_recorded_child(state):
+    """Real-child integration: a long-sleeping child whose argv carries the voice-loop marker is
+    recorded in the pidfile, then taken over — it must receive SIGTERM."""
+    child = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(300)", "voice-loop-speak-integration-marker"]
+    )
+    try:
+        (state / "playing.pid").write_text(str(child.pid), encoding="utf-8")
+        speak.take_over()
+        assert child.wait(timeout=10) == -signal.SIGTERM
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.wait(timeout=10)
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="the identity check is Linux-only")
+def test_take_over_spares_a_real_child_without_the_marker(state):
+    """PID reuse, live: the pidfile points at a same-user process that is NOT voice-loop — it must
+    survive the takeover untouched."""
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(300)"])
+    try:
+        (state / "playing.pid").write_text(str(child.pid), encoding="utf-8")
+        speak.take_over()
+        time.sleep(0.2)  # a delivered SIGTERM would have landed by now
+        assert child.poll() is None
+    finally:
+        child.kill()
+        child.wait(timeout=10)
+
+
+# --- the cloud synthesis request shapes, mocked at the urllib seam ------------------------------
+
+
+class FakeResponse:
+    def __init__(self, body: bytes) -> None:
+        self._body = body
+
+    def read(self) -> bytes:
+        return self._body
+
+    def close(self) -> None:
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        return False
+
+
+class FakeOpener:
+    def __init__(self, body: bytes) -> None:
+        self.body = body
+        self.requests: list[tuple[object, float | None]] = []
+
+    def open(self, request, timeout=None):
+        self.requests.append((request, timeout))
+        return FakeResponse(self.body)
+
+
+@pytest.fixture
+def opener(monkeypatch):
+    holder: dict[str, FakeOpener] = {}
+    monkeypatch.setattr(speak.urllib.request, "build_opener", lambda *handlers: holder["opener"])
+
+    def install(body: bytes) -> FakeOpener:
+        holder["opener"] = FakeOpener(body)
+        return holder["opener"]
+
+    return install
+
+
+def test_elevenlabs_synthesis_posts_the_documented_shape(opener):
+    fake = opener(b"MP3-audio-bytes")
+    config = {
+        "tts": {
+            "backend": "cloud",
+            "cloud": {
+                "provider": "elevenlabs",
+                "voice_id": "v123",
+                "output_format": "mp3_22050_32",
+                "voice_settings": {"stability": 0.6, "style": 0.1},
+            },
+        }
+    }
+    s = speak.resolve_settings(config, "Linux")
+    assert speak.synthesize("hello there", s, "xi-secret") == b"MP3-audio-bytes"
+
+    request, timeout = fake.requests[0]
+    assert request.full_url == "https://api.elevenlabs.io/v1/text-to-speech/v123?output_format=mp3_22050_32"
+    assert request.get_method() == "POST"
+    assert request.get_header("Xi-api-key") == "xi-secret"
+    assert request.get_header("Content-type") == "application/json"
+    assert timeout == 60.0
+    assert json.loads(request.data) == {
+        "text": "hello there",
+        "model_id": "eleven_multilingual_v2",
+        "voice_settings": {"stability": 0.6, "style": 0.1},
+    }
+
+
+def test_elevenlabs_omits_voice_settings_when_unset(opener):
+    fake = opener(b"MP3-audio-bytes")
+    config = {"tts": {"backend": "cloud", "cloud": {"provider": "elevenlabs", "voice_id": "v123"}}}
+    s = speak.resolve_settings(config, "Linux")
+    assert speak.synthesize("hi", s, "xi-secret") == b"MP3-audio-bytes"
+    request, _ = fake.requests[0]
+    assert request.full_url == "https://api.elevenlabs.io/v1/text-to-speech/v123?output_format=mp3_44100_128"
+    assert json.loads(request.data) == {"text": "hi", "model_id": "eleven_multilingual_v2"}
+
+
+def test_openai_compatible_synthesis_posts_the_documented_shape(opener):
+    fake = opener(b"WAV-audio-bytes")
+    config = {
+        "tts": {
+            "backend": "cloud",
+            "endpoint": "https://speech.example.com",
+            "cloud": {"voice_id": "onyx", "model": "gpt-4o-mini-tts"},
+        }
+    }
+    s = speak.resolve_settings(config, "Linux")
+    assert speak.synthesize("hi", s, "sk-secret") == b"WAV-audio-bytes"
+
+    request, timeout = fake.requests[0]
+    assert request.full_url == "https://speech.example.com/v1/audio/speech"
+    assert request.get_method() == "POST"
+    assert request.get_header("Authorization") == "Bearer sk-secret"
+    assert timeout == 60.0
+    assert json.loads(request.data) == {
+        "model": "gpt-4o-mini-tts",
+        "voice": "onyx",
+        "input": "hi",
+        "response_format": "wav",
+    }
+
+
+def test_openai_compatible_defaults_to_the_local_server_and_alloy(opener):
+    fake = opener(b"WAV-audio-bytes")
+    s = speak.resolve_settings({"tts": {"backend": "cloud"}}, "Linux")
+    assert speak.synthesize("hi", s, "sk-secret") == b"WAV-audio-bytes"
+    request, _ = fake.requests[0]
+    assert request.full_url == "http://127.0.0.1:8355/v1/audio/speech"
+    payload = json.loads(request.data)
+    assert payload["voice"] == "alloy"
+    assert payload["model"] == "tts-1"

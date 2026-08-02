@@ -18,7 +18,9 @@ Deliberate behaviours, found by live debugging — do not "simplify" them away:
 * dedup — a same-as-last read IS the stale previous turn, so it is dropped, not spoken twice.
 * takeover — a fresher hook invocation supersedes a still-playing older one. Scoped precisely:
   the speaking chain records its PIDs (this process + the current player/command child) in a
-  pidfile, and a new invocation SIGTERMs exactly those — nothing pattern-matched, nothing else.
+  pidfile, and a new invocation SIGTERMs exactly those — nothing pattern-matched, nothing else —
+  after confirming via /proc/<pid>/cmdline that each pid still IS the voice-loop chain (a
+  pidfile outlives its process, and the kernel recycles PIDs).
 * streaming — the marked text is split into sentence chunks (tiny sentences merged so a chunk is
   at least ~MIN_CHUNK_CHARS chars); chunk 1 starts playing as soon as IT is synthesized, and the
   next chunk synthesizes while the previous one plays. Perceived latency is one small synthesis,
@@ -70,6 +72,12 @@ _SENTENCE_END = re.compile(r"(?<=[.!?…])\s+")
 _STATE_DIR = os.path.join(os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state")), "voice-loop")
 _LOG_PATH = os.path.join(_STATE_DIR, "speak.log")
 _LAST_PATH = os.path.join(_STATE_DIR, "last-spoken")
+
+# CROSS-SCRIPT CONTRACT (keep in sync with dictate.py): playing.pid holds the space-separated
+# PIDs of the live speaking chain — this python process first, then the current player/command
+# child. dictate.py's echo guard reads THIS file to stop in-flight playback before recording
+# (its pkill fallback only fires when the file is absent), and both takeover paths verify each
+# pid via /proc/<pid>/cmdline before signalling (PID-reuse guard).
 _PID_PATH = os.path.join(_STATE_DIR, "playing.pid")
 
 # state the SIGTERM handler (takeover by a fresher invocation) must be able to reach:
@@ -93,7 +101,12 @@ def load_config(path: str) -> dict:
         with open(path, encoding="utf-8") as fh:
             loaded = json.load(fh)
         return loaded if isinstance(loaded, dict) else {}
-    except (OSError, ValueError):
+    except FileNotFoundError:
+        return {}  # no config at all is the normal zero-setup case — not worth a log line
+    except (OSError, ValueError) as err:
+        # ValueError covers both corrupt JSON and UnicodeDecodeError (a non-UTF-8 file); one
+        # informative line so a broken config is diagnosable instead of silently ignored
+        log(f"config ignored ({path}): {type(err).__name__}: {err}")
         return {}
 
 
@@ -128,7 +141,7 @@ def resolve_settings(config: dict, system: str) -> dict:
         "speaker": speaker,
         # top-level "language" is the one the user sets; ".tts.language" is the advanced escape for
         # people who dictate in one language and listen in another.
-        "language": str(cfg(config, "tts.language", cfg(config, "language", "ru"))),
+        "language": str(cfg(config, "tts.language", cfg(config, "language", "en"))),
         "command": str(cfg(config, "tts.command", "")),
         "provider": provider,
         "voice_id": str(cfg(config, "tts.cloud.voice_id", speaker)),
@@ -149,13 +162,19 @@ def read_key(key_file: str, key_env: str, environ) -> str:
         try:
             with open(path, encoding="utf-8") as fh:
                 return re.sub(r"[ \t\r\n]", "", fh.read())
-        except OSError:
-            pass
+        except (OSError, UnicodeDecodeError) as err:
+            # the type name only — never the file's content (it may be a half-corrupt key)
+            log(f"key file unreadable ({path}): {type(err).__name__} — falling back to ${key_env}")
     return environ.get(key_env, "")
 
 
-def extract_from_lines(lines, marker: str, limit: int) -> str:
-    """Marker-tagged text of the LAST assistant message, joined and clipped — '' when none."""
+def extract_from_lines(lines, marker: str, limit: int) -> str | None:
+    """Marker-tagged text of the LAST assistant message, joined and clipped.
+
+    Returns None when NO assistant message has reached the transcript yet — the flush-race
+    signature the caller retries on — and '' when the last assistant message IS present and
+    parsed but yields no spoken text (no marker line, or a bare marker with nothing after it):
+    a re-read cannot change a parsed message, so '' means exit at once, never backoff."""
     last = None
     for line in lines:
         try:
@@ -169,17 +188,20 @@ def extract_from_lines(lines, marker: str, limit: int) -> str:
         if any(parts):
             last = "\n".join(parts)
     if not last:
-        return ""
-    out = [ln.lstrip()[len(marker):].strip() for ln in last.splitlines() if ln.lstrip().startswith(marker)]
-    return " ".join(x for x in out if x)[:limit]
+        return None
+    marked = [ln.lstrip()[len(marker):].strip() for ln in last.splitlines() if ln.lstrip().startswith(marker)]
+    out = [x for x in marked if x]
+    if marked and not out:
+        log("marker with no text")  # a bare marker is a decided "nothing to say", not a race
+    return " ".join(out)[:limit]
 
 
-def extract(path: str, marker: str, limit: int) -> str:
+def extract(path: str, marker: str, limit: int) -> str | None:
     try:
         with open(path, encoding="utf-8") as fh:
             return extract_from_lines(fh, marker, limit)
     except OSError:
-        return ""
+        return None  # an unreadable transcript is "nothing extracted yet", retried like a race
 
 
 def chunk_sentences(text: str, min_chars: int = MIN_CHUNK_CHARS) -> list[str]:
@@ -383,16 +405,50 @@ def _write_pidfile(*pids: int) -> None:
         pass
 
 
+def _cmdline_of(pid: int) -> str | None:
+    """/proc/<pid>/cmdline with NULs as spaces — None when unreadable (process already gone, or
+    not ours to inspect). Linux-only by construction; callers gate on the platform.
+    Duplicated helper — keep in sync with dictate.py."""
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as fh:
+            raw = fh.read()
+    except OSError:
+        return None
+    return raw.replace(b"\0", b" ").decode("utf-8", "replace")
+
+
+def pid_looks_like_speak(pid: int, read_cmdline=_cmdline_of, platform_id: str = sys.platform) -> bool:
+    """PID-reuse guard (duplicated helper — keep in sync with dictate.py): a pidfile outlives its
+    process and the kernel recycles PIDs, so before SIGTERMing a recorded pid, confirm it still
+    looks like the voice-loop speaking chain: the player child's argv carries the
+    "voice-loop-speak-" temp-WAV prefix, the python half of the chain carries "speak.py".
+
+    Non-Linux has no /proc/<pid>/cmdline; rather than depend on parsing `ps` there, the check is
+    skipped and the historical raw-signal behaviour kept (the pidfile is same-user state, so the
+    blast radius of a stale pid is one same-user SIGTERM — unchanged from before). On Linux an
+    unreadable cmdline means the process is already gone (nothing to stop) or is not ours to
+    inspect (then not ours to signal either) — both mean: do not signal."""
+    if not platform_id.startswith("linux"):
+        return True
+    cmdline = read_cmdline(pid)
+    if cmdline is None:
+        return False
+    return "voice-loop-speak" in cmdline or "speak.py" in cmdline
+
+
 def take_over() -> None:
     """A fresher line supersedes a still-playing older one: SIGTERM exactly the PIDs the previous
-    chain recorded (its python process + its current player child) — nothing else."""
+    chain recorded (its python process + its current player child) — nothing else — and only
+    after each pid passes the PID-reuse guard above. A tts.command child records no marker in its
+    own argv, but killing its identity-verified python parent stops it too (the SIGTERM handler
+    terminates the child). Same semantics as dictate.py's echo guard (cross-script contract)."""
     try:
         with open(_PID_PATH, encoding="utf-8") as fh:
             pids = [int(tok) for tok in fh.read().split()]
     except (OSError, ValueError):
         return
     for pid in pids:
-        if pid and pid != os.getpid():
+        if pid and pid != os.getpid() and pid_looks_like_speak(pid):
             try:
                 os.kill(pid, signal.SIGTERM)
             except (ProcessLookupError, PermissionError):
@@ -530,10 +586,12 @@ def main() -> int:
     except OSError:
         prev = ""
 
-    # Flush race: read immediately; retry ONLY on the race signatures (empty, or same-as-last).
+    # Flush race: read immediately; retry ONLY on the race signatures — nothing extracted yet
+    # (None), or an extract identical to the previously spoken line. A parsed last message that
+    # yields '' (no marker, or a marker with no text) is FINAL: exit at once, zero backoff.
     text = extract(transcript, s["marker"], s["max_chars"])
     for pause in BACKOFF:
-        if text and text != prev:
+        if text == "" or (text and text != prev):
             break
         time.sleep(pause)
         text = extract(transcript, s["marker"], s["max_chars"])
