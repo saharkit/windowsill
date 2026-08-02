@@ -621,8 +621,11 @@ async def tts_stream_endpoint(payload: dict) -> Response:
                 yield event("chunk", {"index": sent, "audio": audio})
                 sent += 1
         except Exception as exc:
+            # The full exception stays in the server log; the client gets the class name at most —
+            # str(exc) can carry paths, config values and other internals (CodeQL: information
+            # exposure through an exception).
             log.exception("streaming synthesis failed after %d chunk(s)", sent)
-            yield event("error", {"error": str(exc), "chunks": sent})
+            yield event("error", {"error": f"synthesis failed ({type(exc).__name__})", "chunks": sent})
             return
         yield event("end", {"chunks": sent})
 

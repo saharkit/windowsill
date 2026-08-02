@@ -171,7 +171,7 @@ Three event types, in this order:
 |---|---|---|
 | `chunk` | `{"index": 0, "audio": "<base64>"}` | one **complete, standalone WAV file** (own header, engine sample rate: 48 kHz Silero / 24 kHz XTTS). Decode base64, play, done. `index` counts from 0 in order. |
 | `end` | `{"chunks": N}` | terminal success — N `chunk` events were sent |
-| `error` | `{"error": "...", "chunks": N}` | terminal failure **mid-stream** (the `200` already left with the first bytes, so a late failure becomes the last event, never a 500). N chunks were already sent and are valid. |
+| `error` | `{"error": "synthesis failed (<ExceptionClass>)", "chunks": N}` | terminal failure **mid-stream** (the `200` already left with the first bytes, so a late failure becomes the last event, never a 500). N chunks were already sent and are valid. The message is deliberately generic — the exception class name at most; the full detail stays in the server log. |
 
 A stream always ends with exactly one `end` **or** one `error` event. Requests refused *before*
 synthesis starts (empty text, unsupported language, misconfigured xtts) return plain JSON `400`/`500`

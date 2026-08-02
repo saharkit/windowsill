@@ -87,10 +87,27 @@ def test_stream_mid_stream_failure_ends_with_a_terminal_error_event(client, monk
     assert response.status_code == 200  # the status left with the first bytes; the failure is an event
     parsed = events(response.text)
     assert parsed[0][0] == "chunk"
-    assert parsed[-1] == ("error", {"error": "model said no", "chunks": 1})
+    assert parsed[-1] == ("error", {"error": "synthesis failed (RuntimeError)", "chunks": 1})
     assert "streaming synthesis failed after 1 chunk(s)" in caplog.text
     # the app survives: the very next request is served normally
     assert client.get("/health").json()["ok"] is True
+
+
+def test_stream_error_event_never_carries_exception_internals(client, monkeypatch):
+    """What str(exc) says stays in the server log — the wire gets the class name at most."""
+    secret = "/home/user/.secret/reference.wav is unreadable"
+    model = FakeSilero()
+
+    def explode(self, text: str, speaker: str, sample_rate: int):
+        raise RuntimeError(secret)
+
+    monkeypatch.setattr(FakeSilero, "apply_tts", explode)
+    monkeypatch.setattr(voice_server, "tts", lambda language: model)
+
+    response = client.post("/tts/stream", json={"text": "Привет."})
+
+    assert secret not in response.text
+    assert events(response.text)[-1] == ("error", {"error": "synthesis failed (RuntimeError)", "chunks": 0})
 
 
 def test_stream_refuses_bad_requests_with_plain_json_like_tts(client, fake_silero):
