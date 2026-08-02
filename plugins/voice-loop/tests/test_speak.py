@@ -329,7 +329,8 @@ def test_streaming_not_detected_on_garbage_or_no_answer():
 # production code truncates with int(), and 0.3 s would land on 2299 instead of 2300.
 EXTRACT_SECONDS = 0.25  # the transcript read, before any audio path is entered
 PRE_AUDIO_SECONDS = 2.0  # /health + stream open + the first synthesis: the wait that was invisible
-FIRST_AUDIO_MS = 2250  # what the two paths below must BOTH report
+PLAYBACK_SECONDS = 0.5  # how long one chunk takes to play, i.e. what a player process costs
+FIRST_AUDIO_MS = 2250  # what every path below must report, however the wait was spent
 
 
 class FakeClock:
@@ -363,7 +364,7 @@ class FakePlayerProcess:
         return self.returncode
 
 
-def _measure_first_audio_ms(monkeypatch, build_source, playback: float = 0.5):
+def _measure_first_audio_ms(monkeypatch, build_source, playback: float = PLAYBACK_SECONDS):
     """Run one audio path under a driven clock and return (_play_stream result, spawn instants).
 
     The shape is the same for both paths: t0 at hook start, EXTRACT_SECONDS for the transcript
@@ -496,6 +497,136 @@ def test_a_still_unflushed_transcript_does_retry(state, monkeypatch):
     rc, sleeps = _run_main_against("{not json yet", state, monkeypatch)
     assert rc == 0
     assert sleeps == list(speak.BACKOFF)  # None IS the race signature — the backoff still applies
+
+
+# --- end to end: the timings line main() actually LOGS ------------------------------------------
+#
+# The cases above pin _play_stream's contract, but they hand it a t0 themselves — so they cannot
+# see the bug, which lived in main()'s COMPOSITION: which clock gets passed at the call site. These
+# drive the real main() from stdin to the emitted log line, with every I/O seam faked and time
+# charged in named slices, so a fresh `time.monotonic()` at either call site is caught.
+
+HEALTH_SECONDS = 0.125  # the /health probe, before any synthesis is even requested
+OPEN_SECONDS = 0.125  # POSTing /tts/stream and getting a response back
+STREAM_SYNTH_SECONDS = 1.75  # the server's first chunk — waited out by stream_source's eager pull
+BLOB_SYNTH_SECONDS = 1.875  # the blob path's first /tts call, pulled lazily inside _play_stream
+CHUNK_GAP_SECONDS = 0.125  # the server producing chunk 2 while chunk 1 plays
+# Both paths are budgeted to the SAME time-to-first-sound, so one expected number covers both:
+#   stream: 0.25 extract + 0.125 health + 0.125 open + 1.75  synth = 2.25 s
+#   blob:   0.25 extract + 0.125 health +               1.875 synth = 2.25 s
+
+
+class FakeStreamResponse:
+    """What _open_stream hands back: an iterable of raw SSE lines that can be closed."""
+
+    def __init__(self, lines) -> None:
+        self._lines = lines
+        self.closed = False
+
+    def __iter__(self):
+        return iter(self._lines)
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def _timings_logged(state) -> dict[str, int]:
+    """The `timings …` line parsed back into numbers — the hook's actual published contract."""
+    logged = (state / "speak.log").read_text(encoding="utf-8")
+    lines = [line for line in logged.splitlines() if " timings " in line]
+    assert len(lines) == 1, f"expected exactly one timings line, got: {lines}"
+    fields = lines[0].split("timings ", 1)[1].split()
+    assert [f.split("=")[0] for f in fields] == ["extract_ms", "first_audio_ms", "total_ms"]
+    return {key: int(value) for key, value in (f.split("=") for f in fields)}
+
+
+def _run_hook_on_a_driven_clock(state, monkeypatch, *, streaming: bool):
+    """Run the REAL main() end to end with time under the test's control.
+
+    Every seam that costs a listener time is faked to charge a named slice to the clock: the
+    transcript read, the /health probe, then either opening the stream and the server's first
+    chunk, or the blob path's first synthesis. The player is a fake process whose `wait` is
+    playback. Returns (rc, spawn offsets in ms from hook start, the log text).
+    """
+    clock = FakeClock()
+    monkeypatch.setattr(speak.time, "monotonic", clock)
+    t0 = clock()  # main() takes its own t0 first thing; on this clock it is exactly this instant
+
+    real_extract = speak.extract
+
+    def slow_extract(path, marker, limit):
+        clock.advance(EXTRACT_SECONDS)  # the transcript read, incl. any flush-race retries
+        return real_extract(path, marker, limit)
+
+    def slow_health(url, timeout):
+        clock.advance(HEALTH_SECONDS)
+        return b'{"ok": true, "streaming": true}' if streaming else b'{"ok": true}'
+
+    def slow_open_stream(endpoint, payload, timeout):
+        clock.advance(OPEN_SECONDS)
+
+        def sse_lines():
+            clock.advance(STREAM_SYNTH_SECONDS)  # the first chunk: the wait that was invisible
+            yield from _chunk(0, WAV_A)
+            clock.advance(CHUNK_GAP_SECONDS)
+            yield from _chunk(1, WAV_B)
+            yield from _event("end", {"chunks": 2})
+
+        return FakeStreamResponse(sse_lines())
+
+    def slow_synthesize(text, s, key):
+        clock.advance(BLOB_SYNTH_SECONDS)
+        return WAV_A
+
+    monkeypatch.setattr(speak, "extract", slow_extract)
+    monkeypatch.setattr(speak, "_get", slow_health)
+    monkeypatch.setattr(speak, "_open_stream", slow_open_stream)
+    monkeypatch.setattr(speak, "synthesize", slow_synthesize)
+
+    spawns: list[float] = []
+
+    def fake_popen(argv, **kwargs):
+        spawns.append(clock())
+        return FakePlayerProcess(clock, PLAYBACK_SECONDS)
+
+    monkeypatch.setattr(speak.subprocess, "Popen", fake_popen)
+
+    line = "The dawn comes and the latency number finally tells the truth."
+    rc, sleeps = _run_main_against(_assistant(f"🔊 {line}"), state, monkeypatch)
+    assert sleeps == []  # the transcript is flushed; no backoff may pollute the measurement
+    return rc, [round((at - t0) * 1000) for at in spawns], (state / "speak.log").read_text(encoding="utf-8")
+
+
+def test_logged_first_audio_ms_counts_the_wait_before_the_stream_s_first_chunk(state, monkeypatch):
+    """The bug's real shape, end to end: /health + stream open + the first chunk all elapse before
+    _play_stream is entered, and the LOGGED number must still contain them."""
+    rc, spawns, logged = _run_hook_on_a_driven_clock(state, monkeypatch, streaming=True)
+
+    assert rc == 0
+    assert "via=stream" in logged  # the streaming call site really is the one under test
+    timings = _timings_logged(state)
+    assert timings["extract_ms"] == 250
+    assert timings["first_audio_ms"] == FIRST_AUDIO_MS  # NOT the ~0 a call-site clock would report
+    assert spawns[0] == timings["first_audio_ms"]  # sound begins when the first player is spawned
+    # one clock, in order: the read is inside the wait for sound, which is inside the whole run
+    assert timings["extract_ms"] < timings["first_audio_ms"] < timings["total_ms"]
+    expected_total = FIRST_AUDIO_MS + round((CHUNK_GAP_SECONDS + 2 * PLAYBACK_SECONDS) * 1000)
+    assert timings["total_ms"] == expected_total
+
+
+def test_logged_first_audio_ms_counts_the_blob_path_s_first_synthesis(state, monkeypatch):
+    """The other call site: an older server sends the hook down the blob path, where the first
+    synthesis happens lazily INSIDE _play_stream — same definition, same number."""
+    rc, spawns, logged = _run_hook_on_a_driven_clock(state, monkeypatch, streaming=False)
+
+    assert rc == 0
+    assert "via=tts" in logged  # the /health probe declined streaming, so this is the blob path
+    timings = _timings_logged(state)
+    assert timings["extract_ms"] == 250
+    assert timings["first_audio_ms"] == FIRST_AUDIO_MS
+    assert spawns == [timings["first_audio_ms"]]
+    assert timings["extract_ms"] < timings["first_audio_ms"] < timings["total_ms"]
+    assert timings["total_ms"] == FIRST_AUDIO_MS + round(PLAYBACK_SECONDS * 1000)
 
 
 # --- the PID-reuse identity check (duplicated helper — kept in sync with dictate.py) ------------
