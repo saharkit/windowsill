@@ -20,11 +20,61 @@ claude plugin marketplace add saharkit/windowsill
 (or, from inside a running Claude Code session, the slash-command form: `/plugin marketplace add
 saharkit/windowsill`.)
 
-Then install what you want — this one is typed **inside a session**, not in your shell:
+Then install what you want — in the shell, or inside a session as `/plugin install
+<plugin>@windowsill`:
 
-```text
-/plugin install <plugin>@windowsill
+```sh
+claude plugin install <plugin>@windowsill
 ```
+
+### The whole ritual, as a tester runs it
+
+Four commands, in this order, on a machine that has never seen this shelf:
+
+```sh
+claude plugin marketplace add saharkit/windowsill   # 1. add the shelf
+claude plugin list --available --json               # 2. read what is on it
+claude plugin install voice-loop@windowsill         # 3. take one down
+claude plugin details voice-loop                    # 4. see what you took
+```
+
+Three things in that sequence surprise people, and none of them is a fault of the shelf:
+
+- **`claude plugin list` with no flags lists what is _installed_, not what is available.** Straight
+  after step 1 it says "No plugins installed" — which is correct, because you have not installed
+  anything yet. The catalog is step 2, and it needs **both** flags: `--available` without `--json`
+  is silently ignored and you get the installed list again, which is the exact way this reads as
+  "list does not work".
+- **There is no `marketplace info`.** `claude plugin marketplace` has exactly four verbs: `add`,
+  `list`, `remove`, `update`. What a marketplace carries is read with `list --available --json`.
+- **`details` resolves an _installed_ plugin**, so there is no read-it-before-you-install for a
+  `plugin@marketplace` id. Until there is, clone and point one invocation at the checkout:
+
+  ```sh
+  git clone https://github.com/saharkit/windowsill
+  claude --plugin-dir windowsill/plugins/voice-loop plugin details voice-loop
+  ```
+
+  `--plugin-dir` is a flag on `claude` itself and goes **before** the subcommand. It loads the
+  plugin for that one command, so you get its component inventory and projected token cost —
+  skills, hooks, always-on tokens — with nothing installed and nothing left behind.
+
+Two more commands worth knowing, neither of them part of the ritual: `claude plugin validate
+<path> --strict` checks a manifest (this repository's own, or a plugin's) and fails on
+unrecognized fields and missing metadata; `claude plugin eval <path>` runs a plugin's `evals/`
+cases — voice-loop seeds three, see
+[`plugins/voice-loop/evals/`](plugins/voice-loop/evals/README.md).
+
+One sentence on pinning, because a directory reader will ask: the official marketplace pins
+third-party plugins by `ref` + `sha`, since their sources are other repositories. Everything here
+is a **relative source inside this repository** (`./plugins/<name>`), so the marketplace clone you
+added *is* the pin — you run what `marketplace add` fetched until you run `marketplace update`.
+Each entry also carries the metadata a directory reads without cloning — author, homepage, license,
+keywords, category ([issue #20](https://github.com/saharkit/windowsill/issues/20)). That lives in
+the manifest; `list --available --json` projects a narrower view of it (id, description, version,
+source), so read `.claude-plugin/marketplace.json` for the rest. Keeping this page true to what the
+CLI actually does is the conformance pass in
+[issue #56](https://github.com/saharkit/windowsill/issues/56).
 
 ## What is on the sill
 
@@ -52,6 +102,7 @@ plugins/<name>/
   README.md                    the plugin's own front page (the table above links to it)
   hooks/ scripts/ skills/      whatever the plugin actually ships
   tests/ + its runner config   its own suite, invoked from its own directory
+  evals/                       its `claude plugin eval` cases, if it has any
   docs/                        its own deeper reading, if it needs any
 ```
 
@@ -60,7 +111,10 @@ The rules that follow from that:
 - **The version lives in `plugins/<name>/.claude-plugin/plugin.json`** and is mirrored into
   `.claude-plugin/marketplace.json` and into the catalog row above. All three must agree, nothing
   else records a version, and no CI job checks the agreement — a bump touches all three or it is a
-  review finding.
+  review finding. The plugin's directory metadata (author, homepage, license, keywords) is mirrored
+  the same way and carries the same obligation; `category` is the one field that belongs **only**
+  to the marketplace entry, and `claude plugin validate <path> --strict` says so if you put it in
+  the wrong file.
 - **Tests belong to the plugin.** Its runner configuration (`pytest.ini`, `.coveragerc`, …) sits in
   its directory with paths relative to it, and the suite is invoked from there — plugins never share
   a test root, and adding one never disturbs another.

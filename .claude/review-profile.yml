@@ -78,6 +78,16 @@ rules:
       QA owns whether a test actually proves anything; architect owns whether the fake sits at the
       seam it claims and the suite stays runnable without models, network or hardware.
 
+  - paths: ["plugins/*/evals/**"]
+    lenses: [architect, qa, security]
+    why: >-
+      `claude plugin eval` cases, and the README stating their policy. QA owns whether a grader
+      pins the contract it names — a pattern loose enough to match any answer proves nothing, and
+      an eval that cannot fail is worse than none. Architect owns that they stay the plugin's own
+      rather than the shelf's, and free-grader (no judge model in a verdict). Security because a
+      case file is executable surface: `context.scaffold_script` runs author-supplied bash as
+      whoever passes `--scaffold`, and `execution.allowed_tools` grants gated tools to the run.
+
   - paths: ["plugins/*/pytest.ini", "plugins/*/.coveragerc"]
     lenses: [architect, qa]
     why: >-
@@ -109,8 +119,10 @@ rules:
       Prose. No mandatory lens — accuracy against the tree is the author's job. This is the last
       rule, so it only catches what nothing above claimed: `plugins/*/server/README.md` never
       reaches it (`plugins/*/server/**` claims it first, at three lenses, and its XTTS pins are
-      mechanically checked by the xtts-install-probe workflow), and neither do README.md,
-      CLAUDE.md or TESTING.md.
+      mechanically checked by the xtts-install-probe workflow), `plugins/*/evals/README.md` never
+      reaches it either (`plugins/*/evals/**` claims it, and it states that suite's read-only,
+      free-grader policy rather than describing a feature), and neither do README.md, CLAUDE.md
+      or TESTING.md.
 
 # Anything unmatched (a new top-level path, a new plugin shape) falls back to the two-lens minimum.
 default:

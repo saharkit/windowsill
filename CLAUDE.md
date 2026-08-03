@@ -21,6 +21,14 @@ It is recorded in **three** places in all: that manifest, its mirror in
 three must agree, and **nothing in CI checks that they do** — a bump that misses one is caught by a
 reviewer or not at all. Do not add a fourth site (this file deliberately names no version number).
 
+The rest of a plugin's **directory metadata** — author, homepage, repository, license, keywords — is
+mirrored between the same first two manifests and carries the same drift obligation; `category` is
+marketplace-entry-only (`plugin.json` tolerates it, ignores it at load time, and says so under
+`--strict`). What a machine *can* check here is field validity: `claude plugin validate <path>
+--strict` reads either manifest and fails on unrecognized fields, a malformed URL or absent
+metadata. It is not in CI — the `claude` CLI is not on the runners — so it is a pre-review habit
+rather than a gate.
+
 On the shelf today: **`plugins/voice-loop`** — two-way voice for Claude Code.
 
 ## Stack, per plugin tree
@@ -47,6 +55,12 @@ removed; the XTTS engine's own pins are deliberately NOT in it — see `server/R
 - `tests/`, `pytest.ini`, `.coveragerc` live in the plugin directory and are invoked from there. The
   suite touches **no models, no network and no audio hardware** — expensive dependencies are faked at
   a seam while the real function bodies run.
+- `evals/` holds three `claude plugin eval` cases (`evals/<case>/case.yaml`), run by hand with
+  `claude plugin eval plugins/voice-loop`. They are the machine-checkable half of the conformance
+  pass, and they are **not a gate**: they spend model tokens per run and the CLI is not on the CI
+  runners. Every assertion is a free `regex` grader over the final message, and no case grants a
+  gated tool, so a run installs, writes and executes nothing. `evals/README.md` states that policy;
+  `evals/results/` is a generated artifact and is git-ignored.
 
 ## The gates, as CI runs them today
 

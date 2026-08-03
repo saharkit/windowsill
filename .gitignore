@@ -14,3 +14,9 @@ htmlcov/
 # Local environments — never shared; each machine builds its own.
 .venv/
 venv/
+
+# `claude plugin eval` results. The default --output-dir is ./evals/results/<timestamp>/ relative
+# to where you ran it, so the pattern is unanchored to catch both a run from the repository root
+# and one from inside a plugin directory. A run's aggregate-result.json and HTML report carry
+# machine paths, timings and token costs: local evidence, not tree state.
+**/evals/results/

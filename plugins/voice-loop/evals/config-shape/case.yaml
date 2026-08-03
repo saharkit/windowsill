@@ -1,0 +1,53 @@
+# Does the plugin teach the agent the config file it owns — path, keys and values?
+# Everything here is graded by regex over the final message: no model judge, no cost beyond the
+# run itself, and the same verdict on every machine.
+schema_version: "1.0"
+name: config-shape
+description: >-
+  A LAN + German setup, asked for as a config file rather than an install. The agent must name
+  ~/.config/voice-loop/config.json and fill in the three values the request pins.
+tags:
+  - voice-loop
+  - config
+
+execution:
+  prompt: |-
+    I have just installed the voice-loop plugin. Set it up for German: both speech recognition
+    and synthesis should go through a voice-loop server on my LAN at http://192.168.1.50:8355.
+
+    Do not install anything and do not run any commands on this machine — I only want the
+    configuration: tell me the path of the file and show me its full contents.
+  max_turns: 6
+  timeout_seconds: 240
+
+runs: 3
+
+graders:
+  - type: regex
+    name: names-the-config-file
+    target: last_message
+    pattern: '\.config/voice-loop/config\.json'
+    match: contains
+
+  - type: regex
+    name: language-is-german
+    target: last_message
+    pattern: '"language"\s*:\s*"de"'
+    match: contains
+
+  - type: regex
+    name: both-backends-are-lan
+    target: last_message
+    pattern: '"backend"\s*:\s*"lan"'
+    match: contains
+
+  - type: regex
+    name: endpoint-is-the-one-asked-for
+    target: last_message
+    pattern: '"endpoint"\s*:\s*"http://192\.168\.1\.50:8355"'
+    match: contains
+
+expected_outcome: >-
+  The reply names ~/.config/voice-loop/config.json and shows a config whose language is "de" and
+  whose stt and tts blocks both use the "lan" backend against http://192.168.1.50:8355. Without the
+  plugin loaded the agent has no way to know this schema, so the baseline arm should score near zero.

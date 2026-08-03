@@ -12,9 +12,20 @@
       "description": "Talk to Claude Code and hear it answer: a Stop hook speaks marker-tagged lines, a push-to-talk script dictates into the prompt, and /voice-setup installs it all. Local, LAN, or cloud speech backends.",
       "version": "0.3.2",
       "author": {
-        "name": "Sahar"
+        "name": "Sahar",
+        "url": "https://github.com/saharkit"
       },
+      "homepage": "https://github.com/saharkit/windowsill/tree/main/plugins/voice-loop",
+      "repository": "https://github.com/saharkit/windowsill",
+      "license": "MIT",
       "category": "productivity",
+      "keywords": [
+        "voice",
+        "tts",
+        "stt",
+        "dictation",
+        "accessibility"
+      ],
       "source": "./plugins/voice-loop"
     }
   ]

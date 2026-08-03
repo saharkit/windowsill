@@ -197,6 +197,7 @@ plugins/voice-loop/
   skills/voice-design/        voice casting
   server/                     the self-hostable speech server (FastAPI + faster-whisper + Silero), Dockerfile
   tests/                      the server's unit tests (no models, no network) — 100% gated in CI
+  evals/                      `claude plugin eval` cases for the skills (run by hand, not a gate)
   docs/                       architecture, troubleshooting, FAQ
   pytest.ini, .coveragerc     this plugin's own test run (invoked from this directory)
   TESTING.md                  the human acceptance checklist
@@ -238,9 +239,13 @@ transcript (case, punctuation and stress marks ignored). No microphone, no speak
 runs in a bare container, and it is what CI runs on Linux and macOS on every commit.
 
 The server's own Python is unit-tested with a hard 100% coverage gate on Python 3.10–3.13, and the
-Stop hook is invoked for real in CI. The parts a machine cannot check for you — the hotkey, a real
-microphone, whether you actually hear it — are a written checklist. Both halves, and what the
-coverage number honestly claims, are in [TESTING.md](TESTING.md).
+Stop hook is invoked for real in CI. What the skills *teach* is checked separately, by a real
+session: `claude plugin eval plugins/voice-loop` runs the three cases in
+[`evals/`](evals/README.md) — the config file, the green-but-silent diagnosis, the
+never-a-key-in-the-config rule — each graded by pattern rather than by a judge model. The parts a
+machine cannot check for you — the hotkey, a real microphone, whether you actually hear it — are a
+written checklist. All of it, and what the coverage number honestly claims, is in
+[TESTING.md](TESTING.md).
 
 **Uninstalling:** removing the plugin does not remove the 🔊 line from your `CLAUDE.md`, the
 config/state dirs (`~/.config/voice-loop/`, `~/.local/state/voice-loop/`), downloaded models under

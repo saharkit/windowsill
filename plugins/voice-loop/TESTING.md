@@ -96,6 +96,23 @@ Real invocation is the guarantee for the runtime path. Every spoken run also log
 `timings extract_ms=… first_audio_ms=… total_ms=…` to `~/.local/state/voice-loop/speak.log`, so a
 latency claim is checkable against the state log rather than taken on faith.
 
+### The skills — `claude plugin eval`, run by hand
+
+Nothing above touches the two skills. What `voice-setup` teaches an agent is *behaviour*, and CI has
+no model to put the question to. `evals/` holds three cases for `claude plugin eval` that ask a real
+session instead: the config file this plugin owns, the green-but-silent diagnosis, and the
+cloud-key-indirection rule. Each is graded by `regex` over the final answer, so a verdict costs no
+judge model and reads the same on every machine, and no case grants a gated tool — a run installs,
+writes and executes nothing.
+
+```sh
+claude plugin eval plugins/voice-loop        # from the repository root
+```
+
+It is **not a gate**: it spends model tokens per run and the `claude` CLI is not on the CI runners.
+Run it by hand, beside the checklist below. [`evals/README.md`](evals/README.md) states the policy
+and what is still missing (the redaction contract, which arrives with its own ticket).
+
 ### What neither of those covers
 
 The hotkey, the microphone, the paste keystroke into a real window, the Accessibility consent, and
@@ -124,12 +141,19 @@ Environment under test:
 
 ## 1. Install from the marketplace, clean machine
 
+Rows 1.1–1.4 are the tester ritual from the shelf README, run **verbatim, in this order** — the
+README is wrong if any of them needs an undocumented extra step.
+
 | # | check | expected | observed | pass |
 |---|---|---|---|---|
 | 1.1 | `claude plugin marketplace add saharkit/windowsill` (shell), or `/plugin marketplace add saharkit/windowsill` in a session | marketplace added, no errors | | |
-| 1.2 | `/plugin install voice-loop@windowsill` | plugin installs; it appears in `/plugin` | | |
-| 1.3 | Start a fresh session | no hook errors in the session; the Stop hook is registered | | |
-| 1.4 | `/voice-setup` is offered / discoverable by name | the skill is listed | | |
+| 1.2 | `claude plugin list --available --json` | JSON with `installed` and `available`; voice-loop is under `available` as `voice-loop@windowsill`, with its description, version `0.3.2` and source `./plugins/voice-loop`. (Plain `claude plugin list` printing nothing here is CORRECT — it lists what is *installed*) | | |
+| 1.3 | `claude plugin install voice-loop@windowsill` (or `/plugin install voice-loop@windowsill` in a session) | plugin installs; it appears in `/plugin` | | |
+| 1.4 | `claude plugin details voice-loop` | component inventory: 2 skills, 2 hooks, and a projected token cost | | |
+| 1.5 | Start a fresh session | no hook errors in the session; the Stop hook is registered | | |
+| 1.6 | `/voice-setup` is offered / discoverable by name | the skill is listed | | |
+| 1.7 | On a clone, BEFORE installing: `claude --plugin-dir <clone>/plugins/voice-loop plugin details voice-loop` | the same inventory as 1.4, with nothing installed — the documented workaround for the missing details-before-install path | | |
+| 1.8 | `claude plugin validate . --strict` and `claude plugin validate plugins/voice-loop --strict`, on a clone | both pass, no warnings | | |
 
 ## 2. `/voice-setup` under DEFAULT permission mode
 

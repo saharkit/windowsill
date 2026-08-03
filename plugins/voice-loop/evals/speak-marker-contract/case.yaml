@@ -1,0 +1,49 @@
+# The plugin's most-reported non-bug: everything is installed and green, and nothing is ever
+# spoken, because nothing has told the model to WRITE a marked line. The fix is one convention
+# line in a CLAUDE.md — this case checks the agent reaches it instead of debugging the audio path.
+schema_version: "1.0"
+name: speak-marker-contract
+description: >-
+  A green install that stays silent. The agent must diagnose the missing speak convention: the
+  marker, the CLAUDE.md that carries it, and the one-line instruction itself.
+tags:
+  - voice-loop
+  - troubleshooting
+
+execution:
+  prompt: |-
+    voice-loop is installed on this machine and /voice-setup finished green — the loopback
+    selftest passes and the server's /health endpoint is fine. But when a turn ends, nothing is
+    ever spoken.
+
+    What is missing, and what exactly do I do about it? Do not run any commands, just tell me.
+  max_turns: 6
+  timeout_seconds: 240
+
+runs: 3
+
+graders:
+  - type: regex
+    name: names-the-marker
+    target: last_message
+    pattern: '🔊'
+    match: contains
+
+  - type: regex
+    name: points-at-a-claude-md
+    target: last_message
+    pattern: 'CLAUDE\.md'
+    match: contains
+
+  - type: regex
+    name: gives-the-convention-line
+    target: last_message
+    pattern: 'spoken summary'
+    flags: i
+    match: contains
+
+expected_outcome: >-
+  The reply explains that only lines starting with the marker are voiced and that nothing yet asks
+  the model to write one, then hands over the convention line to add to a CLAUDE.md ("End each
+  reply with a one-sentence spoken summary on its own line, starting with the marker"). Diagnosing
+  the server, the hook registration or the audio device instead is a miss.
