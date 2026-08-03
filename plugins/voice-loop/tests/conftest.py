@@ -32,8 +32,8 @@ class ImpatientGate:
     where the real gate would block for good, where this one raises GateHeldTwice instead, which
     surfaces as an ordinary named failure through the endpoint under test.
 
-    Only the unbounded acquire (`with _model_gate:`, what the server does) raises; a probe that
-    passes its own timeout gets an ordinary bool back, so a test can still ask "is it free?".
+    Only the unbounded acquire (`acquire()` with no timeout, what model_slot() does) raises; a probe
+    that passes its own timeout gets an ordinary bool back, so a test can still ask "is it free?".
     """
 
     def __init__(self, patience: float = 2.0) -> None:
@@ -65,9 +65,16 @@ class ImpatientGate:
 
 @pytest.fixture
 def one_slot_gate(monkeypatch) -> ImpatientGate:
-    """The model gate narrowed to ONE slot for the duration of a test, and impatient about it."""
+    """The model gates narrowed to ONE shared slot for a test, and impatient about it.
+
+    ONE object standing in for BOTH device queues, deliberately: the property these tests pin is
+    that a request releases its slot before it retries, and a fallback retry often crosses devices
+    (a broken XTTS on the card handing over to Silero on the CPU). Two separate gates would let a
+    request hold one of each and the regression would pass unnoticed; one shared slot keeps the
+    question honest whichever queue the retry lands on.
+    """
     gate = ImpatientGate()
-    monkeypatch.setattr(voice_server, "_model_gate", gate)
+    monkeypatch.setattr(voice_server, "_model_gates", {device: gate for device in voice_server.MODEL_DEVICES})
     return gate
 
 

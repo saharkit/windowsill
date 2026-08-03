@@ -35,9 +35,11 @@ def test_health_reports_capabilities(client, monkeypatch):
     body = client.get("/health").json()
 
     assert body["ok"] is True
-    assert body["version"] == voice_server.SERVER_VERSION == "0.4.0"
+    assert body["version"] == voice_server.SERVER_VERSION == "0.4.1"
     assert body["model_concurrency"] == voice_server.MODEL_CONCURRENCY >= 1
     assert body["model_in_flight"] == 0
+    assert body["model_waiting"] == 0
+    assert sorted(body["model_queues"]) == ["cpu", "gpu"]
     assert body["device"] == "cpu"
     assert body["language"] == "ru"
     assert body["stt_model"] == "small"
@@ -238,6 +240,72 @@ def test_stt_duration_cap_passes_an_unparseable_riff(client, fake_whisper, monke
     response = client.post("/stt", files={"audio": ("clip.wav", b"RIFFfake", "audio/wav")})
     assert response.status_code == 200
     assert len(fake_whisper.calls) == 1
+
+
+# --- the wall-clock transcription budget (the cap the duration guard cannot enforce) ---------------
+
+
+class FakeClock:
+    """A clock that only moves when a test says so — elapsed time as an input, never a sleep."""
+
+    def __init__(self, steps: list[float]) -> None:
+        self.steps = list(steps)
+        self.now = 0.0
+
+    def __call__(self) -> float:
+        if self.steps:
+            self.now += self.steps.pop(0)
+        return self.now
+
+
+def test_bounded_segments_passes_a_transcription_that_finishes_in_time():
+    clock = FakeClock([0.0, 1.0, 1.0])  # start, then a second per segment, against a budget of 10
+    kept = list(voice_server.bounded_segments(iter("abc"), 10.0, clock))
+    assert kept == ["a", "b", "c"]
+
+
+def test_bounded_segments_gives_up_once_the_budget_is_spent():
+    clock = FakeClock([0.0, 1.0, 99.0])
+    with pytest.raises(voice_server.TranscriptionTimeout) as raised:
+        list(voice_server.bounded_segments(iter("abc"), 10.0, clock))
+    assert "10 second budget" in str(raised.value)
+
+
+def test_bounded_segments_does_not_check_after_the_last_segment():
+    """The exhaustion probe is not a place to give up — a stream that is simply over is not failed."""
+    clock = FakeClock([0.0, 1.0, 1.0, 9_000.0])
+    assert list(voice_server.bounded_segments(iter("ab"), 10.0, clock)) == ["a", "b"]
+    assert clock.steps == [9_000.0]  # the clock was never read again once the segments ran out
+
+
+def test_bounded_segments_budget_of_zero_means_no_bound():
+    clock = FakeClock([0.0, 10_000.0])
+    assert list(voice_server.bounded_segments(iter("ab"), 0.0, clock)) == ["a", "b"]
+
+
+def test_stt_abandons_a_transcription_that_outruns_its_budget(client, monkeypatch, fake_whisper):
+    """The format-agnostic half of the holding-time bound: no header is consulted at all."""
+
+    def outran(segments, budget, **_):
+        raise voice_server.TranscriptionTimeout(f"outran its {budget:.0f} second budget")
+
+    monkeypatch.setattr(voice_server, "STT_TIMEOUT", 30.0)
+    monkeypatch.setattr(voice_server, "bounded_segments", outran)
+
+    response = client.post("/stt", files={"audio": ("clip.ogg", b"OggS" + b"\x00" * 64, "audio/ogg")})
+
+    assert response.status_code == 503
+    assert response.json()["error"] == "transcription outran the 30 second time budget and was abandoned"
+    assert "VOICE_LOOP_STT_TIMEOUT" in response.json()["hint"]
+    # And the slot went back with the failed call — the queue behind it is free, which is the point.
+    assert voice_server.model_in_flight() == 0
+    assert voice_server.queue_depths()["cpu"]["waiting"] == 0
+
+
+def test_stt_timeout_default_is_the_documented_one(client, fake_whisper):
+    assert voice_server.STT_TIMEOUT == 900.0
+    response = client.post("/stt", files={"audio": ("clip.wav", b"RIFFfake", "audio/wav")})
+    assert response.status_code == 200  # an ordinary clip is nowhere near it
 
 
 def test_wav_duration_skips_a_zero_rate_header():
