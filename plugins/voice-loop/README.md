@@ -130,7 +130,11 @@ recorded, nothing pattern-matched) and speaks the new line instead.
 
 The hook also reads the transcript **immediately** and retries only on the actual flush-race
 signatures (an empty extract, or one identical to the last spoken line), with adaptive backoff —
-an already-flushed transcript costs zero sleep.
+an already-flushed transcript costs zero sleep. If that backoff runs out while a previous line is
+**still playing**, the hook keeps looking until the clip ends (bounded at 20 s) rather than giving
+up: a line written during a long clip is **queued, not dropped**. And a hook that does end up
+speaking nothing always writes the reason to `speak.log` — a line you never hear is never a line
+nothing can account for.
 
 Every spoken run logs its own before/after evidence to `~/.local/state/voice-loop/speak.log`:
 
