@@ -195,11 +195,13 @@ plugins/voice-loop/
   scripts/selftest.sh         hardware-free loopback proof (TTS -> STT -> compare)
   skills/voice-setup/         the agent installer
   skills/voice-design/        voice casting
+  skills/voice-conformance/   runs the conformance pass and files the report
   server/                     the self-hostable speech server (FastAPI + faster-whisper + Silero), Dockerfile
   tests/                      the server's unit tests (no models, no network) — 100% gated in CI
   docs/                       architecture, troubleshooting, FAQ
   pytest.ini, .coveragerc     this plugin's own test run (invoked from this directory)
-  TESTING.md                  the human acceptance checklist
+  TESTING.md                  what the gates prove, and what they honestly do not
+  CONFORMANCE.md              the acceptance run a human signs a release off with
 ```
 
 ## Permissions — the ladder, and why the default rung is the low one
@@ -238,9 +240,16 @@ transcript (case, punctuation and stress marks ignored). No microphone, no speak
 runs in a bare container, and it is what CI runs on Linux and macOS on every commit.
 
 The server's own Python is unit-tested with a hard 100% coverage gate on Python 3.10–3.13, and the
-Stop hook is invoked for real in CI. The parts a machine cannot check for you — the hotkey, a real
-microphone, whether you actually hear it — are a written checklist. Both halves, and what the
-coverage number honestly claims, are in [TESTING.md](TESTING.md).
+Stop hook is invoked for real in CI. What the coverage number honestly claims — and what it
+deliberately does not — is in [TESTING.md](TESTING.md).
+
+The parts a machine cannot check for you — the hotkey, a real microphone, the paste into a real
+window, whether you actually hear it — are the **conformance pass**. Say *"run the conformance
+pass"* (or `/voice-conformance`) in a session: Claude walks
+[CONFORMANCE.md](CONFORMANCE.md) row by row, runs everything runnable itself, asks you only for the
+physical acts, and writes one report with a PASS/FAIL/SKIP verdict and evidence for **every** row —
+which it can then file as a labelled issue. That report, not a green CI badge, is what a release is
+signed off on.
 
 **Uninstalling:** removing the plugin does not remove the 🔊 line from your `CLAUDE.md`, the
 config/state dirs (`~/.config/voice-loop/`, `~/.local/state/voice-loop/`), downloaded models under

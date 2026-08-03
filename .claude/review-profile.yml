@@ -96,12 +96,14 @@ rules:
       checks that they agree, so the agreement is a review obligation. The catalog table is also
       shelf state: a plugin that is not in it is not on the shelf.
 
-  - paths: ["CLAUDE.md", ".claude/**", "plugins/*/TESTING.md"]
+  - paths: ["CLAUDE.md", ".claude/**", "plugins/*/TESTING.md", "plugins/*/CONFORMANCE.md"]
     lenses: [architect, qa]
     why: >-
       The documents that state the bar rather than merely describe a feature: the repo passport,
-      this map, and the file that says what the coverage number does and does not claim. Exempting
-      them as prose would mean the bar's own text is the one thing the bar never checks.
+      this map, the file that says what the coverage number does and does not claim, and the
+      acceptance form a release is signed off on — whose rows ARE the release bar, and which an
+      agent executes, so a wrong row is a wrong run rather than a typo. Exempting them as prose
+      would mean the bar's own text is the one thing the bar never checks.
 
   - paths: ["**/*.md", "tales/**", "LICENSE", ".gitignore"]
     lenses: []
@@ -110,7 +112,7 @@ rules:
       rule, so it only catches what nothing above claimed: `plugins/*/server/README.md` never
       reaches it (`plugins/*/server/**` claims it first, at three lenses, and its XTTS pins are
       mechanically checked by the xtts-install-probe workflow), and neither do README.md,
-      CLAUDE.md or TESTING.md.
+      CLAUDE.md, TESTING.md or CONFORMANCE.md.
 
 # Anything unmatched (a new top-level path, a new plugin shape) falls back to the two-lens minimum.
 default:

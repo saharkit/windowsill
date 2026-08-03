@@ -1,7 +1,7 @@
 # voice-loop — testing
 
-Two halves: what CI proves mechanically (below), and the human acceptance checklist (further down)
-for everything a machine structurally cannot reach.
+Two halves: what CI proves mechanically (this file), and the human acceptance pass
+([CONFORMANCE.md](CONFORMANCE.md)) for everything a machine structurally cannot reach.
 
 ## What "tested" means here — the honest version
 
@@ -99,118 +99,25 @@ latency claim is checkable against the state log rather than taken on faith.
 ### What neither of those covers
 
 The hotkey, the microphone, the paste keystroke into a real window, the Accessibility consent, and
-whether you can actually *hear* it. That is the checklist below, and it needs a human.
+whether you can actually *hear* it. That is the **conformance pass**, and it needs a human.
 
-## Human acceptance checklist
+## The conformance pass — where the human half lives now
 
-Run this before every release, on a machine that has never had voice-loop on it (a clean container or a
-fresh VM for Linux; a teammate's untouched Mac for the macOS branch). "Works on the machine it was
-built on" is not a result.
+The checklist that used to sit at the bottom of this file is now
+**[CONFORMANCE.md](CONFORMANCE.md)**: the same coverage, restructured so an agent executes it rather
+than a person transcribing chat messages by hand. A tester says *"run the conformance pass"* (or
+`/voice-conformance`); Claude runs every machine-checkable row itself, asks the human only for the
+physical acts, records a **PASS / FAIL / SKIP verdict with evidence for every row**, and emits one
+report file — `conformance-<version>-<date>.md`, stamped with the version read out of
+`.claude-plugin/plugin.json` at run time — which it then offers to file as a `conformance`-labelled
+issue.
 
-**How to use it:** one row per check. Fill in *observed* and *pass/fail*, and sign off at the bottom.
-A failed row is a release blocker unless it is explicitly waived in writing with a reason.
+The division of labour between the two files is worth stating once, because it is the reason there
+are two:
 
-Environment under test:
+- **This file** describes the guarantees — what the 100% number covers, what it deliberately does
+  not, and which real invocations in CI stand in for the parts coverage cannot honestly claim.
+- **CONFORMANCE.md** is the run. It is a form with a verdict cell per row, and the release bar reads
+  off it: a full pass on a clean machine, no unwaived FAIL, and every SKIP carrying a reason.
 
-| field | value |
-|---|---|
-| date | |
-| tester | |
-| OS / version | |
-| desktop / session (GNOME-Wayland, KDE, X11, macOS) | |
-| plugin version | |
-| backends chosen (stt / tts) | |
-| language | |
-
-## 1. Install from the marketplace, clean machine
-
-| # | check | expected | observed | pass |
-|---|---|---|---|---|
-| 1.1 | `claude plugin marketplace add saharkit/windowsill` (shell), or `/plugin marketplace add saharkit/windowsill` in a session | marketplace added, no errors | | |
-| 1.2 | `/plugin install voice-loop@windowsill` | plugin installs; it appears in `/plugin` | | |
-| 1.3 | Start a fresh session | no hook errors in the session; the Stop hook is registered | | |
-| 1.4 | `/voice-setup` is offered / discoverable by name | the skill is listed | | |
-
-## 2. `/voice-setup` under DEFAULT permission mode
-
-Run Claude Code with its normal (default) permission mode — **not** bypass. Count every permission
-prompt the setup causes.
-
-| # | check | expected | observed | pass |
-|---|---|---|---|---|
-| 2.1 | The agent states its plan before acting | a short plan, then work | | |
-| 2.2 | **Permission prompt count for the whole install** | **≤ 3** (more = FAIL — that is the acceptance bar) | count: | |
-| 2.3 | Language question comes first and is pre-answered from the environment | one confirm for the common case | | |
-| 2.4 | Backend choice is offered per direction with the cost/privacy tradeoff stated | user makes an informed choice | | |
-| 2.5 | No `sudo` is ever executed silently | any root step is PRINTED for the user to run | | |
-| 2.6 | Default paste tier is clipboard (no root, no consent dialog) | `auto_paste: false` unless the user opted in | | |
-| 2.7 | `~/.config/voice-loop/config.json` is written and valid | `jq . ~/.config/voice-loop/config.json` parses | | |
-| 2.8 | No secret is written into the config | keys are in a `key_file` or an env var only | | |
-| 2.9 | Setup ends by running the selftest | green selftest, reported plainly | | |
-
-## 3. The loop itself
-
-| # | check | expected | observed | pass |
-|---|---|---|---|---|
-| 3.1 | `bash plugins/voice-loop/scripts/selftest.sh` | exits 0, prints said/heard/similarity | | |
-| 3.2 | **Dictation round-trip**: press hotkey, say a sentence, press again | the transcript appears in the prompt (or on the clipboard, tier 1) within a few seconds | | |
-| 3.3 | Dictation in `send` mode with auto-paste enabled | text is pasted AND Enter is pressed once — exactly once | | |
-| 3.4 | Long dictation (~30 s of speech) | no truncation of the tail; the last words are present | | |
-| 3.4a | **Hold** the dictation hotkey down for two or three seconds, then release | ONE recording starts (and is still recording on release) — not a burst of start/stop cycles, and no second cycle however long the hold. `dictate.log` shows one `recording via …` and a `toggle ignored — key repeat` line per repeat, no `clip too short`. A tap ~1 s after release stops it normally | | |
-| 3.5 | **Speak-back**: assistant replies with a 🔊 line | it is audibly spoken, once, and matches the text | | |
-| 3.6 | Unmarked lines | are NOT spoken | | |
-| 3.7 | Two turns in a row | the second turn speaks the new line, not a repeat of the first (dedup) | | |
-| 3.8 | A fast turn right after another | no overlapping playback — the fresher line wins | | |
-| 3.9 | Stress/pronunciation of your own proper names (ru/uk) | acceptable after adding them to `stress.json` | | |
-| 3.10 | **Streaming**: a 🔊 line of three or more full sentences | playback starts after roughly one sentence's worth of synthesis, not after the whole line; no audible gap between chunks | | |
-| 3.11 | The timing log after 3.10 | `speak.log` shows `played … chunks=N` with N > 1, and a `timings` line whose `first_audio_ms` is well below `total_ms` | | |
-| 3.12 | **Eager mode** (`speak.eager: true`): ask for a long tool-heavy turn whose assistant writes two 🔊 lines mid-turn, several tool calls apart | both are narrated **before the turn ends**, in the order written, one after the other (never overlapping) — and each is spoken **once**: the `Stop` hook at the end of the turn adds nothing they already said | | |
-| 3.13 | Turn eager on **mid-session**, then let one tool call fire | the session so far is NOT recited; only lines written from that point on are spoken (`speak.log` shows `seeded N line(s) of history`) | | |
-| 3.14 | With eager **off** (the default), three turns whose 🔊 line is `Done.`, then `Working.`, then `Done.` again | all three are spoken — the repeat is not swallowed. `spoken.ledger` is never created: eager-off behaviour is unchanged from before eager mode existed | | |
-| 3.15 | With eager **on**, the same three turns | all three are spoken here too — the ledger keys on the message, not just the text | | |
-| 3.16 | A 🔊 line long enough to play for ~10 s, then send the next prompt straight away so its reply lands mid-clip | the second line is **spoken** (after the first clip, or in place of it — never skipped), and `speak.log` shows `queued, not dropped` | | |
-| 3.17 | Any turn whose 🔊 line you did **not** hear | `speak.log` has a line saying why — a give-up, a dedup, a synthesis failure. A turn that produced *no* log line at all is a bug | | |
-
-## 4. Negative cases — failures must be legible, never hangs
-
-| # | check | expected | observed | pass |
-|---|---|---|---|---|
-| 4.1 | Speech server stopped, then run `selftest.sh` | clear "server not reachable" message, non-zero exit, **within the timeout, no hang** | | |
-| 4.2 | Speech server stopped, then a 🔊 reply | the turn completes normally; nothing hangs; the reason is in `~/.local/state/voice-loop/speak.log` | | |
-| 4.3 | Speech server stopped, then press the dictation hotkey | notification says nothing was recognized; no stuck recording; a second press behaves sanely | | |
-| 4.4 | Wrong/expired cloud key | clear error naming the key source (`key_file` / env var); no key echoed anywhere | | |
-| 4.5 | No microphone / no recorder installed | clear message naming what to install; no silent no-op, no stuck PID file | | |
-| 4.6 | Unsupported TTS language requested | HTTP 400 listing the supported languages, not a stack trace | | |
-| 4.7 | Kill the recorder process mid-recording | next hotkey press starts a fresh recording (stale PID file is cleared) | | |
-| 4.8 | `jq` not installed | scripts fall back to defaults instead of crashing the turn | | |
-
-## 5. macOS branch (run on a Mac, first teammate = beta acceptance)
-
-| # | check | expected | observed | pass |
-|---|---|---|---|---|
-| 5.1 | `/voice-setup` picks the macOS adapters | `afplay` / `pbcopy` / `osascript`, Homebrew for anything missing | | |
-| 5.2 | Accessibility consent is requested once, explained before it appears | one dialog, then auto-paste works | | |
-| 5.3 | `say -v <voice>` fallback path | speaks with the built-in voice when configured | | |
-| 5.4 | Apple Silicon: whisper.cpp path if chosen | transcription is noticeably fast; `stt.command` wired correctly | | |
-| 5.5 | Nothing in the install required root | true / false | | |
-| 5.6 | `/voice-setup` on a **Touch Bar** Mac | it detects the Touch Bar (or asks), offers a physical chord (⌘I) rather than `F9`, and states the `fn` caveat | | |
-| 5.7 | The chord it wired actually toggles dictation | one press records, one press stops — from any focused app, with no `fn` gymnastics | | |
-
-## 6. `/voice-design` (only if the user has an ElevenLabs key)
-
-| # | check | expected | observed | pass |
-|---|---|---|---|---|
-| 6.1 | Key is read from a file, never pasted into chat or config | `key_file` used; nothing echoed | | |
-| 6.2 | A request to imitate a named real person | politely declined, generalized description offered instead | | |
-| 6.3 | Previews are saved, numbered, and mapped to their ids | user can tell which is which | | |
-| 6.4 | Chosen voice id lands in `tts.cloud.voice_id` | rest of the config survives the edit | | |
-| 6.5 | Speak-back in the new voice | plays (player handles mp3) | | |
-
----
-
-**Sign-off**
-
-| | name | date | verdict |
-|---|---|---|---|
-| Tester | | | pass / fail |
-| Waived items (with reason) | | | |
+Neither replaces the other, and a green CI run is not a conformance pass.

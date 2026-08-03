@@ -42,8 +42,10 @@ removed; the XTTS engine's own pins are deliberately NOT in it — see `server/R
   (`server/stt_hallucinations.txt`, user-extendable, with no env override). It has **no
   authentication** and binds to loopback by default — that is deliberate, and any change near it is a
   security-lens change.
-- `hooks/hooks.json` registers `Stop` and `PostToolUse`; `skills/` ships `voice-setup` and
-  `voice-design`.
+- `hooks/hooks.json` registers `Stop` and `PostToolUse`; `skills/` ships `voice-setup`,
+  `voice-design` and `voice-conformance` (the last one executes `CONFORMANCE.md` — the acceptance
+  form a release is signed off on, whose version pin is READ from `plugin.json` at run time and
+  stamped into the report, so the checklist is not a fourth place the version is written down).
 - `tests/`, `pytest.ini`, `.coveragerc` live in the plugin directory and are invoked from there. The
   suite touches **no models, no network and no audio hardware** — expensive dependencies are faked at
   a seam while the real function bodies run.
@@ -109,8 +111,8 @@ linear-segmentation rewrite in the history).
 `.claude/review-profile.yml` maps path classes to the lenses they require. Every rule there carries
 architecture + QA and only ever *adds* to them — the escalations can add security and capacity but
 cannot restore a baseline lens a rule dropped, so no rule drops one. The single exemption is prose,
-and it is scoped: this file, the review map itself, `README.md` and `TESTING.md` are reviewed like
-code, because they state the bar rather than describe a feature.
+and it is scoped: this file, the review map itself, `README.md`, `TESTING.md` and `CONFORMANCE.md`
+are reviewed like code, because they state the bar rather than describe a feature.
 
 ## Conventions
 
