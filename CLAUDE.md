@@ -50,13 +50,18 @@ removed; the XTTS engine's own pins are deliberately NOT in it — see `server/R
 
 ## The gates, as CI runs them today
 
-**`.github/workflows/selftest.yml`** — on push to `main`, on every pull request, and manual:
+**`.github/workflows/selftest.yml`** — on push to `main`, on every pull request, on the merge
+queue's `merge_group` ref, and manual:
 
 - **`shellcheck` job** — `bash -n` over `plugins/voice-loop/scripts/*.sh`, then `shellcheck -S
   warning` over the same; voice-loop's manifests must parse as JSON (three hardcoded paths —
   `marketplace.json`, the plugin's `plugin.json`, its `hooks.json`; a second plugin's manifests are
   not checked until that step lists them); `selftest.sh --help` and its unknown-argument rejection
   are asserted.
+- **`gate` job** — the aggregate the `main protection` ruleset requires as its ONLY status
+  context: `needs` all three real jobs, `if: always()`, and fails unless every needed result is
+  `success` — one fixed-name check that reports on every run (matrix jobs publish per-leg
+  display names, which is why the ruleset must not point at them).
 - **`coverage` job** — `cd plugins/voice-loop && pytest --cov=voice_server --cov-report=term-missing
   --cov-fail-under=100`, on Python **3.10, 3.11, 3.12 and 3.13**. `.coveragerc` sets `branch = True`,
   so the 100% is **statements *and* branches**. It is **scoped to `server/voice_server.py`**: the hook
