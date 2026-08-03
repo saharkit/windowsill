@@ -18,7 +18,9 @@ A Claude Code plugin that closes the voice loop in both directions:
   (In a long tool-heavy turn, [eager mode](#eager-mode--hear-a-line-when-it-is-written-not-when-the-turn-ends)
   speaks them as they are written instead of at the end.)
 - **in** — a push-to-talk script: press a hotkey, speak, press again. The audio is transcribed and
-  lands in the focused window (or on your clipboard, which is the default no-permissions path).
+  the text lands wherever your cursor is when you stop — **any app**, not just Claude Code (or on
+  your clipboard, which is the default no-permissions path). That reach is the feature and the
+  footgun in one: see [Where the text lands](#where-the-text-lands--and-the-one-way-it-bites).
 
 Speech runs where you choose: **on this machine**, on **a box on your network**, or in the **cloud**.
 Setup is not a document you follow — it is `/voice-setup`, a skill that probes your machine, installs
@@ -217,6 +219,47 @@ grants. Dictation is where privileges can creep in, so it is tiered and **starts
 
 `/voice-setup` is written for default permission mode: it announces its plan, batches its work into a
 few coarse actions, and never hides a `sudo`.
+
+## Where the text lands — and the one way it bites
+
+Dictation is not wired into Claude Code. It is a hotkey that fills your clipboard and — on the
+auto-paste tier — presses your paste key, so **the text lands wherever your cursor is when you stop:
+any app**. A commit message, a browser search box, a colleague's chat window. That is system-wide
+dictation, for free, and it is the reason the script is worth binding at all.
+
+> **The same sentence, said plainly: one wrong window switch and words meant for the agent land
+> somewhere else.** Start dictating in Claude Code, alt-tab to Slack while you are still speaking,
+> stop the recording — the transcript is pasted into Slack. In `send` mode it is *sent*. Worst case
+> that is something private in a public channel, and nothing about the paste knows the difference.
+
+If you would rather trade the reach for a seatbelt:
+
+```json
+{ "dictate": { "paste_target": "same-window" } }
+```
+
+The guard remembers which window was focused when the recording **started**. If focus moved by the
+time you stop, nothing is pasted anywhere: the text sits on your clipboard and a notification says
+*"focus moved — text is in the clipboard"*, so you paste it yourself, in the window you meant. The
+default is `"any"` — the power behaviour above — and the guard only applies on the auto-paste tier,
+because on the clipboard tier you were always the one choosing the window.
+
+What "the same window" can mean depends on what your desktop will tell us, and it is not the same
+everywhere:
+
+| session | what is compared | so it catches |
+|---|---|---|
+| macOS | the frontmost **application** (`osascript` / System Events) | app-to-app switches; *not* two windows of the same app |
+| X11 | the active **window** id (`xdotool getactivewindow`) | any window switch, same app or not |
+| Wayland | nothing — no portable query exists, and each compositor answers differently or not at all | **nothing: the guard degrades to `"any"`** and the warning above is your only protection |
+
+That last row is the honest one. Under Wayland (including XWayland, where `xdotool` would answer for
+X clients only and go stale the moment you switch to a native window) there is no answer we trust, so
+the paste goes ahead rather than being suppressed on a guess. Every unknown degrades the same way —
+a missing `xdotool`, a probe that timed out, a first recording started before the setting was on: a
+guard that cannot see focus must not become a dictation that never pastes. `dictate.log` records what
+it saw at start (`focus at start: …`) and why it suppressed a paste, so the guard is never silent
+about which of the two happened.
 
 ## Verify it yourself
 
