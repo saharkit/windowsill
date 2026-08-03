@@ -137,7 +137,7 @@ broken engine is latency, and the `tts_fallbacks` counter says how often it is b
 |---|---|
 | `~/.config/voice-loop/config.json` | the only configuration; written by `/voice-setup` |
 | `~/.config/voice-loop/stress.json` | optional stress overrides for the synthesizer |
-| `stt_hallucinations.txt` (next to `voice_server.py`) | known Whisper silence hallucinations `/stt` drops (user-extendable) |
+| `stt_hallucinations.txt` (next to `voice_server.py`) | known Whisper hallucinations `/stt` drops whole, or strips off the tail of real speech (user-extendable) |
 | `~/.config/voice-loop/*.key` | optional cloud key files (mode 600) |
 | `~/.local/state/voice-loop/` | logs, the last spoken line, the recorder PID, the last WAV |
 | `~/.local/share/voice-loop/` | optional: the venv, models, voice previews |

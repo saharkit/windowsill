@@ -149,6 +149,10 @@ _accent: dict[str, object] = {}
 _stress: list[tuple[re.Pattern[str], str]] | None = None
 _hallucinations: list[str] | None = None
 _hallucinations_dropped = 0
+_hallucination_tails_stripped = 0
+# What this microphone actually hallucinates, pattern -> hits: the blocklist grows from evidence
+# rather than anecdote, so /health has to say WHICH entry fired, not just how often one did.
+_hallucinations_by_pattern: dict[str, int] = {}
 _tts_fallbacks = 0
 # Its own lock rather than the model gate's `_in_flight_lock` below: this counter is bumped on the
 # request path from several threads, and it has nothing to do with how many model slots are held.
@@ -161,13 +165,16 @@ def reset_caches() -> None:
     Used by the tests between cases. Nothing in the running server calls it, so editing
     stress.json or the hallucination blocklist requires a restart in the current server.
     """
-    global _whisper, _xtts, _stress, _hallucinations, _hallucinations_dropped, _tts_fallbacks
+    global _whisper, _xtts, _stress, _hallucinations, _hallucinations_dropped
+    global _hallucination_tails_stripped, _tts_fallbacks
     _whisper = None
     _xtts = None
     _stress = None
     _hallucinations = None
     _hallucinations_dropped = 0
+    _hallucination_tails_stripped = 0
     _tts_fallbacks = 0
+    _hallucinations_by_pattern.clear()
     _tts.clear()
     _accent.clear()
 
@@ -314,6 +321,77 @@ def matched_hallucination(text: str) -> str | None:
             if len(normalized) == len(pattern) or not normalized[len(pattern)].isalnum():
                 return pattern
     return None
+
+
+# A sentence break: end punctuation (an ellipsis included, "продолжение следует…" carries one)
+# followed by whitespace. Deliberately not a general segmenter — it only has to find where the
+# model started a new sentence, which is where the appended caption begins.
+SENTENCE_BREAK = re.compile(r"(?<=[.!?…])\s+")
+
+
+def strip_hallucinated_tail(text: str) -> tuple[str, list[tuple[str, str]]]:
+    """Peel blocklisted closing captions off the END of a transcript, keeping the speech before them.
+
+    A whisper trained on subtitles finishes a silent tail with a learned closing caption
+    ("Продолжение следует…", "Thanks for watching"), APPENDED to an otherwise complete transcript.
+    So this is not the whole-drop of matched_hallucination: the transcript is right, the last
+    sentence is an addition, and only that sentence goes.
+
+    A sentence break before the tail is REQUIRED. Without one, "скажи ему спасибо за просмотр" is
+    ordinary speech that happens to end in a blocklisted phrase, and eating its last words would be
+    a worse bug than the one this fixes — a quiet loss instead of a quiet addition. Only the LAST
+    sentence is ever examined, and peeling stops at the first one that does not match.
+
+    Returns the kept text and the peeled tails (last sentence first), each with the pattern it hit.
+    """
+    kept = text.strip()
+    peeled: list[tuple[str, str]] = []
+    while True:
+        sentences = SENTENCE_BREAK.split(kept)
+        if len(sentences) < 2:
+            return kept, peeled
+        pattern = matched_hallucination(sentences[-1])
+        if pattern is None:
+            return kept, peeled
+        peeled.append((sentences[-1], pattern))
+        kept = " ".join(sentences[:-1]).strip()
+
+
+def count_hallucination(pattern: str) -> None:
+    """Record one blocklist hit against the pattern that caught it, for the /health corpus."""
+    _hallucinations_by_pattern[pattern] = _hallucinations_by_pattern.get(pattern, 0) + 1
+
+
+def filter_transcript(text: str) -> str:
+    """The transcript as it should reach the user — every blocklist hit removed, logged and counted.
+
+    Two shapes, two contracts, in this order:
+
+    * a trailing closing caption is STRIPPED and the speech before it kept (see
+      strip_hallucinated_tail) — the transcript is complete, the caption is the addition;
+    * what remains, if it IS a hallucination end to end, is dropped whole, as since the blocklist
+      shipped.
+
+    Nothing is removed invisibly: each hit is logged at INFO with the exact text that went, so an
+    operator chasing a word the user swears they said can see the filter fire — the pasted text is
+    the cleaned one, the log is where the difference lives.
+
+    Counters bump on the event loop (the endpoint awaits the model in the threadpool and filters
+    after), so they need no lock of their own.
+    """
+    global _hallucinations_dropped, _hallucination_tails_stripped
+    kept, peeled = strip_hallucinated_tail(text)
+    for tail, pattern in peeled:
+        _hallucination_tails_stripped += 1
+        count_hallucination(pattern)
+        log.info("stripped a hallucinated tail %r (matched %r) off %r", tail, pattern, text)
+    pattern = matched_hallucination(kept)
+    if pattern is not None:
+        _hallucinations_dropped += 1
+        count_hallucination(pattern)
+        log.info("dropped a hallucinated transcript %r (matched %r)", kept, pattern)
+        return ""
+    return kept
 
 
 def acute_to_plus(text: str) -> str:
@@ -845,6 +923,8 @@ def health() -> dict[str, object]:
         "tts_loaded": sorted(_tts),
         "xtts_loaded": _xtts is not None,
         "stt_hallucinations_dropped": _hallucinations_dropped,
+        "stt_hallucination_tails_stripped": _hallucination_tails_stripped,
+        "stt_hallucinations_by_pattern": dict(_hallucinations_by_pattern),
     }
 
 
@@ -905,12 +985,7 @@ async def stt(request: Request, audio: UploadFile = File(...), language: str = "
             status_code=413,
         )
     text, info = await run_in_threadpool(transcribe_upload, data, language)
-    pattern = matched_hallucination(text)
-    if pattern is not None:
-        global _hallucinations_dropped
-        _hallucinations_dropped += 1
-        log.info("dropped a hallucinated transcript %r (matched %r)", text, pattern)
-        text = ""
+    text = filter_transcript(text)
     return JSONResponse({"text": text, "language": info.language, "duration": info.duration})
 
 

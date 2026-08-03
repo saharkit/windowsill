@@ -140,11 +140,29 @@ can also just type a combining acute in the text you send (`робо́та`); it
 ### Hallucination blocklist (`stt_hallucinations.txt`)
 
 Whisper on a near-silent clip sometimes invents a well-known junk transcript instead of returning
-nothing — TV end-credits, «Спасибо за просмотр», "Thank you for watching". `/stt` drops a transcript
-whose **full** normalized text equals (or extends, at a word boundary) an entry in the
-`stt_hallucinations.txt` sitting next to `voice_server.py` — one pattern per line, `#` comments
-allowed; genuine speech that merely contains a phrase is never touched. Extend the file freely;
-every drop is logged and counted in `GET /health` → `stt_hallucinations_dropped`.
+nothing — TV end-credits, «Спасибо за просмотр», "Thank you for watching". The patterns live in
+`stt_hallucinations.txt` next to `voice_server.py`, one per line, `#` comments allowed; a pattern
+fires where the normalized text equals it or extends it at a word boundary, so genuine speech that
+merely contains a phrase mid-sentence is never touched. Extend the file freely.
+
+A pattern removes one of two amounts:
+
+| the match is | what goes | why |
+|---|---|---|
+| the **whole** transcript | all of it — `/stt` returns `""` | the clip was silence and the model filled it |
+| the **last sentence** | that sentence only, the speech before it kept | a closing caption appended to a complete dictation on a silent tail |
+
+The tail-strip needs a **sentence break** in front of the caption. Real speech that simply ends in a
+blocklisted phrase («напиши ему спасибо за просмотр») keeps its last words — quietly losing them
+would be a worse bug than the addition this removes.
+
+Nothing goes invisibly. Every hit is logged at INFO with the exact text removed (the drop and the
+strip say which they were), and counted in `GET /health`:
+
+- `stt_hallucinations_dropped` — transcripts dropped whole;
+- `stt_hallucination_tails_stripped` — closing captions peeled off real speech;
+- `stt_hallucinations_by_pattern` — pattern → hits, the corpus of what *your* microphone
+  hallucinates. What shows up here is what belongs in the file.
 
 ## XTTS engine (voice cloning)
 
