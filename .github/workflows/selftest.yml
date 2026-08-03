@@ -42,6 +42,58 @@ jobs:
           grep -q "unknown argument: --no-such-flag" /tmp/selftest-err.txt \
             || { echo "unknown-arg rejection lost its diagnostic"; cat /tmp/selftest-err.txt; exit 1; }
 
+      - name: tls-probe.sh argument branches (no network needed)
+        run: |
+          bash plugins/voice-loop/scripts/tls-probe.sh --help > /tmp/tls-help.txt
+          grep -q "Usage:" /tmp/tls-help.txt || { echo "--help did not print the usage text"; exit 1; }
+          set +e
+          bash plugins/voice-loop/scripts/tls-probe.sh --no-such-flag 2>/tmp/tls-err.txt
+          rc=$?
+          set -e
+          # 64, not 1: a mis-invocation must never come back as the certificate diagnosis, because
+          # /voice-setup is told to act on exit 1 by running what the message names
+          [ "$rc" = "64" ] || { echo "an unknown argument exited $rc, not 64"; cat /tmp/tls-err.txt; exit 1; }
+          grep -q "unknown argument: --no-such-flag" /tmp/tls-err.txt \
+            || { echo "unknown-arg rejection lost its diagnostic"; cat /tmp/tls-err.txt; exit 1; }
+          set +e
+          bash plugins/voice-loop/scripts/tls-probe.sh --url 2>/tmp/tls-dangling.txt
+          rc=$?
+          set -e
+          [ "$rc" = "64" ] || { echo "a flag with no value exited $rc, not 64"; exit 1; }
+          grep -q -- "--url wants a value after it" /tmp/tls-dangling.txt \
+            || { echo "a missing value was reported as something else"; cat /tmp/tls-dangling.txt; exit 1; }
+          # a plain-http URL has no certificate to verify: refused, never reported as fine
+          set +e
+          bash plugins/voice-loop/scripts/tls-probe.sh --url http://127.0.0.1:8355 2>/tmp/tls-http.txt
+          rc=$?
+          set -e
+          [ "$rc" = "64" ] || { echo "an http:// URL was probed instead of refused (exit $rc)"; exit 1; }
+          grep -q "no certificate to verify" /tmp/tls-http.txt \
+            || { echo "the http:// refusal lost its diagnostic"; cat /tmp/tls-http.txt; exit 1; }
+
+      - name: tls-probe.sh fails closed when its preconditions are missing
+        run: |
+          # The launcher's own two guards. Both are one line of bash that nothing else exercises,
+          # and both are what a user with a broken install actually meets first.
+          set +e
+          # bash by absolute path: with PATH emptied, `env` could not look the interpreter up either
+          env PATH=/nonexistent "$(command -v bash)" plugins/voice-loop/scripts/tls-probe.sh 2>/tmp/tls-nopy.txt
+          rc=$?
+          set -e
+          [ "$rc" = "1" ] || { echo "a missing python3 did not fail closed (exit $rc)"; exit 1; }
+          grep -q "python3 is required" /tmp/tls-nopy.txt \
+            || { echo "the missing-python3 guard lost its diagnostic"; cat /tmp/tls-nopy.txt; exit 1; }
+          orphan="$RUNNER_TEMP/orphan-launcher"
+          mkdir -p "$orphan"
+          cp plugins/voice-loop/scripts/tls-probe.sh "$orphan/"   # deliberately WITHOUT the .py
+          set +e
+          bash "$orphan/tls-probe.sh" 2>/tmp/tls-nopy2.txt
+          rc=$?
+          set -e
+          [ "$rc" = "1" ] || { echo "a launcher with no tls-probe.py beside it did not fail closed"; exit 1; }
+          grep -q "tls-probe.py is missing" /tmp/tls-nopy2.txt \
+            || { echo "the missing-script guard lost its diagnostic"; cat /tmp/tls-nopy2.txt; exit 1; }
+
   coverage:
     name: server unit tests (python ${{ matrix.python }})
     runs-on: ubuntu-latest
@@ -159,6 +211,162 @@ jobs:
             --endpoint http://127.0.0.1:8355 \
             --language "$VOICE_LOOP_LANGUAGE" \
             --strict --threshold 0.7
+
+      - name: TLS-probe contract (real invocation — green, then an overridden store)
+        run: |
+          # The setup probe, both ways round, on both lanes. GREEN first: a real handshake against
+          # a real host from the same python3 the hooks run under. Exit 2 is NOT a probe
+          # regression — it is the probe's own "the host was unreachable, so TLS is neither proven
+          # nor disproven" — and a runner egress hiccup must not read as a broken feature on a
+          # gate-blocking job.
+          set +e
+          bash plugins/voice-loop/scripts/tls-probe.sh --timeout 20
+          rc=$?
+          set -e
+          case "$rc" in
+            0) ;;
+            2) echo "::warning::the probe could not reach its host (exit 2) — TLS unproven, not red" ;;
+            *) echo "the probe called a healthy interpreter red (exit $rc)"; exit 1 ;;
+          esac
+
+          # Then RED — but only ONE branch at a time, and this is the env-override branch. remedy()
+          # diagnoses SSL_CERT_FILE/SSL_CERT_DIR first and unconditionally, so a store emptied THIS
+          # way can never reach the python.org remedy #52 is about: what it proves is that an
+          # override in force is named as the thing to unset. The python.org branch has its own
+          # step below, and that is the one carrying the acceptance criterion.
+          empty="$RUNNER_TEMP/empty-ca"
+          mkdir -p "$empty" && : > "$empty/none.pem"
+          set +e
+          SSL_CERT_FILE="$empty/none.pem" SSL_CERT_DIR="$empty" \
+            bash plugins/voice-loop/scripts/tls-probe.sh --timeout 20 >/tmp/tls-red.txt 2>&1
+          rc=$?
+          set -e
+          cat /tmp/tls-red.txt
+          [ "$rc" = "1" ] || { echo "a cert-less store did not exit 1 (got $rc)"; exit 1; }
+          grep -q "certificate verification failed" /tmp/tls-red.txt \
+            || { echo "the failure was not classified as a certificate problem"; exit 1; }
+          grep -q "Fix, exactly:" /tmp/tls-red.txt \
+            || { echo "the failure message no longer names a fix -- that IS the feature"; exit 1; }
+          grep -q "unset SSL_CERT_FILE SSL_CERT_DIR" /tmp/tls-red.txt \
+            || { echo "an override in force was not diagnosed as the override"; exit 1; }
+
+      - name: TLS-probe contract (real invocation — the python.org trap names its own installer)
+        run: |
+          set -euo pipefail
+          # THE acceptance criterion of #52, pinned by a real invocation: on python.org-installer
+          # Python with an unpopulated store, the message names
+          # "/Applications/Python X.Y/Install Certificates.command" VERBATIM and offers to run it.
+          # No runner has such a Python, so the two things remedy() keys that diagnosis off are
+          # stood up FOR REAL rather than mocked — an interpreter that really lives under the
+          # framework layout, and a real file at the installer's own path — while the failure
+          # itself is a real handshake against a real self-signed listener. Nothing here sets
+          # SSL_CERT_*: an override would short-circuit to the branch the step above covers.
+          probe="$PWD/plugins/voice-loop/scripts/tls-probe.py"
+          work="$RUNNER_TEMP/tls-trap"
+          rm -rf "$work"; mkdir -p "$work"
+
+          # 1. the interpreter: this python's own binary, copied under the framework layout, with
+          #    the rest of its prefix symlinked in beside it. The version is a deliberately
+          #    impossible 9.9, so nothing here can collide with a real install on the macOS lane.
+          fw="$work/Library/Frameworks/Python.framework/Versions/9.9"
+          prefix=$(python3 -c 'import sys; print(sys.base_prefix)')
+          mkdir -p "$fw/bin"
+          cp "$(python3 -c 'import sys; print(sys._base_executable or sys.executable)')" "$fw/bin/python3"
+          for entry in "$prefix"/*; do
+            [ "$(basename "$entry")" = "bin" ] || ln -s "$entry" "$fw/$(basename "$entry")"
+          done
+          got=$("$fw/bin/python3" -c 'import ssl, sys; print(sys.base_prefix)')
+          [ "$got" = "$fw" ] \
+            || { echo "the framework-shaped interpreter did not take (base_prefix=$got)"; exit 1; }
+
+          # 2. the installer, at the one absolute path the message has to name. It exits non-zero
+          #    on purpose: --fix below really spawns it, and a repair that does not take must be
+          #    reported as such rather than claimed green.
+          apps="/Applications/Python 9.9"
+          installer="$apps/Install Certificates.command"
+          sudo mkdir -p "$apps"
+          printf '#!/bin/sh\necho "the installer stub ran" >&2\nexit 9\n' | sudo tee "$installer" >/dev/null
+          sudo chmod 0755 "$installer"
+
+          # 3. a certificate that genuinely does not verify, served by this machine — no
+          #    third-party bad-certificate host to depend on, and no network egress needed.
+          openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj "/CN=127.0.0.1" \
+            -keyout "$work/key.pem" -out "$work/cert.pem" 2>/dev/null
+          cat > "$work/listener.py" <<'PY'
+          import http.server, ssl, sys
+          ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+          ctx.load_cert_chain(sys.argv[1], sys.argv[2])
+          srv = http.server.HTTPServer(("127.0.0.1", 8399), http.server.BaseHTTPRequestHandler)
+          srv.socket = ctx.wrap_socket(srv.socket, server_side=True)
+          srv.serve_forever()
+          PY
+          python3 "$work/listener.py" "$work/cert.pem" "$work/key.pem" >/dev/null 2>&1 &
+          listener=$!
+          trap 'kill "$listener" 2>/dev/null || true; sudo rm -rf "/Applications/Python 9.9"' EXIT
+          python3 -c "
+          import socket, sys, time
+          for _ in range(80):
+              try:
+                  socket.create_connection(('127.0.0.1', 8399), 0.5).close(); sys.exit(0)
+              except OSError: time.sleep(0.25)
+          sys.exit('the self-signed listener never came up')
+          "
+
+          run_probe() {   # the probe, from that interpreter, with the environment demonstrably clean
+            env -u SSL_CERT_FILE -u SSL_CERT_DIR "$fw/bin/python3" "$probe" \
+              --url https://127.0.0.1:8399/ --timeout 20 "$@"
+          }
+
+          set +e
+          run_probe >"$work/red.txt" 2>&1
+          rc=$?
+          set -e
+          cat "$work/red.txt"
+          [ "$rc" = "1" ] || { echo "a certificate that does not verify did not exit 1 (got $rc)"; exit 1; }
+          grep -q "certificate verification failed" "$work/red.txt" \
+            || { echo "the failure was not classified as a certificate problem"; exit 1; }
+          grep -qF "Fix, exactly:" "$work/red.txt" \
+            || { echo "the failure message no longer names a fix -- that IS the feature"; exit 1; }
+          grep -qF "$installer" "$work/red.txt" \
+            || { echo "the message did not name $installer -- that IS ticket #52"; exit 1; }
+          grep -qF -- "--fix" "$work/red.txt" \
+            || { echo "a runnable remedy was not offered as runnable"; exit 1; }
+          if grep -q "unset SSL_CERT" "$work/red.txt"; then
+            echo "the env-override branch answered a machine that has no override"; exit 1
+          fi
+          if grep -q "the installer stub ran" "$work/red.txt"; then
+            echo "the installer was executed without --fix"; exit 1
+          fi
+
+          # the same answer, machine-readable, so the BRANCH is pinned and not merely its prose
+          set +e
+          run_probe --json >"$work/red.json" 2>/dev/null
+          rc=$?
+          set -e
+          [ "$rc" = "1" ] || { echo "--json disagreed with the prose run (exit $rc)"; exit 1; }
+          python3 - "$work/red.json" <<'PY'
+          import json, sys
+          report = json.load(open(sys.argv[1]))
+          assert report["result"] == "certificate", report
+          fix = report["fix"]
+          assert fix["kind"] == "install-certificates-command", fix
+          assert fix["runnable"] is True, fix
+          assert fix["command"] == "/Applications/Python 9.9/Install Certificates.command", fix
+          print("the python.org branch answered, and it named its own installer")
+          PY
+
+          # and --fix really SPAWNS that path: one argv with a space in it, a real subprocess, whose
+          # non-zero exit comes back as "which half failed" rather than a claimed green.
+          set +e
+          run_probe --fix >"$work/fix.txt" 2>&1
+          rc=$?
+          set -e
+          cat "$work/fix.txt"
+          [ "$rc" = "1" ] || { echo "a repair that did not take was not still red (exit $rc)"; exit 1; }
+          grep -q "the installer stub ran" "$work/fix.txt" \
+            || { echo "--fix did not actually spawn the installer"; exit 1; }
+          grep -q "exit 9" "$work/fix.txt" \
+            || { echo "the failed repair did not say which half of it failed"; exit 1; }
 
       - name: Stop-hook contract (real invocation, no speakers)
         env:

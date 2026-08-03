@@ -167,6 +167,54 @@ stability. Raise `stability` to 0.6–0.75, keep `style` ≤ 0.15, `similarity_b
 `use_speaker_boost: true`. Keep each request short — long blocks drift in tone toward the end. If
 artifacts survive the settings, regenerate a new preview rather than tuning further.
 
+## macOS: `CERTIFICATE_VERIFY_FAILED` on every https call
+
+**Cause:** you are on python.org-installer Python, whose bundled OpenSSL ships with an **empty
+certificate store**. The installer drops a script to populate it and nothing runs that script for
+you, so until you do, *every* https call from that interpreter fails the same way — the cloud TTS
+request, `torch.hub`'s model download, and `pip install` itself:
+
+```
+SSL: CERTIFICATE_VERIFY_FAILED — unable to get local issuer certificate
+```
+
+It is not your key, not your network and not the plugin. Ask the probe:
+
+```sh
+bash "${CLAUDE_PLUGIN_ROOT}/scripts/tls-probe.sh"   # 0 verified · 1 certificate · 2 unreachable · 64 called wrong
+```
+
+It names the exact fix for *this* machine, and with `--fix` it runs the runnable one and probes
+again (so a green is a re-verified green, not a hope). The fix for the python.org case is the
+installer's own command — no root, and it touches nothing but that Python:
+
+```sh
+"/Applications/Python 3.12/Install Certificates.command"     # substitute your X.Y
+```
+
+`/voice-setup` now runs this probe on macOS **before** it installs anything, which is the point:
+the failure used to surface hours later as a silent hook.
+
+A few neighbours that look identical and are not:
+
+| the probe says | it means |
+|---|---|
+| `env-override` — `SSL_CERT_FILE` / `SSL_CERT_DIR` is set | an override beats every store below it; an empty or stale one fails exactly like the trap. Unset it and probe again |
+| `homebrew-certifi` | not python.org Python, so the empty-store trap does not apply — an intercepting proxy's own CA is the usual cause here |
+| `system-trust-store` (Linux) | missing/stale `ca-certificates`, or a proxy MITM |
+| `UNKNOWN … could not be reached` | the network, not TLS. Nothing to fix here |
+| exit **64** with a usage message | the probe was called wrong (a typo'd flag, a missing value, an `http://` URL). Not a diagnosis of anything — fix the invocation |
+
+The probe deliberately **bypasses proxies**, like the rest of the scripts — it is asking about this
+interpreter's own store. A corporate proxy that intercepts TLS is the case above it, and its CA
+belongs in the trust store rather than in a probe flag. That is also why a green under a configured
+`HTTPS_PROXY` prints a note saying so: `pip` and the model download *do* go through the proxy, and
+its CA has to be trusted separately — the probe having stepped around it proves nothing about them.
+
+Note this is per-interpreter, not per-machine: a **venv inherits the store of the python it was
+built from**. If the server's venv has a different base than the `python3` on your `PATH`, probe
+that one too — `~/.local/share/voice-loop/venv/bin/python .../scripts/tls-probe.py`.
+
 ## The server is on another machine and unreachable
 
 The server binds `127.0.0.1` by default and has **no authentication** — that is deliberate. Reach it
