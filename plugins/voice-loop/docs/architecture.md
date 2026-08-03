@@ -86,10 +86,15 @@ alone.
 1. A global hotkey (per desktop — `gsettings`, KDE shortcuts, sway/Hyprland config, `skhd`) runs
    `dictate-toggle.sh`. It is a **toggle**: first press records, second press stops.
    A **held** key is one toggle, not a stream of them: the OS turns it into an autorepeat, and a
-   re-fire within `dictate.debounce_ms` of the previous toggle is dropped before the direction is
-   even chosen (otherwise every second repeat would stop a recording milliseconds old). The stamp
-   it compares against lives in `dictate-last-toggle` and is read and written under a non-blocking
-   `flock`, so two near-simultaneous fires cannot both read the old value. On macOS this is also
+   re-fire within `dictate.debounce_ms` of the previous **fire** is dropped before the direction is
+   even chosen (otherwise every second repeat would stop a recording milliseconds old). The window
+   is measured from the last fire, *admitted or dropped* — that is what makes it a debounce rather
+   than a rate limiter: measured from the last admitted toggle, a hold would re-admit once per
+   window for as long as it lasted. The stamp it compares against lives in `dictate-last-toggle`,
+   is refreshed on every fire, and is read and written under a non-blocking `flock`, so two
+   near-simultaneous fires cannot both read the old value. The default window (750 ms) is sized
+   above the OS's key-repeat *delay*, not its interval: a shorter window would let the first repeat
+   through. On macOS this is also
    why the wiring prefers a physical chord over the F-row: on a Touch Bar model `F9` needs `fn`
    held and may deliver no keycode at all.
 2. Stopping sends `SIGINT` first (so `sox`/`ffmpeg` finalize the WAV header), waits for the process

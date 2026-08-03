@@ -19,7 +19,9 @@ Deliberate behaviours, found by live debugging — do not "simplify" them away:
 * key-repeat guard — a toggle is a human TAP. A HELD hotkey is turned into an autorepeat stream by
   the OS (4+ fires per second), and every second fire stops a recording milliseconds old, so the
   log fills with "clip too short" and nothing is ever transcribed (windowsill#49). A re-fire within
-  dictate.debounce_ms of the previous toggle is dropped before either branch is chosen.
+  dictate.debounce_ms of the previous FIRE — admitted or dropped, the stamp moves either way — is
+  dropped before either branch is chosen. Measuring from the last fire is what makes it a DEBOUNCE
+  rather than a rate limiter: a key held for ten seconds is ONE toggle, not one every window.
 * start is an ATOMIC claim — the pidfile is created with O_CREAT|O_EXCL before any recorder is
   spawned, so of two near-simultaneous hotkey invocations exactly one starts a recorder; the
   loser exits with a note. Stop removes the pidfile BEFORE signalling the recorder, so a racing
@@ -54,6 +56,7 @@ Deliberate behaviours, found by live debugging — do not "simplify" them away:
 from __future__ import annotations
 
 import json
+import math
 import os
 import platform
 import re
@@ -81,11 +84,17 @@ BYTES_PER_SECOND = RECORD_RATE * 2
 WAV_HEADER_BYTES = 44
 # Below this length there is no phrase, only a bounced hotkey; STT is skipped entirely.
 MIN_CLIP_SECONDS = 0.3
-# Key-repeat guard: how long after a toggle another one is treated as autorepeat rather than as a
-# second tap. Half a second is far longer than a key-repeat interval (~4 Hz once the OS starts
-# repeating) and far shorter than any dictation worth transcribing — a recording stopped inside it
-# would be dropped by the min-clip guard anyway. Tunable as dictate.debounce_ms; 0 turns it off.
-DEBOUNCE_SECONDS = 0.5
+# Key-repeat guard: how long after a FIRE another one is treated as autorepeat rather than as a
+# second tap. The window is sized against the OS's repeat DELAY, not its repeat interval — the
+# interval is the easy part (~4 Hz, and every one of those fires restarts the window anyway), while
+# the delay is what the FIRST repeat waits out, and it is 375 ms (macOS default), 500 ms (GNOME) or
+# 660 ms (X11 default). A window at or under that delay lets exactly one repeat through, which is
+# one bogus stop→STT→paste per hold; 750 ms clears all three with margin. The upper bound is the
+# deliberate quick tap, and it is far away: three quarters of a second of speech is not a phrase
+# anyone meant to dictate, so nothing a human intends is lost here. A repeat delay configured longer
+# than the window (macOS allows 2 s) admits one repeat again — raise debounce_ms past it.
+# Tunable as dictate.debounce_ms; 0 turns the guard off.
+DEBOUNCE_SECONDS = 0.75
 
 _STATE_DIR = os.path.join(os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state")), "voice-loop")
 _LOG_PATH = os.path.join(_STATE_DIR, "dictate.log")
@@ -146,6 +155,25 @@ def cfg(config: dict, dotted: str, default):
     return node
 
 
+def resolve_debounce_ms(value) -> float:
+    """The key-repeat window as the config gave it, or the default when it is not a usable number.
+
+    Every other dictate setting is a `str(...)` that cannot throw; this one is a float, and it is
+    read before ANY branch of main runs. A bare `float("soon")` (or `float(None)`) would therefore
+    kill the hotkey with a traceback nobody sees — the visible symptom being a key that does
+    nothing and an EMPTY dictate.log, which troubleshooting.md teaches the user to read as "the
+    binding, not the script". A misconfigured guard falls back instead, loudly, in that same log.
+    Infinities are rejected with the rest: a window of `inf` is a hotkey that never fires again."""
+    try:
+        ms = float(value)
+    except (TypeError, ValueError):
+        ms = float("nan")
+    if not math.isfinite(ms):
+        log(f"dictate.debounce_ms is not a usable number ({value!r}) — using {DEBOUNCE_SECONDS * 1000:.0f} ms")
+        return DEBOUNCE_SECONDS * 1000
+    return max(0.0, ms)  # negative is "off", same as 0 — clamped so the log and the docs agree
+
+
 def resolve_settings(config: dict, system: str) -> dict:
     """Every knob dictate-toggle.sh honoured, same names, same defaults, same precedence."""
     return {
@@ -157,7 +185,7 @@ def resolve_settings(config: dict, system: str) -> dict:
         or cfg(config, "dictate.auto_paste", False) == "true",
         "recorder": str(cfg(config, "dictate.recorder", "auto")),
         # milliseconds in the config (what a human reasons about for a keypress), seconds inside
-        "debounce_ms": float(cfg(config, "dictate.debounce_ms", DEBOUNCE_SECONDS * 1000)),
+        "debounce_ms": resolve_debounce_ms(cfg(config, "dictate.debounce_ms", DEBOUNCE_SECONDS * 1000)),
         "clipboard": str(cfg(config, "dictate.clipboard", "auto")),
         "start_sound": str(cfg(config, "dictate.start_sound", "")),
         "stop_sound": str(cfg(config, "dictate.stop_sound", "")),
@@ -526,9 +554,18 @@ def stop_speak_playback() -> None:
 def debounce_toggle(window: float, now: float | None = None) -> float | None:
     """Stamp this toggle, or refuse it as a key-repeat re-fire.
 
-    Returns None when the toggle may proceed (and the stamp now names this moment), or the age in
-    seconds of the previous toggle when this invocation lands inside ``window`` and must be
-    dropped. ``window <= 0`` disables the guard.
+    Returns None when the toggle may proceed, or the age in seconds of the previous fire when this
+    invocation lands inside ``window`` and must be dropped. ``window <= 0`` disables the guard.
+
+    The stamp is refreshed on EVERY fire, admitted or dropped — that is the whole difference
+    between a debounce and a rate limiter. Measured from the last ADMITTED toggle instead, a held
+    key would re-admit every ``window`` for as long as it is held (a three-second hold becoming six
+    record→STT→paste cycles at the default), which is windowsill#49 re-timed rather than fixed, and
+    worse than the original: the clips are then window-sized, so they clear MIN_CLIP_SECONDS and
+    reach the focused window as pasted garbage instead of dying in the min-clip guard. Refreshing
+    makes the window a QUIET PERIOD: a hold is one toggle whatever its length, and the guard clears
+    one window after the key is released. A key genuinely stuck down therefore holds dictation
+    still, which is the strictly better failure — a stuck key that sprays transcripts is not.
 
     Why this is not the pidfile claim: the claim arbitrates two invocations that both want to
     START. Autorepeat is the opposite shape — fires that alternate start/stop/start/stop, each one
@@ -549,7 +586,7 @@ def debounce_toggle(window: float, now: float | None = None) -> float | None:
     the next reader's clock, and a plain ``age >= 0`` test would let exactly the autorepeat fire it
     exists to catch straight through. A stamp further ahead than the window is a clock stepped
     backwards (ntp, a resume, a hand-edited file) and is admitted rather than wedging the toggle
-    until wall-clock catches up."""
+    until wall-clock catches up — and the refresh below then puts the stamp back on this clock."""
     if window <= 0:
         return None
     now = time.time() if now is None else now
@@ -563,22 +600,25 @@ def debounce_toggle(window: float, now: float | None = None) -> float | None:
             try:
                 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except OSError:
+                # a named reason of its own: "0 ms" below is a verdict, not a measured age
+                log("debounce stamp locked by another toggle — same-instant re-fire")
                 return 0.0
         try:
             previous = float(os.read(fd, 64).decode("ascii", "replace").strip() or "0")
         except (OSError, ValueError):
             previous = 0.0  # empty or garbage stamp: no previous toggle we can trust
         age = now - previous
-        if abs(age) < window:
-            return max(0.0, age)
         try:
+            # unconditional, and before the verdict is returned: the window restarts on a DROPPED
+            # fire too, which is what keeps a held key at one toggle instead of one per window
             os.lseek(fd, 0, os.SEEK_SET)
             os.ftruncate(fd, 0)
             os.write(fd, f"{now:.6f}".encode("ascii"))
         except OSError as err:
-            # the stamp did not move, so the next fire is not debounced — noisier, never wedged
+            # the stamp did not move, so the guard degrades to measuring from the last fire it
+            # COULD record — noisier under a hold, never wedged
             log(f"debounce stamp not written: {err}")
-        return None
+        return max(0.0, age) if abs(age) < window else None
     finally:
         try:
             os.close(fd)  # releases the flock with the file description
@@ -779,6 +819,7 @@ def main(argv: list[str]) -> int:
 
     # Key-repeat guard, before the pidfile is even read (see debounce_toggle): a held hotkey
     # autorepeats, and the fire that follows would otherwise stop a recording milliseconds old.
+    # The window restarts on every fire, so the whole hold is one toggle however long it lasts.
     # Log only — a notification per repeat would be the same spam in another window.
     age = debounce_toggle(s["debounce_ms"] / 1000.0)
     if age is not None:

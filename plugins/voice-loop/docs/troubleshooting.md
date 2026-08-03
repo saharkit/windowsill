@@ -53,10 +53,16 @@ Look at the timestamps in `~/.local/state/voice-loop/dictate.log`: several fires
 second is not you pressing quickly, it is **key repeat**. Holding the hotkey instead of tapping it
 makes the OS deliver it 4+ times a second, and every second fire stops a recording milliseconds old.
 
-**Handled by design:** a re-fire within `dictate.debounce_ms` (500 ms by default) of the previous
-toggle is dropped before either branch is chosen, and logged as `toggle ignored — key repeat`. So
-the fix is nothing — tap or hold, one press is one toggle. Set `debounce_ms` to `0` only if you
-genuinely want the raw behaviour back.
+**Handled by design:** a re-fire within `dictate.debounce_ms` (750 ms by default) of the previous
+fire is dropped before either branch is chosen, and logged as `toggle ignored — key repeat`. Each
+dropped fire restarts the window, so a key held for ten seconds is still one toggle and the guard
+clears one window after you let go. So the fix is nothing — tap or hold, one press is one toggle.
+Set `debounce_ms` to `0` only if you genuinely want the raw behaviour back.
+
+The suppression covers *both* directions, which is worth knowing for the one asymmetric case: a
+press meant as **stop** that lands inside the window is dropped too, so the microphone is still
+recording. Press once more, past the window, and it stops normally — nothing is sent anywhere in
+between, but the recording is genuinely still running until you do.
 
 ## The hotkey does nothing at all on my Mac
 

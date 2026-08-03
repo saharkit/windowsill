@@ -69,7 +69,7 @@ def test_defaults_with_empty_config_linux():
     assert s["stt_command"] == ""
     assert s["key_env"] == "VOICE_LOOP_STT_API_KEY"
     assert s["timeout"] == 60.0
-    assert s["debounce_ms"] == 500.0
+    assert s["debounce_ms"] == 750.0
 
 
 def test_darwin_defaults_follow_the_platform():
@@ -568,13 +568,34 @@ def test_debounce_admits_a_toggle_past_the_window(state):
     assert dictate.debounce_toggle(0.5, now=1000.9) is not None
 
 
-def test_a_dropped_refire_does_not_move_the_stamp(state):
-    """Otherwise a key held down would keep pushing the window forward and the toggle would never
-    fire again, however long the user leant on it."""
+def test_a_dropped_refire_refreshes_the_stamp(state):
+    """The debounce contract, and the whole of windowsill#49: the window is measured from the last
+    FIRE, not the last admitted toggle. Otherwise a held key re-admits every window forever — a
+    rate limiter, which is the reported bug re-timed rather than fixed."""
     assert dictate.debounce_toggle(0.5, now=1000.0) is None
     for tick in (1000.1, 1000.2, 1000.3, 1000.4):
         assert dictate.debounce_toggle(0.5, now=tick) is not None
-    assert dictate.debounce_toggle(0.5, now=1000.6) is None  # 0.6 s after the stamp, not after 1000.4
+    # 0.6 s after the ADMITTED toggle but only 0.2 s after the last repeat: still the same hold
+    assert dictate.debounce_toggle(0.5, now=1000.6) is not None
+    assert (state / "dictate-last-toggle").read_text(encoding="utf-8") == "1000.600000"
+    # …and the quiet period runs from the release, so the next real tap gets through
+    assert dictate.debounce_toggle(0.5, now=1001.2) is None
+
+
+@pytest.mark.parametrize(
+    "delay,interval",
+    [(0.5, 0.03), (0.375, 0.09), (0.66, 0.04)],  # GNOME, macOS, X11 defaults: repeat delay, then interval
+)
+def test_a_held_key_is_one_toggle_however_long_it_is_held(state, delay, interval):
+    """The acceptance shape the ticket describes, on every desktop's real autorepeat timing: the
+    OS's repeat DELAY, then its repeat interval, for three seconds of hold. Exactly one fire may be
+    admitted — a rate limiter re-admits every window instead (~4 more toggles here), and its first
+    re-admission is the repeat that lands past the delay."""
+    window = dictate.DEBOUNCE_SECONDS
+    fires = [1000.0] + [1000.0 + delay + interval * i for i in range(int(3.0 / interval))]
+    admitted = [now for now in fires if dictate.debounce_toggle(window, now=now) is None]
+    assert admitted == [1000.0]
+    assert dictate.debounce_toggle(window, now=fires[-1] + window + 0.01) is None  # released
 
 
 def test_a_zero_window_turns_the_guard_off_and_writes_no_stamp(state):
@@ -604,11 +625,52 @@ def test_a_stamp_from_the_future_never_wedges_the_toggle(state):
     assert dictate.debounce_toggle(0.5, now=1000.0) is None
 
 
-def test_the_guard_fails_open_when_the_stamp_cannot_be_written(state, monkeypatch):
+def test_the_guard_fails_open_when_the_stamp_cannot_be_opened(state, monkeypatch):
     monkeypatch.setattr(dictate, "_TOGGLE_PATH", str(state))  # a directory: O_RDWR cannot open it
     assert dictate.debounce_toggle(0.5) is None
     assert dictate.debounce_toggle(0.5) is None  # a guard that cannot keep time never blocks a tap
     assert "debounce stamp unavailable" in (state / "dictate.log").read_text(encoding="utf-8")
+
+
+def test_the_guard_fails_open_when_the_state_dir_is_missing(state, monkeypatch):
+    """The realistic shape of the previous test's failure — a first run with no state dir yet, so
+    O_CREAT gets ENOENT rather than the EISDIR a tmp_path can produce."""
+    monkeypatch.setattr(dictate, "_TOGGLE_PATH", str(state / "not-created-yet" / "dictate-last-toggle"))
+    assert dictate.debounce_toggle(0.5) is None
+    assert "debounce stamp unavailable" in (state / "dictate.log").read_text(encoding="utf-8")
+
+
+def test_main_creates_the_state_dir_before_the_guard_reads_it(state, monkeypatch, tmp_path):
+    """Ordering regression guard: the guard runs earlier in main than anything else that touches
+    the state dir, so if the makedirs ever moved below it, every FIRST toggle on a clean machine
+    would run unguarded and log 'stamp unavailable'."""
+    fresh = tmp_path / "never-existed"
+    monkeypatch.setattr(dictate, "_STATE_DIR", str(fresh))
+    monkeypatch.setattr(dictate, "_LOG_PATH", str(fresh / "dictate.log"))
+    monkeypatch.setattr(dictate, "_PID_PATH", str(fresh / "dictate.pid"))
+    monkeypatch.setattr(dictate, "_TOGGLE_PATH", str(fresh / "dictate-last-toggle"))
+    monkeypatch.setattr(dictate.subprocess, "Popen", lambda argv, **kw: FakeProc())
+    monkeypatch.setattr(dictate, "stop_speak_playback", lambda: None)
+    monkeypatch.setattr(dictate, "note", lambda message, system: None)
+    _write_config(monkeypatch, state, {"dictate": {"recorder": "arecord"}})
+
+    assert dictate.main(["dictate.py"]) == 0
+    assert (fresh / "dictate-last-toggle").exists()  # the guard stamped a real first toggle
+    assert "debounce stamp unavailable" not in (fresh / "dictate.log").read_text(encoding="utf-8")
+
+
+def test_a_stamp_that_cannot_be_rewritten_never_blocks_the_toggle(state, monkeypatch):
+    """The write half of fail-open: the file opens but the refresh fails (a full or read-only
+    filesystem). The guard says so and admits the toggle — a debounce that cannot record time must
+    never become a hotkey that records no audio."""
+
+    def refuse(*_args):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(dictate.os, "ftruncate", refuse)
+    assert dictate.debounce_toggle(0.5, now=1000.0) is None
+    assert dictate.debounce_toggle(0.5, now=1000.1) is None  # the stamp never moved: still open
+    assert "debounce stamp not written" in (state / "dictate.log").read_text(encoding="utf-8")
 
 
 @pytest.mark.skipif(dictate.fcntl is None, reason="POSIX flock only")
@@ -621,12 +683,22 @@ def test_a_toggle_that_cannot_take_the_stamp_lock_is_a_refire(state):
         assert dictate.debounce_toggle(0.5) == 0.0
     finally:
         os.close(holder)
+    # the 0.0 above is a verdict, not a measurement, so the log says which of the two it was —
+    # main can only report it as "0 ms after the previous one", same as a future stamp
+    assert "locked by another toggle" in (state / "dictate.log").read_text(encoding="utf-8")
     assert dictate.debounce_toggle(0.5) is None  # the lock is gone with the fd: back to normal
 
 
-def test_rapid_double_fire_produces_exactly_one_recording_cycle(state, monkeypatch):
-    """The acceptance case (windowsill#49): key-repeat fires the toggle twice inside the window;
-    the second must not stop the recording the first started."""
+def test_a_repeat_burst_through_main_produces_exactly_one_recording_cycle(state, monkeypatch):
+    """The acceptance case (windowsill#49) end to end: key-repeat fires the whole toggle several
+    times over; none of the repeats may reach either branch.
+
+    debounce_ms is pinned wide rather than left at its default because this test runs on the REAL
+    clock — under `-n auto` on a loaded runner a default-sized window is a race against how long
+    eight `main()` invocations take. The window semantics that a wide window cannot show (measured
+    from the last fire, not the last admitted toggle) are proven with an injected clock in
+    `test_a_held_key_is_one_toggle_however_long_it_is_held`, and on the real clock by the
+    dictation-contract leg of selftest.yml, whose repeat train outlasts its window."""
     spawned: list[list[str]] = []
     monkeypatch.setattr(dictate.subprocess, "Popen", lambda argv, **kw: spawned.append(argv) or FakeProc())
     monkeypatch.setattr(dictate, "stop_speak_playback", lambda: None)
@@ -634,16 +706,18 @@ def test_rapid_double_fire_produces_exactly_one_recording_cycle(state, monkeypat
     monkeypatch.setattr(dictate.os, "kill", lambda pid, sig: kills.append((pid, sig)))
     notes: list[str] = []
     monkeypatch.setattr(dictate, "note", lambda message, system: notes.append(message))
-    _write_config(monkeypatch, state, {"dictate": {"recorder": "arecord"}})
+    _write_config(monkeypatch, state, {"dictate": {"recorder": "arecord", "debounce_ms": 30000}})
 
     assert dictate.main(["dictate.py"]) == 0
-    assert dictate.main(["dictate.py"]) == 0  # the OS repeat, immediately after
+    for _ in range(7):  # the OS repeats, immediately after
+        assert dictate.main(["dictate.py"]) == 0
 
     assert len(spawned) == 1  # one recorder…
-    assert kills == []  # …never signalled: the repeat did not reach the stop branch at all
+    assert kills == []  # …never signalled: no repeat reached the stop branch at all
     assert (state / "dictate.pid").read_text(encoding="utf-8") == "4242"  # still recording
     assert notes.count("recording…") == 1
-    assert "key repeat" in (state / "dictate.log").read_text(encoding="utf-8")
+    log = (state / "dictate.log").read_text(encoding="utf-8")
+    assert log.count("toggle ignored — key repeat") == 7
 
 
 def test_a_second_press_past_the_window_still_stops_the_recording(state, monkeypatch):
@@ -661,6 +735,23 @@ def test_a_second_press_past_the_window_still_stops_the_recording(state, monkeyp
     stamp.write_text(f"{time.time() - 5:.3f}", encoding="utf-8")  # the human pauses, then presses again
     assert dictate.main(["dictate.py"]) == 0
     assert stopped == [FakeProc.pid]
+
+
+@pytest.mark.parametrize("bad", ["soon", [], {}, "", None, float("inf"), "nan"])
+def test_an_unusable_debounce_ms_falls_back_instead_of_killing_the_hotkey(state, bad):
+    """A float() straight off the config would raise here — before the pidfile is read, before any
+    branch runs — and the user's only symptom would be a dead hotkey with an EMPTY log, which
+    troubleshooting.md teaches them to read as a broken key binding."""
+    resolved = dictate.resolve_settings({"dictate": {"debounce_ms": bad}}, "Linux")["debounce_ms"]
+    assert resolved == dictate.DEBOUNCE_SECONDS * 1000
+    if bad not in ("", None):  # cfg() treats those two as "unset" and never reaches the coercion
+        assert "not a usable number" in (state / "dictate.log").read_text(encoding="utf-8")
+
+
+def test_a_negative_debounce_ms_is_off_not_a_wedged_toggle(state):
+    """`window <= 0` already disabled the guard; clamping makes the config value say what SKILL.md
+    documents — 0 and below are the same "off"."""
+    assert dictate.resolve_settings({"dictate": {"debounce_ms": -250}}, "Linux")["debounce_ms"] == 0.0
 
 
 def test_debounce_ms_is_configurable_and_zero_disables_it(state, monkeypatch):

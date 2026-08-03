@@ -38,7 +38,7 @@ Run a single command that gathers everything you need:
 uname -s; uname -m; echo "LANG=$LANG LC_ALL=$LC_ALL XDG_SESSION_TYPE=$XDG_SESSION_TYPE XDG_CURRENT_DESKTOP=$XDG_CURRENT_DESKTOP"; \
 for c in jq curl python3 pw-record arecord aplay paplay ffmpeg wl-copy xclip ydotool wtype xdotool notify-send gsettings sox rec afplay pbcopy osascript say brew skhd nvidia-smi; do \
   command -v "$c" >/dev/null 2>&1 && echo "have $c"; done; \
-pgrep -qx TouchBarServer 2>/dev/null && echo "have touchbar"; \
+pgrep -x TouchBarServer >/dev/null 2>&1 && echo "have touchbar"; \
 python3 -c 'import sys; print("python", sys.version.split()[0])' 2>/dev/null; \
 (nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null || true); \
 cat ~/.config/voice-loop/config.json 2>/dev/null || echo "no existing config"
@@ -228,7 +228,7 @@ referenced). Full schema — omit what you do not need, the scripts have default
     "auto_paste": false,
     "recorder": "auto",
     "clipboard": "auto",
-    "debounce_ms": 500,
+    "debounce_ms": 750,
     "start_sound": "",
     "stop_sound": ""
   }
@@ -245,8 +245,12 @@ Field notes worth telling the user:
   macOS `cmd+v`.
 - `dictate.debounce_ms` — the key-repeat guard. A *held* hotkey autorepeats, and without this every
   second fire would stop a recording milliseconds old ("clip too short" in the log, nothing ever
-  transcribed). 500 ms is the default and there is rarely a reason to touch it; `0` turns the guard
-  off, and a value above ~1000 starts eating deliberate quick taps.
+  transcribed). The window restarts on every fire, dropped ones included, so a hold is ONE toggle
+  however long it lasts and clears one window after release. 750 ms is the default — chosen to
+  exceed the longest common key-repeat *delay* (X11's 660 ms; GNOME 500, macOS 375), because a
+  window shorter than that delay lets the first repeat through — and there is rarely a reason to
+  touch it. `0` (or any negative value) turns the guard off. Raise it only for a keyboard whose
+  repeat delay is longer still; a value that large starts eating deliberate quick taps.
 - `tts.command` / `stt.command` — the escape hatch for engines that are not HTTP servers (`say`,
   whisper.cpp). `tts.command` receives text on stdin and makes the sound itself; `stt.command`
   receives the WAV path as its last argument and prints the transcript.
@@ -356,7 +360,8 @@ Notes to give the user:
 
 Always tell the user the script is a **toggle**: press to start, press again to stop and transcribe.
 Tapping is the gesture — *holding* the key does not queue up toggles, because a re-fire within
-`dictate.debounce_ms` (500 ms) of the previous one is ignored.
+`dictate.debounce_ms` (750 ms) of the previous fire is ignored, and each ignored fire restarts that
+window: a key held for ten seconds is still one toggle.
 
 ## Step 7 — the speak convention (the line that makes the model speak)
 
