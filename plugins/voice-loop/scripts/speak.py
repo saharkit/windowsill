@@ -19,6 +19,20 @@ Deliberate behaviours, found by live debugging — do not "simplify" them away:
   The transcript is read IMMEDIATELY; a retry happens only on the two real race signatures — an
   EMPTY extract, or an extract IDENTICAL to the previously spoken line — with adaptive backoff
   (0.15 → 1.0 s), so an already-flushed transcript costs zero sleep.
+* queued, not dropped — that backoff is 2.65 s all told, and one cloud clip runs ~10 s. A Stop that
+  ran out of ladder while the PREVIOUS line was still playing used to give up, and the line was
+  never spoken at all: the voice appeared to lag turns behind. So when the ladder runs out with
+  nothing new, the Stop path keeps re-reading FOR AS LONG AS an older speaking chain is audibly
+  alive (playing.pid, same identity check the takeover uses), bounded by PLAYBACK_POLLS. The retry
+  CONDITION is unchanged — it waits only while there is nothing new — so a line that was already
+  there is never delayed by a millisecond; only a line that would have been dropped is now late.
+  Only Stop waits: an eager firing's next chance is one tool call away (see the lock note below).
+* never a silent drop — a hook that stops without speaking says why in the log. This one cost a
+  session of log archaeology: speak.log held NO entry at all for lines the user never heard.
+  Every path that abandons a line now logs its reason. Three stay quiet on purpose, because a log
+  nobody can read is as good as no log: an eager firing with nothing new (it claimed nothing, and
+  its line waits for the next tool call), a message with no marked line in it (there was nothing to
+  lose), and a hook the user has switched off (``speak.enabled``, once per turn, forever).
 * dedup — a same-as-last read IS the stale previous turn, so it is dropped, not spoken twice.
 * eager speaking (opt-in, ``speak.eager``) — Stop fires only at the END of a turn, so a 🔊 line
   printed early in a long tool-heavy turn is heard minutes late. With eager on, hooks.json also
@@ -112,6 +126,14 @@ except ImportError:  # pragma: no cover - POSIX-only; Linux and macOS are the su
 # Retry backoff for the flush race: adaptive, front-loaded — most races resolve within the first
 # fraction of a second, so we probe early instead of sleeping a flat 5 x 0.7 s tail.
 BACKOFF = (0.15, 0.3, 0.5, 0.7, 1.0)
+
+# What happens where that ladder runs out, on the Stop path only: while an OLDER speaking chain is
+# still playing, a line with nothing new behind it is not lost, it is standing in a queue — so keep
+# looking. The bound is a COUNT of polls rather than a wall clock, because that is the same bound a
+# test can drive with a fake sleep; PLAYBACK_POLLS * PLAYBACK_POLL is the ceiling in seconds (20 s
+# — two cloud clips' worth), and it exists so a wedged player can never hold a turn open.
+PLAYBACK_POLL = 0.25
+PLAYBACK_POLLS = 80
 
 # The spoken-ledger is a rolling window, not a journal: it only has to answer "did we already say
 # this line?" for the transcript currently in front of us. LEDGER_LINES is roughly a long session's
@@ -679,23 +701,82 @@ def pid_looks_like_speak(pid: int, read_cmdline=_cmdline_of, platform_id: str = 
     return "voice-loop-speak" in cmdline or "speak.py" in cmdline
 
 
+def _recorded_pids() -> list[int]:
+    """The speaking chain playing.pid records, minus our own pid and minus an unreadable or
+    unparseable file. One reader for both users of that file — the takeover that SIGTERMs the chain
+    and the waiter that waits it out — so neither can drift into seeing it differently."""
+    try:
+        with open(_PID_PATH, encoding="utf-8") as fh:
+            pids = [int(tok) for tok in fh.read().split()]
+    except (OSError, ValueError):
+        return []
+    return [pid for pid in pids if pid and pid != os.getpid()]
+
+
 def take_over() -> None:
     """A fresher line supersedes a still-playing older one: SIGTERM exactly the PIDs the previous
     chain recorded (its python process + its current player child) — nothing else — and only
     after each pid passes the PID-reuse guard above. A tts.command child records no marker in its
     own argv, but killing its identity-verified python parent stops it too (the SIGTERM handler
     terminates the child). Same semantics as dictate.py's echo guard (cross-script contract)."""
-    try:
-        with open(_PID_PATH, encoding="utf-8") as fh:
-            pids = [int(tok) for tok in fh.read().split()]
-    except (OSError, ValueError):
-        return
-    for pid in pids:
-        if pid and pid != os.getpid() and pid_looks_like_speak(pid):
+    for pid in _recorded_pids():
+        if pid_looks_like_speak(pid):
             try:
                 os.kill(pid, signal.SIGTERM)
             except (ProcessLookupError, PermissionError):
                 pass
+
+
+def playback_is_live() -> bool:
+    """True while ANOTHER voice-loop speaking chain is still on the air.
+
+    The pidfile alone does not answer this: a chain that was superseded leaves through _on_sigterm,
+    which exits before the cleanup that would remove the file, so the record outlives the process.
+    ``os.kill(pid, 0)`` is the existence probe — it delivers no signal — and pid_looks_like_speak is
+    the same PID-reuse guard the takeover applies before signalling. A pid that is gone, that is not
+    ours to signal, or that the kernel has since handed to somebody else is not one to wait for."""
+    for pid in _recorded_pids():
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            continue
+        if pid_looks_like_speak(pid):
+            return True
+    return False
+
+
+def wait_out_playback(read, settled, text=None):
+    """Keep re-reading the transcript for as long as an older chain is still audibly playing.
+
+    Entered at exactly one place: where the Stop path had exhausted BACKOFF with nothing new and
+    used to give up in silence. So it can only turn a DROPPED line into a late one — it never
+    delays a line that had already arrived, because a settled read never reaches here.
+
+    ``read`` is one transcript read, ``settled`` decides whether its result is final, and ``text``
+    is the unsettled read we arrived with — handed straight back when nothing is playing at all, so
+    the caller still knows WHICH give-up it is about to log (a stale repeat reads differently from
+    a transcript that never flushed). Returns the first settled read, or, once the loop has run,
+    the freshest unsettled one.
+
+    Bounded twice: the loop ends the instant playback does, and it never takes more than
+    PLAYBACK_POLLS polls however long a player wedges for."""
+    polls = 0
+    while playback_is_live():
+        if polls >= PLAYBACK_POLLS:
+            log(f"stop: still playing after {polls * PLAYBACK_POLL:.0f}s of waiting — waiting no longer")
+            return text
+        time.sleep(PLAYBACK_POLL)
+        polls += 1
+        text = read()
+        if settled(text):
+            log(f"stop: the line waited {polls * PLAYBACK_POLL:.2f}s behind the one in front — queued, not dropped")
+            return text
+    if polls:
+        # Playback just ended. The transcript often lands in that same instant, so look once more
+        # before handing the answer back — an unsettled one is the caller's give-up to log.
+        text = read()
+        log(f"stop: the line in front finished after {polls * PLAYBACK_POLL:.2f}s of waiting")
+    return text
 
 
 def _on_sigterm(signum, frame):  # noqa: ARG001 — signal-handler signature
@@ -827,6 +908,7 @@ def main() -> int:
     try:
         payload = json.loads(sys.stdin.read())
     except ValueError:
+        log("hook payload was not JSON — nothing to speak")
         return 0
     if not isinstance(payload, dict):
         payload = {}
@@ -837,6 +919,9 @@ def main() -> int:
         return 0  # the opt-in no-op: one stdin read per tool call, and the transcript untouched
     transcript = payload.get("transcript_path")
     if not transcript or not os.path.isfile(transcript):
+        # Both shapes — a payload naming no transcript at all, and one naming a file that is not
+        # there — end the turn's speech before a single line has been read. Neither was visible.
+        log(f"no transcript to read: transcript_path={transcript!r}")
         return 0
 
     # The ledger, the lock and the seeding are eager mode's machinery, and they exist ONLY when the
@@ -882,6 +967,7 @@ def main() -> int:
             prev = ""
 
         claimed: list[str] = []
+        vetoed: list[str] = []
 
         def read_fresh() -> str | None:
             """One transcript read: the marked lines this event owns, minus everything the ledger
@@ -891,17 +977,25 @@ def main() -> int:
             if not ledger_on:
                 return extract(transcript, s["marker"], s["max_chars"])
             claimed.clear()
+            vetoed.clear()  # what the ledger turned away, so a quiet exit can say WHY it was quiet
             seen = set(read_ledger())
 
             def accept(index: int, line: str) -> bool:
                 key = ledger_key(transcript, index, line)
                 if key in seen:
+                    vetoed.append(key)
                     return False
                 seen.add(key)  # a line repeated within one read is still one line
                 claimed.append(key)
                 return True
 
             return extract(transcript, s["marker"], s["max_chars"], all_messages=eager, accept=accept)
+
+        def settled(value: str | None) -> bool:
+            """Is this read final? '' is: a parsed message with no marked text in it cannot change
+            on a re-read. A non-empty extract is, unless the eager-off dedup recognises it as the
+            previous utterance. None never is — that is the flush race's own signature."""
+            return value == "" or bool(value and (ledger_on or value != prev))
 
         # Flush race: read immediately; retry ONLY on the race signatures — nothing new extracted
         # (None: no assistant message yet, or nothing but lines already spoken), or, with the ledger
@@ -911,17 +1005,32 @@ def main() -> int:
         text = read_fresh()
         if not eager:
             for pause in BACKOFF:
-                if text == "" or (text and (ledger_on or text != prev)):
+                if settled(text):
                     break
                 time.sleep(pause)
                 text = read_fresh()
+            if not settled(text):
+                # 2.65 s of ladder against a clip that runs ~10 s: this is where the line used to
+                # be dropped, in silence. The retry condition has not changed — we are here only
+                # because there is still nothing new — so waiting out the line in front costs a
+                # ready line nothing and buys a late one its turn.
+                text = wait_out_playback(read_fresh, settled, text)
         if not text:
+            if text is None and not eager:
+                # A Stop that leaves without speaking has abandoned the line for good: unlike an
+                # eager firing, it has no successor one tool call behind it. The ledger's veto is
+                # the one quiet case that ISN'T a loss — eager already said those lines out loud.
+                if vetoed:
+                    log(f"stop: nothing new — the ledger already accounts for {len(vetoed)} marked line(s)")
+                else:
+                    log("stop: gave up with nothing new in the transcript — a line written now is DROPPED")
             return 0
         # dedup: the stale previous turn, dropped, not spoken twice. This is the WHOLE of the
         # eager-off memory — deliberately shallow, so a line repeated later in a session is heard
         # again. With the ledger on, the ledger has already answered the question more precisely,
         # and re-asking it here would silence exactly the repeat the message index exists to keep.
         if not ledger_on and text == prev:
+            log(f"stop: dropped a read identical to the last spoken line (dedup): {text[:80]}")
             return 0
         extract_ms = int((time.monotonic() - t0) * 1000)
 
@@ -1013,6 +1122,11 @@ def main() -> int:
         total_ms = int((time.monotonic() - t0) * 1000)
         if played:
             log(f"played rc={rc} bytes={total_bytes} chunks={played} via={via}")
+        else:
+            # The line was claimed and then never made a sound — synthesis produced nothing, or the
+            # player would not spawn. Both already log their own reason; this is the consequence,
+            # said plainly, so the log never has to be read backwards to notice a lost line.
+            log(f"nothing played via={via} — the line was claimed but no audio reached the player")
         log(f"timings extract_ms={extract_ms} first_audio_ms={first_ms} total_ms={total_ms}")
         return 0
     finally:

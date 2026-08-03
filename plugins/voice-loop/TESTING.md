@@ -62,11 +62,23 @@ the real runtime. So the guarantee is layered differently:
    nothing, and waits for nobody; a rival is still locked out mid-playback, not merely during the
    claim; `Stop` supersedes a holder it cannot wait out), and — pinned from
    both sides — that **none of that machinery exists with `speak.eager` off**, where `Stop` keeps
-   exactly its pre-eager prev-utterance dedup and never touches the ledger;
+   exactly its pre-eager prev-utterance dedup and never touches the ledger. The **give-up** is
+   pinned there too, in both directions: a line that lands ten seconds into a real playing chain
+   (a live child in `playing.pid`, read back through the real identity guard — only the clock is
+   faked) is spoken rather than dropped; the wait is bounded by its poll count however long a
+   player wedges for; a line that was already there never waits for anybody; and every exit that
+   abandons a line logs its reason, while the one exit that abandons nothing — an eager firing
+   with nothing new, which fires on every tool call — deliberately stays out of the log;
 3. a **real invocation of the Stop hook in CI**: a synthetic transcript, the actual `speak.sh`, the
    actual speech server, a no-op player — asserting that the marked line was extracted, that an
    unmarked line was *not* spoken, and that synthesis and playback returned success;
-4. a **real invocation of eager mode in CI** — the step beside it, on the same live server, because
+4. a **real invocation of the queue in CI** — two real hook processes, because what is being waited
+   on is one process reading another's `playing.pid`, and no fake can show that the file is written
+   early enough or read back as live. A first firing takes the stage with a long-running player; a
+   second fires *while that clip is in the air* and its own marked line only reaches the transcript
+   five seconds later, past the whole 2.65 s ladder. The step asserts the second firing logged
+   `queued, not dropped`, never logged a give-up, and actually spoke that late line;
+5. a **real invocation of eager mode in CI** — the step beside it, on the same live server, because
    a subsystem that only ever ran under fakes is a subsystem nobody has run. A second config turns
    `speak.eager` on (the first one, and the step above, stay default-off) and a second state dir
    keeps the run countable, so "spoken exactly once" is a number rather than a hopeful grep. Real
@@ -77,7 +89,7 @@ the real runtime. So the guarantee is layered differently:
    firing ever saw — and finally two firings launched back to back over one fresh line, asserting
    that exactly ONE of them played it while the other logged its line *unclaimed* instead of
    queueing behind the speaker (the **lock**, non-blocking, in real processes);
-5. the **loopback selftest** (`selftest.sh`), which is itself one of the scripts, exercised against a
+6. the **loopback selftest** (`selftest.sh`), which is itself one of the scripts, exercised against a
    live server on both Linux and macOS.
 
 Real invocation is the guarantee for the runtime path. Every spoken run also logs
@@ -156,6 +168,8 @@ prompt the setup causes.
 | 3.13 | Turn eager on **mid-session**, then let one tool call fire | the session so far is NOT recited; only lines written from that point on are spoken (`speak.log` shows `seeded N line(s) of history`) | | |
 | 3.14 | With eager **off** (the default), three turns whose 🔊 line is `Done.`, then `Working.`, then `Done.` again | all three are spoken — the repeat is not swallowed. `spoken.ledger` is never created: eager-off behaviour is unchanged from before eager mode existed | | |
 | 3.15 | With eager **on**, the same three turns | all three are spoken here too — the ledger keys on the message, not just the text | | |
+| 3.16 | A 🔊 line long enough to play for ~10 s, then send the next prompt straight away so its reply lands mid-clip | the second line is **spoken** (after the first clip, or in place of it — never skipped), and `speak.log` shows `queued, not dropped` | | |
+| 3.17 | Any turn whose 🔊 line you did **not** hear | `speak.log` has a line saying why — a give-up, a dedup, a synthesis failure. A turn that produced *no* log line at all is a bug | | |
 
 ## 4. Negative cases — failures must be legible, never hangs
 

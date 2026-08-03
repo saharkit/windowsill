@@ -198,6 +198,83 @@ jobs:
           [ "${chunks:-0}" -gt 1 ] \
             || { echo "expected a multi-chunk stream (chunks>1), got chunks=${chunks:-none} -- the marked text no longer spans multiple server chunks"; exit 1; }
 
+      - name: queued-not-dropped contract (real invocation — a line behind a playing clip)
+        env:
+          PHRASE: ${{ matrix.hook_phrase }}
+          LANGUAGE: ${{ matrix.language }}
+        run: |
+          # The flush-race backoff is 2.65 s all told and a real clip runs far longer than that, so
+          # a Stop firing that arrived while the previous line was still playing used to run out of
+          # ladder and return 0 IN SILENCE — the line was never spoken and the log never said so.
+          # Two REAL hook processes prove the fix, because the thing being waited on is one process
+          # reading another's playing.pid: fakes cannot show that the file is written early enough
+          # or read back as live. Own config and own state dir, like the eager step beside it, so
+          # every line counted here is one of ours.
+          export VOICE_LOOP_CONFIG="$RUNNER_TEMP/queue-config.json"
+          export XDG_STATE_HOME="$RUNNER_TEMP/queue-state"
+          export TRANSCRIPT="$RUNNER_TEMP/queue-transcript.jsonl"
+          state="$XDG_STATE_HOME/voice-loop"
+          log="$state/speak.log"
+
+          # A player that holds the stage far longer than the backoff ladder — the ~10 s clip from
+          # the report, rounded up so a slow runner cannot end it before the second hook looks.
+          cat > "$RUNNER_TEMP/long-clip" <<'SH'
+          #!/usr/bin/env bash
+          sleep 15
+          SH
+          chmod +x "$RUNNER_TEMP/long-clip"
+
+          cat > "$VOICE_LOOP_CONFIG" <<JSON
+          {
+            "language": "$LANGUAGE",
+            "tts": { "backend": "lan", "endpoint": "http://127.0.0.1:8355" },
+            "speak": { "marker": "🔊", "player": "$RUNNER_TEMP/long-clip", "timeout": 180 }
+          }
+          JSON
+
+          A=$(python3 -c 'import os; print(os.environ["PHRASE"].split(".")[0].strip() + ".")')
+          B=$(python3 -c 'import os; print(os.environ["PHRASE"].split(".")[1].strip() + ".")')
+          append() { python3 "$RUNNER_TEMP/append.py" "$1"; }
+          fire() { printf '%s' "{\"transcript_path\": \"$TRANSCRIPT\"}" | bash plugins/voice-loop/scripts/speak.sh; }
+          cat > "$RUNNER_TEMP/append.py" <<'PY'
+          # one assistant message appended to the transcript, in the shape speak.py reads
+          import json, os, sys
+
+          rec = {"type": "assistant", "message": {"content": [{"type": "text", "text": sys.argv[1]}]}}
+          with open(os.environ["TRANSCRIPT"], "a", encoding="utf-8") as fh:
+              fh.write(json.dumps(rec) + "\n")
+          PY
+
+          # (1) The line in front: a Stop firing that starts playing and stays playing.
+          append "🔊 $A"
+          fire & first=$!
+          for _ in $(seq 1 60); do
+            if [ -s "$state/playing.pid" ]; then break; fi
+            sleep 1
+          done
+          [ -s "$state/playing.pid" ] || { echo "the first firing never recorded a speaking chain"; exit 1; }
+
+          # (2) The next turn fires WHILE that clip is in the air, and its own line only reaches the
+          # transcript five seconds later — past the 2.65 s ladder, which is the whole point.
+          ( sleep 5; append "🔊 $B" ) & late=$!
+          fire
+          wait "$late" || true
+          kill "$first" 2>/dev/null || true
+          wait "$first" || true
+
+          echo "--- speak.log"; cat "$log"
+          grep -q "queued, not dropped" "$log" \
+            || { echo "the second firing did not wait out the clip in front -- the line was dropped at 2.65s again"; exit 1; }
+          if grep -q "gave up with nothing new" "$log"; then
+            echo "the second firing gave up while the previous line was still playing"; exit 1
+          fi
+          grep -qF "text: $B" "$log" \
+            || { echo "the queued line was never spoken"; exit 1; }
+          grep -qF "$B" "$state/last-spoken" \
+            || { echo "the queued line never reached last-spoken"; exit 1; }
+          grep -q "played rc=0" "$log" \
+            || { echo "nothing was played at all in this step"; exit 1; }
+
       - name: eager-speaking contract (real invocation — ledger, seeding, lock)
         env:
           PHRASE: ${{ matrix.hook_phrase }}

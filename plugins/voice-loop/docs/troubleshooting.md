@@ -101,6 +101,26 @@ repeats anyway:
 **Nothing is spoken at all:** does the reply contain a line that *starts* with the marker? A marker
 in the middle of a line is not spoken. Ask for it in your `CLAUDE.md` if you want it consistently.
 
+## The voice lags a couple of replies behind, or skips lines entirely
+
+**Cause:** the hook arrived while the *previous* line was still playing and found nothing new to
+say yet. It waits out the clip in front (up to 20 s) and speaks the line late rather than dropping
+it — but a line written after that ceiling, or while nothing is playing at all, is genuinely gone.
+
+`speak.log` now says which happened, and the wording is the diagnosis:
+
+- `queued, not dropped` — the line waited behind a playing clip and was then spoken. Working as
+  intended; if the wait itself is the complaint, shorten the spoken lines so each clip is shorter;
+- `gave up with nothing new in the transcript` — the ladder ran out with nothing playing behind it.
+  The line never reached the transcript in time and was **lost**;
+- `still playing … waiting no longer` — a clip outlasted the 20 s ceiling. Usually a wedged player:
+  check `speak.player` actually exits when the file ends (`aplay -q`, `afplay`, `mpg123 -q`);
+- `dropped a read identical to the last spoken line (dedup)` — the reply repeated the previous
+  turn's line verbatim; see the section above.
+
+If the log has **no entry at all** for a turn, the hook never ran: check that it is registered, and
+that `speak.enabled` is not false.
+
 ## The voice sounds robotic / mangles names
 
 Two different causes, and the common one is not synthesis quality.
