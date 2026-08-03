@@ -11,9 +11,9 @@ saharkit/windowsill`). **The root belongs to the shelf; each plugin owns its own
 directory and nothing else at the top level.
 
 Root-level, and this is the whole list (every tracked entry): `README.md` (the catalog),
-`.claude-plugin/marketplace.json` (what `marketplace add` reads), `.github/` (shared CI), `plugins/`
-(one directory per plugin), `tales/` (story content, not a plugin), `LICENSE`, `.gitignore`,
-`.claude/`, this file.
+`ACHIEVEMENTS.md` (the milestone ledger), `.claude-plugin/marketplace.json` (what `marketplace add`
+reads), `.github/` (shared CI), `plugins/` (one directory per plugin), `tales/` (story content, not
+a plugin), `LICENSE`, `.gitignore`, `.claude/`, this file.
 
 A plugin's **version lives in `plugins/<name>/.claude-plugin/plugin.json`** — that is the source.
 It is recorded in **three** places in all: that manifest, its mirror in
@@ -109,8 +109,10 @@ linear-segmentation rewrite in the history).
 `.claude/review-profile.yml` maps path classes to the lenses they require. Every rule there carries
 architecture + QA and only ever *adds* to them — the escalations can add security and capacity but
 cannot restore a baseline lens a rule dropped, so no rule drops one. The single exemption is prose,
-and it is scoped: this file, the review map itself, `README.md` and `TESTING.md` are reviewed like
-code, because they state the bar rather than describe a feature.
+and it is scoped: this file, the review map itself, `README.md`, `ACHIEVEMENTS.md` and `TESTING.md`
+are reviewed like code, because they state the bar rather than describe a feature. The ledger is in
+that list for its own reason: nothing mechanical can check that a milestone row is true, so the
+review lens is the only thing standing between it and an unearned claim.
 
 ## Conventions
 
