@@ -1,14 +1,23 @@
 # Known Whisper silence hallucinations — transcripts the model invents on near-silent or noisy
 # clips instead of returning nothing. One pattern per line; blank lines and '#' comments are
 # ignored. Matching is normalized (whitespace collapsed, lowercased, trailing punctuation
-# stripped) and applies only when the FULL transcript equals a pattern or starts with one at a
-# word boundary — genuine speech that merely contains a phrase is never touched.
+# stripped) and a pattern fires where the text equals it or extends it at a word boundary —
+# genuine speech that merely contains a phrase mid-sentence is never touched.
+#
+# A pattern is applied at TWO places, and they remove different amounts:
+#   - the WHOLE transcript matches -> the transcript is dropped (the clip was silence);
+#   - the LAST SENTENCE matches   -> just that sentence is stripped and the speech before it kept
+#     (a closing caption appended to a complete dictation). A sentence break is required, so a
+#     phrase ending a sentence of real speech survives.
 #
 # Extend freely; the server re-reads the file after reset_caches() or a restart.
 
 # --- Russian TV end-credits (the classic subtitle-corpus artifacts) ---
 Редактор субтитров
 Корректор А.Егорова
+# Deliberately bare: the caption comes as «Субтитры <сделал|и озвучка|от> …» with an endless tail of
+# studio names, and the four recorded variants below are only the ones we have seen so far.
+Субтитры
 Субтитры делал DimaTorzok
 Субтитры сделал DimaTorzok
 Субтитры создавал DimaTorzok
@@ -17,6 +26,7 @@
 
 # --- Russian gratitude / channel pleas ---
 Спасибо за просмотр
+Спасибо за внимание
 Подписывайтесь на канал
 Подпишись на канал
 Ставьте лайки
@@ -32,6 +42,13 @@ Don't forget to subscribe
 Like and subscribe
 See you in the next video
 See you next time
+
+# --- English closing captions (the twins of the Russian end-credits above) ---
+Subtitles by
+Subtitles created by
+Subtitled by
+Captions by
+To be continued
 
 # --- Widely reported in the whisper / faster-whisper issue trackers ---
 Subtitles by the Amara.org community
