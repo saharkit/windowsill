@@ -1399,3 +1399,212 @@ def test_an_unlockable_state_dir_speaks_anyway(state, monkeypatch):
     lock = speak.acquire_lock()
     assert isinstance(lock, speak._NoLock)
     speak.release_lock(lock)
+
+
+# --- the give-up: a line queued behind playback, and never a silent drop -------------------------
+#
+# The report these pin: BACKOFF is 2.65 s all told, one cloud clip runs ~10 s, and a Stop that ran
+# out of ladder while that clip was still playing returned 0 without writing a single line to the
+# log. The line was never spoken and nothing said so — it took log archaeology over a speak.log
+# with NO entries at all to find, which is why "every give-up is logged" is pinned here as hard as
+# the queueing itself.
+
+PLAYBACK_SECONDS_IN_FLIGHT = 10.0  # the clip from the report — four times the whole BACKOFF ladder
+
+
+def _speak_log(state) -> str:
+    log_path = state / "speak.log"
+    return log_path.read_text(encoding="utf-8") if log_path.exists() else ""
+
+
+def test_playback_is_live_only_for_a_pid_that_exists_and_is_the_chain(state, monkeypatch):
+    assert speak.playback_is_live() is False  # no pidfile at all: nobody to wait for
+    (state / "playing.pid").write_text(f"{os.getpid()} 0", encoding="utf-8")
+    assert speak.playback_is_live() is False  # our own pid, and pid 0, are not somebody else
+    (state / "playing.pid").write_text("111 222", encoding="utf-8")
+    monkeypatch.setattr(speak.os, "kill", lambda pid, sig: None)  # both pids exist
+    monkeypatch.setattr(speak, "pid_looks_like_speak", lambda pid: pid == 222)
+    assert speak.playback_is_live() is True
+    monkeypatch.setattr(speak, "pid_looks_like_speak", lambda pid: False)
+    assert speak.playback_is_live() is False  # recycled pids: the file lies, the guard does not
+
+
+def test_a_pidfile_that_outlived_its_chain_is_not_waited_for(state):
+    """Real-child integration, the negative half: a superseded chain leaves through _on_sigterm,
+    which exits before the cleanup that would remove its pidfile — so the record routinely outlives
+    the process. The existence probe is what stops the next firing waiting out a dead speaker."""
+    child = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(300)", "voice-loop-speak-liveness-marker"]
+    )
+    try:
+        (state / "playing.pid").write_text(str(child.pid), encoding="utf-8")
+        assert speak.playback_is_live() is True
+    finally:
+        child.kill()
+        child.wait(timeout=10)
+    assert speak.playback_is_live() is False  # same file, same pid, nobody home
+
+
+def test_the_wait_hands_back_the_first_read_that_settles(state, monkeypatch):
+    sleeps: list[float] = []
+    monkeypatch.setattr(speak.time, "sleep", lambda seconds: sleeps.append(seconds))
+    monkeypatch.setattr(speak, "playback_is_live", lambda: True)
+    answers = iter([None, None, "the line that landed late"])
+    text = speak.wait_out_playback(lambda: next(answers), lambda value: bool(value))
+    assert text == "the line that landed late"
+    assert sleeps == [speak.PLAYBACK_POLL] * 3
+    assert "queued, not dropped" in _speak_log(state)
+
+
+def test_the_wait_is_bounded_by_its_poll_count_however_long_playback_runs(state, monkeypatch):
+    """A wedged player must not hold the turn open. The bound is a count of polls, not a wall
+    clock, precisely so it is the same bound under a fake sleep as under a real one."""
+    sleeps: list[float] = []
+    monkeypatch.setattr(speak.time, "sleep", lambda seconds: sleeps.append(seconds))
+    monkeypatch.setattr(speak, "playback_is_live", lambda: True)  # a clip that never ends
+    # The eager-off shape of "nothing new": every re-read returns the same stale previous line.
+    text = speak.wait_out_playback(lambda: "the stale read", lambda value: False, "the stale read")
+    assert text == "the stale read"  # the caller still logs the RIGHT give-up over it
+    assert len(sleeps) == speak.PLAYBACK_POLLS
+    assert "waiting no longer" in _speak_log(state)
+
+
+def test_the_wait_costs_nothing_when_nothing_is_playing(state, monkeypatch):
+    """The give-up path with an empty stage: no sleep, no re-read, and no log line of its own —
+    the caller's give-up line is the one that belongs there."""
+
+    def never(*args, **kwargs):
+        raise AssertionError("nothing is playing: there is nothing to wait for")
+
+    monkeypatch.setattr(speak.time, "sleep", never)
+    monkeypatch.setattr(speak, "playback_is_live", lambda: False)
+    assert speak.wait_out_playback(never, never, "the stale read") == "the stale read"
+    assert _speak_log(state) == ""
+
+
+def test_the_wait_takes_one_last_look_when_the_clip_in_front_ends(state, monkeypatch):
+    """The transcript often lands in the very instant the clip in front finishes; a wait that
+    stopped looking at the end of playback would drop exactly that line."""
+    monkeypatch.setattr(speak.time, "sleep", lambda seconds: None)
+    live = iter([True, True, False])
+    monkeypatch.setattr(speak, "playback_is_live", lambda: next(live))
+    answers = iter([None, None, "the line that landed as the clip ended"])
+    text = speak.wait_out_playback(lambda: next(answers), lambda value: bool(value))
+    assert text == "the line that landed as the clip ended"
+    assert "the line in front finished" in _speak_log(state)
+
+
+def test_a_line_written_while_the_previous_clip_plays_is_queued_not_dropped(state, monkeypatch):
+    """THE ACCEPTANCE CASE, end to end through the real main().
+
+    A previous chain is really playing — a live child recorded in playing.pid, read back through
+    the real pidfile and the real identity guard — and this turn's marked line only reaches the
+    transcript ten seconds in, four times the whole BACKOFF ladder. The old hook ran its 2.65 s,
+    found nothing, and returned 0 in silence: the line was never spoken and the log never mentioned
+    it. Only the clock is faked here; the liveness the wait hangs on is a real process.
+    """
+    transcript = state / "transcript.jsonl"
+    transcript.write_text("", encoding="utf-8")
+    # Spawned BEFORE the audio half is faked: _record_speech replaces subprocess.Popen itself.
+    child = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(300)", "voice-loop-speak-in-flight-marker"]
+    )
+    (state / "playing.pid").write_text(str(child.pid), encoding="utf-8")
+    spoken = _record_speech(monkeypatch)
+    _write_config(state, monkeypatch)  # eager off: the default, and the configuration that was hit
+
+    elapsed = [0.0]
+
+    def fake_sleep(seconds: float) -> None:
+        elapsed[0] += seconds
+        if elapsed[0] >= PLAYBACK_SECONDS_IN_FLIGHT and child.poll() is None:
+            _append_message(transcript, "🔊 the line that waited its turn")
+            child.kill()
+            child.wait(timeout=10)  # reaped: the clip is over and playing.pid points at nobody
+
+    try:
+        payload = json.dumps({"transcript_path": str(transcript), "hook_event_name": "Stop"})
+        monkeypatch.setattr(speak.sys, "stdin", _Stdin(payload))
+        monkeypatch.setattr(speak.time, "sleep", fake_sleep)
+        assert speak.main() == 0
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.wait(timeout=10)
+
+    assert spoken == ["the line that waited its turn"]  # voiced, not dropped
+    assert elapsed[0] >= PLAYBACK_SECONDS_IN_FLIGHT  # and it really did outlast the clip
+    assert "queued, not dropped" in _speak_log(state)
+
+
+def test_a_line_that_is_already_there_never_waits_for_the_clip_in_front(state, monkeypatch):
+    """The retry CONDITION is untouched: the wait is reachable only where the ladder ran out with
+    nothing new. A turn whose line is already in the transcript still supersedes a playing clip at
+    once — the takeover must not quietly become a queue."""
+
+    def never() -> bool:
+        raise AssertionError("a settled read must never wait for anybody")
+
+    monkeypatch.setattr(speak, "playback_is_live", never)
+    _write_config(state, monkeypatch)
+    assert _speak_turns(state, monkeypatch, ["Done."]) == ["Done."]
+
+
+def test_a_stop_that_gives_up_says_so_instead_of_returning_in_silence(state, monkeypatch):
+    """The whole ladder burned on a transcript that never flushed, nothing playing behind it: the
+    line is genuinely lost, and the log is the only place that can ever say so."""
+    rc, sleeps = _run_main_against("{not json yet", state, monkeypatch)
+    assert (rc, sleeps) == (0, list(speak.BACKOFF))  # the ladder itself is unchanged
+    assert "gave up with nothing new in the transcript — a line written now is DROPPED" in _speak_log(state)
+
+
+def test_the_dedup_drop_names_the_line_it_dropped(state, monkeypatch):
+    """Dropping the stale previous turn is correct and stays; being unable to tell it apart from a
+    lost line in the log is what was not."""
+    _write_config(state, monkeypatch)
+    assert _speak_turns(state, monkeypatch, ["Done.", "Done."]) == ["Done."]
+    assert "dropped a read identical to the last spoken line (dedup): Done." in _speak_log(state)
+
+
+def test_a_payload_with_no_readable_transcript_is_logged(state, monkeypatch):
+    monkeypatch.setenv("VOICE_LOOP_CONFIG", str(state / "absent.json"))
+    monkeypatch.setattr(speak.sys, "stdin", _Stdin(json.dumps({"transcript_path": str(state / "gone.jsonl")})))
+    assert speak.main() == 0
+    assert "no transcript to read" in _speak_log(state)
+
+
+def test_a_payload_that_is_not_json_is_logged(state, monkeypatch):
+    monkeypatch.setenv("VOICE_LOOP_CONFIG", str(state / "absent.json"))
+    monkeypatch.setattr(speak.sys, "stdin", _Stdin("this is not a hook payload"))
+    assert speak.main() == 0
+    assert "hook payload was not JSON" in _speak_log(state)
+
+
+def test_stop_names_the_ledger_when_it_stays_quiet_rather_than_crying_drop(state, monkeypatch):
+    """Not every quiet Stop lost something. With eager on, the line it finds nothing new about is
+    the one an eager firing already said out loud — the log names the ledger, because a give-up
+    line here would cry wolf once per turn and drown the real ones."""
+    _write_config(state, monkeypatch, eager=True)
+    transcript = state / "transcript.jsonl"
+    transcript.write_text("", encoding="utf-8")
+    spoken = _record_speech(monkeypatch)
+    assert _fire(state, monkeypatch, transcript, "PostToolUse")[0] == 0  # seeds this transcript
+    _append_message(transcript, "🔊 said by the eager firing")
+    assert _fire(state, monkeypatch, transcript, "PostToolUse")[0] == 0  # speaks it mid-turn
+    assert _fire(state, monkeypatch, transcript, "Stop")[0] == 0  # and Stop has nothing to add
+    assert spoken == ["said by the eager firing"]
+    assert "the ledger already accounts for 1 marked line(s)" in _speak_log(state)
+
+
+def test_an_eager_firing_with_nothing_new_stays_out_of_the_log(state, monkeypatch):
+    """The one deliberate silence. An eager firing that finds nothing new has dropped NOTHING —
+    it claimed nothing, and the next tool call is a free retry — and it fires on every tool call,
+    so a line per firing would drown the drops this change exists to make visible."""
+    _write_config(state, monkeypatch, eager=True)
+    transcript = state / "transcript.jsonl"
+    transcript.write_text(_assistant("🔊 history, seeded and never spoken") + "\n", encoding="utf-8")
+    _record_speech(monkeypatch)
+    assert _fire(state, monkeypatch, transcript, "PostToolUse")[0] == 0
+    before = _speak_log(state)
+    assert _fire(state, monkeypatch, transcript, "PostToolUse")[0] == 0
+    assert _speak_log(state) == before  # not one line added by a firing that lost nothing

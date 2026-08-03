@@ -45,8 +45,17 @@ alone.
      retry happens only on the two real race signatures — an **empty** extract, or one **identical
      to the last spoken line** — with adaptive backoff (0.15 → 1.0 s), so an already-flushed
      transcript costs zero sleep;
+   - **queue**: that ladder is 2.65 s and a clip runs ten times longer. When it runs out with
+     nothing new *and a previous line is still playing* (`playing.pid`, the same record the
+     takeover reads), Stop keeps re-reading until that clip ends — bounded at 20 s — instead of
+     giving up. The retry *condition* is unchanged, so a line that was already there is never
+     delayed; only a line that would have been **dropped** is now merely late;
    - **dedup**: a read identical to the previous turn's *is* the stale previous turn, so it is
      dropped rather than spoken twice.
+
+   Every one of those exits that abandons a line **logs why**. The paths that abandon nothing stay
+   quiet on purpose: an eager firing with nothing new keeps its line for the next tool call, and a
+   message with no marked line in it never had one to lose.
 4. Playback **streams**. The marked text is split into sentence chunks (tiny sentences merged so a
    chunk is at least ~40 characters); the first chunk plays as soon as *it* is synthesized while the
    next one synthesizes. When the server's `/health` reports `"streaming": true`, the whole text
