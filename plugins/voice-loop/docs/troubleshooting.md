@@ -207,3 +207,15 @@ references tools installed in a shell-only `PATH` (Homebrew, `~/.local/bin`), us
 ### Dictation echoes the assistant back
 
 You pressed the hotkey while a spoken line was still playing, and the microphone transcribed the speakers. The dictation script now stops in-flight speech playback when a recording starts (the echo guard). If you still catch echo (external speakers, high volume), start recording after the line finishes, or use headphones.
+
+## None of the above — report it
+
+`/report-bug` collects the evidence for you: versions, config with the secrets stripped, both log
+tails, `/health`, and the last job states, in one bundle it shows you in full before asking whether
+to send it and where. Nothing about your machine — and nothing you said or heard — leaves without
+that yes. See [the README section](../README.md#when-it-misbehaves--report-bug) for exactly what is
+stripped, and run the collector by hand if you would rather read the bundle first:
+
+```sh
+bash "${CLAUDE_PLUGIN_ROOT}/scripts/report-bug.sh" collect --summary "what went wrong"
+```

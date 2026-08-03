@@ -196,9 +196,12 @@ plugins/voice-loop/
   scripts/dictate-toggle.sh   push-to-talk launcher (stable hotkey entry point)
   scripts/dictate.py          the toggle: record -> transcribe -> clipboard/paste-into-prompt
   scripts/selftest.sh         hardware-free loopback proof (TTS -> STT -> compare)
+  scripts/report-bug.sh       bug-report launcher (stable entry point for /report-bug)
+  scripts/report_bug.py       the collector: diagnostics -> redaction -> one bundle -> a transport
   skills/voice-setup/         the agent installer
   skills/voice-design/        voice casting
   skills/voice-remove/        the symmetric uninstaller (service, hotkey, config, caches, convention)
+  skills/report-bug/          consent-first bug reporting
   server/                     the self-hostable speech server (FastAPI + faster-whisper + Silero), Dockerfile
   tests/                      the server's unit tests (no models, no network) — 100% gated in CI
   docs/                       architecture, troubleshooting, FAQ
@@ -318,6 +321,39 @@ download.
 
 Deeper reading: [architecture](docs/architecture.md) ·
 [troubleshooting](docs/troubleshooting.md) · [FAQ](docs/faq.md).
+
+## When it misbehaves — `/report-bug`
+
+```text
+/report-bug dictation pastes nothing since this morning
+```
+
+Claude does the log archaeology instead of you. It collects one bundle — plugin and server versions,
+OS and hardware class, your config, the tails of `dictate.log` and `speak.log`, `/health` for the
+endpoints your config names, the state-dir sizes and ages, and the last 20 job states — then **shows
+you every byte of it in chat and asks before anything is sent**, naming where it would go.
+
+What the collector strips before you ever see it:
+
+- **keys and tokens** — by shape, and by config key name (`api_key` goes; `api_key_env` and
+  `key_file` stay, because "which variable was consulted" is half the diagnosis);
+- **you** — your username and home paths, and every host except loopback;
+- **what was said.** A log line carrying speech keeps its event and loses its words:
+  `transcript: <redacted 30 chars>`. The length is a diagnostic; the sentence is yours. Third-party
+  output appended to the same log (a recorder's stderr, a `whisper.cpp` transcript) is withheld
+  whole, and a line the collector's table does not recognise is cut rather than trusted.
+
+Then you pick a transport: **`gh issue create`** if you have the CLI (issues are where the fixes
+live), a **pre-filled new-issue URL** you submit yourself if you have a GitHub account but no CLI, or
+a **mailto:** if you have neither — that last one waits on a project mailbox that does not exist yet,
+and `/report-bug` says so rather than sending mail into a void. The bundle file stays in
+`~/.local/state/voice-loop/` either way; if you decline, it never leaves your machine.
+
+The collector runs standalone too, if you would rather read the bundle before Claude does:
+
+```sh
+bash plugins/voice-loop/scripts/report-bug.sh collect --summary "no sound after an update"
+```
 
 ## Author
 
