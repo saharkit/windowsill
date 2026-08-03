@@ -357,18 +357,29 @@ jobs:
           {
             "language": "$LANGUAGE",
             "stt": { "backend": "lan", "endpoint": "http://127.0.0.1:8355" },
-            "dictate": { "recorder": "pw-record", "clipboard": "wl-copy" }
+            "dictate": { "recorder": "pw-record", "clipboard": "wl-copy", "debounce_ms": 2000 }
           }
           JSON
           export PATH="$fake:$PATH"
+          # debounce_ms is widened from its 500 ms default so BOTH sides of the key-repeat guard are
+          # deterministic here rather than racing an interpreter start: the immediate re-fire below
+          # is unambiguously inside the window, and the real second toggle (3 s later) is
+          # unambiguously outside it.
           python3 plugins/voice-loop/scripts/dictate.py paste   # toggle 1: start the fake recorder
-          sleep 1
+          python3 plugins/voice-loop/scripts/dictate.py paste   # OS key repeat: must be IGNORED
+          sleep 3
           python3 plugins/voice-loop/scripts/dictate.py paste   # toggle 2: stop -> STT -> clipboard
           state="${XDG_STATE_HOME:-$HOME/.local/state}/voice-loop"
           echo "--- dictate.log"; cat "$state/dictate.log"
           echo "--- clipboard capture"; cat "$FAKE_CLIP_FILE" 2>/dev/null || true; echo
           grep -q "recording via pw-record" "$state/dictate.log" \
             || { echo "the fake recorder was never started"; exit 1; }
+          # the key-repeat guard: the held-key re-fire neither started a second recorder nor
+          # stopped the first one (windowsill#49) — one recording cycle for the whole burst
+          grep -q "toggle ignored — key repeat" "$state/dictate.log" \
+            || { echo "the key-repeat re-fire was not debounced"; exit 1; }
+          [ "$(grep -c "recording via pw-record" "$state/dictate.log")" = "1" ] \
+            || { echo "the key-repeat re-fire started a second recording"; exit 1; }
           if grep -q "clip too short" "$state/dictate.log"; then
             echo "the recorded clip was dropped by the min-clip guard"; exit 1
           fi

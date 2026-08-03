@@ -47,6 +47,7 @@ def state(monkeypatch, tmp_path):
     monkeypatch.setattr(dictate, "_WAV_PATH", str(tmp_path / "dictate.wav"))
     monkeypatch.setattr(dictate, "_LAST_WAV_PATH", str(tmp_path / "dictate-last.wav"))
     monkeypatch.setattr(dictate, "_SPEAK_PID_PATH", str(tmp_path / "playing.pid"))
+    monkeypatch.setattr(dictate, "_TOGGLE_PATH", str(tmp_path / "dictate-last-toggle"))
     return tmp_path
 
 
@@ -68,6 +69,7 @@ def test_defaults_with_empty_config_linux():
     assert s["stt_command"] == ""
     assert s["key_env"] == "VOICE_LOOP_STT_API_KEY"
     assert s["timeout"] == 60.0
+    assert s["debounce_ms"] == 500.0
 
 
 def test_darwin_defaults_follow_the_platform():
@@ -441,7 +443,11 @@ def test_claim_pidfile_admits_exactly_one_winner(state):
 
 def test_concurrent_toggles_start_exactly_one_recorder(state, monkeypatch):
     """The injected race window: both invocations pass the pidfile-liveness check and reach the
-    claim together — the O_EXCL create is the only arbiter, and it must pick exactly one."""
+    claim together — the O_EXCL create is the only arbiter, and it must pick exactly one.
+
+    debounce_ms is 0 on purpose: the key-repeat guard sits in front of this race and would drop the
+    second invocation before it ever reached the claim, which is a different (also tested)
+    property. Turning it off is how the claim itself stays reachable."""
     barrier = threading.Barrier(2)
     real_claim = dictate.claim_pidfile
 
@@ -455,7 +461,7 @@ def test_concurrent_toggles_start_exactly_one_recorder(state, monkeypatch):
     monkeypatch.setattr(dictate, "stop_speak_playback", lambda: None)
     notes: list[str] = []
     monkeypatch.setattr(dictate, "note", lambda message, system: notes.append(message))
-    _write_config(monkeypatch, state, {"dictate": {"recorder": "arecord"}})
+    _write_config(monkeypatch, state, {"dictate": {"recorder": "arecord", "debounce_ms": 0}})
 
     rcs: list[int] = []
     threads = [threading.Thread(target=lambda: rcs.append(dictate.main(["dictate.py"]))) for _ in range(2)]
@@ -543,6 +549,137 @@ def test_stop_removes_the_pidfile_before_signalling(state, monkeypatch):
     assert dictate.stop_and_transcribe(s, "Linux", "send", 12345) == 0
     # the slot was freed BEFORE the signal: a racing start claims fresh, never adopts a dying recorder
     assert seen == [(12345, dictate.signal.SIGINT, False)]
+
+
+# --- the key-repeat guard: a held hotkey is one toggle, not a stream of them --------------------
+
+
+def test_debounce_admits_the_first_toggle_and_drops_a_refire_inside_the_window(state):
+    assert dictate.debounce_toggle(0.5, now=1000.0) is None  # nothing before it: proceed
+    age = dictate.debounce_toggle(0.5, now=1000.25)  # OS autorepeat, ~4 Hz
+    assert age is not None
+    assert age == pytest.approx(0.25, abs=0.01)
+
+
+def test_debounce_admits_a_toggle_past_the_window(state):
+    assert dictate.debounce_toggle(0.5, now=1000.0) is None
+    assert dictate.debounce_toggle(0.5, now=1000.5) is None  # the boundary belongs to the tap
+    # and the stamp moved with it, so the window is measured from the LAST admitted toggle
+    assert dictate.debounce_toggle(0.5, now=1000.9) is not None
+
+
+def test_a_dropped_refire_does_not_move_the_stamp(state):
+    """Otherwise a key held down would keep pushing the window forward and the toggle would never
+    fire again, however long the user leant on it."""
+    assert dictate.debounce_toggle(0.5, now=1000.0) is None
+    for tick in (1000.1, 1000.2, 1000.3, 1000.4):
+        assert dictate.debounce_toggle(0.5, now=tick) is not None
+    assert dictate.debounce_toggle(0.5, now=1000.6) is None  # 0.6 s after the stamp, not after 1000.4
+
+
+def test_a_zero_window_turns_the_guard_off_and_writes_no_stamp(state):
+    assert dictate.debounce_toggle(0.0) is None
+    assert dictate.debounce_toggle(-1.0) is None
+    assert not (state / "dictate-last-toggle").exists()
+
+
+def test_a_garbage_stamp_is_read_as_no_previous_toggle(state):
+    (state / "dictate-last-toggle").write_text("not-a-timestamp", encoding="utf-8")
+    assert dictate.debounce_toggle(0.5, now=1000.0) is None
+    assert (state / "dictate-last-toggle").read_text(encoding="utf-8") == "1000.000000"
+
+
+def test_a_stamp_a_hair_in_the_future_still_debounces(state):
+    """Writing the stamp rounds; two fires microseconds apart can therefore read a stamp marginally
+    AHEAD of their own clock. Testing `age >= 0` there would wave through exactly the autorepeat
+    the guard exists to catch, so the window is measured on the absolute age."""
+    (state / "dictate-last-toggle").write_text("1000.0005", encoding="utf-8")
+    assert dictate.debounce_toggle(0.5, now=1000.0) == 0.0
+
+
+def test_a_stamp_from_the_future_never_wedges_the_toggle(state):
+    # a clock stepped backwards (ntp, a suspend/resume) by more than the window must not lock
+    # dictation out until wall-clock catches up
+    (state / "dictate-last-toggle").write_text("99999999999", encoding="utf-8")
+    assert dictate.debounce_toggle(0.5, now=1000.0) is None
+
+
+def test_the_guard_fails_open_when_the_stamp_cannot_be_written(state, monkeypatch):
+    monkeypatch.setattr(dictate, "_TOGGLE_PATH", str(state))  # a directory: O_RDWR cannot open it
+    assert dictate.debounce_toggle(0.5) is None
+    assert dictate.debounce_toggle(0.5) is None  # a guard that cannot keep time never blocks a tap
+    assert "debounce stamp unavailable" in (state / "dictate.log").read_text(encoding="utf-8")
+
+
+@pytest.mark.skipif(dictate.fcntl is None, reason="POSIX flock only")
+def test_a_toggle_that_cannot_take_the_stamp_lock_is_a_refire(state):
+    """Losing the non-blocking flock means another invocation is stamping RIGHT NOW — microseconds
+    apart is autorepeat, not two taps."""
+    holder = os.open(dictate._TOGGLE_PATH, os.O_CREAT | os.O_RDWR, 0o600)
+    dictate.fcntl.flock(holder, dictate.fcntl.LOCK_EX | dictate.fcntl.LOCK_NB)
+    try:
+        assert dictate.debounce_toggle(0.5) == 0.0
+    finally:
+        os.close(holder)
+    assert dictate.debounce_toggle(0.5) is None  # the lock is gone with the fd: back to normal
+
+
+def test_rapid_double_fire_produces_exactly_one_recording_cycle(state, monkeypatch):
+    """The acceptance case (windowsill#49): key-repeat fires the toggle twice inside the window;
+    the second must not stop the recording the first started."""
+    spawned: list[list[str]] = []
+    monkeypatch.setattr(dictate.subprocess, "Popen", lambda argv, **kw: spawned.append(argv) or FakeProc())
+    monkeypatch.setattr(dictate, "stop_speak_playback", lambda: None)
+    kills: list[tuple[int, int]] = []
+    monkeypatch.setattr(dictate.os, "kill", lambda pid, sig: kills.append((pid, sig)))
+    notes: list[str] = []
+    monkeypatch.setattr(dictate, "note", lambda message, system: notes.append(message))
+    _write_config(monkeypatch, state, {"dictate": {"recorder": "arecord"}})
+
+    assert dictate.main(["dictate.py"]) == 0
+    assert dictate.main(["dictate.py"]) == 0  # the OS repeat, immediately after
+
+    assert len(spawned) == 1  # one recorder…
+    assert kills == []  # …never signalled: the repeat did not reach the stop branch at all
+    assert (state / "dictate.pid").read_text(encoding="utf-8") == "4242"  # still recording
+    assert notes.count("recording…") == 1
+    assert "key repeat" in (state / "dictate.log").read_text(encoding="utf-8")
+
+
+def test_a_second_press_past_the_window_still_stops_the_recording(state, monkeypatch):
+    """The guard must debounce autorepeat without breaking the toggle it protects."""
+    monkeypatch.setattr(dictate.subprocess, "Popen", lambda argv, **kw: FakeProc())
+    monkeypatch.setattr(dictate, "stop_speak_playback", lambda: None)
+    monkeypatch.setattr(dictate, "note", lambda message, system: None)
+    monkeypatch.setattr(dictate, "_pid_alive", lambda pid: pid == FakeProc.pid)
+    stopped: list[int] = []
+    monkeypatch.setattr(dictate, "stop_and_transcribe", lambda s, system, mode, pid: stopped.append(pid) or 0)
+    _write_config(monkeypatch, state, {"dictate": {"recorder": "arecord"}})
+
+    assert dictate.main(["dictate.py"]) == 0
+    stamp = state / "dictate-last-toggle"
+    stamp.write_text(f"{time.time() - 5:.3f}", encoding="utf-8")  # the human pauses, then presses again
+    assert dictate.main(["dictate.py"]) == 0
+    assert stopped == [FakeProc.pid]
+
+
+def test_debounce_ms_is_configurable_and_zero_disables_it(state, monkeypatch):
+    assert dictate.resolve_settings({"dictate": {"debounce_ms": 150}}, "Linux")["debounce_ms"] == 150.0
+    assert dictate.resolve_settings({"dictate": {"debounce_ms": 0}}, "Linux")["debounce_ms"] == 0.0
+
+    spawned: list[list[str]] = []
+    monkeypatch.setattr(dictate.subprocess, "Popen", lambda argv, **kw: spawned.append(argv) or FakeProc())
+    monkeypatch.setattr(dictate, "stop_speak_playback", lambda: None)
+    monkeypatch.setattr(dictate, "note", lambda message, system: None)
+    monkeypatch.setattr(dictate, "_pid_alive", lambda pid: pid == FakeProc.pid)
+    stopped: list[int] = []
+    monkeypatch.setattr(dictate, "stop_and_transcribe", lambda s, system, mode, pid: stopped.append(pid) or 0)
+    _write_config(monkeypatch, state, {"dictate": {"recorder": "arecord", "debounce_ms": 0}})
+
+    assert dictate.main(["dictate.py"]) == 0
+    assert dictate.main(["dictate.py"]) == 0  # with the guard off, back to the old raw behaviour
+    assert len(spawned) == 1
+    assert stopped == [FakeProc.pid]
 
 
 # --- the cloud/LAN STT request shapes, mocked at the urllib seam --------------------------------

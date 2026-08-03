@@ -16,6 +16,10 @@ Deliberate behaviours, found by live debugging — do not "simplify" them away:
 
 * toggle — one hotkey, two meanings: a pidfile with a LIVE pid means "recording, stop it";
   anything else (absent, stale pid) means "start". A stale pidfile is removed, never obeyed.
+* key-repeat guard — a toggle is a human TAP. A HELD hotkey is turned into an autorepeat stream by
+  the OS (4+ fires per second), and every second fire stops a recording milliseconds old, so the
+  log fills with "clip too short" and nothing is ever transcribed (windowsill#49). A re-fire within
+  dictate.debounce_ms of the previous toggle is dropped before either branch is chosen.
 * start is an ATOMIC claim — the pidfile is created with O_CREAT|O_EXCL before any recorder is
   spawned, so of two near-simultaneous hotkey invocations exactly one starts a recorder; the
   loser exits with a note. Stop removes the pidfile BEFORE signalling the recorder, so a racing
@@ -65,6 +69,11 @@ import urllib.parse
 import urllib.request
 import uuid
 
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - POSIX-only; Linux and macOS are the supported platforms
+    fcntl = None  # type: ignore[assignment]
+
 # Every recorder in the table records 16 kHz mono S16 — 32000 bytes of PCM per second. The clip
 # guard converts the WAV's size to seconds with this constant, so the two must move together.
 RECORD_RATE = 16000
@@ -72,12 +81,21 @@ BYTES_PER_SECOND = RECORD_RATE * 2
 WAV_HEADER_BYTES = 44
 # Below this length there is no phrase, only a bounced hotkey; STT is skipped entirely.
 MIN_CLIP_SECONDS = 0.3
+# Key-repeat guard: how long after a toggle another one is treated as autorepeat rather than as a
+# second tap. Half a second is far longer than a key-repeat interval (~4 Hz once the OS starts
+# repeating) and far shorter than any dictation worth transcribing — a recording stopped inside it
+# would be dropped by the min-clip guard anyway. Tunable as dictate.debounce_ms; 0 turns it off.
+DEBOUNCE_SECONDS = 0.5
 
 _STATE_DIR = os.path.join(os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state")), "voice-loop")
 _LOG_PATH = os.path.join(_STATE_DIR, "dictate.log")
 _PID_PATH = os.path.join(_STATE_DIR, "dictate.pid")
 _WAV_PATH = os.path.join(_STATE_DIR, "dictate.wav")
 _LAST_WAV_PATH = os.path.join(_STATE_DIR, "dictate-last.wav")
+# When the previous toggle happened — the whole state the key-repeat guard keeps. Separate from the
+# pidfile on purpose: the pidfile says whether a recorder is running, this says how long ago the
+# hotkey was last acted on, and the guard has to answer before either branch is chosen.
+_TOGGLE_PATH = os.path.join(_STATE_DIR, "dictate-last-toggle")
 
 # CROSS-SCRIPT CONTRACT (keep in sync with speak.py): speak.py records its live speaking chain in
 # playing.pid — space-separated PIDs, its python process first, then the current player/command
@@ -138,6 +156,8 @@ def resolve_settings(config: dict, system: str) -> dict:
         "auto_paste": cfg(config, "dictate.auto_paste", False) is True
         or cfg(config, "dictate.auto_paste", False) == "true",
         "recorder": str(cfg(config, "dictate.recorder", "auto")),
+        # milliseconds in the config (what a human reasons about for a keypress), seconds inside
+        "debounce_ms": float(cfg(config, "dictate.debounce_ms", DEBOUNCE_SECONDS * 1000)),
         "clipboard": str(cfg(config, "dictate.clipboard", "auto")),
         "start_sound": str(cfg(config, "dictate.start_sound", "")),
         "stop_sound": str(cfg(config, "dictate.stop_sound", "")),
@@ -503,6 +523,69 @@ def stop_speak_playback() -> None:
                 pass
 
 
+def debounce_toggle(window: float, now: float | None = None) -> float | None:
+    """Stamp this toggle, or refuse it as a key-repeat re-fire.
+
+    Returns None when the toggle may proceed (and the stamp now names this moment), or the age in
+    seconds of the previous toggle when this invocation lands inside ``window`` and must be
+    dropped. ``window <= 0`` disables the guard.
+
+    Why this is not the pidfile claim: the claim arbitrates two invocations that both want to
+    START. Autorepeat is the opposite shape — fires that alternate start/stop/start/stop, each one
+    legitimately winning its own claim, and together producing nothing but empty clips. The guard
+    therefore runs BEFORE the direction is chosen and drops the fire whichever branch it would have
+    taken.
+
+    Read-compare-write happens under a non-blocking exclusive flock on the stamp file itself, so
+    two invocations cannot both read the old timestamp and both proceed. Failing to TAKE the lock
+    is itself the answer: another toggle is inside that critical section right now, which is a
+    re-fire by definition — no human taps twice in the microseconds it is held. Where a lock is not
+    available at all (no fcntl) the plain read-compare-write still catches autorepeat, which is
+    sequential; and where the stamp cannot be written at all (an unwritable state dir) the guard
+    fails OPEN — a debounce that cannot record time must not be a hotkey that never records audio.
+
+    The window is measured on the ABSOLUTE age, so a stamp that reads slightly in the future still
+    debounces: rounding when the stamp is written can put it a fraction of a millisecond ahead of
+    the next reader's clock, and a plain ``age >= 0`` test would let exactly the autorepeat fire it
+    exists to catch straight through. A stamp further ahead than the window is a clock stepped
+    backwards (ntp, a resume, a hand-edited file) and is admitted rather than wedging the toggle
+    until wall-clock catches up."""
+    if window <= 0:
+        return None
+    now = time.time() if now is None else now
+    try:
+        fd = os.open(_TOGGLE_PATH, os.O_CREAT | os.O_RDWR, 0o600)
+    except OSError as err:
+        log(f"debounce stamp unavailable ({_TOGGLE_PATH}): {err} — toggling anyway")
+        return None
+    try:
+        if fcntl is not None:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                return 0.0
+        try:
+            previous = float(os.read(fd, 64).decode("ascii", "replace").strip() or "0")
+        except (OSError, ValueError):
+            previous = 0.0  # empty or garbage stamp: no previous toggle we can trust
+        age = now - previous
+        if abs(age) < window:
+            return max(0.0, age)
+        try:
+            os.lseek(fd, 0, os.SEEK_SET)
+            os.ftruncate(fd, 0)
+            os.write(fd, f"{now:.6f}".encode("ascii"))
+        except OSError as err:
+            # the stamp did not move, so the next fire is not debounced — noisier, never wedged
+            log(f"debounce stamp not written: {err}")
+        return None
+    finally:
+        try:
+            os.close(fd)  # releases the flock with the file description
+        except OSError:
+            pass
+
+
 def claim_pidfile() -> int | None:
     """Atomically claim the single recording slot.
 
@@ -693,6 +776,14 @@ def main(argv: list[str]) -> int:
     )
     s = resolve_settings(load_config(cfg_path), system)
     mode = argv[1] if len(argv) > 1 and argv[1] else s["mode"]
+
+    # Key-repeat guard, before the pidfile is even read (see debounce_toggle): a held hotkey
+    # autorepeats, and the fire that follows would otherwise stop a recording milliseconds old.
+    # Log only — a notification per repeat would be the same spam in another window.
+    age = debounce_toggle(s["debounce_ms"] / 1000.0)
+    if age is not None:
+        log(f"toggle ignored — key repeat ({age * 1000:.0f} ms after the previous one)")
+        return 0
 
     try:
         with open(_PID_PATH, encoding="utf-8") as fh:
