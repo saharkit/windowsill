@@ -36,9 +36,8 @@ Run a single command that gathers everything you need:
 
 ```sh
 uname -s; uname -m; echo "LANG=$LANG LC_ALL=$LC_ALL XDG_SESSION_TYPE=$XDG_SESSION_TYPE XDG_CURRENT_DESKTOP=$XDG_CURRENT_DESKTOP"; \
-for c in jq curl python3 pw-record arecord aplay paplay ffmpeg wl-copy xclip ydotool wtype xdotool notify-send gsettings sox rec afplay pbcopy osascript say brew skhd nvidia-smi; do \
+for c in jq curl python3 pw-record arecord aplay paplay ffmpeg wl-copy xclip ydotool wtype xdotool notify-send gsettings sox rec afplay pbcopy osascript say brew nvidia-smi; do \
   command -v "$c" >/dev/null 2>&1 && echo "have $c"; done; \
-pgrep -x TouchBarServer >/dev/null 2>&1 && echo "have touchbar"; \
 python3 -c 'import sys; print("python", sys.version.split()[0])' 2>/dev/null; \
 (nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null || true); \
 cat ~/.config/voice-loop/config.json 2>/dev/null || echo "no existing config"
@@ -47,10 +46,6 @@ cat ~/.config/voice-loop/config.json 2>/dev/null || echo "no existing config"
 From the output decide: OS branch (Linux / macOS), session type (Wayland / X11), desktop (GNOME /
 KDE / other), whether a GPU exists, and what is already installed. Report the findings in two or three
 lines — not a wall of text.
-
-`have touchbar` means this Mac's function row is the virtual Touch Bar strip (`TouchBarServer` runs
-on that hardware and nowhere else) — it decides the hotkey in Step 6. It is a positive signal only:
-its absence on macOS means "probably not, ask" rather than "definitely not".
 
 ## Step 1 — language (ASK FIRST — it shapes every later option)
 
@@ -228,7 +223,6 @@ referenced). Full schema — omit what you do not need, the scripts have default
     "auto_paste": false,
     "recorder": "auto",
     "clipboard": "auto",
-    "debounce_ms": 750,
     "start_sound": "",
     "stop_sound": ""
   }
@@ -243,14 +237,6 @@ Field notes worth telling the user:
   -loglevel quiet` if a cloud provider returns mp3.
 - `dictate.paste_key` — must match the target app: terminals usually `ctrl+shift+v` or `shift+insert`,
   macOS `cmd+v`.
-- `dictate.debounce_ms` — the key-repeat guard. A *held* hotkey autorepeats, and without this every
-  second fire would stop a recording milliseconds old ("clip too short" in the log, nothing ever
-  transcribed). The window restarts on every fire, dropped ones included, so a hold is ONE toggle
-  however long it lasts and clears one window after release. 750 ms is the default — chosen to
-  exceed the longest common key-repeat *delay* (X11's 660 ms; GNOME 500, macOS 375), because a
-  window shorter than that delay lets the first repeat through — and there is rarely a reason to
-  touch it. `0` (or any negative value) turns the guard off. Raise it only for a keyboard whose
-  repeat delay is longer still; a value that large starts eating deliberate quick taps.
 - `tts.command` / `stt.command` — the escape hatch for engines that are not HTTP servers (`say`,
   whisper.cpp). `tts.command` receives text on stdin and makes the sound itself; `stt.command`
   receives the WAV path as its last argument and prints the transcript.
@@ -293,10 +279,6 @@ which is exactly why the scripts paste from the clipboard instead of typing the 
 
 ## Step 6 — hotkey
 
-One rule before the per-desktop recipes: **on macOS, bind a physical chord, not an F-row key.** See
-the macOS subsection below for why and for the question to ask. On Linux the F-row is a real key and
-`F9` remains the default.
-
 ### GNOME (gsettings, no root)
 
 ```sh
@@ -317,51 +299,15 @@ gsettings set org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:$KE
 
 Substitute the real absolute path — `${CLAUDE_PLUGIN_ROOT}` is not expanded by the desktop.
 
-### macOS — ASK, and default to a physical chord
-
-The function row is not a reliable binding target on a Mac. On a **Touch Bar** model it is a virtual
-strip: unless *Keyboard → Function Keys → "F1, F2, etc. keys always shown in Touch Bar"* is on, `F9`
-only exists while `fn` is held, so a plain `f9` binding can receive **no keycode at all** and the
-hotkey silently does nothing. A chord like ⌘I is a real key combination on every Mac.
-
-Take the default from the Step 0 probe (`have touchbar` → chord, no question needed beyond a
-confirm) and ask **one** question either way — the probe only sees the machine you are running on:
-
-> Dictation hotkey: **⌘I** (a physical chord — works on every Mac, Touch Bar or not)? Or an F-row key
-> (`F9`), which on a Touch Bar Mac needs `fn` held?
-
-`skhd` — Homebrew, user space, no root:
-
-```sh
-brew install skhd && \
-mkdir -p ~/.config/skhd && \
-printf 'cmd - i : %s\n' '<PLUGIN_ROOT>/scripts/dictate-toggle.sh send' >> ~/.config/skhd/skhdrc && \
-skhd --start-service
-```
-
-Substitute the real absolute path — `${CLAUDE_PLUGIN_ROOT}` is not expanded outside the session.
-`skhd --restart-service` after any later edit of `skhdrc`. skhd costs **one Accessibility consent**
-(System Settings → Privacy & Security → Accessibility) — the same class of grant as the tier-2 paste
-in Step 5, and still no root.
-
-Notes to give the user:
-- ⌘I is *Get Info* in Finder and *italic* in editors, and skhd grabs it globally. If that bothers
-  them, any other chord is the same line with a different left side — `cmd + shift - d`,
-  `ctrl + alt - d`, `fn - space`.
-- If they insist on the F-row on a Touch Bar Mac, the binding is `fn - f9`, not `f9` — and it fires
-  only while the Touch Bar shows the function row.
-- The Homebrew-free alternative is a Shortcuts.app Quick Action bound to a key. Same Fn caveat.
-
 ### Other environments — print instructions, do not guess
 
 - **KDE**: System Settings → Shortcuts → Custom Shortcuts → new → command.
 - **Sway/Hyprland**: one config line, print it ready to paste
   (`bindsym F9 exec /path/to/dictate-toggle.sh send`).
+- **macOS**: `brew install skhd` (`f9 : /path/to/dictate-toggle.sh send`) or a Shortcuts.app
+  Quick Action bound to a key. Both are user-space.
 
 Always tell the user the script is a **toggle**: press to start, press again to stop and transcribe.
-Tapping is the gesture — *holding* the key does not queue up toggles, because a re-fire within
-`dictate.debounce_ms` (750 ms) of the previous fire is ignored, and each ignored fire restarts that
-window: a key held for ten seconds is still one toggle.
 
 ## Step 7 — the speak convention (the line that makes the model speak)
 
