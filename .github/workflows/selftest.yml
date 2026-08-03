@@ -1,5 +1,9 @@
 name: selftest
 
+# least-privilege floor (infra#216 lens round): nothing in this workflow spends the token
+permissions:
+  contents: read
+
 on:
   push:
     branches: [main]
@@ -395,10 +399,13 @@ jobs:
     if: always()
     steps:
       - name: every needed job succeeded
+        # needs-JSON travels as a real env var, never template-substituted into the script text —
+        # closes the GHA script-injection class even if a job later grows outputs (lens round, low #1)
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
         run: |
-          results='${{ toJSON(needs) }}'
-          echo "$results"
-          echo "$results" | python3 -c "
+          echo "$NEEDS_JSON"
+          echo "$NEEDS_JSON" | python3 -c "
           import json, sys
           needs = json.load(sys.stdin)
           bad = {k: v['result'] for k, v in needs.items() if v['result'] != 'success'}
