@@ -47,6 +47,43 @@ is a recorder-flush problem; if the audio is complete but the transcript is shor
 **A recording seems stuck:** the PID file is stale. Press the hotkey once more — the script clears a
 dead PID and starts fresh.
 
+## The log is full of "clip too short", nothing is ever transcribed
+
+Look at the timestamps in `~/.local/state/voice-loop/dictate.log`: several fires inside the same
+second is not you pressing quickly, it is **key repeat**. Holding the hotkey instead of tapping it
+makes the OS deliver it 4+ times a second, and every second fire stops a recording milliseconds old.
+
+**Handled by design:** a re-fire within `dictate.debounce_ms` (750 ms by default) of the previous
+fire is dropped before either branch is chosen, and logged as `toggle ignored — key repeat`. Each
+dropped fire restarts the window, so a key held for ten seconds is still one toggle and the guard
+clears one window after you let go. So the fix is nothing — tap or hold, one press is one toggle.
+Set `debounce_ms` to `0` only if you genuinely want the raw behaviour back.
+
+The suppression covers *both* directions, which is worth knowing for the one asymmetric case: a
+press meant as **stop** that lands inside the window is dropped too, so the microphone is still
+recording. Press once more, past the window, and it stops normally — nothing is sent anywhere in
+between, but the recording is genuinely still running until you do.
+
+## The hotkey does nothing at all on my Mac
+
+**Cause:** on a **Touch Bar** MacBook the function row is a virtual strip, not keys. Unless *Keyboard
+→ Function Keys → "F1, F2, etc. keys always shown in Touch Bar"* is enabled, `F9` exists only while
+`fn` is held — so a binding on plain `f9` may never receive a keycode.
+
+Bind a **physical chord** instead. With `skhd` (`brew install skhd`), in `~/.config/skhd/skhdrc`:
+
+```
+cmd - i : /path/to/plugins/voice-loop/scripts/dictate-toggle.sh send
+```
+
+then `skhd --restart-service`. Any chord works — `cmd + shift - d`, `ctrl + alt - d`; ⌘I collides
+with *Get Info* in Finder and *italic* in editors, and skhd takes it globally, so pick another if you
+use those. To keep the F-row anyway, the binding must be `fn - f9`.
+
+Two checks before blaming the key: skhd needs one **Accessibility** consent (System Settings →
+Privacy & Security → Accessibility), and `~/.local/state/voice-loop/dictate.log` staying empty on a
+press means the script was never run at all — that is the binding, not the script.
+
 ## It speaks the previous answer, or speaks twice
 
 **Cause:** the Stop hook can fire *before* the final assistant message reaches the transcript file.

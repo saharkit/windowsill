@@ -144,6 +144,7 @@ prompt the setup causes.
 | 3.2 | **Dictation round-trip**: press hotkey, say a sentence, press again | the transcript appears in the prompt (or on the clipboard, tier 1) within a few seconds | | |
 | 3.3 | Dictation in `send` mode with auto-paste enabled | text is pasted AND Enter is pressed once — exactly once | | |
 | 3.4 | Long dictation (~30 s of speech) | no truncation of the tail; the last words are present | | |
+| 3.4a | **Hold** the dictation hotkey down for two or three seconds, then release | ONE recording starts (and is still recording on release) — not a burst of start/stop cycles, and no second cycle however long the hold. `dictate.log` shows one `recording via …` and a `toggle ignored — key repeat` line per repeat, no `clip too short`. A tap ~1 s after release stops it normally | | |
 | 3.5 | **Speak-back**: assistant replies with a 🔊 line | it is audibly spoken, once, and matches the text | | |
 | 3.6 | Unmarked lines | are NOT spoken | | |
 | 3.7 | Two turns in a row | the second turn speaks the new line, not a repeat of the first (dedup) | | |
@@ -178,6 +179,8 @@ prompt the setup causes.
 | 5.3 | `say -v <voice>` fallback path | speaks with the built-in voice when configured | | |
 | 5.4 | Apple Silicon: whisper.cpp path if chosen | transcription is noticeably fast; `stt.command` wired correctly | | |
 | 5.5 | Nothing in the install required root | true / false | | |
+| 5.6 | `/voice-setup` on a **Touch Bar** Mac | it detects the Touch Bar (or asks), offers a physical chord (⌘I) rather than `F9`, and states the `fn` caveat | | |
+| 5.7 | The chord it wired actually toggles dictation | one press records, one press stops — from any focused app, with no `fn` gymnastics | | |
 
 ## 6. `/voice-design` (only if the user has an ElevenLabs key)
 
