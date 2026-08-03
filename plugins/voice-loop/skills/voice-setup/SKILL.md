@@ -89,6 +89,28 @@ transcribes a short phrase in a couple of seconds on a modern CPU; `base`/`tiny`
 accurate. Silero TTS is CPU-friendly (near real-time). First run downloads roughly 0.5–1.5 GB of
 models. Say this **before** installing, not after.
 
+### Switching away from `local` on a re-run (clean up behind the old choice)
+
+Step 0 printed the existing config, so you know what the previous run chose. If a direction *was*
+`local`, **neither** direction is `local` now, and the probe found the user unit
+(`systemctl --user is-enabled voice-loop.service`), then that server keeps starting at every login
+and holding its models in RAM for nothing. Say that plainly and offer, with disabling as the
+default:
+
+```sh
+systemctl --user disable --now voice-loop.service
+```
+
+Stop **and** disable — a stop alone comes back at the next login. Leave the unit file, the venv and
+the model caches where they are: they are the expensive part, and switching back later is then one
+`systemctl --user enable --now voice-loop.service` rather than another 0.5–1.5 GB download. Tell the
+user that is what you left, and that `/voice-remove` is what deletes it.
+
+Nothing else about a backend switch needs cleaning: a `cloud` → `local` move leaves the key file
+alone (it is the user's secret, and `/voice-remove` is where it gets removed on purpose), and `lan`
+leaves nothing on this machine at all. On macOS there is no unit to disable — the server, if the
+user ran one, was started by hand.
+
 ## Step 3 — install dependencies (one batch, user space only)
 
 ### Linux
@@ -409,4 +431,6 @@ Then verify the two interactive halves with the user (for a command-only setup t
 
 Report at the end: language, both backends, paste tier, hotkey, and the verification result
 (loopback selftest or ear-check, whichever applied). If anything is left
-undone (e.g. the user declined the ydotool step), say exactly what and how to finish it later.
+undone (e.g. the user declined the ydotool step), say exactly what and how to finish it later. Close
+by naming the way back out: `/voice-remove` undoes everything this install touched — the service,
+the hotkey, the config, the caches and the `CLAUDE.md` line.

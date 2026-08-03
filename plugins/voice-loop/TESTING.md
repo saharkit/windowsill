@@ -147,6 +147,7 @@ prompt the setup causes.
 | 2.7 | `~/.config/voice-loop/config.json` is written and valid | `jq . ~/.config/voice-loop/config.json` parses | | |
 | 2.8 | No secret is written into the config | keys are in a `key_file` or an env var only | | |
 | 2.9 | Setup ends by running the selftest | green selftest, reported plainly | | |
+| 2.10 | **Re-run** `/voice-setup` on a `local` install and pick `cloud` (or `lan`) for **both** directions | it notices the now-unused local service and offers to `systemctl --user disable --now voice-loop.service`; after accepting, `is-enabled` says `disabled` and the unit file, venv and model caches are still there (switching back is one `enable --now`, no re-download) | | |
 
 ## 3. The loop itself
 
@@ -205,6 +206,26 @@ prompt the setup causes.
 | 6.3 | Previews are saved, numbered, and mapped to their ids | user can tell which is which | | |
 | 6.4 | Chosen voice id lands in `tts.cloud.voice_id` | rest of the config survives the edit | | |
 | 6.5 | Speak-back in the new voice | plays (player handles mp3) | | |
+
+## 7. `/voice-remove` (run this LAST — it ends the machine's install)
+
+Run it on the same machine sections 1–5 were run on, **before** `/plugin uninstall`. Same permission
+discipline as section 2: default mode, count the prompts.
+
+| # | check | expected | observed | pass |
+|---|---|---|---|---|
+| 7.1 | `/voice-remove` on a machine with the full install | inventory printed **first** — every path with its size — before anything is deleted | | |
+| 7.2 | **Permission prompt count for the whole removal** | **≤ 3** | count: | |
+| 7.3 | The local service | `systemctl --user is-active voice-loop.service` → inactive, `is-enabled` → not found; the unit file is gone; it does not come back after a re-login | | |
+| 7.4 | The hotkey | the binding is gone (GNOME: the voice-loop path is out of `custom-keybindings` **and the user's other custom shortcuts still work**; macOS: only the `dictate-toggle` line left `skhdrc`) | | |
+| 7.5 | Decline every deletion offer | nothing at all is deleted; the report says so plainly | | |
+| 7.6 | A cloud `key_file` present, and "delete the config" accepted **without** accepting the key question | `config.json` gone, `*.key` **still there**, the directory still exists, and the report names the kept key path | | |
+| 7.7 | Model caches | each is listed with a size and offered separately; the shared parents (`~/.cache/huggingface/hub`, `~/.cache/torch/hub`) are **never** deleted wholesale — an unrelated HF model in that cache survives | | |
+| 7.8 | The `CLAUDE.md` convention line | the matching line (and its blank line) is removed from the file the user picked; the rest of the file is byte-identical; a custom `speak.marker` is matched too | | |
+| 7.9 | The closing report | lists what was intentionally left — kept keys/caches, shared packages, the root `ydotoold` daemon with its removal command **printed not run**, macOS Accessibility consents — and ends with `/plugin uninstall voice-loop@windowsill` | | |
+| 7.10 | No `sudo` is ever executed | any root step is PRINTED for the user to run | | |
+| 7.11 | `/voice-remove` on a machine with **nothing** installed | says there is nothing to remove and stops — no invented work, no errors | | |
+| 7.12 | After 7.1–7.9, start a fresh session and end a reply with a 🔊 line | nothing is spoken, no hook errors, no stray processes; `/plugin uninstall voice-loop@windowsill` then completes cleanly | | |
 
 ---
 
