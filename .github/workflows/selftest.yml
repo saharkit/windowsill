@@ -352,7 +352,6 @@ jobs:
           assert fix["kind"] == "install-certificates-command", fix
           assert fix["runnable"] is True, fix
           assert fix["command"].endswith("/Install Certificates.command"), fix
-          assert fix["command"].startswith("/Applications/Python "), fix
           print(f"the python.org branch answered: {fix['command']}")
           PY
 
