@@ -7,7 +7,7 @@ One small FastAPI app:
 | `POST /stt` | multipart `audio=@file.wav`, query `?language=ru` → `{"text": ..., "language": ..., "duration": ...}` |
 | `POST /tts` | JSON `{"text": ..., "language": "ru", "speaker": "baya"}` → `audio/wav` (one blob), `X-Voice-Loop-Engine` naming the engine that spoke |
 | `POST /tts/stream` | same JSON → `text/event-stream` of WAV segments as they are synthesized — see [Streaming synthesis](#streaming-synthesis-ttsstream) |
-| `GET /health` | device, models, engine (and its fallback), what is loaded, server `version` |
+| `GET /health` | device, models, engine (and its fallback), what is loaded, per-device queue depth, server `version` |
 
 STT is [faster-whisper](https://github.com/SYSTRAN/faster-whisper) (multilingual). TTS is
 [Silero](https://github.com/snakers4/silero-models) by default, with automatic stress marking for
@@ -60,25 +60,50 @@ the GPU free for recognition. `compute_type` defaults to `float16` on CUDA and `
 
 ## Capacity
 
-All models share one machine — and on CUDA, one card. Every model call (an `/stt` transcription, a
-`/tts` blob, each `/tts/stream` chunk) therefore goes through a single bounded executor: at most
-`VOICE_LOOP_MODEL_CONCURRENCY` calls run at once. The default is **1** on CUDA — the resident models
-already hold most of the VRAM, and concurrent calls stack per-call activation memory into an OOM —
-and up to **2** on CPU (by core count), where the models release the GIL in native code and a second
-slot buys real parallelism. Excess requests queue. `/health` reports the limit and the live count as
-`model_concurrency` / `model_in_flight`.
+Every model call — an `/stt` transcription, a `/tts` blob, each `/tts/stream` chunk — takes a slot
+from a bounded executor before it runs. **There is one executor per device, not one per server**,
+because the GPU and the CPU are disjoint hardware: Silero synthesis is pinned to the CPU precisely so
+it does not compete with recognition on the card, and a single global queue would hand that
+separation straight back — one user dictating would block another user's playback for no physical
+reason. So a call queues on the device it actually runs on, and the two queues never touch. Whisper
+follows `VOICE_LOOP_DEVICE`, Silero is always on the CPU, XTTS goes wherever it managed to load
+(a card too small for it drops it to the CPU, and its queue follows).
 
-Two caps keep any single request from monopolizing that executor:
+`VOICE_LOOP_MODEL_CONCURRENCY` sizes the queue of the device this server runs its models on. The
+default is **1** on a GPU — the resident models already hold most of the VRAM, and concurrent calls
+stack per-call activation memory into an OOM — and up to **2** on CPU (by core count), where the
+models release the GIL in native code and a second slot buys real parallelism. The other queue is
+the incidental one (Silero's CPU slot on a GPU box) and keeps its own default, so raising the
+primary never quietly widens it. Excess requests queue.
+
+`/health` reports both what is running and what is **queued behind it**:
+
+```json
+"model_concurrency": 1, "model_in_flight": 1, "model_waiting": 3,
+"model_queues": {"gpu": {"limit": 1, "in_flight": 1, "waiting": 3},
+                 "cpu": {"limit": 2, "in_flight": 0, "waiting": 0}}
+```
+
+`model_in_flight` alone cannot tell **busy** from **saturated** — at the limit it reads the same
+either way. `model_waiting` is the number that says whether anybody is paying for the wait, and
+`model_queues` says on which hardware.
+
+Three caps keep any single request from monopolizing an executor:
 
 - **`/tts` renders its whole blob in one executor hold**, so it carries the small cap
   (`VOICE_LOOP_MAX_TTS_TEXT_BLOB`, 3000 characters). Longer texts belong on `/tts/stream`, which
   takes and **releases** the executor per sentence chunk and keeps the big cap
   (`VOICE_LOOP_MAX_TTS_TEXT`, 20 000).
 - **`/stt` uploads are byte-capped at 25 MB — but bytes are not time**: 25 MB of compressed audio
-  can decode to hours of transcription in one executor hold. Uploads whose WAV header is cheaply
-  parseable are additionally duration-capped at `VOICE_LOOP_MAX_STT_SECONDS` (600 s). Compressed
-  codecs reveal their duration only by decoding — the very work the cap exists to avoid — so they
-  pass through on the byte cap alone; be aware of that holding-time reality if you raise the caps.
+  can decode to hours of transcription. Uploads whose WAV header is cheaply parseable are
+  additionally duration-capped at `VOICE_LOOP_MAX_STT_SECONDS` (600 s). Compressed codecs reveal
+  their duration only by decoding — the very work the cap exists to avoid — so they pass through on
+  the byte cap alone, honestly unmeasured.
+- **`/stt` therefore also carries a wall clock**, `VOICE_LOOP_STT_TIMEOUT` (900 s), which needs no
+  header and so bounds the holding time whatever the codec. Whisper decodes lazily, so the budget is
+  checked as segments arrive and a transcription that outruns it is abandoned — `503`, with its slot
+  handed straight back to whoever is queued. What can overshoot is one segment's decoding, not one
+  file's. Set it to `0` to switch the bound off and let long uploads run as long as they need.
 
 ## Configuration (all environment variables)
 
@@ -101,11 +126,12 @@ Two caps keep any single request from monopolizing that executor:
 | `VOICE_LOOP_ACCENT` | `1` | set `0` to skip automatic accentuation |
 | `VOICE_LOOP_MAX_UPLOAD_BYTES` | `26214400` (25 MB) | `/stt` upload size cap — a larger clip gets `413` |
 | `VOICE_LOOP_MAX_STT_SECONDS` | `600` | `/stt` duration cap when the WAV header is parseable — see [Capacity](#capacity) |
+| `VOICE_LOOP_STT_TIMEOUT` | `900` | `/stt` wall-clock transcription budget, any codec; `0` disables it — see [Capacity](#capacity) |
 | `VOICE_LOOP_MAX_TTS_TEXT` | `20000` | `/tts/stream` text length cap — longer text gets `400` |
 | `VOICE_LOOP_MAX_TTS_TEXT_BLOB` | `3000` | `/tts` single-blob text cap — longer text gets `400` pointing at `/tts/stream` |
-| `VOICE_LOOP_MODEL_CONCURRENCY` | `1` on CUDA, else up to `2` | concurrent model calls — see [Capacity](#capacity) |
+| `VOICE_LOOP_MODEL_CONCURRENCY` | `1` on a GPU, else up to `2` | concurrent model calls on the primary device — see [Capacity](#capacity) |
 
-`GET /health` also reports a `version` field (`"0.4.0"`). It is for diagnostics and bug reports;
+`GET /health` also reports a `version` field (`"0.4.1"`). It is for diagnostics and bug reports;
 clients should detect features through the capability flags (`"streaming": true` and friends), not
 by comparing version strings.
 
@@ -369,7 +395,8 @@ CORS-"simple" request, so any web page you visit could quietly fire real request
 to any request a browser labels as coming from another site — `Sec-Fetch-Site: cross-site`, or an
 `Origin` header naming anything other than a loopback host (`127.x`, `localhost`, `[::1]`) or
 `null`. Non-browser clients (curl, the plugin scripts) send neither header and are unaffected.
-Related request caps: `/stt` uploads are limited by `VOICE_LOOP_MAX_UPLOAD_BYTES` (25 MB default)
-and, for parseable WAV, `VOICE_LOOP_MAX_STT_SECONDS`; `/tts` text by `VOICE_LOOP_MAX_TTS_TEXT_BLOB`
+Related request caps: `/stt` uploads are limited by `VOICE_LOOP_MAX_UPLOAD_BYTES` (25 MB default),
+by `VOICE_LOOP_STT_TIMEOUT` (900 s of transcription, whatever the codec) and, for parseable WAV, by
+`VOICE_LOOP_MAX_STT_SECONDS`; `/tts` text by `VOICE_LOOP_MAX_TTS_TEXT_BLOB`
 (3000 default) and `/tts/stream` text by `VOICE_LOOP_MAX_TTS_TEXT` (20 000 default) — see
 [Capacity](#capacity) for why the two TTS paths differ.

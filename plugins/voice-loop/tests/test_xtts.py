@@ -219,6 +219,7 @@ def test_xtts_is_loaded_once_on_the_resolved_device(monkeypatch, coqui_installed
     assert len(coqui_installed.instances) == 1
     assert first.args == (voice_server.XTTS_MODEL_ID,)
     assert first.device == "cpu"
+    assert voice_server._xtts_device == "cpu"  # the queue synthesis_device() will send work to
 
 
 def test_xtts_model_dir_override_loads_from_disk(monkeypatch, coqui_installed):
@@ -253,6 +254,10 @@ def test_xtts_gpu_oom_falls_back_to_cpu(monkeypatch, import_fake, caplog):
     assert attempts == ["cuda", "cpu"]
     assert model.device == "cpu"
     assert "retrying on CPU" in caplog.text
+    # And the gate follows the hardware, not the request: this synthesis now queues on the CPU,
+    # which is the case no reading of VOICE_LOOP_DEVICE could have guessed.
+    assert voice_server._xtts_device == "cpu"
+    assert voice_server.synthesis_device("xtts") == "cpu"
 
 
 def test_reset_caches_drops_the_xtts_model(coqui_installed, monkeypatch):

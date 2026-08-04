@@ -21,10 +21,13 @@ LAN or an ssh tunnel. Everything is configured through the environment — see R
     VOICE_LOOP_ACCENT        1 | 0 — enable automatic accentuation (default 1; ru and uk)
     VOICE_LOOP_MAX_UPLOAD_BYTES  /stt upload size cap    (default 26214400 — 25 MB)
     VOICE_LOOP_MAX_STT_SECONDS   /stt duration cap for parseable WAV uploads (default 600)
+    VOICE_LOOP_STT_TIMEOUT   /stt wall-clock transcription budget, ANY codec (default 900 seconds;
+                             0 disables it — see bounded_segments below)
     VOICE_LOOP_MAX_TTS_TEXT  /tts/stream text length cap (default 20000 characters)
     VOICE_LOOP_MAX_TTS_TEXT_BLOB /tts (single blob) text length cap (default 3000 characters)
-    VOICE_LOOP_MODEL_CONCURRENCY how many model calls may run at once (default: 1 on cuda,
-                             else up to 2 depending on core count — see model_slot below)
+    VOICE_LOOP_MODEL_CONCURRENCY how many model calls may run at once on the PRIMARY device
+                             (default: 1 on a GPU, else up to 2 depending on core count; the other
+                             device keeps its own default — see model_slot below)
 
 Language is a request-level field: /stt takes ?language=, /tts takes {"language": ...}. Both fall back
 to VOICE_LOOP_LANGUAGE. STT (whisper) is multilingual out of the box; TTS is limited to the languages
@@ -47,7 +50,9 @@ import re
 import sys
 import tempfile
 import threading
+import time
 import wave
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -59,7 +64,7 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 from starlette.concurrency import run_in_threadpool
 
 MIN_PYTHON = (3, 10)
-SERVER_VERSION = "0.4.0"
+SERVER_VERSION = "0.4.1"
 
 
 def require_python(version: tuple[int, int] | None = None) -> None:
@@ -131,6 +136,11 @@ MAX_TTS_CHARS = 800  # Silero degrades past ~1000 characters per call
 PAUSE_SECONDS = 0.4
 MAX_UPLOAD_BYTES = int(os.environ.get("VOICE_LOOP_MAX_UPLOAD_BYTES", str(25 * 1024 * 1024)))
 MAX_STT_SECONDS = float(os.environ.get("VOICE_LOOP_MAX_STT_SECONDS", "600"))
+# The codec-independent half of the same bound. MAX_STT_SECONDS can only measure a WAV header, so a
+# byte-capped upload of a compressed codec is admitted unmeasured; this is the wall clock that runs
+# while it is being transcribed. Generous on purpose — 600 s of admitted audio on a small model on
+# CPU is well inside it — because it exists to stop the pathological case, not to hurry an honest one.
+STT_TIMEOUT = float(os.environ.get("VOICE_LOOP_STT_TIMEOUT", "900"))
 MAX_TTS_TEXT = int(os.environ.get("VOICE_LOOP_MAX_TTS_TEXT", "20000"))
 MAX_TTS_TEXT_BLOB = int(os.environ.get("VOICE_LOOP_MAX_TTS_TEXT_BLOB", "3000"))
 
@@ -145,6 +155,10 @@ HALLUCINATIONS_FILE = Path(__file__).with_name("stt_hallucinations.txt")
 _whisper = None
 _tts: dict[str, object] = {}
 _xtts = None
+# Where XTTS actually landed — "" until it loads. It normally loads on the resolved device, but a
+# card too small for it degrades to CPU (see xtts()), and the queue it takes a slot from has to
+# follow the hardware it really runs on rather than the one it was asked for.
+_xtts_device = ""
 _accent: dict[str, object] = {}
 _stress: list[tuple[re.Pattern[str], str]] | None = None
 _hallucinations: list[str] | None = None
@@ -165,10 +179,11 @@ def reset_caches() -> None:
     Used by the tests between cases. Nothing in the running server calls it, so editing
     stress.json or the hallucination blocklist requires a restart in the current server.
     """
-    global _whisper, _xtts, _stress, _hallucinations, _hallucinations_dropped
+    global _whisper, _xtts, _xtts_device, _stress, _hallucinations, _hallucinations_dropped
     global _hallucination_tails_stripped, _tts_fallbacks
     _whisper = None
     _xtts = None
+    _xtts_device = ""
     _stress = None
     _hallucinations = None
     _hallucinations_dropped = 0
@@ -191,45 +206,112 @@ def resolve_compute_type(device: str) -> str:
     return "float16" if device == "cuda" else "int8"
 
 
-def default_model_concurrency() -> int:
-    """How many model calls may run at once when VOICE_LOOP_MODEL_CONCURRENCY does not say.
+# The two queues in front of every model call. NOT one: the GPU and the CPU are disjoint hardware
+# and Silero is pinned to the CPU (see tts()) precisely so synthesis does not compete with GPU
+# recognition — a single global gate hands that separation straight back, letting one user's
+# dictation block another user's playback for no physical reason. So a call queues on the device it
+# actually runs on, and the two queues never touch.
+#
+# "gpu" covers every non-CPU torch device ("cuda", "cuda:1", "mps"): there is one accelerator budget
+# to protect, and its name is not what makes it scarce.
+MODEL_DEVICES = ("gpu", "cpu")
+
+
+def model_device(device: str) -> str:
+    """The queue a torch device name belongs to — one of MODEL_DEVICES."""
+    return "cpu" if device == "cpu" else "gpu"
+
+
+def default_model_concurrency(device: str = "") -> int:
+    """How many model calls may run at once on a device when VOICE_LOOP_MODEL_CONCURRENCY does not say.
 
     The device split: the models release the GIL inside native code, so on CPU a second slot buys
-    real multicore speedup — but on CUDA every concurrent call stacks its per-call activation
+    real multicore speedup — but on a GPU every concurrent call stacks its per-call activation
     memory on the ONE shared VRAM budget (whisper + the voices are already resident), and the only
     thing a second slot buys is an OOM. The floor of 1 keeps a single-core box from deadlocking.
     """
-    if resolve_device() == "cuda":
+    if (device or model_device(resolve_device())) == "gpu":
         return 1
     return max(1, min(2, (os.cpu_count() or 2) // 2))
 
 
 MODEL_CONCURRENCY = int(os.environ.get("VOICE_LOOP_MODEL_CONCURRENCY", "0")) or default_model_concurrency()
 
-# The one queue in front of every model call — /stt transcription, /tts blob rendering, and each
-# /tts/stream chunk synthesis. A plain threading semaphore ON PURPOSE, and one mechanism for all
-# three sites: every model call already runs on a worker thread (run_in_threadpool for the
-# endpoints, Starlette's iterate_in_threadpool for the stream generator), so a sync gate reaches
-# all of them — an async CapacityLimiter could not guard the inside of the sync generator. Global
-# rather than per-engine because whisper and TTS share one VRAM budget. anyio's ~40-thread default
-# pool is what queues behind it; the gate bounds MODEL work, not thread occupancy.
-_model_gate = threading.BoundedSemaphore(MODEL_CONCURRENCY)
-_model_in_flight = 0
+# One knob, and it sets the queue the operator was thinking about: the device this server runs its
+# models on. The other queue is the incidental one (Silero's CPU slot on a GPU box, the idle GPU
+# queue on a CPU box) and keeps its own default, so raising the primary never quietly widens it.
+MODEL_CONCURRENCY_BY_DEVICE = {
+    device: MODEL_CONCURRENCY if device == model_device(resolve_device()) else default_model_concurrency(device)
+    for device in MODEL_DEVICES
+}
+
+# Plain threading semaphores ON PURPOSE, and one mechanism for every call site — /stt transcription,
+# /tts blob rendering, each /tts/stream chunk synthesis: every model call already runs on a worker
+# thread (run_in_threadpool for the endpoints, Starlette's iterate_in_threadpool for the stream
+# generator), so a sync gate reaches all of them — an async CapacityLimiter could not guard the
+# inside of the sync generator. anyio's ~40-thread default pool is what queues behind them; the
+# gates bound MODEL work, not thread occupancy.
+_model_gates = {device: threading.BoundedSemaphore(MODEL_CONCURRENCY_BY_DEVICE[device]) for device in MODEL_DEVICES}
+# In flight is what is RUNNING; waiting is what is queued behind it. Both, because one of them alone
+# cannot tell "busy" from "saturated": at the limit the first number reads the same either way, and
+# the second is the one that says whether anybody is paying for it.
+_model_in_flight = {device: 0 for device in MODEL_DEVICES}
+_model_waiting = {device: 0 for device in MODEL_DEVICES}
 _in_flight_lock = threading.Lock()
 
 
 @contextmanager
-def model_slot():
-    """Hold one of the MODEL_CONCURRENCY slots for the duration of one model call."""
-    global _model_in_flight
-    with _model_gate:
+def model_slot(device: str = ""):
+    """Hold one slot on `device`'s queue (default: the primary device's) for one model call."""
+    device = model_device(device or resolve_device())
+    with _in_flight_lock:
+        _model_waiting[device] += 1
+    try:
+        _model_gates[device].acquire()
+    finally:  # queued or refused, the caller is no longer waiting
         with _in_flight_lock:
-            _model_in_flight += 1
-        try:
-            yield
-        finally:
-            with _in_flight_lock:
-                _model_in_flight -= 1
+            _model_waiting[device] -= 1
+    with _in_flight_lock:
+        _model_in_flight[device] += 1
+    try:
+        yield
+    finally:
+        with _in_flight_lock:
+            _model_in_flight[device] -= 1
+        _model_gates[device].release()
+
+
+def model_in_flight(device: str = "") -> int:
+    """Model calls running right now — on one device's queue, or across both when unnamed."""
+    with _in_flight_lock:
+        if device:
+            return _model_in_flight[model_device(device)]
+        return sum(_model_in_flight.values())
+
+
+def queue_depths() -> dict[str, dict[str, int]]:
+    """One coherent snapshot of both queues — limit, running and queued, per device."""
+    with _in_flight_lock:
+        return {
+            device: {
+                "limit": MODEL_CONCURRENCY_BY_DEVICE[device],
+                "in_flight": _model_in_flight[device],
+                "waiting": _model_waiting[device],
+            }
+            for device in MODEL_DEVICES
+        }
+
+
+def synthesis_device(engine: str = "") -> str:
+    """The device an engine's synthesis really runs on — which queue it must take its slot from.
+
+    Silero is pinned to the CPU in tts(), always. XTTS loads on the resolved device but degrades to
+    the CPU when the card cannot hold it, so this follows where it ACTUALLY landed; before the first
+    load there is nothing to read yet and the resolved device is the honest guess.
+    """
+    if (engine or TTS_ENGINE) == "xtts":
+        return _xtts_device or resolve_device()
+    return "cpu"
 
 
 def whisper():
@@ -508,7 +590,7 @@ def xtts():
     set COQUI_TOS_AGREED=1 to accept), never bundled with this repo. A GPU too small for the model
     (~2-2.5 GB of VRAM) degrades to CPU instead of failing the request.
     """
-    global _xtts
+    global _xtts, _xtts_device
     if _xtts is None:
         device = resolve_device()
         try:
@@ -517,6 +599,7 @@ def xtts():
             log.warning("XTTS-v2 does not fit on the GPU — retrying on CPU")
             device = "cpu"
             _xtts = _load_xtts(device)
+        _xtts_device = device  # the queue synthesis_device() sends the next request to
         log.info("loaded XTTS-v2 on %s", device)
     return _xtts
 
@@ -904,11 +987,17 @@ def resolve_engine(text: str, language: str) -> tuple[str, bool, JSONResponse | 
 
 @app.get("/health")
 def health() -> dict[str, object]:
+    queues = queue_depths()
     return {
         "ok": True,
         "version": SERVER_VERSION,
         "model_concurrency": MODEL_CONCURRENCY,
-        "model_in_flight": _model_in_flight,
+        "model_in_flight": sum(queue["in_flight"] for queue in queues.values()),
+        # Busy and saturated read identically without this: at the limit `model_in_flight` is
+        # pinned to it either way, and `model_waiting` is what says whether anyone is queued
+        # behind. `model_queues` splits both by device, which is where the slots actually are.
+        "model_waiting": sum(queue["waiting"] for queue in queues.values()),
+        "model_queues": queues,
         "device": resolve_device(),
         "cuda": torch.cuda.is_available(),
         "language": LANGUAGE,
@@ -947,16 +1036,56 @@ def wav_duration_seconds(data: bytes) -> float | None:
         return None
 
 
+class TranscriptionTimeout(Exception):
+    """A transcription outran its wall-clock budget and was abandoned with its slot given back."""
+
+
+def _default_clock() -> float:
+    """Monotonic seconds. Elapsed time is an INPUT here, injected so a test needs no sleep."""
+    return time.monotonic()
+
+
+def bounded_segments(
+    segments, budget: float, clock: Callable[[], float] = _default_clock
+) -> Iterator[object]:
+    """Consume transcript segments until the wall clock passes `budget` seconds, then give up.
+
+    The format-agnostic half of the /stt holding-time bound. wav_duration_seconds() can measure a
+    WAV header and nothing else, so 25 MB of a compressed codec is admitted honestly unmeasured —
+    and it can decode to hours of transcription holding one model slot. faster-whisper decodes
+    LAZILY, as this generator is drawn from, so a deadline checked between segments bounds the hold
+    whatever the codec.
+
+    The check sits where a segment ARRIVES, so what gets abandoned is the work still to come. It is
+    deliberately not checked after the last one: the exhaustion probe ends the loop before the
+    check would run, so a transcription that is simply over is never failed for the moment it spent
+    ending. What can still overshoot the budget is one segment's decoding, not one file's.
+
+    A budget of 0 or less means no bound — the behaviour before this cap existed, kept for an
+    operator who would rather wait than lose a long dictation.
+    """
+    if budget <= 0:
+        yield from segments
+        return
+    deadline = clock() + budget
+    for segment in segments:
+        if clock() > deadline:
+            raise TranscriptionTimeout(f"transcription outran its {budget:.0f} second budget")
+        yield segment
+
+
 def transcribe_upload(data: bytes, language: str) -> tuple[str, object]:
     """The blocking body of /stt — runs in the threadpool so the event loop stays responsive."""
     with tempfile.NamedTemporaryFile(suffix=".wav") as handle:
         handle.write(data)
         handle.flush()
-        with model_slot():
+        with model_slot(resolve_device()):  # whisper is the one model that follows the GPU
             segments, info = whisper().transcribe(
                 handle.name, language=language, vad_filter=True, initial_prompt=STT_HINT
             )
-            text = " ".join(segment.text.strip() for segment in segments).strip()
+            text = " ".join(
+                segment.text.strip() for segment in bounded_segments(segments, STT_TIMEOUT)
+            ).strip()
     return text, info
 
 
@@ -984,7 +1113,22 @@ async def stt(request: Request, audio: UploadFile = File(...), language: str = "
             },
             status_code=413,
         )
-    text, info = await run_in_threadpool(transcribe_upload, data, language)
+    try:
+        text, info = await run_in_threadpool(transcribe_upload, data, language)
+    except TranscriptionTimeout:
+        # The slot went back with the failed call (model_slot releases on the way out), so the
+        # queue behind it moves on immediately — which is the whole point of the bound.
+        log.warning("abandoned a transcription that outran the %.0f second budget", STT_TIMEOUT)
+        return JSONResponse(
+            {
+                "error": f"transcription outran the {STT_TIMEOUT:.0f} second time budget "
+                "and was abandoned",
+                "hint": "send a shorter clip — an upload inside the byte cap can still be hours of "
+                "compressed audio, which no header cap can see; or raise VOICE_LOOP_STT_TIMEOUT "
+                "on the server",
+            },
+            status_code=503,
+        )
     text = filter_transcript(text)
     return JSONResponse({"text": text, "language": info.language, "duration": info.duration})
 
@@ -996,11 +1140,12 @@ def render_tts(text: str, language: str, speaker: str, engine: str = "") -> byte
     MAX_TTS_TEXT_BLOB cap while /tts/stream (a slot per chunk) carries the big one. The slot is
     taken and released INSIDE one call, so a fallback retry (which is a second call) acquires only
     after the failed primary's slot is back: a one-slot gate is never held twice for one request.
+    That holds across engines too — the retry may well queue on the OTHER device.
     """
     sample_rate = engine_sample_rate(engine)
     pause = torch.zeros(int(sample_rate * PAUSE_SECONDS))
     pieces = []
-    with model_slot():
+    with model_slot(synthesis_device(engine)):
         for piece in synthesis_pieces(text, language, speaker, engine):
             pieces.append(piece)
             pieces.append(pause)
@@ -1062,8 +1207,8 @@ async def tts_endpoint(request: Request, payload: dict) -> Response:
     return Response(wav, media_type="audio/wav", headers={ENGINE_HEADER: engine_label(engine, is_fallback)})
 
 
-def gated_pieces(pieces):
-    """Wrap a synthesis generator so each chunk takes — and RELEASES — one model slot.
+def gated_pieces(pieces, device: str = ""):
+    """Wrap a synthesis generator so each chunk takes — and RELEASES — one model slot on `device`.
 
     The release between chunks is the point: a long stream queues fairly behind other requests
     instead of holding the executor for its whole duration, which is what lets /tts/stream carry a
@@ -1071,7 +1216,7 @@ def gated_pieces(pieces):
     """
     iterator = iter(pieces)
     while True:
-        with model_slot():
+        with model_slot(device):
             try:
                 piece = next(iterator)
             except StopIteration:
@@ -1143,9 +1288,10 @@ async def tts_stream_endpoint(request: Request, payload: dict) -> Response:
         current, fell_back, sent = engine, is_fallback, 0
         while True:
             sample_rate = engine_sample_rate(current)  # 48 kHz Silero / 24 kHz XTTS — per ENGINE
+            device = synthesis_device(current)  # and the queue is per ENGINE too
             pause = torch.zeros(int(sample_rate * PAUSE_SECONDS))
             try:
-                for piece in gated_pieces(synthesis_pieces(text, language, speaker, current)):
+                for piece in gated_pieces(synthesis_pieces(text, language, speaker, current), device):
                     if sent:
                         piece = torch.cat([pause, piece])
                     out = io.BytesIO()

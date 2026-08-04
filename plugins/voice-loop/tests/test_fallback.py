@@ -36,7 +36,7 @@ class BrokenXtts(FakeXtts):
         self.in_flight = in_flight if in_flight is not None else []
 
     def tts(self, text: str, speaker_wav: str, language: str) -> list[float]:
-        self.in_flight.append(voice_server._model_in_flight)
+        self.in_flight.append(voice_server.model_in_flight())
         super().tts(text, speaker_wav, language)
         raise RuntimeError("xtts said no")
 
@@ -49,7 +49,7 @@ class RecordingSilero(FakeSilero):
         self.in_flight = in_flight
 
     def apply_tts(self, text: str, speaker: str, sample_rate: int):
-        self.in_flight.append(voice_server._model_in_flight)
+        self.in_flight.append(voice_server.model_in_flight())
         return super().apply_tts(text, speaker, sample_rate)
 
 
@@ -452,7 +452,7 @@ def test_the_failed_primary_releases_its_slot_before_the_fallback_takes_one(
 
     assert response.status_code == 200
     assert in_flight == [1, 1]  # one slot during the primary, one during the fallback — never two
-    assert voice_server._model_in_flight == 0
+    assert voice_server.model_in_flight() == 0
     assert one_slot_gate.acquire(timeout=1)  # and the gate is genuinely free afterwards
     one_slot_gate.release()
 
@@ -513,7 +513,7 @@ def test_the_failed_stream_releases_its_slot_before_the_restart_takes_one(
     assert response.status_code == 200
     assert events(response.text)[-1] == ("end", {"chunks": 1, "engine": "silero (fallback)"})
     assert in_flight == [1, 1]  # one slot for the dead primary chunk, one for the restart — never two
-    assert voice_server._model_in_flight == 0
+    assert voice_server.model_in_flight() == 0
     assert one_slot_gate.acquire(timeout=1)
     one_slot_gate.release()
 
