@@ -226,6 +226,7 @@ referenced). Full schema — omit what you do not need, the scripts have default
     "mode": "send",
     "paste_key": "ctrl+shift+v",
     "auto_paste": false,
+    "paste_target": "any",
     "recorder": "auto",
     "clipboard": "auto",
     "debounce_ms": 750,
@@ -243,6 +244,16 @@ Field notes worth telling the user:
   -loglevel quiet` if a cloud provider returns mp3.
 - `dictate.paste_key` — must match the target app: terminals usually `ctrl+shift+v` or `shift+insert`,
   macOS `cmd+v`.
+- `dictate.paste_target` — `"any"` (default) or `"same-window"`. Auto-paste lands the text in
+  whatever window is focused when the recording **stops** — that is system-wide dictation, and it is
+  also how a sentence meant for the agent ends up in a chat window if the user switches mid-speech.
+  Say both halves when you set up tier 2/3; do not talk anyone into the guard. `"same-window"`
+  remembers the window focused at **start** and, if focus moved, pastes nothing — the text stays on
+  the clipboard with a "focus moved" notification. It applies only when `auto_paste` is true, the
+  identity is the frontmost *application* on macOS (`osascript`) and the active *window* on X11
+  (`xdotool`), and **on Wayland there is no portable query at all**, so it degrades to `"any"` — do
+  not offer it there as if it worked. An unrecognised value resolves to `"same-window"`, on the
+  grounds that only somebody asking for the guard writes the key in the first place.
 - `dictate.debounce_ms` — the key-repeat guard. A *held* hotkey autorepeats, and without this every
   second fire would stop a recording milliseconds old ("clip too short" in the log, nothing ever
   transcribed). The window restarts on every fire, dropped ones included, so a hold is ONE toggle
@@ -287,6 +298,13 @@ sudo systemctl enable --now ydotoold
 
 State the tradeoff honestly: this grants a background daemon the ability to synthesize input events.
 If the user declines, tier 1 remains fully functional — that is the point of the ladder.
+
+**Whenever you turn tier 2 or 3 on, say what auto-paste actually does**, in one sentence and without
+drama: the text is pasted into whatever window is focused when they stop the recording, so switching
+windows mid-sentence sends it there instead — useful (it works in every app) and occasionally
+expensive (a private line into a public channel). Then mention `dictate.paste_target: "same-window"`
+as available, and leave the choice with them; the default stays `"any"`. On a Wayland session, say
+that the guard cannot work there rather than offering it.
 
 Note for tier 2/3 alike: older `ydotool` only accepts **named key combos** and cannot type non-ASCII,
 which is exactly why the scripts paste from the clipboard instead of typing the text.

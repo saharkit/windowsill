@@ -6,7 +6,9 @@
 # chord like cmd-i instead — the virtual F-row needs fn held and may deliver no keycode at all):
 #   press once  -> recording starts
 #   press again -> recording stops, audio goes to STT, the text lands in your clipboard
-#                  (and, if auto_paste is enabled, is pasted into the focused window)
+#                  (and, if auto_paste is enabled, is pasted into whatever window is focused THEN —
+#                  any app, which is the feature; switch windows mid-sentence and the text follows
+#                  your cursor. dictate.paste_target: "same-window" trades that reach for a guard)
 # HOLDING the key is not a stream of toggles: dictate.py ignores a re-fire within
 # dictate.debounce_ms (750 ms by default) of the previous one, and each ignored fire restarts that
 # window — so a key held down is ONE toggle however long it is held.

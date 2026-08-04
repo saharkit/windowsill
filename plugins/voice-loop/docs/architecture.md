@@ -112,6 +112,15 @@ alone.
 3. The WAV goes to the configured STT backend; the transcript comes back as text.
 4. The text is **always** put on the clipboard. Auto-paste is an opt-in extra, and when it is not
    available the script says "copied — press `<paste_key>`" instead of failing.
+5. Auto-paste is **paste-at-focus**: the keystroke goes to whatever is focused at *stop* time, which
+   is what makes the hotkey work in any app and what sends a sentence to the wrong window if you
+   switch mid-speech. `dictate.paste_target: "same-window"` (opt-in; the default is `"any"`) records
+   the focused window at *start* in `dictate-focus` and suppresses the paste if it moved, leaving the
+   text on the clipboard with a notification. The identity is whatever the platform can name — the
+   frontmost application on macOS, the active window id on X11, and **nothing on Wayland**, where no
+   portable query exists. Every unknown — no probe, a failed probe, an unwritable state dir —
+   degrades to `"any"` and pastes: the guard fails open, for the same reason the debounce stamp does.
+   The stamp is consumed on every stop, so an identity never outlives its own recording.
 
 ## The three backends
 
@@ -160,7 +169,7 @@ broken engine is latency, and the `tts_fallbacks` counter says how often it is b
 | `~/.config/voice-loop/stress.json` | optional stress overrides for the synthesizer |
 | `stt_hallucinations.txt` (next to `voice_server.py`) | known Whisper hallucinations `/stt` drops whole, or strips off the tail of real speech (user-extendable) |
 | `~/.config/voice-loop/*.key` | optional cloud key files (mode 600) |
-| `~/.local/state/voice-loop/` | logs, the last spoken line, the recorder PID, the last WAV |
+| `~/.local/state/voice-loop/` | logs, the last spoken line, the recorder PID, the last WAV, the toggle and focus stamps |
 | `~/.local/share/voice-loop/` | optional: the venv, models, voice previews |
 
 Nothing is written into the repo, and nothing outside these paths is touched.

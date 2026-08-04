@@ -49,6 +49,15 @@ Deliberate behaviours, found by live debugging — do not "simplify" them away:
   exposes no virtual-keyboard protocol, so wtype is not available there — the clipboard path
   covers it), xdotool (X11). Failing to paste falls back to "it is in your clipboard, press
   <paste_key>" — that is the default tier, not an error.
+* paste-at-focus, and the guard for it — auto-paste presses the paste key into whatever is focused
+  when the recording STOPS, which is the feature (dictate into any app, not just Claude Code) and
+  the footgun in one: switch windows mid-sentence and the words meant for the agent land in a chat.
+  dictate.paste_target: "any" (default, the power behaviour) or "same-window", which records the
+  focused window at START and degrades to clipboard-only if focus moved by stop-time. The identity
+  is what the platform can name — macOS: the frontmost application (so window-to-window inside ONE
+  app is not a move); X11: xdotool's active window id; Wayland: nothing portable exists, so the
+  guard degrades to "any" rather than pretending. Every unknowable half degrades the same way: a
+  guard that cannot see focus must not be a dictation that never pastes.
 * keys — the cloud API key comes from ``key_file`` (wins) or the named env var, is used only as
   an in-process HTTP header, and NEVER appears in argv, in the config, or in the log.
 """
@@ -95,6 +104,10 @@ MIN_CLIP_SECONDS = 0.3
 # than the window (macOS allows 2 s) admits one repeat again — raise debounce_ms past it.
 # Tunable as dictate.debounce_ms; 0 turns the guard off.
 DEBOUNCE_SECONDS = 0.75
+# Wall clock for one focus query (dictate.paste_target: "same-window"). It runs on the recording's
+# critical path twice, so it is short: an osascript that has not answered in two seconds is a
+# wedged System Events, and the guard's answer to "I cannot see focus" is already "paste anyway".
+FOCUS_PROBE_TIMEOUT = 2.0
 
 _STATE_DIR = os.path.join(os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state")), "voice-loop")
 _LOG_PATH = os.path.join(_STATE_DIR, "dictate.log")
@@ -105,6 +118,10 @@ _LAST_WAV_PATH = os.path.join(_STATE_DIR, "dictate-last.wav")
 # pidfile on purpose: the pidfile says whether a recorder is running, this says how long ago the
 # hotkey was last acted on, and the guard has to answer before either branch is chosen.
 _TOGGLE_PATH = os.path.join(_STATE_DIR, "dictate-last-toggle")
+# Which window was focused when THIS recording started — the whole state the same-window guard
+# keeps, written at start and consumed at stop. Absent (guard off at start, an unwritable state
+# dir, a platform that cannot name its focus) reads as "unknown", which pastes.
+_FOCUS_PATH = os.path.join(_STATE_DIR, "dictate-focus")
 
 # CROSS-SCRIPT CONTRACT (keep in sync with speak.py): speak.py records its live speaking chain in
 # playing.pid — space-separated PIDs, its python process first, then the current player/command
@@ -174,6 +191,24 @@ def resolve_debounce_ms(value) -> float:
     return max(0.0, ms)  # negative is "off", same as 0 — clamped so the log and the docs agree
 
 
+def resolve_paste_target(value) -> str:
+    """Either "any" (paste wherever focus is at stop-time) or "same-window" (paste only if focus did
+    not move) — anything else is a typo, and a typo here resolves to "same-window".
+
+    That is the one place in this file where an unusable value does NOT fall back to the default,
+    and the reason is whose typo it is. The default is "any", so the key is absent from every
+    config that wants the default: a person who wrote this key at all wrote it to ask for the
+    guard, and "same_window" or "samewindow" is that person, not someone who meant "any". Falling
+    back to the default here would silently hand them the behaviour they were switching off. The
+    cost of guessing wrong is one clipboard tier — the documented default path, still fully
+    functional — and the log line below says which value did it."""
+    target = str(value)
+    if target in ("any", "same-window"):
+        return target
+    log(f'dictate.paste_target is not a known value ({value!r}) — using "same-window" (the cautious one)')
+    return "same-window"
+
+
 def resolve_settings(config: dict, system: str) -> dict:
     """Every knob dictate-toggle.sh honoured, same names, same defaults, same precedence."""
     return {
@@ -183,6 +218,8 @@ def resolve_settings(config: dict, system: str) -> dict:
         # and NOTHING else (not 1: `1 in (True,)` is true in Python, so the check is explicit)
         "auto_paste": cfg(config, "dictate.auto_paste", False) is True
         or cfg(config, "dictate.auto_paste", False) == "true",
+        # where auto-paste is allowed to land: "any" (the default power behaviour) or "same-window"
+        "paste_target": resolve_paste_target(cfg(config, "dictate.paste_target", "any")),
         "recorder": str(cfg(config, "dictate.recorder", "auto")),
         # milliseconds in the config (what a human reasons about for a keypress), seconds inside
         "debounce_ms": resolve_debounce_ms(cfg(config, "dictate.debounce_ms", DEBOUNCE_SECONDS * 1000)),
@@ -331,6 +368,56 @@ def paste_plan(tool: str, paste_key: str, enter: bool) -> list[tuple[float, list
     return steps
 
 
+def focus_probe_argv(system: str, have, wayland: bool, display: str) -> list[str]:
+    """The command that prints an identity for whatever is focused right now — [] where the
+    platform cannot answer.
+
+    macOS: the frontmost application PROCESS, which is what System Events can name without a
+    per-window accessibility walk. It is coarser than a window — two Terminal windows are one
+    identity — and that is stated in the docs rather than papered over.
+
+    X11: xdotool's active window id, a genuine per-window identity.
+
+    Wayland: nothing. There is no portable "what is focused" query — wlroots, KDE and Mutter each
+    answer it differently or not at all — and xdotool under XWayland would answer for the X subset
+    only, which is worse than not answering: it reports a *stale* id after a switch to a native
+    Wayland window, and a wrong identity is a guard that fires at the wrong times. So $WAYLAND_DISPLAY
+    means [] whatever else is installed, and the guard degrades to "any"."""
+    if system == "Darwin":
+        if not have("osascript"):
+            return []
+        return [
+            "osascript",
+            "-e",
+            'tell application "System Events" to get name of first application process whose frontmost is true',
+        ]
+    if wayland:
+        return []
+    if display and have("xdotool"):
+        return ["xdotool", "getactivewindow"]
+    return []
+
+
+def focus_changed(started: str, current: str) -> bool:
+    """True only when BOTH ends named a focus and the names differ.
+
+    Either half unknown ('' — the guard was off at start, the state dir was unwritable, the probe
+    is missing, the platform cannot answer, the query failed) means the question was never
+    answered, and an unanswered question degrades to "any": paste. Suppressing on an unknown is the
+    other failure, and it is the worse one — dictation that silently stops pasting on every Wayland
+    desktop, with the user's only evidence a notification saying focus moved when it did not."""
+    return bool(started) and bool(current) and started != current
+
+
+def same_window_guard_on(s: dict) -> bool:
+    """Whether this run needs the focus probe at all.
+
+    Only the auto-paste tier can paste into the wrong window: on the default clipboard tier the
+    human presses the paste key themselves, in whatever window they meant, so there is nothing to
+    guard and no reason to spend a probe on every recording."""
+    return bool(s["auto_paste"]) and s["paste_target"] == "same-window"
+
+
 def multipart_form(fields: dict[str, str], file_field: str, filename: str, payload: bytes, boundary: str) -> bytes:
     """A multipart/form-data body the way curl -F built it: text fields, then one WAV part."""
     lines: list[str] = []
@@ -388,6 +475,59 @@ def note(message: str, system: str) -> None:
             )
     except OSError:
         pass
+
+
+def current_focus(system: str, environ=None) -> str:
+    """Ask the platform what is focused — '' for "cannot say", which is never an error here.
+
+    Bounded like every other spawn in this file: an argv list (never a shell string), a mandatory
+    timeout, check=False with the exit code read rather than raised. A probe that fails, times out
+    or is not installed simply leaves the guard with an unknown, which pastes."""
+    environ = os.environ if environ is None else environ
+    argv = focus_probe_argv(system, shutil.which, bool(environ.get("WAYLAND_DISPLAY")), environ.get("DISPLAY", ""))
+    if not argv:
+        return ""
+    try:
+        result = subprocess.run(argv, capture_output=True, timeout=FOCUS_PROBE_TIMEOUT, check=False)
+    except (OSError, subprocess.SubprocessError) as err:
+        log(f"focus probe failed ({argv[0]}): {type(err).__name__}")
+        return ""
+    if result.returncode != 0:
+        log(f"focus probe returned {result.returncode} ({argv[0]}) — focus unknown")
+        return ""
+    return result.stdout.decode("utf-8", "replace").strip()
+
+
+def remember_focus(system: str) -> None:
+    """Record the focus this recording started in, for stop_and_transcribe to compare against."""
+    identity = current_focus(system)
+    try:
+        with open(_FOCUS_PATH, "w", encoding="utf-8") as fh:
+            fh.write(identity)
+    except OSError as err:
+        # fail open, like the debounce stamp: a guard that cannot keep state must not become a
+        # dictation that never pastes — stop reads no identity and treats the target as "any"
+        log(f"focus not recorded: {err} — the same-window guard degrades to paste-at-focus")
+        return
+    log(f"focus at start: {identity or 'unknown — the same-window guard degrades to paste-at-focus'}")
+
+
+def take_remembered_focus() -> str:
+    """Read and CONSUME the start-time focus — '' when there is none.
+
+    Consumed rather than merely read so that a stop which never reaches the paste decision (a clip
+    below the guard, an empty transcription) cannot leave an identity behind for a later recording
+    to compare itself against."""
+    try:
+        with open(_FOCUS_PATH, encoding="utf-8") as fh:
+            identity = fh.read().strip()
+    except OSError:
+        identity = ""
+    try:
+        os.unlink(_FOCUS_PATH)
+    except OSError:
+        pass
+    return identity
 
 
 def sound(path: str, player: str) -> None:
@@ -686,6 +826,10 @@ def start_recording(s: dict, system: str, pidfile_fd: int) -> int:
         except OSError:
             pass
     log(f"recording via {recorder} pid={proc.pid}")
+    # After the recorder is live, never before it: the probe may spend up to FOCUS_PROBE_TIMEOUT,
+    # and none of that may be time the microphone is not yet capturing.
+    if same_window_guard_on(s):
+        remember_focus(system)
     sound(s["start_sound"], s["player"])
     note("recording…", system)
     return 0
@@ -700,6 +844,9 @@ def _wait_gone(pid: int) -> bool:
 
 
 def stop_and_transcribe(s: dict, system: str, mode: str, recorder_pid: int) -> int:
+    # Consumed unconditionally, whatever this stop goes on to do (see take_remembered_focus): an
+    # identity must never outlive its own recording. Only the same-window guard below reads it.
+    started_focus = take_remembered_focus()
     # Remove the pidfile BEFORE signalling: from this point the recording slot is free, so a
     # racing start claims a FRESH pidfile instead of adopting (and re-stopping) a dying recorder.
     try:
@@ -768,6 +915,14 @@ def stop_and_transcribe(s: dict, system: str, mode: str, recorder_pid: int) -> i
             return 1
 
     if s["auto_paste"]:
+        # The same-window guard (dictate.paste_target): auto-paste presses the paste key into
+        # whatever is focused NOW, so a window switch during the sentence sends it somewhere it was
+        # never meant to go. Probing again only when start left an identity to compare against —
+        # an unknown at either end degrades to "any", which is the documented default.
+        if same_window_guard_on(s) and started_focus and focus_changed(started_focus, current_focus(system)):
+            note("focus moved — text is in the clipboard", system)
+            log("focus moved since this recording started — paste suppressed (dictate.paste_target=same-window)")
+            return 0
         sock = os.environ.get("YDOTOOL_SOCKET", "/tmp/.ydotool_socket")
         try:
             sock_ok = stat.S_ISSOCK(os.stat(sock).st_mode)

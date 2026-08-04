@@ -30,6 +30,37 @@ the keystroke. GNOME's Mutter on Wayland is the common case — `wtype` simply c
 **Pasted into the wrong place / nothing appears:** `dictate.paste_key` must match the focused app.
 Terminals usually want `ctrl+shift+v` or `shift+insert`; GUI apps and macOS want `cmd+v`.
 
+## The transcript went into the wrong app entirely
+
+Not a bug — **paste-at-focus**. Auto-paste presses your paste key into whatever is focused when you
+*stop* the recording, so switching windows mid-sentence sends the text to the new window. Dictate
+into Claude Code, alt-tab to a chat while still speaking, stop: the transcript is pasted into the
+chat, and in `send` mode it is sent. This is the same property that makes the hotkey useful anywhere,
+so it is not going away by default.
+
+**The seatbelt**, if you want it, is `dictate.paste_target: "same-window"`: the focused window is
+remembered when the recording starts, and if focus moved by stop-time nothing is pasted — the text
+stays on the clipboard and the notification says *"focus moved — text is in the clipboard"*.
+
+**It is not protecting me:** check `~/.local/state/voice-loop/dictate.log` for the `focus at start:`
+line each guarded recording writes.
+
+- `focus at start: unknown …` — this desktop cannot be asked what is focused, so the guard degrades
+  to `"any"` and pastes. **Wayland is the whole class**: no portable query exists, `xdotool` under
+  XWayland only sees X clients and goes stale the moment you switch to a native Wayland window, and a
+  wrong identity would suppress the paste exactly when focus did *not* move. X11 needs `xdotool`
+  installed and a `$DISPLAY`; macOS needs `osascript`.
+- no `focus at start:` line at all — the guard was off for that recording: it applies only to
+  `auto_paste: true` (on the clipboard tier you choose the window yourself), and it reads the config
+  as it was when the recording **started**.
+- on macOS the identity is the frontmost **application**, not the window — moving between two windows
+  of the same app is not a move the guard can see.
+
+**It suppresses a paste I wanted:** you switched windows (or, on X11, the window id changed under
+you). Press your paste key — the text is on the clipboard — or set `paste_target` back to `"any"`.
+Note that a typo in the value resolves to `"same-window"`, not to the default: only somebody who
+wanted the guard writes that key at all. `dictate.log` says so if it happened.
+
 **Older `ydotool` types garbage for non-Latin text:** it only accepts *named key combos* and cannot
 type non-ASCII. That is precisely why the scripts paste from the clipboard instead of typing.
 

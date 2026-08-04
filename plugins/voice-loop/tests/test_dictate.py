@@ -48,6 +48,7 @@ def state(monkeypatch, tmp_path):
     monkeypatch.setattr(dictate, "_LAST_WAV_PATH", str(tmp_path / "dictate-last.wav"))
     monkeypatch.setattr(dictate, "_SPEAK_PID_PATH", str(tmp_path / "playing.pid"))
     monkeypatch.setattr(dictate, "_TOGGLE_PATH", str(tmp_path / "dictate-last-toggle"))
+    monkeypatch.setattr(dictate, "_FOCUS_PATH", str(tmp_path / "dictate-focus"))
     return tmp_path
 
 
@@ -70,6 +71,7 @@ def test_defaults_with_empty_config_linux():
     assert s["key_env"] == "VOICE_LOOP_STT_API_KEY"
     assert s["timeout"] == 60.0
     assert s["debounce_ms"] == 750.0
+    assert s["paste_target"] == "any"  # the power behaviour stays the default; the guard is opt-in
 
 
 def test_darwin_defaults_follow_the_platform():
@@ -264,6 +266,248 @@ def test_xdotool_plan_capitalizes_insert():
 
 def test_unknown_paste_tool_builds_no_plan():
     assert dictate.paste_plan("", "ctrl+shift+v", enter=True) == []
+
+
+# --- paste_target: the same-window guard --------------------------------------------------------
+
+
+def test_paste_target_resolves_the_two_documented_values(state):
+    assert dictate.resolve_settings({}, "Linux")["paste_target"] == "any"
+    assert dictate.resolve_settings({"dictate": {"paste_target": "any"}}, "Linux")["paste_target"] == "any"
+    same = dictate.resolve_settings({"dictate": {"paste_target": "same-window"}}, "Linux")
+    assert same["paste_target"] == "same-window"
+    assert not (state / "dictate.log").exists()  # a known value is not worth a line
+
+
+@pytest.mark.parametrize("bad", ["same_window", "samewindow", "window", True, 1])
+def test_an_unknown_paste_target_resolves_to_the_cautious_side_and_says_so(state, bad):
+    """The one setting whose typo does NOT fall back to the default: "any" is what an absent key
+    already means, so anybody who wrote this key wrote it to ask for the guard. Falling back to the
+    default would hand them the exact behaviour they were switching off, silently."""
+    assert dictate.resolve_settings({"dictate": {"paste_target": bad}}, "Linux")["paste_target"] == "same-window"
+    assert "not a known value" in (state / "dictate.log").read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("unset", ["", None])
+def test_an_absent_or_empty_paste_target_is_the_default_not_a_typo(state, unset):
+    # bash-cfg parity: cfg() treats both as "unset", so the resolver never sees them
+    assert dictate.resolve_settings({"dictate": {"paste_target": unset}}, "Linux")["paste_target"] == "any"
+    assert not (state / "dictate.log").exists()
+
+
+def test_focus_probe_asks_system_events_on_macos():
+    argv = dictate.focus_probe_argv("Darwin", have("osascript"), wayland=False, display="")
+    assert argv[:2] == ["osascript", "-e"]
+    assert "frontmost is true" in argv[2]
+    assert dictate.focus_probe_argv("Darwin", have_none, wayland=False, display="") == []
+
+
+def test_focus_probe_uses_xdotool_on_x11_only():
+    assert dictate.focus_probe_argv("Linux", have("xdotool"), wayland=False, display=":0") == [
+        "xdotool",
+        "getactivewindow",
+    ]
+    assert dictate.focus_probe_argv("Linux", have("xdotool"), wayland=False, display="") == []  # no X11 session
+    assert dictate.focus_probe_argv("Linux", have_none, wayland=False, display=":0") == []
+
+
+def test_focus_is_unknowable_on_wayland_even_with_xdotool_installed():
+    """XWayland's xdotool answers for the X subset only: after a switch to a native Wayland window
+    it reports the previous id, so it would suppress the paste exactly when focus did NOT move and
+    allow it when it did. No answer beats a wrong one — the guard degrades to "any" instead."""
+    assert dictate.focus_probe_argv("Linux", have("xdotool"), wayland=True, display=":0") == []
+
+
+def test_focus_changed_only_when_both_ends_are_known_and_differ():
+    assert dictate.focus_changed("claude", "slack") is True
+    assert dictate.focus_changed("claude", "claude") is False
+    # an unknown at either end is an unanswered question, and that degrades to "any": paste
+    assert dictate.focus_changed("", "slack") is False
+    assert dictate.focus_changed("claude", "") is False
+    assert dictate.focus_changed("", "") is False
+
+
+def test_the_guard_is_scoped_to_the_auto_paste_tier():
+    """On the clipboard tier the human presses the paste key themselves, in whatever window they
+    meant — there is nothing to guard, and no reason to spend a probe on every recording."""
+    on = {"auto_paste": True, "paste_target": "same-window"}
+    assert dictate.same_window_guard_on(on) is True
+    assert dictate.same_window_guard_on({**on, "auto_paste": False}) is False
+    assert dictate.same_window_guard_on({**on, "paste_target": "any"}) is False
+
+
+def test_current_focus_returns_the_probe_output_stripped(state, monkeypatch):
+    monkeypatch.setattr(dictate.shutil, "which", have("xdotool"))
+    monkeypatch.setenv("DISPLAY", ":0")
+    monkeypatch.delenv("WAYLAND_DISPLAY", raising=False)
+    calls: list[tuple[list[str], float]] = []
+
+    class Done:
+        returncode = 0
+        stdout = b" 44040199 \n"
+
+    def fake_run(argv, **kw):
+        calls.append((argv, kw["timeout"]))
+        assert kw["check"] is False and kw["capture_output"] is True  # bounded, argv-only, no raise
+        return Done()
+
+    monkeypatch.setattr(dictate.subprocess, "run", fake_run)
+    assert dictate.current_focus("Linux") == "44040199"
+    assert calls == [(["xdotool", "getactivewindow"], dictate.FOCUS_PROBE_TIMEOUT)]
+
+
+def test_current_focus_is_unknown_without_a_probe(state, monkeypatch):
+    def no_spawn(*args, **kwargs):
+        raise AssertionError("no probe exists on this platform — nothing may be spawned")
+
+    monkeypatch.setattr(dictate.subprocess, "run", no_spawn)
+    monkeypatch.setenv("WAYLAND_DISPLAY", "wayland-0")
+    assert dictate.current_focus("Linux") == ""
+
+
+@pytest.mark.parametrize(
+    "outcome",
+    [
+        OSError("no such tool"),
+        subprocess.TimeoutExpired(cmd="xdotool", timeout=2.0),  # a wedged probe is not a wedged toggle
+        "nonzero",
+    ],
+)
+def test_a_failed_probe_is_an_unknown_focus_not_a_crash(state, monkeypatch, outcome):
+    monkeypatch.setattr(dictate.shutil, "which", have("xdotool"))
+    monkeypatch.setenv("DISPLAY", ":0")
+    monkeypatch.delenv("WAYLAND_DISPLAY", raising=False)
+
+    class Failed:
+        returncode = 1
+        stdout = b""
+
+    def fake_run(argv, **kw):
+        if outcome == "nonzero":
+            return Failed()
+        raise outcome
+
+    monkeypatch.setattr(dictate.subprocess, "run", fake_run)
+    assert dictate.current_focus("Linux") == ""
+    assert (state / "dictate.log").exists()  # unknown, but never silently
+
+
+def test_the_start_focus_is_written_and_then_consumed_by_the_stop(state, monkeypatch):
+    monkeypatch.setattr(dictate, "current_focus", lambda system: "Claude Code")
+    dictate.remember_focus("Linux")
+    assert (state / "dictate-focus").read_text(encoding="utf-8") == "Claude Code"
+    assert dictate.take_remembered_focus() == "Claude Code"
+    # consumed: an identity must never outlive its own recording
+    assert not (state / "dictate-focus").exists()
+    assert dictate.take_remembered_focus() == ""
+
+
+def test_an_unwritable_focus_stamp_degrades_to_paste_at_focus(state, monkeypatch):
+    monkeypatch.setattr(dictate, "current_focus", lambda system: "Claude Code")
+    monkeypatch.setattr(dictate, "_FOCUS_PATH", str(state / "not-created-yet" / "dictate-focus"))
+    dictate.remember_focus("Linux")  # fails open, exactly like the debounce stamp
+    assert dictate.take_remembered_focus() == ""
+    assert "focus not recorded" in (state / "dictate.log").read_text(encoding="utf-8")
+
+
+class PasteRun:
+    """What a stop that reached the paste decision actually did."""
+
+    def __init__(self) -> None:
+        self.clipboard: list[bytes] = []
+        self.pastes: list[str] = []
+        self.notes: list[str] = []
+
+
+@pytest.fixture
+def paste_run(state, monkeypatch):
+    """Everything before the paste decision, out of the way: a clip past the min-clip guard, a
+    transcript, a recorder already gone, a fake clipboard and a fake paste tool."""
+    (state / "dictate.wav").write_bytes(b"\0" * (dictate.WAV_HEADER_BYTES + dictate.BYTES_PER_SECOND))
+    run = PasteRun()
+    monkeypatch.setattr(dictate, "transcribe", lambda s: "hello agent")
+    monkeypatch.setattr(dictate, "_pid_alive", lambda pid: False)
+    monkeypatch.setattr(dictate.os, "kill", lambda pid, sig: None)
+    monkeypatch.setattr(dictate.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(dictate, "note", lambda message, system: run.notes.append(message))
+    monkeypatch.setattr(dictate.subprocess, "run", lambda argv, **kw: run.clipboard.append(kw["input"]))
+    monkeypatch.setattr(
+        dictate, "_run_paste", lambda tool, paste_key, enter, sock: run.pastes.append(paste_key) or True
+    )
+    return run
+
+
+def _guarded(**overrides) -> dict:
+    config = {"auto_paste": True, "paste_target": "same-window", "clipboard": "xclip", **overrides}
+    return dictate.resolve_settings({"dictate": config}, "Linux")
+
+
+def test_a_window_switch_mid_sentence_keeps_the_text_in_the_clipboard(state, monkeypatch, paste_run):
+    """The reported footgun, guarded: dictation starts in the agent, the human switches to a chat
+    while speaking, and the transcript must not be typed into that chat."""
+    (state / "dictate-focus").write_text("Claude Code", encoding="utf-8")
+    monkeypatch.setattr(dictate, "current_focus", lambda system: "Slack")
+    assert dictate.stop_and_transcribe(_guarded(), "Linux", "send", 12345) == 0
+    assert paste_run.pastes == []  # nothing was typed anywhere
+    assert paste_run.clipboard == [b"hello agent", b"hello agent"]  # both selections, as always
+    assert paste_run.notes[-1] == "focus moved — text is in the clipboard"
+    assert "paste suppressed" in (state / "dictate.log").read_text(encoding="utf-8")
+
+
+def test_the_guard_pastes_when_focus_stayed_put(state, monkeypatch, paste_run):
+    (state / "dictate-focus").write_text("Claude Code", encoding="utf-8")
+    monkeypatch.setattr(dictate, "current_focus", lambda system: "Claude Code")
+    assert dictate.stop_and_transcribe(_guarded(), "Linux", "send", 12345) == 0
+    assert paste_run.pastes == ["ctrl+shift+v"]
+
+
+def test_an_unknowable_focus_pastes_rather_than_wedging_dictation(state, monkeypatch, paste_run):
+    """Wayland, a missing xdotool, a probe that failed: the guard degrades to "any" — the whole
+    point of the documented fallback. Suppressing here would be dictation that stops pasting on a
+    whole class of desktops with a notification claiming focus moved when it did not."""
+    monkeypatch.setattr(dictate, "current_focus", lambda system: "")
+    assert dictate.stop_and_transcribe(_guarded(), "Linux", "send", 12345) == 0
+    assert paste_run.pastes == ["ctrl+shift+v"]
+
+
+def test_the_default_target_never_probes_focus_at_all(state, monkeypatch, paste_run):
+    (state / "dictate-focus").write_text("Claude Code", encoding="utf-8")
+
+    def never(system):
+        raise AssertionError('paste_target "any" must not probe focus')
+
+    monkeypatch.setattr(dictate, "current_focus", never)
+    assert dictate.stop_and_transcribe(_guarded(paste_target="any"), "Linux", "send", 12345) == 0
+    assert paste_run.pastes == ["ctrl+shift+v"]
+    assert not (state / "dictate-focus").exists()  # consumed anyway: no identity outlives its run
+
+
+def test_a_stop_that_never_reaches_the_paste_decision_still_consumes_the_focus(state, monkeypatch):
+    """A clip below the min-clip guard returns early. If the identity survived that, the NEXT
+    recording (started while the guard was off, so writing nothing) would be compared against a
+    window from minutes ago and suppressed for no reason."""
+    (state / "dictate-focus").write_text("Claude Code", encoding="utf-8")
+    monkeypatch.setattr(dictate, "_pid_alive", lambda pid: False)
+    monkeypatch.setattr(dictate.os, "kill", lambda pid, sig: None)
+    monkeypatch.setattr(dictate.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(dictate, "note", lambda message, system: None)
+    assert dictate.stop_and_transcribe(_guarded(), "Linux", "send", 12345) == 0  # no WAV: clip too short
+    assert not (state / "dictate-focus").exists()
+
+
+def test_start_records_the_focus_only_for_a_guarded_run(state, monkeypatch):
+    monkeypatch.setattr(dictate.subprocess, "Popen", lambda argv, **kw: FakeProc())
+    monkeypatch.setattr(dictate, "stop_speak_playback", lambda: None)
+    monkeypatch.setattr(dictate, "note", lambda message, system: None)
+    monkeypatch.setattr(dictate, "current_focus", lambda system: "Claude Code")
+
+    unguarded = dictate.resolve_settings({"dictate": {"recorder": "arecord", "auto_paste": True}}, "Linux")
+    assert dictate.start_recording(unguarded, "Linux", dictate.claim_pidfile()) == 0
+    assert not (state / "dictate-focus").exists()
+
+    os.unlink(state / "dictate.pid")
+    assert dictate.start_recording(_guarded(recorder="arecord"), "Linux", dictate.claim_pidfile()) == 0
+    assert (state / "dictate-focus").read_text(encoding="utf-8") == "Claude Code"
 
 
 # --- multipart building and response parsing ----------------------------------------------------

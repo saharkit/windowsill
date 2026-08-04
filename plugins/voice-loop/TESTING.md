@@ -157,6 +157,10 @@ prompt the setup causes.
 | 3.3 | Dictation in `send` mode with auto-paste enabled | text is pasted AND Enter is pressed once — exactly once | | |
 | 3.4 | Long dictation (~30 s of speech) | no truncation of the tail; the last words are present | | |
 | 3.4a | **Hold** the dictation hotkey down for two or three seconds, then release | ONE recording starts (and is still recording on release) — not a burst of start/stop cycles, and no second cycle however long the hold. `dictate.log` shows one `recording via …` and a `toggle ignored — key repeat` line per repeat, no `clip too short`. A tap ~1 s after release stops it normally | | |
+| 3.4b | **Paste-at-focus, the feature** (auto-paste on, `paste_target` at its default `any`): start dictation in Claude Code, switch to another app while still speaking, stop | the text is pasted into the app you switched TO — that is the documented behaviour, not a bug. Confirm the README's warning describes what you just saw | | |
+| 3.4c | **The same-window guard** (`dictate.paste_target: "same-window"`, auto-paste on), same switch as 3.4b — **macOS/X11 only** | NOTHING is pasted anywhere; the notification says "focus moved — text is in the clipboard"; your paste key still pastes it. `dictate.log` has `focus at start: …` and a `paste suppressed` line | | |
+| 3.4d | The guard with **no** window switch | pastes exactly as before — the guard is invisible when you stay put | | |
+| 3.4e | The guard on **Wayland** (GNOME/KDE/sway) | it pastes anyway (degrades to `any` — no portable focus query exists) and `dictate.log` says `focus at start: unknown …`. A suppressed paste here would be the bug | | |
 | 3.5 | **Speak-back**: assistant replies with a 🔊 line | it is audibly spoken, once, and matches the text | | |
 | 3.6 | Unmarked lines | are NOT spoken | | |
 | 3.7 | Two turns in a row | the second turn speaks the new line, not a repeat of the first (dedup) | | |

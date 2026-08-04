@@ -56,3 +56,12 @@ own process off a hotkey and never touches the session at all.
 **Can I use it without Claude Code?**
 The dictation script is a standalone toggle — bind it to a hotkey and it fills your clipboard in any
 app. The speak hook is the only Claude-Code-specific part.
+
+**Where exactly does the dictated text go?**
+On the default tier, your clipboard, and you paste it where you want. With auto-paste on, into
+whatever window is focused when you *stop* the recording — any app, which is the point, and also the
+catch: switch windows mid-sentence and the text follows your cursor, not your intent. If that risk
+outweighs the reach, `dictate.paste_target: "same-window"` pastes only when focus has not moved since
+the recording started (macOS and X11; on Wayland nothing can answer the question, so it degrades to
+the default). The [README](../README.md#where-the-text-lands--and-the-one-way-it-bites) spells both
+halves out.
