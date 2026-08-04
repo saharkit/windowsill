@@ -48,7 +48,8 @@ Answer two or three questions (language, where speech should run) and the instal
 proof: with HTTP speech endpoints (local server, LAN, cloud) that is the green **loopback selftest**;
 with a direct-command backend (e.g. macOS `tts.command: "say …"`, which has no endpoint to loop
 through) it is the **ear-check** — the agent speaks a line and you confirm you heard it. To pick a
-custom synthetic voice afterwards: `/voice-design`.
+custom synthetic voice afterwards: `/voice-design`. To take the whole contour back off:
+[`/voice-remove`](#uninstall).
 
 Supported platforms: Linux and macOS. Windows/WSL is untested — we would rather say so than guess.
 
@@ -197,6 +198,7 @@ plugins/voice-loop/
   scripts/selftest.sh         hardware-free loopback proof (TTS -> STT -> compare)
   skills/voice-setup/         the agent installer
   skills/voice-design/        voice casting
+  skills/voice-remove/        the symmetric uninstaller (service, hotkey, config, caches, convention)
   server/                     the self-hostable speech server (FastAPI + faster-whisper + Silero), Dockerfile
   tests/                      the server's unit tests (no models, no network) — 100% gated in CI
   docs/                       architecture, troubleshooting, FAQ
@@ -285,10 +287,34 @@ Stop hook is invoked for real in CI. The parts a machine cannot check for you �
 microphone, whether you actually hear it — are a written checklist. Both halves, and what the
 coverage number honestly claims, are in [TESTING.md](TESTING.md).
 
-**Uninstalling:** removing the plugin does not remove the 🔊 line from your `CLAUDE.md`, the
-config/state dirs (`~/.config/voice-loop/`, `~/.local/state/voice-loop/`), downloaded models under
-`~/.local/share/voice-loop/`, or a local server service you enabled — a proper uninstall story is
-tracked in [issue #17](https://github.com/saharkit/windowsill/issues/17).
+## Uninstall
+
+`/plugin uninstall voice-loop@windowsill` removes **the plugin directory and its hook
+registrations** — and nothing else. Everything `/voice-setup` put *outside* the plugin stays where
+it is, because it lives in your own config, state and cache directories:
+
+| left behind by a plugin uninstall | what it is |
+|---|---|
+| `~/.config/voice-loop/` | `config.json`, `stress.json`, and any cloud `*.key` file |
+| `~/.local/state/voice-loop/` | `speak.log`, `dictate.log`, the spoken-ledger, the recorder PID |
+| `~/.local/share/voice-loop/` | the server's venv, its copy of the server, whisper.cpp models, voice previews |
+| `~/.cache/torch/hub/*silero*`, `~/.cache/huggingface/hub/models--*faster-whisper*`, `~/.local/share/tts/` | downloaded model weights — in caches **shared** with other tools, so nothing wholesale-deletes them |
+| `voice-loop.service` (systemd **user** unit) | the local speech server, still starting at every login |
+| the dictation hotkey | a GNOME custom keybinding or an `skhd` line, now pointing at a deleted script |
+| the 🔊 line in your `CLAUDE.md` | the speak convention setup offered to add |
+
+So run **`/voice-remove` first, then the plugin uninstall** — that order matters, because
+uninstalling the plugin takes the removal skill away with it. `/voice-remove` stops and disables the
+user service, unbinds the hotkey, lists each cache with its size and asks per group before deleting
+anything (your **key files are kept unless you say otherwise**, and the shared model caches are
+never removed wholesale), takes the convention line back out of `CLAUDE.md`, and finishes by
+printing what it deliberately left — shared packages like `jq`/`sox`/`skhd`, the root-installed
+`ydotoold` daemon if you opted into tier 3 (its removal command is printed for you to run), and
+macOS Accessibility consents you revoke by hand.
+
+Switching backends is not an uninstall: re-run `/voice-setup`, and if you move off `local` it offers
+to disable the now-idle service while keeping the venv and the weights, so switching back costs no
+download.
 
 Deeper reading: [architecture](docs/architecture.md) ·
 [troubleshooting](docs/troubleshooting.md) · [FAQ](docs/faq.md).

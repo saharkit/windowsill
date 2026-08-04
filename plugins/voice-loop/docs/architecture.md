@@ -172,4 +172,7 @@ broken engine is latency, and the `tts_fallbacks` counter says how often it is b
 | `~/.local/state/voice-loop/` | logs, the last spoken line, the recorder PID, the last WAV, the toggle and focus stamps |
 | `~/.local/share/voice-loop/` | optional: the venv, models, voice previews |
 
-Nothing is written into the repo, and nothing outside these paths is touched.
+Nothing is written into the repo, and nothing outside these paths is touched. `/voice-remove` walks
+this same table in reverse — plus the model caches under `~/.cache/` that the server's own loaders
+(torch.hub, HuggingFace, coqui) fill, which are shared with other tools and so are removed entry by
+entry rather than wholesale.
