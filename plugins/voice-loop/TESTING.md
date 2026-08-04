@@ -90,7 +90,17 @@ the real runtime. So the guarantee is layered differently:
    that exactly ONE of them played it while the other logged its line *unclaimed* instead of
    queueing behind the speaker (the **lock**, non-blocking, in real processes);
 6. the **loopback selftest** (`selftest.sh`), which is itself one of the scripts, exercised against a
-   live server on both Linux and macOS.
+   live server on both Linux and macOS;
+7. **`tests/test_report_bug.py`** for the bug-report collector, where the property under test is what
+   a bundle must NOT contain. A whole fake install is planted — a config with a live-shaped key, a
+   LAN address, a username, both logs carrying real transcript and spoken text, a third-party
+   stderr line — and every one of those strings is then hunted in the rendered bundle. The
+   collector's `LOG_RULES` table classifies log lines written by two *other* files in this plugin,
+   so a second test reads `speak.py` and `dictate.py` and fails if either grows a log call the table
+   does not know, or keeps a row nothing writes any more. An unclassified line is redacted at
+   runtime regardless — the table falling behind costs diagnostics, never a leak. The transports are
+   unit-tested at their seams (an injected subprocess runner for `gh`, URL round-trips through
+   `urlsplit`/`parse_qs` for the other two): no issue is ever created, no mail is ever sent.
 
 Real invocation is the guarantee for the runtime path. Every spoken run also logs
 `timings extract_ms=… first_audio_ms=… total_ms=…` to `~/.local/state/voice-loop/speak.log`, so a
