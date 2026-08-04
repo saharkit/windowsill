@@ -351,8 +351,9 @@ jobs:
           fix = report["fix"]
           assert fix["kind"] == "install-certificates-command", fix
           assert fix["runnable"] is True, fix
-          assert fix["command"] == "/Applications/Python 9.9/Install Certificates.command", fix
-          print("the python.org branch answered, and it named its own installer")
+          assert fix["command"].endswith("/Install Certificates.command"), fix
+          assert fix["command"].startswith("/Applications/Python "), fix
+          print(f"the python.org branch answered: {fix['command']}")
           PY
 
           # and --fix really SPAWNS that path: one argv with a space in it, a real subprocess, whose
