@@ -40,6 +40,7 @@ Not a plugin, but on the sill too:
 | | what it is |
 |---|---|
 | [tales/](tales/README.md) | the shelf's story content — bedtime tales from the school, in Russian, some with a voiced edition. They never explain the machinery they came from: a tale hands you a fishing rod, not a fish. |
+| [ACHIEVEMENTS.md](ACHIEVEMENTS.md) | the milestone ledger for the shelf and the school. Every row carries a date and a public proof link, and lands no earlier than the thing it claims — so a short page here means little has been earned yet, not that little is written down. |
 
 ## What a plugin brings to the shelf
 
@@ -72,8 +73,9 @@ The rules that follow from that:
   with the plugin name so two plugins' checks stay distinguishable on a PR.
 
 Root-level, and this is the whole list: this README (the catalog), `.claude-plugin/marketplace.json`
-(the manifest `marketplace add` reads), `.github/` (shared CI), `plugins/`, `tales/`, `LICENSE`,
-`.gitignore`, `CLAUDE.md` (the passport an agent reads first) and `.claude/` (its review-lens map).
+(the manifest `marketplace add` reads), `.github/` (shared CI), `plugins/`, `tales/`,
+`ACHIEVEMENTS.md` (the milestone ledger), `LICENSE`, `.gitignore`, `CLAUDE.md` (the passport an
+agent reads first) and `.claude/` (its review-lens map).
 
 ## Conventions (every plugin here follows them)
 
