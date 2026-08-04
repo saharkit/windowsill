@@ -273,6 +273,12 @@ LOG_RULES: tuple[tuple[str, str | None], ...] = (
     ("auto-paste unavailable", None),
     ("toggle ignored — key repeat (", None),
     ("pidfile already claimed", None),
+    ("dictate.paste_target is not a known value (", ") — using"),
+    ("focus probe failed (", None),
+    ("focus probe returned ", " — focus"),
+    ("focus not recorded: ", None),
+    ("focus at start: ", " — the same-window"),
+    ("focus moved since this recording started", None),
     # both
     ("unexpected error: ", "unexpected error: "),
 )
