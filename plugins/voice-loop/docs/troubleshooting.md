@@ -152,6 +152,44 @@ it — but a line written after that ceiling, or while nothing is playing at all
 If the log has **no entry at all** for a turn, the hook never ran: check that it is registered, and
 that `speak.enabled` is not false.
 
+## The voice stops entirely mid-session, but everything works by hand
+
+**Signature:** an hour or so into one long Claude Code session, nothing is spoken any more, and
+`speak.log` simply stops growing while the conversation continues — no error, no `dropped`, no
+`gave up`, just nothing after a certain line. And yet the whole plugin chain is healthy: firing the
+hook by hand synthesizes and plays fine:
+
+```sh
+printf '%s' '{"transcript_path": "/path/to/your/transcript.jsonl"}' \
+  | bash "${CLAUDE_PLUGIN_ROOT}/scripts/speak.sh"
+```
+
+**Cause:** the harness itself has stopped invoking the Stop hook. That is above the plugin's pay
+grade to fix — the hook cannot fire itself — and it is exactly the case the sections above cannot
+tell apart from ordinary silence, because their evidence all lives in a log the dead hook no longer
+writes.
+
+**The heartbeat** is what tells the two apart. Every hook invocation — even one that speaks
+nothing — rewrites `~/.local/state/voice-loop/hook-last-fired`, and the server reports its age:
+
+```sh
+curl -s http://127.0.0.1:8355/health | python3 -c 'import json,sys; h=json.load(sys.stdin); print(h["hook_last_fired"], h["hook_last_fired_age_s"])'
+```
+
+If `hook_last_fired_age_s` keeps **growing while you chat** — minutes old, then tens of minutes —
+the harness is no longer calling the hook, and no plugin-side setting will bring the voice back.
+Both fields are `null` when the server cannot see the stamp: the hook never fired on this machine,
+or the server runs on another one (the ssh-tunnel setup) and the client's state dir is not there
+to read.
+
+**Remedy:** restart the Claude Code session — hooks re-initialize on startup, and the voice comes
+back. Nothing else needs reinstalling or reconfiguring; the stamp and the logs survive the restart
+and pick up where they left off.
+
+If you hit this and can reproduce it, it is a harness bug worth reporting upstream to Claude Code:
+the evidence to attach is the speak.log tail (the line the firings stop after), the growing
+`hook_last_fired_age_s`, and the fact that a manual invocation of the same script still plays.
+
 ## The voice sounds robotic / mangles names
 
 Two different causes, and the common one is not synthesis quality.

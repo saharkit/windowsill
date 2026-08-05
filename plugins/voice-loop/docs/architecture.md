@@ -63,7 +63,11 @@ alone.
    the same player queue as they arrive (the server does the sentence chunking); a stream that
    fails before its first chunk falls back once to the blob `/tts` path. A fresher line kills a
    still-playing older one — precisely, by the PIDs the speaking chain recorded.
-5. Every failure path exits 0. A voice problem must never fail a turn.
+5. Every failure path exits 0. A voice problem must never fail a turn. And every invocation —
+   speaking or not — first rewrites the **heartbeat stamp** (`hook-last-fired`, epoch seconds,
+   temp-then-replace): the harness itself has been observed to stop calling the Stop hook mid-session
+   while the whole plugin chain stayed healthy, and the stamp's age — which `GET /health` surfaces as
+   `hook_last_fired_age_s` — is what tells that apart from a hook with nothing to say.
 6. **Eager mode** (opt-in, `speak.eager`) adds a second event to the same script: `hooks.json` also
    registers **PostToolUse**, and `speak.py` branches on `hook_event_name`. The PostToolUse path
    reads the marked lines of *all* assistant messages (not just the last) and does not retry the
@@ -169,7 +173,7 @@ broken engine is latency, and the `tts_fallbacks` counter says how often it is b
 | `~/.config/voice-loop/stress.json` | optional stress overrides for the synthesizer |
 | `stt_hallucinations.txt` (next to `voice_server.py`) | known Whisper hallucinations `/stt` drops whole, or strips off the tail of real speech (user-extendable) |
 | `~/.config/voice-loop/*.key` | optional cloud key files (mode 600) |
-| `~/.local/state/voice-loop/` | logs, the last spoken line, the recorder PID, the last WAV, the toggle and focus stamps |
+| `~/.local/state/voice-loop/` | logs, the last spoken line, the recorder PID, the last WAV, the toggle and focus stamps, the hook heartbeat stamp |
 | `~/.local/share/voice-loop/` | optional: the venv, models, voice previews |
 
 Nothing is written into the repo, and nothing outside these paths is touched. `/voice-remove` walks

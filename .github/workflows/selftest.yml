@@ -450,6 +450,8 @@ jobs:
           grep -qF "$PHRASE" "$state/last-spoken" || { echo "marker extraction failed"; exit 1; }
           if grep -q "plain line" "$state/last-spoken"; then echo "an unmarked line was spoken"; exit 1; fi
           grep -q "played rc=0" "$state/speak.log" || { echo "synthesis/playback path failed"; exit 1; }
+          # the heartbeat: a real hook invocation must leave its last-fired stamp behind
+          test -s "$state/hook-last-fired" || { echo "the hook left no heartbeat stamp"; exit 1; }
           played_line=$(grep "played rc=" "$state/speak.log" | tail -n 1)
           printf '%s\n' "$played_line" | grep -q "via=stream" \
             || { echo "playback did not go via SSE streaming (via=stream missing) -- the stream silently regressed to the blob /tts fallback"; exit 1; }
