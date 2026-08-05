@@ -212,6 +212,8 @@ plugins/voice-loop/
   skills/voice-design/        voice casting
   skills/voice-remove/        the symmetric uninstaller (service, hotkey, config, caches, convention)
   skills/report-bug/          consent-first bug reporting
+  skills/conformance/         the versioned acceptance pass — walks the checklist, fills every verdict
+  CONFORMANCE.md              the checklist itself, pinned to this plugin's version
   server/                     the self-hostable speech server (FastAPI + faster-whisper + Silero), Dockerfile
   tests/                      the server's unit tests (no models, no network) — 100% gated in CI
   docs/                       architecture, troubleshooting, FAQ
