@@ -95,7 +95,7 @@ jobs:
             || { echo "the missing-script guard lost its diagnostic"; cat /tmp/tls-nopy2.txt; exit 1; }
 
   coverage:
-    name: server unit tests (python ${{ matrix.python }})
+    name: unit tests (python ${{ matrix.python }})
     runs-on: ubuntu-latest
     timeout-minutes: 15
     strategy:
@@ -118,9 +118,29 @@ jobs:
       # Each plugin owns its test run: pytest.ini and .coveragerc live in the plugin directory and
       # their paths (testpaths, pythonpath, coverage source) are relative to it, so the suite is
       # invoked from there rather than from the repo root.
-      - name: pytest with a hard 100% coverage gate
+      #
+      # Coverage measures both the server and the scripts (dictate.py, speak.py, report_bug.py,
+      # tls-probe.py). The server's 100% branch-coverage gate is non-negotiable and never dropped;
+      # the scripts gate starts at 80% and ratchets upward. Both are enforced via separate
+      # `coverage report --include` calls so a script regression cannot block on the server bar
+      # and a server regression cannot hide behind a script's lower threshold.
+      - name: pytest with coverage gates (server 100%, scripts 80% ratcheting)
         working-directory: plugins/voice-loop
-        run: pytest --cov=voice_server --cov-report=term-missing --cov-fail-under=100
+        run: |
+          pytest --cov --cov-report=term-missing
+          echo "::group::server coverage gate (non-negotiable 100%)"
+          python -m coverage report --include='server/voice_server*' --fail-under=100
+          echo "::endgroup::"
+          echo "::group::scripts coverage gate (ratcheting from 80%)"
+          python -m coverage report --include='scripts/*' --fail-under=80
+          echo "::endgroup::"
+          # Append to the shelf-level combined coverage total so a future report can sum
+          # across plugins. The combine runs from the repo root so its .coverage is the
+          # single shelf-level data file; --append preserves this plugin's own .coverage.
+          echo "::group::shelf coverage total"
+          cd "$GITHUB_WORKSPACE"
+          python -m coverage combine --append plugins/voice-loop/.coverage
+          echo "::endgroup::"
 
   loopback:
     name: loopback selftest (${{ matrix.os }}, ${{ matrix.language }})
