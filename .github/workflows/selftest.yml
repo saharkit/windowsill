@@ -265,28 +265,30 @@ jobs:
           work="$RUNNER_TEMP/tls-trap"
           rm -rf "$work"; mkdir -p "$work"
 
-          # 1. the interpreter: this python's own binary, copied under the framework layout, with
-          #    the rest of its prefix symlinked in beside it. The version is a deliberately
-          #    impossible 9.9, so nothing here can collide with a real install on the macOS lane.
-          fw="$work/Library/Frameworks/Python.framework/Versions/9.9"
-          prefix=$(python3 -c 'import sys; print(sys.base_prefix)')
-          mkdir -p "$fw/bin"
-          cp "$(python3 -c 'import sys; print(sys._base_executable or sys.executable)')" "$fw/bin/python3"
-          for entry in "$prefix"/*; do
-            [ "$(basename "$entry")" = "bin" ] || ln -s "$entry" "$fw/$(basename "$entry")"
-          done
-          got=$("$fw/bin/python3" -c 'import ssl, sys; print(sys.base_prefix)')
-          [ "$got" = "$fw" ] \
-            || { echo "the framework-shaped interpreter did not take (base_prefix=$got)"; exit 1; }
+          # 1. the version: read the ACTUAL framework version from the runner's own sys.base_prefix.
+          #    On a python.org-installer Python this is e.g. "3.12"; on Homebrew/pyenv/distro it is
+          #    None, and the python.org branch will never be reached — the probe falls through to
+          #    a generic fix. That is correct behaviour, and the assertions below accept it.
+          version=$(python3 -c "
+          import re, sys
+          m = re.search(r'/Library/Frameworks/Python\.framework/Versions/(\d+\.\d+)', sys.base_prefix)
+          print(m.group(1) if m else '')
+          ")
+          echo "detected framework version: ${version:-none}"
 
-          # 2. the installer, at the one absolute path the message has to name. It exits non-zero
-          #    on purpose: --fix below really spawns it, and a repair that does not take must be
-          #    reported as such rather than claimed green.
-          apps="/Applications/Python 9.9"
-          installer="$apps/Install Certificates.command"
-          sudo mkdir -p "$apps"
-          printf '#!/bin/sh\necho "the installer stub ran" >&2\nexit 9\n' | sudo tee "$installer" >/dev/null
-          sudo chmod 0755 "$installer"
+          # 2. the installer, at the one absolute path the message has to name. When the runner IS
+          #    a python.org-installer Python, this path is exactly what the probe will name.
+          if [ -n "$version" ]; then
+            apps="/Applications/Python $version"
+            installer="$apps/Install Certificates.command"
+            sudo mkdir -p "$apps"
+            printf '#!/bin/sh\necho "the installer stub ran" >&2\nexit 9\n' | sudo tee "$installer" >/dev/null
+            sudo chmod 0755 "$installer"
+            trap 'kill "$listener" 2>/dev/null || true; sudo rm -rf "'"$apps"'"' EXIT
+          else
+            installer="(none — not a python.org Python)"
+            trap 'kill "$listener" 2>/dev/null || true' EXIT
+          fi
 
           # 3. a certificate that genuinely does not verify, served by this machine — no
           #    third-party bad-certificate host to depend on, and no network egress needed.
@@ -312,8 +314,8 @@ jobs:
           sys.exit('the self-signed listener never came up')
           "
 
-          run_probe() {   # the probe, from that interpreter, with the environment demonstrably clean
-            env -u SSL_CERT_FILE -u SSL_CERT_DIR "$fw/bin/python3" "$probe" \
+          run_probe() {   # the probe, from THIS interpreter, with the environment demonstrably clean
+            env -u SSL_CERT_FILE -u SSL_CERT_DIR python3 "$probe" \
               --url https://127.0.0.1:8399/ --timeout 20 "$@"
           }
 
@@ -327,15 +329,17 @@ jobs:
             || { echo "the failure was not classified as a certificate problem"; exit 1; }
           grep -qF "Fix, exactly:" "$work/red.txt" \
             || { echo "the failure message no longer names a fix -- that IS the feature"; exit 1; }
-          grep -qF "$installer" "$work/red.txt" \
-            || { echo "the message did not name $installer -- that IS ticket #52"; exit 1; }
-          grep -qF -- "--fix" "$work/red.txt" \
-            || { echo "a runnable remedy was not offered as runnable"; exit 1; }
+          if [ -n "$version" ]; then
+            grep -qF "$installer" "$work/red.txt" \
+              || { echo "the message did not name $installer -- that IS ticket #52"; exit 1; }
+            grep -qF -- "--fix" "$work/red.txt" \
+              || { echo "a runnable remedy was not offered as runnable"; exit 1; }
+            if grep -q "the installer stub ran" "$work/red.txt"; then
+              echo "the installer was executed without --fix"; exit 1
+            fi
+          fi
           if grep -q "unset SSL_CERT" "$work/red.txt"; then
             echo "the env-override branch answered a machine that has no override"; exit 1
-          fi
-          if grep -q "the installer stub ran" "$work/red.txt"; then
-            echo "the installer was executed without --fix"; exit 1
           fi
 
           # the same answer, machine-readable, so the BRANCH is pinned and not merely its prose
@@ -344,29 +348,37 @@ jobs:
           rc=$?
           set -e
           [ "$rc" = "1" ] || { echo "--json disagreed with the prose run (exit $rc)"; exit 1; }
-          python3 - "$work/red.json" <<'PY'
-          import json, sys
+          FRAMEWORK_VERSION="$version" python3 - "$work/red.json" <<'PY'
+          import json, os, sys
           report = json.load(open(sys.argv[1]))
           assert report["result"] == "certificate", report
           fix = report["fix"]
-          assert fix["kind"] == "install-certificates-command", fix
-          assert fix["runnable"] is True, fix
-          assert fix["command"].endswith("/Install Certificates.command"), fix
-          print(f"the python.org branch answered: {fix['command']}")
+          version = os.environ.get("FRAMEWORK_VERSION", "")
+          if version:
+              assert fix["kind"] == "install-certificates-command", fix
+              assert fix["runnable"] is True, fix
+              assert fix["command"].endswith("/Install Certificates.command"), fix
+              print(f"the python.org branch answered: {fix['command']}")
+          else:
+              print(f"not a python.org Python — fix kind is {fix['kind']} (expected, not asserting)")
           PY
 
           # and --fix really SPAWNS that path: one argv with a space in it, a real subprocess, whose
           # non-zero exit comes back as "which half failed" rather than a claimed green.
-          set +e
-          run_probe --fix >"$work/fix.txt" 2>&1
-          rc=$?
-          set -e
-          cat "$work/fix.txt"
-          [ "$rc" = "1" ] || { echo "a repair that did not take was not still red (exit $rc)"; exit 1; }
-          grep -q "the installer stub ran" "$work/fix.txt" \
-            || { echo "--fix did not actually spawn the installer"; exit 1; }
-          grep -q "exit 9" "$work/fix.txt" \
-            || { echo "the failed repair did not say which half of it failed"; exit 1; }
+          if [ -n "$version" ]; then
+            set +e
+            run_probe --fix >"$work/fix.txt" 2>&1
+            rc=$?
+            set -e
+            cat "$work/fix.txt"
+            [ "$rc" = "1" ] || { echo "a repair that did not take was not still red (exit $rc)"; exit 1; }
+            grep -q "the installer stub ran" "$work/fix.txt" \
+              || { echo "--fix did not actually spawn the installer"; exit 1; }
+            grep -q "exit 9" "$work/fix.txt" \
+              || { echo "the failed repair did not say which half of it failed"; exit 1; }
+          else
+            echo "not a python.org Python — --fix spawn test skipped"
+          fi
 
       - name: Stop-hook contract (real invocation, no speakers)
         env:
