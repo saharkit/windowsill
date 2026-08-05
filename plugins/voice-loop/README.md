@@ -229,13 +229,34 @@ grants. Dictation is where privileges can creep in, so it is tiered and **starts
 1. **Default — no root, no consent dialogs, works everywhere.** The transcript goes to your clipboard
    and you press your own paste key. This is fully functional; everything below is convenience.
 2. **Auto-paste, no root.** `wtype` (KDE/wlroots) or `xdotool` (X11) on Linux; on macOS a single
-   Accessibility consent for `osascript`.
+   Accessibility consent for `osascript` — see the macOS note below.
 3. **Auto-paste on GNOME/Wayland — one root step.** Mutter exposes no virtual-keyboard protocol, so
    this needs the `ydotool` daemon. `/voice-setup` **prints** that command for you to run rather than
    running it, and says plainly what it grants.
 
 `/voice-setup` is written for default permission mode: it announces its plan, batches its work into a
 few coarse actions, and never hides a `sudo`.
+
+### macOS Accessibility prompt — what it says, what it costs
+
+The first time you dictate with auto-paste enabled, macOS shows a system dialog:
+
+> **"Claude wants to control this computer"** (or the name of your terminal app)
+
+That is the `osascript` keystroke injection requesting the Accessibility permission — **not** a
+machine takeover. `/voice-setup` explains this BEFORE the dialog appears, and the dialog fires at
+the first actual dictation, not during install: when it appears, you know exactly why.
+
+- **Allow** → keystrokes work and paste is hands-free from then on.
+- **Decline** → dictation still works. The text stays on your clipboard (press **Cmd+V** yourself),
+  the script detects the denial in the osascript error output, and **stops retrying the keystroke
+  path** — the dialog will not reappear. Switching back to auto-paste later is just removing
+  `~/.local/state/voice-loop/dictate-paste-denied` (or re-granting the permission in System Settings
+  → Privacy & Security → Accessibility) and the next toggle retries.
+
+The notification the script shows on denial: *"accessibility permission denied — text is on the
+clipboard"*. Every toggle after that falls back to clipboard silently — the denial is explained once,
+not on every dictation.
 
 ## Where the text lands — and the one way it bites
 

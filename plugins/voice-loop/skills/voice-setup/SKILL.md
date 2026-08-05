@@ -482,6 +482,25 @@ Set this up first and *demonstrate it working* before offering anything else.
 - macOS: `osascript` keystroke. Costs **one Accessibility consent** for the terminal app the hotkey
   runs under (System Settings → Privacy & Security → Accessibility). No root.
 
+**On macOS, ask about auto-paste explicitly — and explain the dialog BEFORE it appears.** The
+question to ask, in its own turn so the user sees it before any consent dialog fires:
+
+> Auto-paste sends keystrokes through System Events, which requires the **Accessibility** permission.
+> The first time you dictate, macOS will show **"Claude wants to control this computer"** (or the
+> name of your terminal app) — that is *this* feature, not a machine takeover. The dialog appears at
+> the FIRST actual dictation, not during setup. Do you want auto-paste?
+>
+> - **Allow** in that dialog → keystrokes work and paste is hands-free.
+> - **Decline** → dictation still works perfectly; the text stays on your clipboard and you press
+>   **Cmd+V** yourself. The script detects the denial and stops retrying the keystroke path, so the
+>   dialog does not reappear.
+>
+> The default is clipboard-only — say "no" and you never see the dialog at all.
+
+When the user says yes, set `auto_paste: true` and say one sentence more — "the prompt will appear
+the first time you actually dictate, not now" — so they are not startled when the dialog pops up
+mid-sentence later. When they say no, keep the default tier 1 and move on.
+
 **Tier 3 (opt-in, needs root ONCE — GNOME/Mutter on Wayland only):** Mutter exposes no
 virtual-keyboard protocol, so `wtype` cannot work there; `ydotool` needs its daemon on
 `/dev/uinput`. Print these for the user to run themselves, and say what they do:

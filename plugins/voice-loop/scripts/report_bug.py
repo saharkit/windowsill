@@ -279,6 +279,9 @@ LOG_RULES: tuple[tuple[str, str | None], ...] = (
     ("focus not recorded: ", None),
     ("focus at start: ", " — the same-window"),
     ("focus moved since this recording started", None),
+    ("accessibility permission denied", None),
+    ("auto-paste denied", None),
+    ("paste spawn failed (", None),
     # both
     ("unexpected error: ", "unexpected error: "),
 )
