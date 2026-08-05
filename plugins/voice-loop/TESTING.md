@@ -101,6 +101,25 @@ the real runtime. So the guarantee is layered differently:
    runtime regardless — the table falling behind costs diagnostics, never a leak. The transports are
    unit-tested at their seams (an injected subprocess runner for `gh`, URL round-trips through
    `urlsplit`/`parse_qs` for the other two): no issue is ever created, no mail is ever sent.
+7. **`tests/test_tls_probe.py`** unit-tests `tls-probe.py` the same way — the https request and the
+   repair spawn are both injected callables, so the classification (verified / certificate /
+   unreachable), the python.org layout detection, and "`--fix` only claims green after a SECOND
+   probe" are pinned without a socket. What a fake cannot prove, **two real invocations in CI** do,
+   and they are deliberately kept apart because they reach *different branches* of the diagnosis:
+   - both lanes probe a real host and expect green (an unreachable host is exit 2 and warns, not a
+     red), then probe again with `SSL_CERT_FILE`/`SSL_CERT_DIR` pointed at an empty store. That
+     second one proves the **env-override** branch and only that — an override in force is
+     diagnosed first and unconditionally, so this shape can never reach the python.org remedy;
+   - so a separate step stands up the **python.org trap itself**: an interpreter that really lives
+     under `/Library/Frameworks/Python.framework/Versions/X.Y`, a real
+     `Install Certificates.command` at the path the message must name, and a real certificate
+     failure from a self-signed listener on the runner. It asserts the acceptance criterion of
+     row 5.8 below — the message names that installer verbatim — through both the prose and
+     `--json`'s `fix.kind`, and then runs `--fix` for real to prove the installer is *spawned* (one
+     argv, space in the path) and that a repair which exits non-zero is still reported red.
+
+   The one thing no runner can offer is a genuine python.org-installer Python with its own empty
+   store; that is row 5.8, checked by a human.
 
 Real invocation is the guarantee for the runtime path. Every spoken run also logs
 `timings extract_ms=… first_audio_ms=… total_ms=…` to `~/.local/state/voice-loop/speak.log`, so a
@@ -210,6 +229,9 @@ prompt the setup causes.
 | 5.5 | Nothing in the install required root | true / false | | |
 | 5.6 | `/voice-setup` on a **Touch Bar** Mac | it detects the Touch Bar (or asks), offers a physical chord (⌘I) rather than `F9`, and states the `fn` caveat | | |
 | 5.7 | The chord it wired actually toggles dictation | one press records, one press stops — from any focused app, with no `fn` gymnastics | | |
+| 5.8 | **python.org-installer Python that has never had `Install Certificates.command` run** (the real trap — a Homebrew or Xcode python will NOT reproduce it): run `/voice-setup` | setup probes TLS *before* installing; the probe goes red, its message **names `/Applications/Python 3.x/Install Certificates.command` verbatim**; the agent asks once, runs it, re-probes green, and the install then completes — **without the user having to know any of this** | | |
+| 5.9 | Same Mac, decline the fix when asked | setup stops with the command printed for you to run, rather than starting a `pip install` that will fail the same way | | |
+| 5.10 | `scripts/tls-probe.sh` by hand on a healthy Mac | exit 0, one OK line naming the interpreter it checked | | |
 
 ## 6. `/voice-design` (only if the user has an ElevenLabs key)
 

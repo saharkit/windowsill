@@ -53,6 +53,15 @@ custom synthetic voice afterwards: `/voice-design`. To take the whole contour ba
 
 Supported platforms: Linux and macOS. Windows/WSL is untested — we would rather say so than guess.
 
+**On macOS, one trap is worth knowing about even though setup now handles it.** python.org-installer
+Python ships an **empty certificate store**, so until `/Applications/Python 3.x/Install
+Certificates.command` has been run once, every https call from it dies with `CERTIFICATE_VERIFY_FAILED
+— unable to get local issuer certificate`: `pip install`, the model download, the cloud TTS request.
+`/voice-setup` probes for this before it installs anything and offers to run that command for you;
+`scripts/tls-probe.sh` is that probe if you want to ask by hand (`--fix` runs the repair and
+re-probes). Details, and the cases that look the same but are not, in
+[troubleshooting](docs/troubleshooting.md#macos-certificate_verify_failed-on-every-https-call).
+
 To hear something, the model must be *asked* to speak — one line in your `CLAUDE.md` is enough, and
 `/voice-setup` now offers to add it for you (globally or per-project). If you skipped that offer,
 add it yourself:
@@ -198,6 +207,7 @@ plugins/voice-loop/
   scripts/selftest.sh         hardware-free loopback proof (TTS -> STT -> compare)
   scripts/report-bug.sh       bug-report launcher (stable entry point for /report-bug)
   scripts/report_bug.py       the collector: diagnostics -> redaction -> one bundle -> a transport
+  scripts/tls-probe.sh/.py    "do https certificates verify from this python?" — names the fix, --fix runs it
   skills/voice-setup/         the agent installer
   skills/voice-design/        voice casting
   skills/voice-remove/        the symmetric uninstaller (service, hotkey, config, caches, convention)

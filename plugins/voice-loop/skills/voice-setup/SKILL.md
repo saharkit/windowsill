@@ -39,7 +39,7 @@ uname -s; uname -m; echo "LANG=$LANG LC_ALL=$LC_ALL XDG_SESSION_TYPE=$XDG_SESSIO
 for c in jq curl python3 pw-record arecord aplay paplay ffmpeg wl-copy xclip ydotool wtype xdotool notify-send gsettings sox rec afplay pbcopy osascript say brew skhd nvidia-smi; do \
   command -v "$c" >/dev/null 2>&1 && echo "have $c"; done; \
 pgrep -qx TouchBarServer 2>/dev/null && echo "have touchbar"; \
-python3 -c 'import sys; print("python", sys.version.split()[0])' 2>/dev/null; \
+python3 -c 'import sys; print("python", sys.version.split()[0], "from", sys.base_prefix)' 2>/dev/null; \
 (nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null || true); \
 cat ~/.config/voice-loop/config.json 2>/dev/null || echo "no existing config"
 ```
@@ -47,6 +47,9 @@ cat ~/.config/voice-loop/config.json 2>/dev/null || echo "no existing config"
 From the output decide: OS branch (Linux / macOS), session type (Wayland / X11), desktop (GNOME /
 KDE / other), whether a GPU exists, and what is already installed. Report the findings in two or three
 lines — not a wall of text.
+
+A `base_prefix` under `/Library/Frameworks/Python.framework/` is **python.org-installer Python**, and
+it comes with an empty certificate store — see the TLS probe at the top of the macOS branch of Step 3.
 
 `have touchbar` means this Mac's function row is the virtual Touch Bar strip (`TouchBarServer` runs
 on that hardware and nowhere else) — it decides the hotkey in Step 6. It is a positive signal only:
@@ -188,6 +191,52 @@ Substitute `<language>` with the code the user chose in Step 1 (it sets the serv
 requests can still override per call). `systemctl --user` is not root.
 
 ### macOS
+
+**First, before anything that talks HTTPS — probe TLS.** A Mac running python.org-installer Python
+has an **empty certificate store** until `/Applications/Python 3.x/Install Certificates.command` has
+been run once, and nothing runs it for the user. Until then every https call from that interpreter
+dies with `SSL: CERTIFICATE_VERIFY_FAILED — unable to get local issuer certificate`: `pip install`,
+the model download, and the cloud TTS request the speak hook makes. The failure is loud and names no
+fix, so a perfectly good install reads as a broken plugin. Probe for it *first*, because everything
+below it needs the network:
+
+```sh
+bash "${CLAUDE_PLUGIN_ROOT}/scripts/tls-probe.sh"
+```
+
+Exit 0 means certificates verify — say one line and move on. Exit 1 is the trap, and the probe's own
+message already names the exact fix. Exit 2 means the host was unreachable, which is a network
+problem, not a certificate one — do not "fix" it. Exit **64** means the probe was called wrong (a
+typo'd flag, a missing value, a non-https URL): correct the command, and do not report it to the
+user as a certificate problem — it is not a diagnosis of their machine at all.
+
+On exit 1, when the fix is the installer's own command (the probe says so, and says it is runnable),
+**ask before running it** — it is a one-line AskUserQuestion, not a silent action:
+
+> Your Python's certificate store is empty (python.org installer). Run its own
+> `Install Certificates.command` now? It needs no root and only affects this Python.
+
+On yes, re-run with `--fix`: it runs that command and **probes again**, so what you report is a
+verified green rather than "we ran something".
+
+```sh
+bash "${CLAUDE_PLUGIN_ROOT}/scripts/tls-probe.sh" --fix
+```
+
+On no — or when the probe printed a fix it will not run for you (a shell pipeline, a package
+manager) — print its command verbatim, say the install cannot finish until it is run, and stop
+there rather than starting a `pip install` that is going to fail the same way.
+
+Two things the probe does not cover, and both are one line to the user rather than a silent
+assumption. It checks the `python3` on `PATH`, which is what the hooks run under: if you build a
+**venv** for the local server (Step 3 below), that venv inherits its base interpreter's store, so
+when the venv's base is a *different* python, probe it too by calling the `.py` with that
+interpreter. And a green while a proxy is configured is a green for *this* probe only — it bypasses
+proxies on purpose, `pip` and the model download do not, and the probe says so in that case.
+
+```sh
+~/.local/share/voice-loop/venv/bin/python "${CLAUDE_PLUGIN_ROOT}/scripts/tls-probe.py" --fix
+```
 
 Most of the contour is built in: `afplay` (play), `pbcopy` (clipboard), `osascript` (keystroke),
 `say` (a decent built-in TTS fallback: `say -v Milena` for Russian, `say -v Lesya` for Ukrainian —
@@ -438,6 +487,9 @@ How the install ends depends on the backend shape — say which proof applies **
   It renders a phrase through TTS, feeds the audio straight back into STT, and compares the
   transcript — no microphone, no speakers, no display. On failure, read its message: it
   distinguishes "server not reachable", "not a WAV", "no text", and "transcript does not match".
+  If the endpoint is **https** and the failure mentions a certificate, that is the Step 3 TLS trap
+  reaching this far — run `scripts/tls-probe.sh` and follow what it names, do not re-run the
+  selftest hoping.
 - **Direct-command backends only (e.g. macOS `tts.command: "say …"`, no HTTP endpoint):** there is
   nothing for the loopback to loop through — `selftest.sh` will say so and exit without testing.
   The install ends with the **ear-check** below instead; do not promise a green selftest here.
