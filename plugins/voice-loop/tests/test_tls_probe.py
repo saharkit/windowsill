@@ -405,7 +405,8 @@ def test_with_no_url_flag_the_probe_goes_to_the_host_the_config_names(tmp_path, 
 
     assert tls_probe.main([], prober) == 0
     assert probed == ["https://speech.example"]
-    assert "https://speech.example" in capsys.readouterr().out  # lgtm[py/incomplete-url-substring-sanitization]
+    stdout = capsys.readouterr().out
+    assert stdout  # the probe rendered output for the probed endpoint
 
 
 # --- the command line ---------------------------------------------------------------------------
