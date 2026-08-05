@@ -1,0 +1,11 @@
+# Coverage of sill_core is a hard gate at 100% (statements AND branches).  The suite runs as
+# `cd plugins/sill-core && pytest …`, and `source` resolves through pytest.ini's `pythonpath`.
+[run]
+branch = True
+source = sill_core
+
+[report]
+show_missing = True
+skip_covered = False
+exclude_lines =
+    pragma: no cover

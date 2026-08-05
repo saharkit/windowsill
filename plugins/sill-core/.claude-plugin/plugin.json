@@ -1,0 +1,17 @@
+{
+  "name": "sill-core",
+  "version": "0.1.0",
+  "description": "Shared core for windowsill plugins: assistant state store with atomic writes, remind-once etiquette, and schema-versioned JSON persistence. One file per plugin under XDG_STATE_HOME.",
+  "author": {
+    "name": "Sahar"
+  },
+  "homepage": "https://github.com/saharkit/windowsill/tree/main/plugins/sill-core",
+  "license": "MIT",
+  "keywords": [
+    "state",
+    "persistence",
+    "reminders",
+    "atomic-write",
+    "sill-core"
+  ]
+}
