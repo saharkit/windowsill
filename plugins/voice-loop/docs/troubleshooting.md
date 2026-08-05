@@ -294,6 +294,17 @@ references tools installed in a shell-only `PATH` (Homebrew, `~/.local/bin`), us
 
 You pressed the hotkey while a spoken line was still playing, and the microphone transcribed the speakers. The dictation script now stops in-flight speech playback when a recording starts (the echo guard). If you still catch echo (external speakers, high volume), start recording after the line finishes, or use headphones.
 
+## The voice said "Voice contour: …"
+
+That is the poller's page, working as intended — read `~/.local/state/voice-loop/contour.json` for
+which alert fired. The four shapes: a service not answering (check the process, then the URL in
+`contour.services`), a service **serving on a device other than its `expect_device`** (it demoted
+itself — usually VRAM pressure from a neighbour; `nvidia-smi` says who holds the card), free VRAM
+under the floor, and `oom_overflows` rising (the card is oversubscribed). The page repeats only
+when the condition clears and returns; `contour.alerts: false` silences the voice while the poller
+keeps writing the file. If the alert text is wrong about the device a client needs, the
+`expect_device` key is the thing to fix — or remove, if nothing depends on the fast path.
+
 ## None of the above — report it
 
 `/report-bug` collects the evidence for you: versions, config with the secrets stripped, both log

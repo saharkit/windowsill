@@ -94,6 +94,32 @@ alone.
    cannot get in leaves its lines unclaimed for the next turn's eager firing rather than claiming
    without the lock.
 
+## The contour check — a page, not a dashboard
+
+The contour's worst failure is the quiet one: a service that demoted itself off the GPU keeps
+serving, correctly and an order of magnitude slower, and nothing breaks loudly. Two pieces watch
+for that (#40), deliberately small — no Prometheus on a box with no sudo:
+
+1. `scripts/contour_poll.py` (behind `contour-poll.sh`, run by the operator's cron or a
+   `systemd --user` timer) polls every configured service's `/health` — bounded wait, bounded
+   body — plus free VRAM from `nvidia-smi` (an argv list, a wall-clock timeout, `check=False`;
+   `vram.command: false` where there is no GPU). It evaluates four rules — unreachable/not-ok,
+   **device demoted** (only against an `expect_device` the operator declared: the alert means "a
+   client depends on the fast path"), **free VRAM under the floor**, and `oom_overflows` on the
+   rise (a delta against the previous status file, so a steady counter does not re-page) — keeps a
+   bounded per-service history, computes the latency SLI as **p95 split by device** for any
+   configured numeric health field, and writes it all to `contour.json` atomically (temp file,
+   fsync, `os.replace` — a reader never sees a truncated file).
+2. The speaking hook is the page. `speak.py`'s `entry()` runs `contour_check` after the turn's own
+   speech — the hook registration surface does not change — and voices every active alert not in
+   `contour-announced`, a file of alert keys pruned to the alerts still active (a condition that
+   clears and returns pages again; one that persists is said once). The alert travels the SAME
+   playback path a marked line takes (`play_text`, extracted so it cannot drift), keeps eager
+   mode's non-blocking lock, and is recorded BEFORE synthesis for the same reason the spoken-ledger
+   claims first: for something that talks out loud, idempotence beats completeness. Opted out with
+   `contour.alerts: false`; an install that never ran the poller has no status file and pays one
+   tolerant read per turn.
+
 ## The dictation path
 
 1. A global hotkey (per desktop — `gsettings`, KDE shortcuts, sway/Hyprland config, `skhd`) runs
@@ -173,7 +199,7 @@ broken engine is latency, and the `tts_fallbacks` counter says how often it is b
 | `~/.config/voice-loop/stress.json` | optional stress overrides for the synthesizer |
 | `stt_hallucinations.txt` (next to `voice_server.py`) | known Whisper hallucinations `/stt` drops whole, or strips off the tail of real speech (user-extendable) |
 | `~/.config/voice-loop/*.key` | optional cloud key files (mode 600) |
-| `~/.local/state/voice-loop/` | logs, the last spoken line, the recorder PID, the last WAV, the toggle and focus stamps, the hook heartbeat stamp |
+| `~/.local/state/voice-loop/` | logs, the last spoken line, the recorder PID, the last WAV, the toggle and focus stamps, the hook heartbeat stamp, the contour poller's `contour.json` and its `contour-announced` ledger |
 | `~/.local/share/voice-loop/` | optional: the venv, models, voice previews |
 
 Nothing is written into the repo, and nothing outside these paths is touched. `/voice-remove` walks

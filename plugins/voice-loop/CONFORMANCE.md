@@ -1,4 +1,4 @@
-# voice-loop conformance — v0.4.0
+# voice-loop conformance — v0.5.0
 
 A versioned acceptance checklist for the voice-loop plugin. This file is pinned to the
 plugin version it tests: a release that changes behaviour changes this checklist, and a
@@ -15,7 +15,7 @@ In a Claude Code session with voice-loop installed:
 
 The skill walks this checklist interactively: it asks you for the physical acts (tap the
 hotkey, confirm you heard the sound) and probes the machine for everything else. The result
-is one report file (`conformance-v0.4.0-YYYYMMDD.md`) with every row adjudicated. The
+is one report file (`conformance-v0.5.0-YYYYMMDD.md`) with every row adjudicated. The
 report is then offered through the same three transports as `/report-bug` — a GitHub issue
 (with the `conformance` label), a pre-filled new-issue URL, or a mailto:.
 
@@ -31,7 +31,7 @@ SKIP needs a reason in the evidence cell (e.g. "Wayland-only guard, tested on X1
 | tester | _(filled at runtime)_ |
 | OS / version | _(filled at runtime)_ |
 | desktop / session (GNOME-Wayland, KDE, X11, macOS) | _(filled at runtime)_ |
-| plugin version | 0.4.0 |
+| plugin version | 0.5.0 |
 | backends chosen (stt / tts) | _(filled at runtime)_ |
 | language | _(filled at runtime)_ |
 
@@ -84,6 +84,8 @@ SKIP needs a reason in the evidence cell (e.g. "Wayland-only guard, tested on X1
 | 3.11 | Queued, not dropped | A 🔊 line long enough to play for ~10 s; send the next prompt so its reply lands mid-clip | the second line is spoken (after the first clip, or in place of it — never skipped); `speak.log` shows `queued, not dropped` | | |
 | 3.12 | Unheard line accounted for | Any turn whose 🔊 line was NOT heard | `speak.log` has a line saying why (give-up, dedup, synthesis failure). A turn with NO log line at all is a FAIL | | |
 | 3.13 | Stress/pronunciation (ru/uk only) | Add a proper name to `~/.config/voice-loop/stress.json`, then say it in a 🔊 line | pronunciation is acceptable after the stress entry is added | | |
+| 3.14 | Contour alert — the page | Add a `contour.services` entry whose `expect_device` the server does NOT match (e.g. `"gpu"` on a CPU-only box), run `bash scripts/contour-poll.sh`, then end a turn | the poller exits 1 and its line names the demotion; at the turn's end the alert is SPOKEN ("Voice contour: …"); `speak.log` shows `contour: voicing 1 alert(s)` | | |
+| 3.15 | Contour alert — once, not every turn | End another turn while the condition persists | the alert is NOT spoken again; then clear the condition (remove the expectation, re-poll), let it recur later — it pages again | | |
 
 ## 4. Degrade paths — failures must be legible, never hangs
 
@@ -119,5 +121,5 @@ SKIP needs a reason in the evidence cell (e.g. "Wayland-only guard, tested on X1
 
 ---
 
-**Checklist version:** 0.4.0 — pinned to `plugins/voice-loop/.claude-plugin/plugin.json`.
+**Checklist version:** 0.5.0 — pinned to `plugins/voice-loop/.claude-plugin/plugin.json`.
 A mismatch between this version and the plugin version is a stale checklist.

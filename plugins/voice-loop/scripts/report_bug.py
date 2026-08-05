@@ -71,6 +71,8 @@ _STATE_FILES = (
     ("dictate.wav", "the clip being recorded"),
     ("dictate-last.wav", "the last recorded clip"),
     ("dictate-last-toggle", "the key-repeat debounce stamp"),
+    ("contour.json", "the contour poller's status — size only, it names the operator's services"),
+    ("contour-announced", "the contour alerts already voiced (opaque alert keys)"),
 )
 
 # How much of each log travels. Sixty lines is two or three full turns of speak.log — enough to see
@@ -253,6 +255,10 @@ LOG_RULES: tuple[tuple[str, str | None], ...] = (
     ("stream died before its first chunk", None),
     ("played rc=", None),
     ("nothing played via=", None),
+    # the contour check (#40): the count is metadata, but the alert text names the operator's
+    # services — host:port derived from THEIR config's URLs — so the message itself is cut
+    ("contour: another firing is speaking", None),
+    ("contour: voicing ", "alert(s): "),
     # dictate.py
     ("dictate.debounce_ms is not a usable number (", "number ("),
     ("stt unreachable: ", None),

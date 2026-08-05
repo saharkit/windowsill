@@ -94,6 +94,31 @@ jobs:
           grep -q "tls-probe.py is missing" /tmp/tls-nopy2.txt \
             || { echo "the missing-script guard lost its diagnostic"; cat /tmp/tls-nopy2.txt; exit 1; }
 
+      - name: contour-poll.sh argument branches (no server needed)
+        run: |
+          bash plugins/voice-loop/scripts/contour-poll.sh --help | grep -q "contour-poll" \
+            || { echo "--help did not print the usage text"; exit 1; }
+          set +e
+          bash plugins/voice-loop/scripts/contour-poll.sh --no-such-flag 2>/tmp/contour-err.txt
+          rc=$?
+          set -e
+          # 64, not 1: a mis-invocation must never read as "an alert is active" — exit 1 is the
+          # page signal a scheduler or a hook branches on
+          [ "$rc" = "64" ] || { echo "an unknown argument exited $rc, not 64"; cat /tmp/contour-err.txt; exit 1; }
+          grep -q "unknown argument" /tmp/contour-err.txt \
+            || { echo "unknown-arg rejection lost its diagnostic"; cat /tmp/contour-err.txt; exit 1; }
+          # a config that names services none of which is usable is a config error (64), never
+          # "contour ok" — a monitoring hole must not report as coverage
+          export VOICE_LOOP_CONFIG="$RUNNER_TEMP/contour-bad.json"
+          printf '%s' '{"contour": {"services": ["not-a-url"]}}' > "$VOICE_LOOP_CONFIG"
+          set +e
+          bash plugins/voice-loop/scripts/contour-poll.sh --status "$RUNNER_TEMP/contour.json" 2>/tmp/contour-cfg.txt
+          rc=$?
+          set -e
+          [ "$rc" = "64" ] || { echo "a config with no usable service exited $rc, not 64"; exit 1; }
+          grep -q "no usable service" /tmp/contour-cfg.txt \
+            || { echo "the config error lost its diagnostic"; cat /tmp/contour-cfg.txt; exit 1; }
+
   coverage:
     name: unit tests (python ${{ matrix.python }})
     runs-on: ubuntu-latest
@@ -250,6 +275,57 @@ jobs:
             --endpoint http://127.0.0.1:8355 \
             --language "$VOICE_LOOP_LANGUAGE" \
             --strict --threshold 0.7
+
+      - name: contour-poll contract (real invocation — quiet, then a REAL demotion page)
+        run: |
+          # The monitoring substrate of #40, proven end to end against the live server this job
+          # already runs: the poller writes contour.json, and the speaking hook — registration
+          # unchanged — voices an active alert ONCE. The demotion is real: the runners have no
+          # GPU, so the server's /health genuinely reports "cpu" while the config declares a
+          # client that depends on "cuda". Own state dir, like the contract steps beside it, so
+          # every file counted here is one of ours.
+          export XDG_STATE_HOME="$RUNNER_TEMP/contour-state"
+          status_dir="$XDG_STATE_HOME/voice-loop"
+          mkdir -p "$status_dir"
+          export VOICE_LOOP_CONFIG="$RUNNER_TEMP/contour-config.json"
+          cat > "$VOICE_LOOP_CONFIG" <<JSON
+          {
+            "tts": { "backend": "lan", "endpoint": "http://127.0.0.1:8355" },
+            "speak": { "player": "true", "timeout": 180 },
+            "contour": {
+              "services": [ { "name": "voice-loop", "health": "http://127.0.0.1:8355/health" } ],
+              "vram": { "command": false }
+            }
+          }
+          JSON
+          # quiet first: the server is up, and nothing is expected of its device
+          bash plugins/voice-loop/scripts/contour-poll.sh --status "$status_dir/contour.json" \
+            || { echo "a healthy contour paged"; cat "$status_dir/contour.json"; exit 1; }
+          python3 - <<'PY'
+          import json, os
+          status = json.load(open(os.path.join(os.environ["XDG_STATE_HOME"], "voice-loop", "contour.json")))
+          service = status["services"]["voice-loop"]
+          assert service["reachable"] is True and service["ok"] is True, status
+          assert status["alerts"] == [], status["alerts"]
+          assert len(status["history"]["voice-loop"]) == 1, status["history"]
+          PY
+          # now declare the dependency — a client relies on cuda and the runner has none: the page
+          python3 -c 'import json, os; p = os.environ["VOICE_LOOP_CONFIG"]; c = json.load(open(p)); c["contour"]["services"][0]["expect_device"] = "cuda"; json.dump(c, open(p, "w"))'
+          set +e
+          bash plugins/voice-loop/scripts/contour-poll.sh --status "$status_dir/contour.json" > /tmp/contour-out.txt
+          rc=$?
+          set -e
+          [ "$rc" = "1" ] || { echo "a real demotion did not page (exit $rc)"; cat /tmp/contour-out.txt; exit 1; }
+          grep -q "ALERT voice-loop is serving on cpu, expected cuda" /tmp/contour-out.txt \
+            || { echo "the demotion alert lost its message"; cat /tmp/contour-out.txt; exit 1; }
+          # …and the hook turns the active alert into a VOICE — exactly once, however often it fires
+          python3 -c 'import json; print(json.dumps({"type": "assistant", "message": {"content": [{"type": "text", "text": "nothing marked here"}]}}))' > /tmp/contour-transcript.jsonl
+          printf '%s' '{"transcript_path": "/tmp/contour-transcript.jsonl"}' | bash plugins/voice-loop/scripts/speak.sh
+          grep -q "contour: voicing 1 alert(s)" "$status_dir/speak.log" \
+            || { echo "the hook did not voice the active alert"; cat "$status_dir/speak.log"; exit 1; }
+          printf '%s' '{"transcript_path": "/tmp/contour-transcript.jsonl"}' | bash plugins/voice-loop/scripts/speak.sh
+          [ "$(grep -c "contour: voicing" "$status_dir/speak.log")" = "1" ] \
+            || { echo "a persistent alert paged twice"; cat "$status_dir/speak.log"; exit 1; }
 
       - name: TLS-probe contract (real invocation — green, then an overridden store)
         run: |

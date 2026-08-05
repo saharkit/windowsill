@@ -104,6 +104,15 @@ Deliberate behaviours, found by live debugging — do not "simplify" them away:
   opening the stream, and the first chunk's synthesis. It was previously measured from inside the
   player loop, which started its clock AFTER the streaming source had already eagerly pulled (and
   waited out) the first chunk; that under-reported a real 2308 ms wait as 3 ms.
+* the contour check (#40) — after the turn's own speech, the hook reads ``contour.json`` (written
+  by ``scripts/contour_poll.py``, the voice contour's poller) and voices every active alert it has
+  not voiced before: a service that demoted itself off the GPU and kept serving breaks nothing
+  loudly, so it must be HEARD, not left on a dashboard nobody opens. Dedup is a small announced
+  file of alert keys, pruned to the alerts still active — a condition that clears and comes back
+  pages again, one that persists is said once. The check travels the SAME playback path a marked
+  line takes (extracted as ``play_text``), keeps eager mode's lock discipline, respects
+  ``speak.enabled``, and is opted out with ``contour.alerts: false``. No status file at all — an
+  install that never set the poller up — costs one tolerant read and silence.
 """
 
 from __future__ import annotations
@@ -189,6 +198,12 @@ _PID_PATH = os.path.join(_STATE_DIR, "playing.pid")
 # needs checked first. GET /health reports its age as hook_last_fired_age_s (cross-process
 # contract with server/voice_server.py: one bare float, nothing else).
 _STAMP_PATH = os.path.join(_STATE_DIR, "hook-last-fired")
+
+# The contour check (#40): the poller's status file, and the announced-ledger of alert keys
+# already voiced (pruned to the alerts still active, so a cleared-and-returned condition pages
+# again). contour.json is written by scripts/contour_poll.py — this hook only ever READS it.
+_CONTOUR_PATH = os.path.join(_STATE_DIR, "contour.json")
+_CONTOUR_ANNOUNCED_PATH = os.path.join(_STATE_DIR, "contour-announced")
 
 # state the SIGTERM handler (takeover by a fresher invocation) must be able to reach:
 # the current player child, the temp WAVs on disk, and the open SSE response (its socket
@@ -813,6 +828,112 @@ def wait_out_playback(read, settled, text=None):
     return text
 
 
+# --- the contour check (#40): the poller writes the file, this hook is the page --------------------
+
+
+def read_contour_alerts(path: str) -> list[dict]:
+    """The poller's active alerts, as its own {key, message, …} dicts — [] on ANY read problem.
+
+    A missing contour.json is the normal state of an install that never set the poller up, and a
+    half-written one is a turn that must not break: both are "nothing to say". Entries without a
+    string key and message are not alerts this hook can voice or dedup, so they are dropped here
+    rather than voiced oddly.
+    """
+    try:
+        with open(path, encoding="utf-8") as fh:
+            status = json.load(fh)
+    except (OSError, ValueError):
+        return []
+    alerts = status.get("alerts") if isinstance(status, dict) else None
+    if not isinstance(alerts, list):
+        return []
+    return [
+        alert
+        for alert in alerts
+        if isinstance(alert, dict) and isinstance(alert.get("key"), str) and isinstance(alert.get("message"), str)
+    ]
+
+
+def _write_contour_announced(keys, path: str) -> None:
+    try:
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("".join(f"{key}\n" for key in sorted(keys)))
+    except OSError:
+        pass  # a state dir that will not write costs the dedup, never the turn
+
+
+def sync_contour_announced(active: list[str], path: str) -> set[str]:
+    """The announced-ledger pruned to the alerts still active; returns the active keys already
+    voiced. Pruning is what lets a condition that cleared and came back page AGAIN — a stale key
+    left behind would mute its return forever."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            announced = set(fh.read().split())
+    except OSError:
+        announced = set()
+    kept = announced & set(active)
+    if kept != announced:
+        _write_contour_announced(kept, path)
+    return kept
+
+
+def mark_contour_announced(keys, path: str) -> None:
+    """Record keys as voiced BEFORE a single byte is synthesized — the spoken-ledger's own choice:
+    an alert whose playback then fails is lost rather than repeated, because for something that
+    talks out loud, idempotence beats completeness."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            announced = set(fh.read().split())
+    except OSError:
+        announced = set()
+    _write_contour_announced(announced | set(keys), path)
+
+
+def contour_check(config: dict, t0: float) -> None:
+    """Voice every active contour alert not yet announced — #40's page, delivered mid-hook.
+
+    Called once per hook firing, after the turn's own speech. Silence is the overwhelming common
+    case and is cheap: no poller status file (the normal state of an install that never set the
+    poller up), no active alerts, or nothing new — all cost one tolerant read. Opted out with
+    ``contour.alerts: false``; a user who switched speech off entirely (``speak.enabled``) is not
+    paged either.
+    """
+    if cfg(config, "contour.alerts", True) in (False, "false"):
+        return
+    alerts = read_contour_alerts(_CONTOUR_PATH)
+    s = resolve_settings(config, platform.system())
+    if not s["enabled"]:
+        return
+    # The sync runs even with NO active alerts: pruning is what lets a cleared-and-returned
+    # condition page again, and it can only happen where the active set is compared.
+    announced = sync_contour_announced([alert["key"] for alert in alerts], _CONTOUR_ANNOUNCED_PATH)
+    fresh = [alert for alert in alerts if alert["key"] not in announced]
+    if not fresh:
+        return
+
+    # The marked-line discipline, kept: with eager on, the alert is voiced under the same
+    # non-blocking speaking lock — a firing that loses leaves it UNANNOUNCED, and the next firing
+    # is one tool call away. With eager off there is no lock anywhere (by design), and the alert
+    # supersedes a chain still playing exactly like a fresher turn's line would.
+    lock = None
+    if s["eager"]:
+        lock = acquire_lock()
+        if lock is None:
+            log("contour: another firing is speaking — alert left unannounced for the next firing")
+            return
+    try:
+        mark_contour_announced([alert["key"] for alert in fresh], _CONTOUR_ANNOUNCED_PATH)
+        text = f"Voice contour: {'; '.join(alert['message'] for alert in fresh)}"
+        log(f"contour: voicing {len(fresh)} alert(s): {text[:80]}")
+        signal.signal(signal.SIGTERM, _on_sigterm)
+        if not s["eager"]:
+            take_over()
+        _write_pidfile(os.getpid())
+        play_text(text[: s["max_chars"]], s, t0, extract_ms=0)
+    finally:
+        release_lock(lock)
+
+
 def _on_sigterm(signum, frame):  # noqa: ARG001 — signal-handler signature
     """We were superseded (or the harness timed us out): stop the player, close the stream socket,
     drop temp files, exit 0."""
@@ -920,6 +1041,92 @@ def _play_stream(audio_iter, s: dict, t0: float) -> tuple[int, int, int, int | N
 
     first_ms = -1 if first_audio_at is None else int((first_audio_at - t0) * 1000)
     return played, total_bytes, first_ms, rc
+
+
+def play_text(text: str, s: dict, t0: float, *, extract_ms: int) -> None:
+    """Everything from "who makes the sound" to the timings log — one text, spoken.
+
+    This is the whole playback tail the marked-line flow grew: the local ``tts.command`` path, the
+    cloud key, server-side streaming with the one-shot blob fallback, and the timings line. It is
+    extracted, not duplicated, so the contour check's alert (#40) travels EXACTLY the path a marked
+    line takes — same synthesis, same fallback, same player. The takeover/pidfile prelude stays
+    with the callers: WHO supersedes whom is a property of the event path, not of the playback.
+    """
+    if s["command"]:
+        # tts.command: speak locally without any server (e.g. "say -v Milena" on macOS, or a
+        # piper pipeline). The command receives the text on stdin and produces the sound itself
+        # — synthesis and playback are one opaque step, so there is nothing to pipeline: the
+        # whole text goes in one call. first_audio_ms keeps its definition here too: t0 -> the
+        # spawn of the process that makes the sound (this command IS the player).
+        first_ms = int((time.monotonic() - t0) * 1000)
+        try:
+            proc = subprocess.Popen(
+                ["/bin/sh", "-c", s["command"]],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except OSError as err:
+            log(f"local command failed: {err}")
+            return
+        _live["proc"] = proc
+        _write_pidfile(os.getpid(), proc.pid)
+        proc.communicate(input=text.encode("utf-8"))
+        _live["proc"] = None
+        log(f"local command rc={proc.returncode}")
+        total_ms = int((time.monotonic() - t0) * 1000)
+        log(f"timings extract_ms={extract_ms} first_audio_ms={first_ms} total_ms={total_ms}")
+        return
+
+    key = ""
+    if s["backend"] == "cloud":
+        key = read_key(s["key_file"], s["key_env"], os.environ)
+        if not key:
+            log(f"cloud tts: no key (key_file unset/unreadable and ${s['key_env']} empty)")
+            return
+
+    result = None
+    via = "tts"
+    if s["backend"] != "cloud":
+        # Server-side streaming: one cheap /health probe per invocation decides the path. Only
+        # a stream that dies BEFORE its first chunk falls back to the blob endpoint (once);
+        # after the first chunk we play what arrives and stop where the stream stops.
+        endpoint = s["endpoint"] or "http://127.0.0.1:8355"
+        if server_offers_streaming(_get(f"{endpoint}/health", min(s["timeout"], HEALTH_TIMEOUT))):
+            payload = {
+                k: v for k, v in (("text", text), ("speaker", s["speaker"]), ("language", s["language"])) if v
+            }
+            resp = _open_stream(endpoint, payload, s["timeout"])
+            if resp is not None:
+                _live["stream"] = resp
+                try:
+                    # stream_source pulls the first chunk eagerly: the whole first synthesis
+                    # is waited out HERE, which is exactly why _play_stream measures from t0.
+                    source = stream_source(resp)
+                    if source is not None:
+                        result = _play_stream(source, s, t0)
+                        via = "stream"
+                    else:
+                        log("stream died before its first chunk — falling back to /tts")
+                finally:
+                    _live["stream"] = None
+                    try:
+                        resp.close()
+                    except OSError:
+                        pass
+    if result is None:
+        # blob path: the client does the sentence chunking (older server, cloud, or fallback)
+        result = _play_stream(_synthesized_audio(chunk_sentences(text), s, key), s, t0)
+    played, total_bytes, first_ms, rc = result
+    total_ms = int((time.monotonic() - t0) * 1000)
+    if played:
+        log(f"played rc={rc} bytes={total_bytes} chunks={played} via={via}")
+    else:
+        # The line was claimed and then never made a sound — synthesis produced nothing, or the
+        # player would not spawn. Both already log their own reason; this is the consequence,
+        # said plainly, so the log never has to be read backwards to notice a lost line.
+        log(f"nothing played via={via} — the line was claimed but no audio reached the player")
+    log(f"timings extract_ms={extract_ms} first_audio_ms={first_ms} total_ms={total_ms}")
 
 
 def main() -> int:
@@ -1091,81 +1298,7 @@ def main() -> int:
             take_over()
         _write_pidfile(os.getpid())
 
-        if s["command"]:
-            # tts.command: speak locally without any server (e.g. "say -v Milena" on macOS, or a
-            # piper pipeline). The command receives the text on stdin and produces the sound itself
-            # — synthesis and playback are one opaque step, so there is nothing to pipeline: the
-            # whole text goes in one call. first_audio_ms keeps its definition here too: t0 -> the
-            # spawn of the process that makes the sound (this command IS the player).
-            first_ms = int((time.monotonic() - t0) * 1000)
-            try:
-                proc = subprocess.Popen(
-                    ["/bin/sh", "-c", s["command"]],
-                    stdin=subprocess.PIPE,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                )
-            except OSError as err:
-                log(f"local command failed: {err}")
-                return 0
-            _live["proc"] = proc
-            _write_pidfile(os.getpid(), proc.pid)
-            proc.communicate(input=text.encode("utf-8"))
-            _live["proc"] = None
-            log(f"local command rc={proc.returncode}")
-            total_ms = int((time.monotonic() - t0) * 1000)
-            log(f"timings extract_ms={extract_ms} first_audio_ms={first_ms} total_ms={total_ms}")
-            return 0
-
-        key = ""
-        if s["backend"] == "cloud":
-            key = read_key(s["key_file"], s["key_env"], os.environ)
-            if not key:
-                log(f"cloud tts: no key (key_file unset/unreadable and ${s['key_env']} empty)")
-                return 0
-
-        result = None
-        via = "tts"
-        if s["backend"] != "cloud":
-            # Server-side streaming: one cheap /health probe per invocation decides the path. Only
-            # a stream that dies BEFORE its first chunk falls back to the blob endpoint (once);
-            # after the first chunk we play what arrives and stop where the stream stops.
-            endpoint = s["endpoint"] or "http://127.0.0.1:8355"
-            if server_offers_streaming(_get(f"{endpoint}/health", min(s["timeout"], HEALTH_TIMEOUT))):
-                payload = {
-                    k: v for k, v in (("text", text), ("speaker", s["speaker"]), ("language", s["language"])) if v
-                }
-                resp = _open_stream(endpoint, payload, s["timeout"])
-                if resp is not None:
-                    _live["stream"] = resp
-                    try:
-                        # stream_source pulls the first chunk eagerly: the whole first synthesis
-                        # is waited out HERE, which is exactly why _play_stream measures from t0.
-                        source = stream_source(resp)
-                        if source is not None:
-                            result = _play_stream(source, s, t0)
-                            via = "stream"
-                        else:
-                            log("stream died before its first chunk — falling back to /tts")
-                    finally:
-                        _live["stream"] = None
-                        try:
-                            resp.close()
-                        except OSError:
-                            pass
-        if result is None:
-            # blob path: the client does the sentence chunking (older server, cloud, or fallback)
-            result = _play_stream(_synthesized_audio(chunk_sentences(text), s, key), s, t0)
-        played, total_bytes, first_ms, rc = result
-        total_ms = int((time.monotonic() - t0) * 1000)
-        if played:
-            log(f"played rc={rc} bytes={total_bytes} chunks={played} via={via}")
-        else:
-            # The line was claimed and then never made a sound — synthesis produced nothing, or the
-            # player would not spawn. Both already log their own reason; this is the consequence,
-            # said plainly, so the log never has to be read backwards to notice a lost line.
-            log(f"nothing played via={via} — the line was claimed but no audio reached the player")
-        log(f"timings extract_ms={extract_ms} first_audio_ms={first_ms} total_ms={total_ms}")
+        play_text(text, s, t0, extract_ms=extract_ms)
         return 0
     finally:
         try:
@@ -1179,9 +1312,27 @@ def main() -> int:
         release_lock(lock)
 
 
+def entry() -> int:
+    """The process entry point: the turn's own speech first, then the contour check (#40).
+
+    Two duties share one invocation because the hook registration surface never changes —
+    hooks.json has always run exactly this file. The check re-reads the small config the turn
+    used, and a failure in it is the outer guard's to log: a broken alert path must never fail a
+    turn either. t0 for the check is taken AFTER the turn's speech, so the alert's own
+    first_audio_ms measures the alert's own wait, not the line's.
+    """
+    rc = main()
+    cfg_path = os.environ.get(
+        "VOICE_LOOP_CONFIG",
+        os.path.join(os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")), "voice-loop/config.json"),
+    )
+    contour_check(load_config(cfg_path), time.monotonic())
+    return rc
+
+
 if __name__ == "__main__":
     try:
-        sys.exit(main())
+        sys.exit(entry())
     except Exception:  # never fail the turn — a hook error must not surface into the session
         try:
             log(f"unexpected error: {sys.exc_info()[1]!r:.200}")

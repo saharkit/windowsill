@@ -120,6 +120,21 @@ the real runtime. So the guarantee is layered differently:
 
    The one thing no runner can offer is a genuine python.org-installer Python with its own empty
    store; that is row 5.8, checked by a human.
+8. **`tests/test_contour_poll.py`** for the contour poller (#40), same seam shape: the health
+   fetch, the `nvidia-smi` spawn and the clock are three injected callables, so the alert rules
+   (unreachable, device demoted — only when `expect_device` declares the dependency, VRAM under
+   the floor, `oom_overflows` on the rise and never on the level), the p95-split-by-device SLI,
+   the atomic status write and the `0/1/64` exit contract are all pinned without a socket or a
+   GPU. The hook half lives in `tests/test_speak.py`: an active alert is voiced once through the
+   real `contour_check` (and once through the real `entry()`, proving the page does not depend on
+   the turn having a marked line), a persistent condition does not re-page, a cleared-and-returned
+   one does, and an alert that loses the eager lock stays unannounced for the next firing. What a
+   fake cannot prove, **one real invocation in the loopback job does** — the *contour-poll
+   contract* step runs the poller against the live server, then declares `expect_device: "cuda"`
+   on runners that have no GPU, so a REAL demotion alert fires: exit 1, the alert message, and
+   the real `speak.sh` voicing it exactly once across two invocations. The `contour.alerts`
+   opt-out, `contour.vram.command: false`, and the announced-ledger pruning are unit-tested above;
+   the one thing no runner can offer is a real oversubscribed card.
 
 Real invocation is the guarantee for the runtime path. Every spoken run also logs
 `timings extract_ms=… first_audio_ms=… total_ms=…` to `~/.local/state/voice-loop/speak.log`, so a

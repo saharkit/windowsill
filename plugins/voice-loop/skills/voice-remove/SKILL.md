@@ -126,7 +126,8 @@ compositor config you did not write.
 Two questions, because they carry different risk.
 
 **State** (`~/.local/state/voice-loop/` — `speak.log`, `dictate.log`, `spoken.ledger`,
-`speaking.lock`, the recorder PID, the last WAV): pure runtime residue, nothing in it is
+`speaking.lock`, the recorder PID, the last WAV, the contour poller's `contour.json` and its
+`contour-announced` ledger): pure runtime residue, nothing in it is
 configuration. Offer deletion plainly; mention the logs are the only record of past runs.
 
 **Config** (`~/.config/voice-loop/`): `config.json` and `stress.json` are re-creatable by re-running

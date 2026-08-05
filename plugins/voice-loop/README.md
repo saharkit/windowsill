@@ -224,6 +224,45 @@ Two more behaviours worth knowing:
   fraction of a second, because it is the turn's last chance; after that it takes over (the
   supersede from the *Latency* section) and tries once more.
 
+## Watching the contour — `contour-poll.sh`
+
+A voice contour is resident services sharing a GPU, and its worst failure is the quiet one: a
+service that demoted itself off the GPU keeps serving — correctly, an order of magnitude slower —
+and nothing breaks loudly. `scripts/contour-poll.sh` is the small monitoring substrate for that:
+one poll per run of every configured service's `/health`, free VRAM from `nvidia-smi`, and the
+results written atomically to `~/.local/state/voice-loop/contour.json`. The speaking hook reads
+that file at the end of every turn and **voices an active alert once** — a page, not a dashboard.
+No Prometheus, no root.
+
+```json
+{
+  "contour": {
+    "services": [
+      { "name": "speech", "health": "http://127.0.0.1:8355/health" },
+      { "name": "converter", "health": "http://192.0.2.10:8358/health",
+        "expect_device": "gpu", "latency_fields": ["rtf"] }
+    ],
+    "vram": { "min_free_mib": 200 }
+  }
+}
+```
+
+- **Alerts.** A service that does not answer (or reports `ok: false`); a service serving on a
+  device other than its `expect_device` — set that key exactly when a client depends on the fast
+  path, because that dependency is yours to declare and the alert means "the fast path is gone";
+  free VRAM under `vram.min_free_mib` (default 200); a rising `oom_overflows` counter. Exit code is
+  `0` quiet, `1` an alert is active, `64` called wrong or a config naming nothing usable.
+- **The SLI.** Every sample is appended to a bounded history (default a week at a five-minute
+  cadence), and any numeric health field named in `latency_fields` gets a **p95 split by device** —
+  the CPU/GPU split is a cliff, so an average across both would be meaningless. That history is
+  what a future SLO gets written against; there is deliberately no SLO yet.
+- **`vram.command: false`** disables the GPU probe (a Mac, a GPU-less box) — an empty string
+  cannot, because an empty config value means "unset" everywhere in this plugin.
+- **`contour.alerts: false`** opts out of the spoken page; the poller keeps writing the file.
+- Scheduling is yours: a cron line or a `systemd --user` timer running
+  `bash .../scripts/contour-poll.sh` every few minutes. The default config (no `contour` key at
+  all) polls just the local speech server on `127.0.0.1:8355` — no host is ever baked in.
+
 ## What is in here
 
 Everything this plugin is lives under its own directory — the repository root belongs to the shelf,
@@ -241,6 +280,7 @@ plugins/voice-loop/
   scripts/report-bug.sh       bug-report launcher (stable entry point for /report-bug)
   scripts/report_bug.py       the collector: diagnostics -> redaction -> one bundle -> a transport
   scripts/tls-probe.sh/.py    "do https certificates verify from this python?" — names the fix, --fix runs it
+  scripts/contour-poll.sh/.py the contour poller: /health + VRAM -> alerts + p95-by-device -> contour.json
   skills/voice-setup/         the agent installer
   skills/voice-design/        voice casting
   skills/voice-remove/        the symmetric uninstaller (service, hotkey, config, caches, convention)

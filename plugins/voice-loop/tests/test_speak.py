@@ -43,6 +43,9 @@ def state(monkeypatch, tmp_path):
     monkeypatch.setattr(speak, "_LEDGER_PATH", str(tmp_path / "spoken.ledger"))
     monkeypatch.setattr(speak, "_LOCK_PATH", str(tmp_path / "speaking.lock"))
     monkeypatch.setattr(speak, "_STAMP_PATH", str(tmp_path / "hook-last-fired"))
+
+    monkeypatch.setattr(speak, "_CONTOUR_PATH", str(tmp_path / "contour.json"))
+    monkeypatch.setattr(speak, "_CONTOUR_ANNOUNCED_PATH", str(tmp_path / "contour-announced"))
     return tmp_path
 
 
@@ -1645,3 +1648,107 @@ def test_an_eager_firing_with_nothing_new_stays_out_of_the_log(state, monkeypatc
     before = _speak_log(state)
     assert _fire(state, monkeypatch, transcript, "PostToolUse")[0] == 0
     assert _speak_log(state) == before  # not one line added by a firing that lost nothing
+
+
+# --- the contour check (#40): the hook voices what the poller found ---------------------------------
+#
+# contour_poll.py writes contour.json; entry() runs contour_check after every firing, so an
+# ACTIVE alert is heard once — a page, not a dashboard. These drive the real contour_check (and
+# one real entry()) with the audio half recorded, exactly like the marked-line tests above.
+
+_DEMOTED = {
+    "key": "device-demoted:rvc",
+    "kind": "device-demoted",
+    "service": "rvc",
+    "message": "rvc is serving on cpu, expected gpu",
+}
+_VOICED = "Voice contour: rvc is serving on cpu, expected gpu"
+
+
+def _contour_status(state, alerts) -> None:
+    (state / "contour.json").write_text(json.dumps({"at": "t", "alerts": alerts}), encoding="utf-8")
+
+
+def test_read_contour_alerts_tolerates_every_bad_shape(state):
+    assert speak.read_contour_alerts(str(state / "absent.json")) == []
+    bad = state / "contour.json"
+    bad.write_text("{corrupt", encoding="utf-8")
+    assert speak.read_contour_alerts(str(bad)) == []
+    bad.write_text(json.dumps(["not", "a", "status"]), encoding="utf-8")
+    assert speak.read_contour_alerts(str(bad)) == []
+    bad.write_text(json.dumps({"alerts": "not a list"}), encoding="utf-8")
+    assert speak.read_contour_alerts(str(bad)) == []
+    # entries without a string key AND message are not voiceable, so they are dropped, not voiced oddly
+    bad.write_text(
+        json.dumps({"alerts": [{"key": 1, "message": "m"}, {"key": "k"}, _DEMOTED]}), encoding="utf-8"
+    )
+    assert speak.read_contour_alerts(str(bad)) == [_DEMOTED]
+
+
+def test_no_status_file_is_the_silent_common_case(state, monkeypatch):
+    spoken = _record_speech(monkeypatch)
+    speak.contour_check({}, 0.0)
+    assert spoken == []  # an install that never set the poller up hears nothing and pays one read
+
+
+def test_an_active_alert_is_voiced_once_and_then_not_again(state, monkeypatch):
+    _contour_status(state, [_DEMOTED])
+    spoken = _record_speech(monkeypatch)
+    speak.contour_check({}, 0.0)
+    speak.contour_check({}, 0.0)  # the condition persists — the page does not repeat
+    assert spoken == [_VOICED]
+    assert (state / "contour-announced").read_text(encoding="utf-8").split() == ["device-demoted:rvc"]
+
+
+def test_a_cleared_and_returned_alert_pages_again(state, monkeypatch):
+    spoken = _record_speech(monkeypatch)
+    _contour_status(state, [_DEMOTED])
+    speak.contour_check({}, 0.0)
+    _contour_status(state, [])  # the condition cleared: the announced key is pruned
+    speak.contour_check({}, 0.0)
+    assert not (state / "contour-announced").read_text(encoding="utf-8").split()
+    _contour_status(state, [_DEMOTED])  # …and came back — a stale key must not mute its return
+    speak.contour_check({}, 0.0)
+    assert spoken == [_VOICED, _VOICED]
+
+
+def test_contour_alerts_opt_out_and_speak_disabled_both_stay_silent(state, monkeypatch):
+    _contour_status(state, [_DEMOTED])
+    spoken = _record_speech(monkeypatch)
+    speak.contour_check({"contour": {"alerts": False}}, 0.0)
+    speak.contour_check({"speak": {"enabled": False}}, 0.0)
+    assert spoken == []
+    assert not (state / "contour-announced").exists()  # nothing claimed either
+
+
+def test_an_alert_that_loses_the_eager_lock_stays_unannounced(state, monkeypatch):
+    _contour_status(state, [_DEMOTED])
+    spoken = _record_speech(monkeypatch)
+    monkeypatch.setattr(speak, "acquire_lock", lambda *grace: None)  # another firing holds it
+    speak.contour_check({"speak": {"eager": True}}, 0.0)
+    assert spoken == []
+    assert not (state / "contour-announced").exists()  # left for the next firing, one tool call away
+    assert "left unannounced" in _speak_log(state)
+
+
+def test_the_alert_text_is_capped_at_max_chars(state, monkeypatch):
+    _contour_status(state, [_DEMOTED])
+    spoken = _record_speech(monkeypatch)
+    speak.contour_check({"speak": {"max_chars": 25}}, 0.0)
+    assert len(spoken) == 1 and len(spoken[0]) <= 25
+    assert _VOICED.startswith(spoken[0])  # truncated, not paraphrased
+
+
+def test_the_hook_entry_voices_the_alert_after_a_turn_with_nothing_to_say(state, monkeypatch):
+    """The page does not depend on the turn having a marked line: a Stop whose transcript holds
+    no marker speaks nothing of its own, and the contour alert is STILL voiced after it — the
+    whole point of putting the check in the hook path."""
+    _write_config(state, monkeypatch)
+    transcript = state / "transcript.jsonl"
+    transcript.write_text(_assistant("a reply with nothing marked in it") + "\n", encoding="utf-8")
+    _contour_status(state, [_DEMOTED])
+    spoken = _record_speech(monkeypatch)
+    monkeypatch.setattr(speak.sys, "stdin", _Stdin(json.dumps({"transcript_path": str(transcript), "hook_event_name": "Stop"})))
+    monkeypatch.setattr(speak.time, "sleep", lambda seconds: None)
+    assert speak.entry() == 0
+    assert spoken == [_VOICED]
