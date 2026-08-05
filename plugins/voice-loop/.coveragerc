@@ -1,9 +1,14 @@
 # Coverage of the server is a hard gate at 100% (statements AND branches) — see TESTING.md (next to
 # this file) for what that number does and does not claim. Read from this directory: the suite runs
 # as `cd plugins/voice-loop && pytest …`, and `source` resolves through pytest.ini's `pythonpath`.
+#
+# scripts/ is also under coverage measurement with its own (lower, ratcheting) fail-under, enforced
+# separately in CI via `coverage report --include='scripts/*'` — the server's 100% is non-negotiable
+# and never dropped. The per-plugin .coverage is appended into the shelf-level .coverage at the repo
+# root so a combined report can sum across plugins.
 [run]
 branch = True
-source = voice_server
+source = voice_server, scripts
 
 [report]
 show_missing = True
