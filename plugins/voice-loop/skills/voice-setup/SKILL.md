@@ -29,6 +29,97 @@ the pieces it names actually exist, and finish with a **passing selftest**. Scri
    (`key_file`) or in an environment variable the config *names* (`api_key_env`).
 4. **Ask, do not assume, but pre-answer.** Every question below carries a derived default. Present the
    default and let the user confirm with one keystroke.
+5. **Every step writes a durable checkpoint.** The install ledger at
+   `~/.local/state/voice-loop/install.ledger` is the ground truth of what has been done. After every
+   step that completes successfully, write a checkpoint marker — so an interruption never loses
+   progress. Before a step with side effects (installing packages, writing config, binding a hotkey),
+   mark the step as *in flight* so re-entry knows it might be partial and re-runs it from scratch
+   rather than trusting half-done work.
+
+## Entry — check for existing install (deterministic lifecycle)
+
+Before anything else, check whether an install was already started or completed:
+
+```sh
+LEDGER_CMD="python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/install_ledger.py\""
+eval "$LEDGER_CMD check"
+```
+
+The exit code and JSON tell you the state:
+
+**Exit 0, `{"state": "none"}`** — fresh install. Create the ledger and proceed:
+
+```sh
+eval "$LEDGER_CMD start"
+```
+
+Proceed to Step 0.
+
+**Exit 1, `{"state": "in_progress", "completed_steps": [...], "next_step": "...", "current_step": "..."}`** — a previous install was interrupted. Present the three choices:
+
+> A previous install was interrupted.
+> Steps completed: <names>. Step in flight: <name>.
+>
+> 1. **Resume** — continue from the next pending step (`next_step`). Steps already done are skipped.
+> 2. **Restart** — clean slate. First undo what the completed steps did (reverse order: remove hotkey
+>    bindings, remove the CLAUDE.md line, remove config, disable service, delete copied server files —
+>    the list of completed steps tells you exactly what to undo), then run `start` to create a fresh
+>    ledger and proceed from Step 0.
+> 3. **Cancel** — leave everything as-is and exit. Run `eval "$LEDGER_CMD cancel"` and stop.
+
+If they pick **resume**: look at `completed_steps` and `next_step`. Skip every step whose id is in
+`completed_steps`. Start at `next_step`. Do NOT run `start` — the existing ledger stays. If
+`current_step` is set (a step was begun but not finished), re-run that step from the beginning
+because it might be in a partial state (half-installed packages, half-written config).
+
+If they pick **restart**: run `eval "$LEDGER_CMD reset"` to delete the ledger, then undo the
+completed work using the list you just read, then run `start` and proceed from Step 0.
+
+If they pick **cancel**: run `eval "$LEDGER_CMD cancel"` and stop. Say that re-running
+`/voice-setup` will offer the same three choices.
+
+**Exit 0, `{"state": "complete"}`** — install is already done. Verify idempotently:
+
+- `jq . ~/.config/voice-loop/config.json` — valid config?
+- If local backend on Linux: `systemctl --user is-active voice-loop.service` — running?
+- If everything is in order: say *"voice-loop is already installed and running — nothing to do"* and
+  skip to the verification check at Step 8. This is a no-op diff, not a re-do.
+- If something is missing: name it and ask whether to repair (re-run only the affected steps).
+
+**Exit 0, `{"state": "cancelled"}`** — the user previously chose cancel. Offer the same three
+choices as in_progress above. The ledger still holds the completed steps from that run.
+
+**If `install_ledger.py` is not found** (the checkout predates the ledger): say so and proceed
+without checkpoints. The install still works — it just won't survive an interruption.
+
+### Per-step checkpoint discipline
+
+After every step that completes (including on resume), write the checkpoint marker:
+
+```sh
+python3 "${CLAUDE_PLUGIN_ROOT}/scripts/install_ledger.py" step-done <step-id>
+```
+
+Before a step that has irreversible side effects (3, 4, 6, 7), mark it as in flight:
+
+```sh
+python3 "${CLAUDE_PLUGIN_ROOT}/scripts/install_ledger.py" step-begin <step-id>
+```
+
+The step ids match the flow below: `step-0-probe`, `step-1-language`, `step-2-backends`,
+`step-3-install-deps`, `step-4-write-config`, `step-5-paste-behaviour`, `step-6-hotkey`,
+`step-7-speak-convention`, `step-8-verify`.
+
+If any step fails and you cannot recover, **do not write its checkpoint**. The ledger stays at the
+last completed step, and the next run will pick up from there. Never write `step-done` for work
+that did not succeed — a false positive in the ledger is worse than redoing the step.
+
+### Esc / Ctrl-C during a prompt
+
+If the user presses Esc (or Ctrl-C) during an interactive prompt (AskUserQuestion), the prompt's
+step did not complete. Do not write its checkpoint. The ledger stays at the last safe step. If the
+step was marked `step-begin`, leave it — re-entry will see `current_step` and re-run it from
+scratch, which is the safe default for a step that might have been half-done.
 
 ## Step 0 — probe (one batch)
 
@@ -55,6 +146,12 @@ it comes with an empty certificate store — see the TLS probe at the top of the
 on that hardware and nowhere else) — it decides the hotkey in Step 6. It is a positive signal only:
 its absence on macOS means "probably not, ask" rather than "definitely not".
 
+**Checkpoint** — after the probe batch succeeds:
+
+```sh
+python3 "${CLAUDE_PLUGIN_ROOT}/scripts/install_ledger.py" step-done step-0-probe
+```
+
 ## Step 1 — language (ASK FIRST — it shapes every later option)
 
 Derive the default from `$LC_ALL` / `$LANG` (`ru_RU.UTF-8` → `ru`), falling back to `en`. Ask **one**
@@ -69,6 +166,12 @@ TTS, or the macOS built-in `say` voice, or recognition-only (dictation without s
 
 *Advanced, mention only if asked or if the user hints at it:* dictation and speak-back may use
 different languages — that is just `stt.language` / `tts.language` next to the top-level `language`.
+
+**Checkpoint** — after the language choice is confirmed:
+
+```sh
+python3 "${CLAUDE_PLUGIN_ROOT}/scripts/install_ledger.py" step-done step-1-language
+```
 
 ## Step 2 — backends (one question, defaults pre-picked)
 
@@ -114,7 +217,19 @@ alone (it is the user's secret, and `/voice-remove` is where it gets removed on 
 leaves nothing on this machine at all. On macOS there is no unit to disable — the server, if the
 user ran one, was started by hand.
 
+**Checkpoint** — after backends are confirmed:
+
+```sh
+python3 "${CLAUDE_PLUGIN_ROOT}/scripts/install_ledger.py" step-done step-2-backends
+```
+
 ## Step 3 — install dependencies (one batch, user space only)
+
+**Begin step** — this step has side effects (packages, venv, service). Mark it in flight:
+
+```sh
+python3 "${CLAUDE_PLUGIN_ROOT}/scripts/install_ledger.py" step-begin step-3-install-deps
+```
 
 ### Linux
 
@@ -253,7 +368,19 @@ invocation that prints the transcript, e.g.
 path is `tts.command: "say -v Milena"`; the Silero server path also works if the user wants the same
 voice as their Linux machines.
 
+**Checkpoint** — after all dependencies are installed and the service (if local) is running:
+
+```sh
+python3 "${CLAUDE_PLUGIN_ROOT}/scripts/install_ledger.py" step-done step-3-install-deps
+```
+
 ## Step 4 — write the config
+
+**Begin step** — writing config is a side effect (the file is the product). Mark it in flight:
+
+```sh
+python3 "${CLAUDE_PLUGIN_ROOT}/scripts/install_ledger.py" step-begin step-4-write-config
+```
 
 Write `~/.config/voice-loop/config.json` (create the directory; `chmod 600` if a `key_file` is
 referenced). Full schema — omit what you do not need, the scripts have defaults for everything:
@@ -337,6 +464,12 @@ Field notes worth telling the user:
   whisper.cpp). `tts.command` receives text on stdin and makes the sound itself; `stt.command`
   receives the WAV path as its last argument and prints the transcript.
 
+**Checkpoint** — after the config file is written and valid (`jq .` parses it):
+
+```sh
+python3 "${CLAUDE_PLUGIN_ROOT}/scripts/install_ledger.py" step-done step-4-write-config
+```
+
 ## Step 5 — paste behaviour (the permission ladder — DEFAULT IS THE NO-ROOT TIER)
 
 **Tier 1 (default, zero root, works everywhere):** `auto_paste: false`. The transcript lands on the
@@ -380,7 +513,19 @@ that the guard cannot work there rather than offering it.
 Note for tier 2/3 alike: older `ydotool` only accepts **named key combos** and cannot type non-ASCII,
 which is exactly why the scripts paste from the clipboard instead of typing the text.
 
+**Checkpoint** — after paste behaviour is configured:
+
+```sh
+python3 "${CLAUDE_PLUGIN_ROOT}/scripts/install_ledger.py" step-done step-5-paste-behaviour
+```
+
 ## Step 6 — hotkey
+
+**Begin step** — binding a hotkey is a side effect (the user's desktop config is modified). Mark it in flight:
+
+```sh
+python3 "${CLAUDE_PLUGIN_ROOT}/scripts/install_ledger.py" step-begin step-6-hotkey
+```
 
 One rule before the per-desktop recipes: **on macOS, bind a physical chord, not an F-row key.** See
 the macOS subsection below for why and for the question to ask. On Linux the F-row is a real key and
@@ -452,7 +597,19 @@ Tapping is the gesture — *holding* the key does not queue up toggles, because 
 `dictate.debounce_ms` (750 ms) of the previous fire is ignored, and each ignored fire restarts that
 window: a key held for ten seconds is still one toggle.
 
+**Checkpoint** — after the hotkey is bound:
+
+```sh
+python3 "${CLAUDE_PLUGIN_ROOT}/scripts/install_ledger.py" step-done step-6-hotkey
+```
+
 ## Step 7 — the speak convention (the line that makes the model speak)
+
+**Begin step** — appending to CLAUDE.md is a side effect (the user's own file is modified). Mark it in flight:
+
+```sh
+python3 "${CLAUDE_PLUGIN_ROOT}/scripts/install_ledger.py" step-begin step-7-speak-convention
+```
 
 The hook voices marked lines, but nothing yet tells the model to *write* them — without this line in
 a `CLAUDE.md`, the plugin sits silent. Offer to add it now (AskUserQuestion, three options):
@@ -473,6 +630,12 @@ summary"); if one exists, say so and leave the file alone.
 
 Whichever option they pick, note that the next step's speak-back check now proves the **whole**
 loop — convention included, not just the plumbing.
+
+**Checkpoint** — after the CLAUDE.md line is appended (or confirmed already present):
+
+```sh
+python3 "${CLAUDE_PLUGIN_ROOT}/scripts/install_ledger.py" step-done step-7-speak-convention
+```
 
 ## Step 8 — verify (mandatory, this is how the install ends)
 
@@ -504,3 +667,19 @@ Report at the end: language, both backends, paste tier, hotkey, and the verifica
 undone (e.g. the user declined the ydotool step), say exactly what and how to finish it later. Close
 by naming the way back out: `/voice-remove` undoes everything this install touched — the service,
 the hotkey, the config, the caches and the `CLAUDE.md` line.
+
+**Checkpoint** — after verification passes:
+
+```sh
+python3 "${CLAUDE_PLUGIN_ROOT}/scripts/install_ledger.py" step-done step-8-verify
+```
+
+**Mark the install complete** — the ledger records that all steps finished:
+
+```sh
+python3 "${CLAUDE_PLUGIN_ROOT}/scripts/install_ledger.py" finish
+```
+
+A re-run of `/voice-setup` from here will see `{"state": "complete"}` and report "already installed"
+rather than re-doing work. This is the idempotence guarantee: running the installer over a completed
+install is a no-op diff.
