@@ -123,6 +123,7 @@ Three caps keep any single request from monopolizing an executor:
 | `VOICE_LOOP_XTTS_REFERENCE` | — | wav of the voice to clone — the `xtts` engine refuses requests without it |
 | `VOICE_LOOP_XTTS_MODEL_DIR` | coqui's cache | load XTTS-v2 from a local directory instead of downloading |
 | `VOICE_LOOP_STRESS_FILE` | `~/.config/voice-loop/stress.json` | your stress overrides |
+| `VOICE_LOOP_HOOK_STAMP_FILE` | `~/.local/state/voice-loop/hook-last-fired` | the hook's heartbeat stamp — `/health` reports its age as `hook_last_fired_age_s`; see [the troubleshooting entry](../docs/troubleshooting.md#the-voice-stops-entirely-mid-session-but-everything-works-by-hand) |
 | `VOICE_LOOP_ACCENT` | `1` | set `0` to skip automatic accentuation |
 | `VOICE_LOOP_MAX_UPLOAD_BYTES` | `26214400` (25 MB) | `/stt` upload size cap — a larger clip gets `413` |
 | `VOICE_LOOP_MAX_STT_SECONDS` | `600` | `/stt` duration cap when the WAV header is parseable — see [Capacity](#capacity) |
@@ -134,6 +135,15 @@ Three caps keep any single request from monopolizing an executor:
 `GET /health` also reports a `version` field (`"0.4.1"`). It is for diagnostics and bug reports;
 clients should detect features through the capability flags (`"streaming": true` and friends), not
 by comparing version strings.
+
+`GET /health` also reports the **hook's heartbeat**: `hook_last_fired` (ISO-8601 UTC) and
+`hook_last_fired_age_s` (seconds since), read from the stamp the speaking hook rewrites on every
+invocation. An age that keeps growing while the session continues means the harness has stopped
+calling the hook — see
+[the troubleshooting entry](../docs/troubleshooting.md#the-voice-stops-entirely-mid-session-but-everything-works-by-hand).
+Both are `null` when the stamp is not readable here — which includes a server running on a
+different machine than the client (the ssh-tunnel setup), since the stamp lives in the *client's*
+state dir.
 
 ### Languages
 

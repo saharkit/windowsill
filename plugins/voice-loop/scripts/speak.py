@@ -88,6 +88,12 @@ Deliberate behaviours, found by live debugging — do not "simplify" them away:
   would. A stream that fails BEFORE its first chunk falls back to the blob /tts path once; after
   the first chunk we play what arrived and stop on the terminal ``error`` event (logged). The
   client-side sentence splitter stays for the blob path and older servers.
+* heartbeat — EVERY invocation, speaking or not, rewrites the ``hook-last-fired`` stamp in the
+  state dir (temp-then-replace, so a reader never sees it torn). It exists because the harness
+  itself once stopped calling the Stop hook mid-session while the whole plugin chain stayed
+  healthy: the stamp's AGE — surfaced as ``hook_last_fired_age_s`` on GET /health — is what tells
+  "the harness is no longer calling us" apart from "there was nothing to say". The remedy for the
+  first is a Claude Code session restart (hooks re-initialize); see docs/troubleshooting.md.
 * keys — the cloud API key comes from ``key_file`` (wins) or the named env var, is used only as an
   in-process HTTP header, and NEVER appears in argv, in the config, or in the log.
 * timing — every spoken run logs ``timings extract_ms=… first_audio_ms=… total_ms=…``, and ALL
@@ -117,6 +123,7 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
+from collections.abc import Callable
 
 try:
     import fcntl
@@ -177,6 +184,12 @@ _LOCK_PATH = os.path.join(_STATE_DIR, "speaking.lock")
 # pid via /proc/<pid>/cmdline before signalling (PID-reuse guard).
 _PID_PATH = os.path.join(_STATE_DIR, "playing.pid")
 
+# The heartbeat: epoch seconds of the last hook INVOCATION, rewritten on every one — even a firing
+# that speaks nothing proves the harness still calls the hook, which is the fact a silent session
+# needs checked first. GET /health reports its age as hook_last_fired_age_s (cross-process
+# contract with server/voice_server.py: one bare float, nothing else).
+_STAMP_PATH = os.path.join(_STATE_DIR, "hook-last-fired")
+
 # state the SIGTERM handler (takeover by a fresher invocation) must be able to reach:
 # the current player child, the temp WAVs on disk, and the open SSE response (its socket
 # must close mid-stream on takeover, not linger until the server finishes synthesizing)
@@ -189,6 +202,27 @@ def log(message: str) -> None:
             open(_LOG_PATH, "w").close()
         with open(_LOG_PATH, "a", encoding="utf-8") as fh:
             fh.write(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} {message}\n")
+    except OSError:
+        pass
+
+
+def _default_wall_clock() -> float:
+    """Epoch seconds. Wall time is an INPUT here, injected so a test needs no real clock."""
+    return time.time()
+
+
+def stamp_hook_fired(clock: Callable[[], float] = _default_wall_clock) -> None:
+    """Record that the harness invoked the hook — the heartbeat whose age /health reports.
+
+    Stamped on EVERY invocation, speaking or not: what it proves is that the harness still calls
+    the hook, which is exactly the fact a silent session needs checked first. Temp-then-replace,
+    so a /health read mid-write sees the old stamp or the new one, never a torn one. Never raises
+    — the stamp is diagnostics, and a hook error must not surface into the session."""
+    try:
+        fd, tmp = tempfile.mkstemp(prefix="voice-loop-stamp-", dir=os.path.dirname(_STAMP_PATH))
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(f"{clock():.3f}\n")
+        os.replace(tmp, _STAMP_PATH)
     except OSError:
         pass
 
@@ -896,6 +930,10 @@ def main() -> int:
         os.makedirs(_STATE_DIR, exist_ok=True)
     except OSError:
         pass
+    # Before anything else — before the config, before the enabled check: the heartbeat. Even a
+    # firing that will speak nothing (disabled, the eager no-op, nothing marked) is proof the
+    # harness still calls the hook, and that proof is the whole point of the stamp.
+    stamp_hook_fired()
 
     cfg_path = os.environ.get(
         "VOICE_LOOP_CONFIG",

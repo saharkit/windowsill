@@ -42,6 +42,7 @@ def state(monkeypatch, tmp_path):
     monkeypatch.setattr(speak, "_PID_PATH", str(tmp_path / "playing.pid"))
     monkeypatch.setattr(speak, "_LEDGER_PATH", str(tmp_path / "spoken.ledger"))
     monkeypatch.setattr(speak, "_LOCK_PATH", str(tmp_path / "speaking.lock"))
+    monkeypatch.setattr(speak, "_STAMP_PATH", str(tmp_path / "hook-last-fired"))
     return tmp_path
 
 
@@ -495,6 +496,42 @@ def test_unmarked_final_message_exits_immediately_without_backoff(state, monkeyp
     rc, sleeps = _run_main_against(_assistant("plain prose, nothing marked"), state, monkeypatch)
     assert rc == 0
     assert sleeps == []
+
+
+# --- the heartbeat stamp: proof the harness still calls the hook ----------------------------------
+
+
+def test_stamp_hook_fired_writes_epoch_seconds_atomically(state):
+    speak.stamp_hook_fired(clock=lambda: 1754157721.5)
+    assert (state / "hook-last-fired").read_text(encoding="utf-8") == "1754157721.500\n"
+    # nothing half-written is left behind — the temp file was renamed over the stamp
+    assert not list(state.glob("voice-loop-stamp-*"))
+
+
+def test_stamp_hook_fired_never_raises(state, monkeypatch):
+    # the stamp lives beside a FILE: its dirname is not a directory, so mkstemp raises — swallowed
+    monkeypatch.setattr(speak, "_STAMP_PATH", str(state / "a-file" / "hook-last-fired"))
+    (state / "a-file").write_text("x", encoding="utf-8")
+    speak.stamp_hook_fired()
+
+
+def test_every_invocation_stamps_even_one_that_speaks_nothing(state, monkeypatch):
+    # the whole point: a firing that exits silently (disabled, nothing marked) still proves the
+    # harness called the hook — that proof is what a silent session is diagnosed by
+    rc, _ = _run_main_against(_assistant("plain prose, nothing marked"), state, monkeypatch)
+    assert rc == 0
+    stamp = float((state / "hook-last-fired").read_text(encoding="utf-8"))
+    assert stamp > 0
+    assert not (state / "last-spoken").exists()  # nothing was spoken, yet the stamp is there
+
+
+def test_a_disabled_hook_still_stamps(state, monkeypatch):
+    config = state / "config.json"
+    config.write_text(json.dumps({"speak": {"enabled": False}}), encoding="utf-8")
+    monkeypatch.setenv("VOICE_LOOP_CONFIG", str(config))
+    monkeypatch.setattr(speak.sys, "stdin", io.StringIO("{}"))
+    assert speak.main() == 0
+    assert (state / "hook-last-fired").exists()
 
 
 def test_a_still_unflushed_transcript_does_retry(state, monkeypatch):

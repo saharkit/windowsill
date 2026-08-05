@@ -66,6 +66,7 @@ _STATE_FILES = (
     ("last-spoken", "the previous utterance — size only, never its text"),
     ("speaking.lock", "the inter-firing speaking lock"),
     ("playing.pid", "the playback pidfile"),
+    ("hook-last-fired", "the hook heartbeat stamp"),
     ("dictate.pid", "the recorder pidfile"),
     ("dictate.wav", "the clip being recorded"),
     ("dictate-last.wav", "the last recorded clip"),

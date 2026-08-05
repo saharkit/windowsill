@@ -18,6 +18,8 @@ LAN or an ssh tunnel. Everything is configured through the environment — see R
     VOICE_LOOP_XTTS_REFERENCE  wav of the voice to clone (the xtts engine refuses requests without it)
     VOICE_LOOP_XTTS_MODEL_DIR  local XTTS-v2 model dir   (optional; default: coqui's own download cache)
     VOICE_LOOP_STRESS_FILE   stress overrides            (default ~/.config/voice-loop/stress.json)
+    VOICE_LOOP_HOOK_STAMP_FILE  the hook's heartbeat stamp (default
+                             $XDG_STATE_HOME/voice-loop/hook-last-fired) — /health reports its age
     VOICE_LOOP_ACCENT        1 | 0 — enable automatic accentuation (default 1; ru and uk)
     VOICE_LOOP_MAX_UPLOAD_BYTES  /stt upload size cap    (default 26214400 — 25 MB)
     VOICE_LOOP_MAX_STT_SECONDS   /stt duration cap for parseable WAV uploads (default 600)
@@ -54,6 +56,7 @@ import time
 import wave
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -128,6 +131,15 @@ USE_ACCENT = os.environ.get("VOICE_LOOP_ACCENT", "1") not in ("0", "false", "no"
 STRESS_FILE = Path(
     os.environ.get("VOICE_LOOP_STRESS_FILE", "")
     or Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "voice-loop" / "stress.json"
+)
+# The hook's heartbeat: speak.py rewrites this stamp on EVERY firing, so its age answers "is the
+# harness still calling the hook?" — the question a mid-session silence needs answered first (the
+# harness itself has been observed to stop invoking the Stop hook in a long session while the whole
+# plugin chain stayed healthy). A server on ANOTHER machine (the ssh-tunnel deployment) cannot see
+# the client's state dir, and reports null rather than a stale read of some other machine's stamp.
+HOOK_STAMP_FILE = Path(
+    os.environ.get("VOICE_LOOP_HOOK_STAMP_FILE", "")
+    or Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "state")) / "voice-loop" / "hook-last-fired"
 )
 
 TTS_SR = 48000
@@ -985,9 +997,29 @@ def resolve_engine(text: str, language: str) -> tuple[str, bool, JSONResponse | 
     return engine, True, None
 
 
+def _default_wall_clock() -> float:
+    """Epoch seconds. Wall time is an INPUT here, injected so a test needs no real clock."""
+    return time.time()
+
+
+def hook_heartbeat(clock: Callable[[], float] = _default_wall_clock) -> tuple[str | None, float | None]:
+    """(ISO-8601 UTC stamp, age in seconds) of the hook's last firing — (None, None) when there is
+    no readable stamp: the hook never fired on this machine, the stamp is corrupt, or the server
+    runs on another machine than the client (the ssh-tunnel deployment) and there is no state dir
+    here to read. The age is signed on purpose: a NEGATIVE age means the stamp is ahead of this
+    machine's clock, which is itself worth knowing before trusting the number."""
+    try:
+        fired = float(HOOK_STAMP_FILE.read_text(encoding="utf-8").strip())
+        stamp = datetime.fromtimestamp(fired, timezone.utc).isoformat(timespec="milliseconds")
+    except (OSError, ValueError, OverflowError):
+        return None, None
+    return stamp, clock() - fired
+
+
 @app.get("/health")
 def health() -> dict[str, object]:
     queues = queue_depths()
+    hook_fired_at, hook_fired_age = hook_heartbeat()
     return {
         "ok": True,
         "version": SERVER_VERSION,
@@ -1014,6 +1046,10 @@ def health() -> dict[str, object]:
         "stt_hallucinations_dropped": _hallucinations_dropped,
         "stt_hallucination_tails_stripped": _hallucination_tails_stripped,
         "stt_hallucinations_by_pattern": dict(_hallucinations_by_pattern),
+        # The hook's heartbeat (see HOOK_STAMP_FILE): nulls when the stamp is not readable HERE,
+        # which includes the ssh-tunnel deployment where hook and server are on different machines.
+        "hook_last_fired": hook_fired_at,
+        "hook_last_fired_age_s": hook_fired_age,
     }
 
 

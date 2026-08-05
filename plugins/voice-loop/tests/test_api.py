@@ -61,6 +61,62 @@ def test_health_reports_a_loaded_voice(client, monkeypatch):
     assert body["tts_loaded"] == ["en"]
 
 
+# --- /health: the hook heartbeat ---------------------------------------------------------------------
+
+
+def test_health_reports_the_hook_heartbeat(client, monkeypatch, tmp_path):
+    stamp = tmp_path / "hook-last-fired"
+    stamp.write_text("1754157721.500\n", encoding="utf-8")
+    monkeypatch.setattr(voice_server, "HOOK_STAMP_FILE", stamp)
+    monkeypatch.setattr(voice_server.time, "time", lambda: 1754157721.5 + 90.0)
+
+    body = client.get("/health").json()
+
+    assert body["hook_last_fired"] == "2025-08-02T18:02:01.500+00:00"
+    assert body["hook_last_fired_age_s"] == 90.0
+
+
+def test_health_reports_a_negative_age_when_the_stamp_is_ahead(client, monkeypatch, tmp_path):
+    # Signed on purpose: the stamp ahead of this clock means two machines disagree about the time.
+    stamp = tmp_path / "hook-last-fired"
+    stamp.write_text("1754157721.500\n", encoding="utf-8")
+    monkeypatch.setattr(voice_server, "HOOK_STAMP_FILE", stamp)
+    monkeypatch.setattr(voice_server.time, "time", lambda: 1754157721.5 - 90.0)
+
+    body = client.get("/health").json()
+
+    assert body["hook_last_fired_age_s"] == -90.0
+
+
+@pytest.mark.parametrize(
+    "stamp",
+    [
+        None,  # no stamp at all: the hook never fired on this machine
+        "not-a-number\n",  # a corrupt stamp reads the same as none
+        "1e400\n",  # parses as inf but no date exists for it — still none, never a 500
+    ],
+)
+def test_health_reports_nulls_without_a_readable_stamp(client, monkeypatch, tmp_path, stamp):
+    path = tmp_path / "hook-last-fired"
+    if stamp is not None:
+        path.write_text(stamp, encoding="utf-8")
+    monkeypatch.setattr(voice_server, "HOOK_STAMP_FILE", path)
+
+    body = client.get("/health").json()
+
+    assert body["hook_last_fired"] is None
+    assert body["hook_last_fired_age_s"] is None
+
+
+def test_health_survives_an_unreadable_stamp(client, monkeypatch, tmp_path):
+    monkeypatch.setattr(voice_server, "HOOK_STAMP_FILE", tmp_path)  # a directory: read fails
+
+    body = client.get("/health").json()
+
+    assert body["hook_last_fired"] is None
+    assert body["hook_last_fired_age_s"] is None
+
+
 # --- /stt ------------------------------------------------------------------------------------------
 
 
