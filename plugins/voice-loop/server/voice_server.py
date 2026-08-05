@@ -10,9 +10,14 @@ LAN or an ssh tunnel. Everything is configured through the environment — see R
     VOICE_LOOP_STT_MODEL     faster-whisper model size   (default small)
     VOICE_LOOP_COMPUTE_TYPE  auto | float16 | int8 | ... (default auto: float16 on cuda, int8 on cpu)
     VOICE_LOOP_STT_HINT      optional lexicon hint biasing the recognizer toward your jargon
-    VOICE_LOOP_TTS_ENGINE    silero | xtts               (default silero; xtts = XTTS-v2 voice cloning)
-    VOICE_LOOP_TTS_FALLBACK_ENGINE  silero | xtts | none — engine a failed synthesis retries on
-                             (default: silero when the engine is xtts, none otherwise)
+    VOICE_LOOP_TTS_ENGINE    silero | xtts | ukrainian   (default silero; xtts = XTTS-v2 voice cloning,
+                             ukrainian = the dedicated robinhad/ukrainian-tts voices — speaks uk only)
+    VOICE_LOOP_TTS_ENGINE_<LANG>  per-language engine override, e.g. VOICE_LOOP_TTS_ENGINE_UK=ukrainian
+                             routes ONLY Ukrainian requests at the ukrainian engine ('-' -> '_', so
+                             zh-cn is VOICE_LOOP_TTS_ENGINE_ZH_CN)
+    VOICE_LOOP_TTS_FALLBACK_ENGINE  silero | xtts | ukrainian | none — engine a failed synthesis retries on
+                             (default: silero when any primary — the global engine or a per-language
+                             override — is not silero, none otherwise)
     VOICE_LOOP_TTS_MODEL     override the Silero model for the default language
     VOICE_LOOP_TTS_SPEAKER   override the default speaker
     VOICE_LOOP_XTTS_REFERENCE  wav of the voice to clone (the xtts engine refuses requests without it)
@@ -30,8 +35,8 @@ LAN or an ssh tunnel. Everything is configured through the environment — see R
                              device keeps its own default — see model_slot below)
 
 Language is a request-level field: /stt takes ?language=, /tts takes {"language": ...}. Both fall back
-to VOICE_LOOP_LANGUAGE. STT (whisper) is multilingual out of the box; TTS is limited to the languages
-Silero ships a model for — an unsupported code returns 400 with the supported list.
+to VOICE_LOOP_LANGUAGE. STT (whisper) is multilingual out of the box; TTS speaks what the selected
+engine speaks — an unsupported code returns 400 with that engine's supported list.
 
 No authentication: bind to loopback (the default) and reach it over ssh, or put it behind a reverse
 proxy if you expose it. Do not put it on an untrusted network as-is.
@@ -64,7 +69,7 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 from starlette.concurrency import run_in_threadpool
 
 MIN_PYTHON = (3, 10)
-SERVER_VERSION = "0.4.1"
+SERVER_VERSION = "0.5.0"
 
 
 def require_python(version: tuple[int, int] | None = None) -> None:
@@ -100,12 +105,26 @@ XTTS_LANGUAGES = {
 }
 XTTS_MODEL_ID = "tts_models/multilingual/multi-dataset/xtts_v2"
 
-ENGINES = ("silero", "xtts")
+# robinhad/ukrainian-tts (the OPTIONAL pip package `ukrainian-tts`) is a dedicated Ukrainian engine:
+# its own trained voices, not a speaker name on a shared multilingual model — the answer to Silero's
+# v4_ua/mykyta reading Ukrainian with a Russian accent. It speaks Ukrainian and nothing else.
+UKRAINIAN_VOICES = ("tetiana", "mykyta", "lada", "oleksa")
+UKRAINIAN_DEFAULT_VOICE = "tetiana"
+# The package's own Stress.Dictionary.value — ukrainian-word-stress in dictionary mode, the same
+# dictionary the Silero path's uk accentuator uses. Named as a plain string so the synthesis seam a
+# test fakes does not have to carry the real enum.
+UKRAINIAN_STRESS = "dictionary"
+
+ENGINES = ("silero", "xtts", "ukrainian")
 ENGINE_HEADER = "X-Voice-Loop-Engine"  # every /tts response names the engine that actually spoke
 
-# What each engine can actually speak, addressed by engine name — the two tables above and nothing
-# else, so a refusal that points at the other engine cannot drift from what that engine speaks.
-ENGINE_LANGUAGES: dict[str, set[str]] = {"silero": set(SILERO_VOICES), "xtts": XTTS_LANGUAGES}
+# What each engine can actually speak, addressed by engine name — the tables above and nothing
+# else, so a refusal that points at another engine cannot drift from what that engine speaks.
+ENGINE_LANGUAGES: dict[str, set[str]] = {
+    "silero": set(SILERO_VOICES),
+    "xtts": XTTS_LANGUAGES,
+    "ukrainian": {"uk"},
+}
 
 HOST = os.environ.get("VOICE_LOOP_HOST", "127.0.0.1")
 PORT = int(os.environ.get("VOICE_LOOP_PORT", "8355"))
@@ -115,10 +134,21 @@ STT_MODEL = os.environ.get("VOICE_LOOP_STT_MODEL", "small")
 COMPUTE_TYPE = os.environ.get("VOICE_LOOP_COMPUTE_TYPE", "auto")
 STT_HINT = os.environ.get("VOICE_LOOP_STT_HINT", "") or None
 TTS_ENGINE = os.environ.get("VOICE_LOOP_TTS_ENGINE", "silero").lower()
-# A down engine should degrade the voice, not silence it. The default pairs the heavy optional
-# engine with the one that is always here; a silero-primary setup has nothing lighter to fall to.
+# Per-language engine overrides: VOICE_LOOP_TTS_ENGINE_UK=ukrainian sends only uk requests to the
+# dedicated engine while every other language stays on the global primary — a voice upgrade for one
+# language, not a server-wide switch. The variable name is the language code uppercased with '-'
+# turned into '_' (zh-cn is VOICE_LOOP_TTS_ENGINE_ZH_CN).
+TTS_ENGINE_BY_LANGUAGE: dict[str, str] = {
+    name.removeprefix("VOICE_LOOP_TTS_ENGINE_").replace("_", "-").lower(): engine.lower()
+    for name, engine in os.environ.items()
+    if name.startswith("VOICE_LOOP_TTS_ENGINE_") and engine
+}
+# A down engine should degrade the voice, not silence it. The default pairs ANY non-Silero primary —
+# the global engine or a per-language override — with the one engine that is always here; a
+# silero-everywhere setup has nothing lighter to fall to.
 TTS_FALLBACK_ENGINE = (
-    os.environ.get("VOICE_LOOP_TTS_FALLBACK_ENGINE", "") or ("silero" if TTS_ENGINE == "xtts" else "none")
+    os.environ.get("VOICE_LOOP_TTS_FALLBACK_ENGINE", "")
+    or ("silero" if TTS_ENGINE != "silero" or set(TTS_ENGINE_BY_LANGUAGE.values()) - {"silero"} else "none")
 ).lower()
 TTS_MODEL_OVERRIDE = os.environ.get("VOICE_LOOP_TTS_MODEL", "")
 TTS_SPEAKER_OVERRIDE = os.environ.get("VOICE_LOOP_TTS_SPEAKER", "")
@@ -132,6 +162,7 @@ STRESS_FILE = Path(
 
 TTS_SR = 48000
 XTTS_SR = 24000  # XTTS-v2 always synthesizes at 24 kHz
+UKRAINIAN_SR = 22050  # robinhad/ukrainian-tts always synthesizes at 22050 Hz
 MAX_TTS_CHARS = 800  # Silero degrades past ~1000 characters per call
 PAUSE_SECONDS = 0.4
 MAX_UPLOAD_BYTES = int(os.environ.get("VOICE_LOOP_MAX_UPLOAD_BYTES", str(25 * 1024 * 1024)))
@@ -159,6 +190,7 @@ _xtts = None
 # card too small for it degrades to CPU (see xtts()), and the queue it takes a slot from has to
 # follow the hardware it really runs on rather than the one it was asked for.
 _xtts_device = ""
+_ukrainian = None
 _accent: dict[str, object] = {}
 _stress: list[tuple[re.Pattern[str], str]] | None = None
 _hallucinations: list[str] | None = None
@@ -179,11 +211,12 @@ def reset_caches() -> None:
     Used by the tests between cases. Nothing in the running server calls it, so editing
     stress.json or the hallucination blocklist requires a restart in the current server.
     """
-    global _whisper, _xtts, _xtts_device, _stress, _hallucinations, _hallucinations_dropped
+    global _whisper, _xtts, _xtts_device, _ukrainian, _stress, _hallucinations, _hallucinations_dropped
     global _hallucination_tails_stripped, _tts_fallbacks
     _whisper = None
     _xtts = None
     _xtts_device = ""
+    _ukrainian = None
     _stress = None
     _hallucinations = None
     _hallucinations_dropped = 0
@@ -305,9 +338,10 @@ def queue_depths() -> dict[str, dict[str, int]]:
 def synthesis_device(engine: str = "") -> str:
     """The device an engine's synthesis really runs on — which queue it must take its slot from.
 
-    Silero is pinned to the CPU in tts(), always. XTTS loads on the resolved device but degrades to
-    the CPU when the card cannot hold it, so this follows where it ACTUALLY landed; before the first
-    load there is nothing to read yet and the resolved device is the honest guess.
+    Silero and the ukrainian engine are pinned to the CPU (both are real-time there; the GPU stays
+    free for STT). XTTS loads on the resolved device but degrades to the CPU when the card cannot
+    hold it, so this follows where it ACTUALLY landed; before the first load there is nothing to
+    read yet and the resolved device is the honest guess.
     """
     if (engine or TTS_ENGINE) == "xtts":
         return _xtts_device or resolve_device()
@@ -604,6 +638,22 @@ def xtts():
     return _xtts
 
 
+def ukrainian_tts():
+    """Lazily loaded robinhad/ukrainian-tts engine, cached; reset_caches() drops it like every model.
+
+    The voices are downloaded by the package on the USER's first request (MIT-licensed, from its
+    Hugging Face repo), never bundled with this repo. CPU-pinned on purpose, like Silero: the model
+    is small and real-time there, and the GPU stays free for recognition.
+    """
+    global _ukrainian
+    if _ukrainian is None:
+        from ukrainian_tts.tts import TTS
+
+        _ukrainian = TTS(device="cpu")
+        log.info("loaded ukrainian-tts on cpu")
+    return _ukrainian
+
+
 def protected_segments(text: str) -> list[tuple[str, bool]]:
     """Cut text into `(segment, is_marked)` runs — the seam that hides '+'-marked tokens.
 
@@ -838,6 +888,64 @@ def xtts_request_error(language: str) -> JSONResponse | None:
     return None
 
 
+def ukrainian_import_error(err: ImportError) -> JSONResponse:
+    """The refusal for a ukrainian-tts import that failed — naming WHICH failure it was.
+
+    Same contract as xtts_import_error, for the same reason: "ukrainian-tts is not installed" is
+    the right answer to exactly one of these and a lie about the rest. The client is told the SHAPE
+    of the failure — the exception class plus, for a ModuleNotFoundError, the missing module's name
+    — never the exception's own text, which can carry paths and other internals (CodeQL:
+    information exposure through an exception). The full message stays in the server log.
+    """
+    log.warning(
+        "the ukrainian engine could not import ukrainian-tts — %s",
+        " ".join(f"{type(err).__name__}: {err}".split())[:300],
+    )
+    module = err.name if isinstance(err, ModuleNotFoundError) else None
+    if module == "ukrainian_tts":
+        return JSONResponse(
+            {
+                "error": "ukrainian import failed: ModuleNotFoundError for 'ukrainian_tts' — the optional "
+                "ukrainian-tts package is not installed",
+                "hint": "pip install ukrainian-tts — its MIT-licensed voices download from Hugging Face "
+                "on first use",
+            },
+            status_code=500,
+        )
+    where = f" in dependency {module!r}" if module else ""
+    return JSONResponse(
+        {
+            "error": f"ukrainian import failed: {type(err).__name__}{where} — the message is in the server log",
+            "hint": "ukrainian-tts is installed but something it imports is not — reinstalling it alone "
+            "will not help; see server/README.md → Ukrainian engine",
+        },
+        status_code=500,
+    )
+
+
+def ukrainian_request_error(language: str) -> JSONResponse | None:
+    """Why a ukrainian-engine request cannot be served right now, or None.
+
+    Checked per request ON PURPOSE, exactly like the xtts probe: the server must still boot and
+    serve /stt with the package absent — a broken TTS engine is a request-level 500, never a
+    startup failure.
+    """
+    try:
+        from ukrainian_tts.tts import TTS  # noqa: F401 — availability probe only; ukrainian_tts() loads
+    except ImportError as err:
+        return ukrainian_import_error(err)
+    if language != "uk":
+        body: dict[str, object] = {
+            "error": f"the ukrainian engine speaks only 'uk', not {language!r}",
+            "supported": ["uk"],
+        }
+        hint = switch_engine_hint("ukrainian", language)
+        if hint:
+            body["hint"] = hint
+        return JSONResponse(body, status_code=400)
+    return None
+
+
 def tts_request_error(text: str, language: str, engine: str = "") -> JSONResponse | None:
     """The shared /tts + /tts/stream refusal, or None when the request can be synthesized.
 
@@ -854,6 +962,8 @@ def tts_request_error(text: str, language: str, engine: str = "") -> JSONRespons
         return JSONResponse({"error": "empty text"}, status_code=400)
     if engine == "xtts":
         return xtts_request_error(language)
+    if engine == "ukrainian":
+        return ukrainian_request_error(language)
     if engine != "silero":
         return JSONResponse(
             {"error": f"unknown TTS engine {engine!r} (VOICE_LOOP_TTS_ENGINE)", "supported": list(ENGINES)},
@@ -874,8 +984,11 @@ def tts_request_error(text: str, language: str, engine: str = "") -> JSONRespons
 
 
 def engine_sample_rate(engine: str = "") -> int:
-    if (engine or TTS_ENGINE) == "xtts":
+    engine = engine or TTS_ENGINE
+    if engine == "xtts":
         return XTTS_SR
+    if engine == "ukrainian":
+        return UKRAINIAN_SR
     return TTS_SR
 
 
@@ -901,12 +1014,42 @@ def xtts_pieces(text: str, language: str):
         yield torch.as_tensor(wav, dtype=torch.float32)
 
 
+def ukrainian_pieces(text: str, language: str, speaker: str = ""):
+    """ukrainian-tts synthesis, one tensor per sentence chunk.
+
+    The package runs its own stress pass (ukrainian-word-stress in dictionary mode — the same
+    dictionary the Silero path's accentuator uses), so the Silero stress pipeline is SKIPPED exactly
+    as for XTTS: '+' markers and combining acutes already in the text are stripped, and stress.json
+    does not reach this engine. The package's API writes a WAV into a file object, so each chunk
+    round-trips through a buffer back into a tensor at the engine's own rate — the rate guard is
+    what keeps a silent upstream rate change from pitching every utterance.
+    """
+    import soundfile as sf
+
+    model = ukrainian_tts()
+    voice = speaker or UKRAINIAN_DEFAULT_VOICE
+    for part in chunk(strip_stress_markers(text)):
+        buffer = io.BytesIO()
+        model.tts(part, voice, UKRAINIAN_STRESS, buffer)
+        buffer.seek(0)
+        samples, rate = sf.read(buffer, dtype="float32")
+        if rate != UKRAINIAN_SR:
+            raise RuntimeError(
+                f"ukrainian-tts wrote {rate} Hz but this server encodes it as {UKRAINIAN_SR} — "
+                "the package changed its output rate"
+            )
+        yield torch.as_tensor(samples)
+
+
 def synthesis_pieces(text: str, language: str, speaker: str = "", engine: str = ""):
     """One synthesized tensor per sentence chunk from ONE engine (empty = the configured primary) —
     the shared core of /tts (which concatenates them) and /tts/stream (which ships each one as it
     appears), and the seam the fallback re-enters with the other engine's name."""
-    if (engine or TTS_ENGINE) == "xtts":
+    engine = engine or TTS_ENGINE
+    if engine == "xtts":
         return xtts_pieces(text, language)
+    if engine == "ukrainian":
+        return ukrainian_pieces(text, language, speaker)
     return silero_pieces(text, language, speaker)
 
 
@@ -916,14 +1059,28 @@ def synthesis_pieces(text: str, language: str, speaker: str = "", engine: str = 
 # below decides WHO speaks; the endpoints below that carry it out and say so on the way back.
 
 
-def fallback_engine() -> str:
+def primary_engine(language: str) -> str:
+    """The engine a request in `language` goes to FIRST: its per-language override, else the global.
+
+    VOICE_LOOP_TTS_ENGINE_UK=ukrainian routes only Ukrainian requests at the dedicated engine while
+    every other language stays on the configured primary — a per-language voice upgrade, not a
+    server-wide switch. An override naming an engine that cannot serve the request is refused (and
+    fallen back from, when there is a fallback) exactly like a bad global setting.
+    """
+    return TTS_ENGINE_BY_LANGUAGE.get(language) or TTS_ENGINE
+
+
+def fallback_engine(primary: str = "") -> str:
     """The engine a broken primary retries on, or "" when there is nothing to fall to.
 
     Deliberately quiet about nonsense: "none", an unknown value, and the primary engine itself all
     mean the same thing here. A fallback is a safety net — misconfiguring it must never turn a
-    working primary into an error.
+    working primary into an error. `primary` is the per-request primary (empty = the global
+    engine): with per-language overrides the same setting can be useless behind one language's
+    primary (silero behind silero) and exactly right behind another's (silero behind ukrainian).
     """
-    if TTS_FALLBACK_ENGINE == TTS_ENGINE or TTS_FALLBACK_ENGINE not in ENGINES:
+    primary = primary or TTS_ENGINE
+    if TTS_FALLBACK_ENGINE == primary or TTS_FALLBACK_ENGINE not in ENGINES:
         return ""
     return TTS_FALLBACK_ENGINE
 
@@ -936,7 +1093,7 @@ def fallback_for(text: str, language: str) -> tuple[str, JSONResponse | None]:
     When it cannot, the caller gets that engine's ordinary refusal to hand back, so the client
     learns why nothing here could speak instead of receiving a bare 500.
     """
-    engine = fallback_engine()
+    engine = fallback_engine(primary_engine(language))
     if not engine:
         return "", None
     refusal = tts_request_error(text, language, engine)
@@ -972,15 +1129,16 @@ def resolve_engine(text: str, language: str) -> tuple[str, bool, JSONResponse | 
     which is exactly what the fallback exists for, so the fallback is asked the same question and
     takes the request over if it can.
     """
-    refusal = tts_request_error(text, language)
+    primary = primary_engine(language)
+    refusal = tts_request_error(text, language, primary)
     if refusal is None:
-        return TTS_ENGINE, False, None
+        return primary, False, None
     if refusal.status_code != 500:
         return "", False, refusal
     engine, refused = fallback_for(text, language)
     if not engine:
         return "", False, refused or refusal
-    log.warning("the %s engine cannot serve requests — falling back to %s", TTS_ENGINE, engine)
+    log.warning("the %s engine cannot serve requests — falling back to %s", primary, engine)
     count_fallback()
     return engine, True, None
 
@@ -1003,7 +1161,8 @@ def health() -> dict[str, object]:
         "language": LANGUAGE,
         "stt_model": STT_MODEL,
         "tts_engine": TTS_ENGINE,
-        "tts_fallback_engine": fallback_engine() or "none",  # the EFFECTIVE one, not the raw setting
+        "tts_engine_overrides": dict(TTS_ENGINE_BY_LANGUAGE),  # the per-language routing, if any
+        "tts_fallback_engine": fallback_engine() or "none",  # the EFFECTIVE one behind the global engine
         "tts_fallbacks": _tts_fallbacks,
         "tts_languages": sorted(SILERO_VOICES),
         "accentuated_languages": sorted(ACCENTUATORS),
@@ -1011,6 +1170,7 @@ def health() -> dict[str, object]:
         "stt_loaded": _whisper is not None,
         "tts_loaded": sorted(_tts),
         "xtts_loaded": _xtts is not None,
+        "ukrainian_loaded": _ukrainian is not None,
         "stt_hallucinations_dropped": _hallucinations_dropped,
         "stt_hallucination_tails_stripped": _hallucination_tails_stripped,
         "stt_hallucinations_by_pattern": dict(_hallucinations_by_pattern),
@@ -1195,7 +1355,7 @@ async def tts_endpoint(request: Request, payload: dict) -> Response:
         alternative, refused = fallback_for(text, language)
         if refused is not None:
             log.exception(
-                "the %s engine failed and %s cannot serve this request either", engine, fallback_engine()
+                "the %s engine failed and %s cannot serve this request either", engine, fallback_engine(engine)
             )
             return refused
         if not alternative:

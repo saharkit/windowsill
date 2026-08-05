@@ -34,8 +34,10 @@ removed; the XTTS engine's own pins are deliberately NOT in it — see `server/R
   point (`speak.sh`, `dictate-toggle.sh`) so the hook/hotkey registration surface never changes.
   `selftest.sh` is the hardware-free loopback harness.
 - `server/voice_server.py` — **one single-file FastAPI app** served by uvicorn (~1.1k lines). STT is
-  faster-whisper; TTS is Silero via `torch.hub`, with an optional XTTS-v2 voice-clone engine that
-  falls back to Silero on failure. Endpoints: `POST /stt`, `POST /tts`, `POST /tts/stream` (SSE),
+  faster-whisper; TTS is Silero via `torch.hub`, with two optional engines that fall back to Silero
+  on failure: an XTTS-v2 voice-clone engine, and the dedicated robinhad/ukrainian-tts voices for
+  Ukrainian (routable per language via `VOICE_LOOP_TTS_ENGINE_UK`). Endpoints: `POST /stt`, `POST
+  /tts`, `POST /tts/stream` (SSE),
   `GET /health`. Every server **setting** is a `VOICE_LOOP_*` environment variable; two file inputs
   sit beside them — the stress dictionary (`$XDG_CONFIG_HOME/voice-loop/stress.json`, relocatable
   via `VOICE_LOOP_STRESS_FILE`) and the STT hallucination blocklist
@@ -74,10 +76,12 @@ queue's `merge_group` ref, and manual:
   lock, "spoken exactly once" as a count); and the dictation contract (fake recorder and clipboard,
   real STT).
 
-**`.github/workflows/xtts-install-probe.yml`** — weekly cron (Mondays 05:17 UTC) and manual. Installs
-the documented XTTS pins into a clean venv and imports them for real, and asserts the same pins are
-documented in `server/requirements.txt`, `server/README.md` and `server/voice_server.py`. No model
-weights are ever downloaded.
+**`.github/workflows/xtts-install-probe.yml`** — weekly cron (Mondays 05:17 UTC) and manual. Two
+jobs, one per optional TTS engine. The XTTS job installs the documented XTTS pins into a clean venv
+and imports them for real, and asserts the same pins are documented in `server/requirements.txt`,
+`server/README.md` and `server/voice_server.py`. The ukrainian job installs `ukrainian-tts` and
+asserts the API surface the server fakes (the stress-mode value, the voice names, the `tts()`
+signature). No model weights are ever downloaded.
 
 **CodeQL** — code scanning is enabled on the repository through GitHub's **default setup**. This is
 a **repository setting, not tree state**: a checkout can only confirm the negative half (there is no

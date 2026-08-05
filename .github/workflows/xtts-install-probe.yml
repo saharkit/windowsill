@@ -1,21 +1,24 @@
 # The one thing the unit suite structurally cannot check.
 #
-# `tests/` fakes the `from TTS.api import TTS` seam on purpose — no models, no network, no 2 GB of
-# wheels — so a 100% green suite says nothing about whether the XTTS install we DOCUMENT still
-# works. It stopped working upstream without a line of this repo changing (#34): coqui-tts declares
-# neither torch nor torchaudio yet imports torchaudio, an unresolved transformers moved to 5.x and
-# dropped `isin_mps_friendly`, and torch>=2.9 wants torchcodec wheels that need CUDA libraries or a
-# system ffmpeg. This job installs the pinned recipe from server/README.md into a clean venv and
-# imports it for real, once a week, so the next upstream break is a red run instead of a stranger's
-# ruined evening.
+# `tests/` fakes the `from TTS.api import TTS` and `from ukrainian_tts.tts import TTS` seams on
+# purpose — no models, no network, no 2 GB of wheels — so a 100% green suite says nothing about
+# whether the optional-engine installs we DOCUMENT still work. XTTS stopped working upstream without
+# a line of this repo changing (#34): coqui-tts declares neither torch nor torchaudio yet imports
+# torchaudio, an unresolved transformers moved to 5.x and dropped `isin_mps_friendly`, and torch>=2.9
+# wants torchcodec wheels that need CUDA libraries or a system ffmpeg. These jobs install the
+# documented recipes into a clean venv and import them for real, once a week, so the next upstream
+# break is a red run instead of a stranger's ruined evening.
 #
 # Deliberately NOT on every push/PR: ~3 minutes of wheel downloads is worth paying weekly, not per
 # commit. Deliberately NO model download either — COQUI_TOS_AGREED is unset and nothing calls the
-# model, so the CPML-licensed weights are never fetched. The import is the whole contract.
+# models, so neither the CPML-licensed XTTS weights nor the ukrainian-tts voices are ever fetched.
+# The import (and, for ukrainian-tts, the API surface the server fakes) is the whole contract.
 #
-# When this goes red: the recipe drifted. Fix the pins in BOTH server/requirements.txt (the [xtts]
-# comment block) and server/README.md → "XTTS engine", and here.
-name: xtts install probe
+# When the xtts job goes red: the recipe drifted. Fix the pins in BOTH server/requirements.txt (the
+# [xtts] comment block) and server/README.md → "XTTS engine", and here. When the ukrainian job goes
+# red: the package changed the API the server calls — check UKRAINIAN_VOICES / UKRAINIAN_STRESS /
+# UKRAINIAN_SR and the ukrainian_pieces() call against the new package.
+name: tts engine install probes
 
 on:
   schedule:
@@ -61,3 +64,40 @@ jobs:
 
       - name: import it for real (no model download — the weights stay untouched)
         run: /tmp/xtts-probe/bin/python -c "from TTS.api import TTS; print('xtts import ok')"
+
+  ukrainian-install:
+    name: the documented ukrainian-tts install still installs and exposes the API the server fakes
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: install the documented recipe into a clean venv (CPU torch first)
+        run: |
+          python3 -m venv /tmp/ukrainian-probe
+          /tmp/ukrainian-probe/bin/pip install --upgrade pip
+          /tmp/ukrainian-probe/bin/pip install --index-url https://download.pytorch.org/whl/cpu torch
+          /tmp/ukrainian-probe/bin/pip install ukrainian-tts
+
+      - name: what actually resolved
+        run: /tmp/ukrainian-probe/bin/pip list | grep -Ei "^(torch|ukrainian-tts|ukrainian-word-stress) "
+
+      - name: import it and pin the API surface the server calls (no model download)
+        run: |
+          /tmp/ukrainian-probe/bin/python - <<'EOF'
+          import inspect
+          from ukrainian_tts.tts import TTS, Voices, Stress
+
+          # The server's UKRAINIAN_VOICES / UKRAINIAN_STRESS constants and the positional
+          # model.tts(text, voice, stress, file) call in ukrainian_pieces() are this contract;
+          # constructing TTS() would download the voices, so the signature stands in for the call.
+          assert Stress.Dictionary.value == "dictionary", list(Stress)
+          assert {voice.value for voice in Voices} >= {"tetiana", "mykyta", "lada"}, list(Voices)
+          params = list(inspect.signature(TTS.tts).parameters)
+          assert params[:5] == ["self", "text", "voice", "stress", "file"], params
+          print("ukrainian-tts import ok; the API surface matches what the server fakes")
+          EOF
