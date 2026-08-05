@@ -16,6 +16,16 @@
       },
       "category": "productivity",
       "source": "./plugins/voice-loop"
+    },
+    {
+      "name": "sill-core",
+      "description": "Shared core for windowsill plugins: assistant state store with atomic writes, remind-once etiquette, and schema-versioned JSON persistence. One file per plugin under XDG_STATE_HOME.",
+      "version": "0.1.0",
+      "author": {
+        "name": "Sahar"
+      },
+      "category": "utility",
+      "source": "./plugins/sill-core"
     }
   ]
 }
