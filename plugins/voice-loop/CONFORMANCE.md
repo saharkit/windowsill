@@ -1,4 +1,4 @@
-# voice-loop conformance — v0.4.0
+# voice-loop conformance — v0.5.0
 
 A versioned acceptance checklist for the voice-loop plugin. This file is pinned to the
 plugin version it tests: a release that changes behaviour changes this checklist, and a
