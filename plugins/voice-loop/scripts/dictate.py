@@ -130,6 +130,11 @@ _FOCUS_PATH = os.path.join(_STATE_DIR, "dictate-focus")
 # speak.py's own take_over does.
 _SPEAK_PID_PATH = os.path.join(_STATE_DIR, "playing.pid")
 
+# When the macOS Accessibility permission for osascript keystroke injection was declined, this
+# marker stops the paste retry for the lifetime of the state dir — the next toggle skips the
+# keystroke path and the text stays on the clipboard without another prompt.
+_PASTE_DENIED_PATH = os.path.join(_STATE_DIR, "dictate-paste-denied")
+
 # A freshly O_EXCL-claimed pidfile holds no pid for only milliseconds (until the recorder is
 # spawned and its pid written). An EMPTY/unparseable pidfile older than this is dead garbage from
 # a crashed invocation and is removed — otherwise the toggle would wedge until a manual rm.
@@ -416,6 +421,50 @@ def same_window_guard_on(s: dict) -> bool:
     human presses the paste key themselves, in whatever window they meant, so there is nothing to
     guard and no reason to spend a probe on every recording."""
     return bool(s["auto_paste"]) and s["paste_target"] == "same-window"
+
+
+# --- paste denial: the macOS Accessibility permission, detected once per session --------------------
+
+
+def _paste_denied() -> bool:
+    """Has the macOS Accessibility permission been declined this session?
+
+    A marker file in the state dir persists across invocations, so a user who declines the
+    permission once is not prompted again on every toggle — the keystroke path is skipped and the
+    text stays on the clipboard."""
+    return os.path.exists(_PASTE_DENIED_PATH)
+
+
+def _mark_paste_denied() -> None:
+    """Record that paste was denied so the next toggle skips the keystroke path.
+
+    Best-effort: if the state dir is unwritable the toggle still falls back to clipboard — it just
+    retries the (failing) keystroke on the next invocation."""
+    try:
+        with open(_PASTE_DENIED_PATH, "w", encoding="utf-8") as fh:
+            fh.write("denied")
+    except OSError:
+        pass
+
+
+def _is_accessibility_denial(stderr: bytes) -> bool:
+    """True when the osascript stderr reads like a macOS Accessibility permission denial.
+
+    The dialog text is 'Claude wants to control this computer' (or the terminal app's name); the
+    osascript error reports it as not being allowed to send keystrokes or assistive-access events.
+    Both wordings are checked case-insensitively so a user running a non-English macOS still gets
+    the detection."""
+    text = stderr.decode("utf-8", "replace").lower()
+    return "not allowed to send keystrokes" in text or "not authorized to send apple events to system events" in text
+
+
+def _log_stderr(stderr_bytes: bytes) -> None:
+    """Write captured subprocess stderr to the dictate log, best-effort."""
+    try:
+        with open(_LOG_PATH, "a", encoding="utf-8") as fh:
+            fh.write(stderr_bytes.decode("utf-8", "replace"))
+    except OSError:
+        pass
 
 
 def multipart_form(fields: dict[str, str], file_field: str, filename: str, payload: bytes, boundary: str) -> bytes:
@@ -929,8 +978,15 @@ def stop_and_transcribe(s: dict, system: str, mode: str, recorder_pid: int) -> i
         except OSError:
             sock_ok = False
         paste_tool = pick_paste_tool(system, shutil.which, sock_ok, os.environ.get("DISPLAY", ""))
+        paste_was_denied = paste_tool == "osascript" and _paste_denied()
         if _run_paste(paste_tool, s["paste_key"], mode == "send", sock):
             log(f"auto-pasted (mode={mode} key={s['paste_key']})")
+            return 0
+        if paste_tool == "osascript" and _paste_denied() and not paste_was_denied:
+            # The user just declined the macOS Accessibility permission — tell them once that
+            # the text is on the clipboard and the keystroke path won't be retried.
+            note("accessibility permission denied — text is on the clipboard", system)
+            log("auto-paste denied — Accessibility permission not granted")
             return 0
         log("auto-paste unavailable — clipboard fallback")
     note(f"copied — press {s['paste_key']} to paste", system)
@@ -938,7 +994,18 @@ def stop_and_transcribe(s: dict, system: str, mode: str, recorder_pid: int) -> i
 
 
 def _run_paste(tool: str, paste_key: str, enter: bool, ydotool_socket: str) -> bool:
-    """Execute a paste plan. True only when the paste keystroke itself was sent."""
+    """Execute a paste plan. True only when the paste keystroke itself was sent.
+
+    On macOS, the first osascript keystroke triggers the Accessibility permission prompt; if the
+    user declines, the denial is detected from stderr, recorded in the state dir, and the keystroke
+    path is skipped on every subsequent toggle — the text stays on the clipboard without another
+    prompt. Other paste failures (tool not installed, a transient error) fall back to clipboard
+    without recording a denial, so the toggle retries on the next invocation."""
+    # If the user already declined the Accessibility permission this session, skip the
+    # keystroke path without retrying — the text stays on the clipboard.
+    if tool == "osascript" and _paste_denied():
+        return False
+
     steps = paste_plan(tool, paste_key, enter)
     if not steps:
         return False
@@ -949,13 +1016,22 @@ def _run_paste(tool: str, paste_key: str, enter: bool, ydotool_socket: str) -> b
         if delay:
             time.sleep(delay)
         try:
-            with open(_LOG_PATH, "a", encoding="utf-8") as errlog:
-                result = subprocess.run(argv, stdout=subprocess.DEVNULL, stderr=errlog, env=env, check=False)
-            failed = result.returncode != 0
-        except OSError:
-            failed = True
-        if failed and required:
-            return False
+            result = subprocess.run(argv, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, env=env, check=False)
+        except OSError as err:
+            log(f"paste spawn failed ({argv[0]}): {err}")
+            if required:
+                return False
+            continue
+        if result.stderr:
+            _log_stderr(result.stderr)
+        if result.returncode != 0:
+            # macOS Accessibility denial: the osascript keystroke fails because the user declined
+            # the permission. Detect the error once, mark it, and stop retrying.
+            if tool == "osascript" and required and _is_accessibility_denial(result.stderr):
+                _mark_paste_denied()
+                log("accessibility permission denied — falling back to clipboard")
+            if required:
+                return False
     return True
 
 

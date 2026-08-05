@@ -49,6 +49,7 @@ def state(monkeypatch, tmp_path):
     monkeypatch.setattr(dictate, "_SPEAK_PID_PATH", str(tmp_path / "playing.pid"))
     monkeypatch.setattr(dictate, "_TOGGLE_PATH", str(tmp_path / "dictate-last-toggle"))
     monkeypatch.setattr(dictate, "_FOCUS_PATH", str(tmp_path / "dictate-focus"))
+    monkeypatch.setattr(dictate, "_PASTE_DENIED_PATH", str(tmp_path / "dictate-paste-denied"))
     return tmp_path
 
 
@@ -591,6 +592,193 @@ def test_note_interpolates_the_escaped_message_on_darwin(monkeypatch):
     dictate.note('copied — press "ctrl+v" to paste', "Darwin")
     assert runs[0][:2] == ["osascript", "-e"]
     assert 'display notification "copied — press \\"ctrl+v\\" to paste" with title "voice-loop"' == runs[0][2]
+
+
+# --- paste denial: macOS Accessibility permission detection and graceful degradation -------------
+
+
+def test_paste_denied_returns_false_when_marker_absent(state):
+    """An invocation that has never seen a denial is not blocked."""
+    assert dictate._paste_denied() is False
+
+
+def test_paste_denied_returns_true_when_marker_exists(state):
+    (state / "dictate-paste-denied").write_text("denied", encoding="utf-8")
+    assert dictate._paste_denied() is True
+
+
+def test_mark_paste_denied_creates_the_marker(state):
+    assert not (state / "dictate-paste-denied").exists()
+    dictate._mark_paste_denied()
+    assert (state / "dictate-paste-denied").exists()
+
+
+def test_mark_paste_denied_is_best_effort_on_unwritable_state_dir(state, monkeypatch):
+    monkeypatch.setattr(dictate, "_PASTE_DENIED_PATH", str(state / "not-created" / "denied"))
+    dictate._mark_paste_denied()  # does not raise
+    assert not (state / "not-created").exists()
+
+
+@pytest.mark.parametrize(
+    "stderr,expected",
+    [
+        (b"execution error: System Events got an error: osascript is not allowed to send keystrokes. (-1743)", True),
+        (b"osascript is not allowed to send keystrokes. (1002)", True),
+        (b"Not authorized to send Apple events to System Events.", True),
+        (b"", False),
+        (b"some other error", False),
+        (b"env: osascript: No such file or directory", False),
+    ],
+)
+def test_is_accessibility_denial_matches_the_known_phrases(stderr, expected):
+    assert dictate._is_accessibility_denial(stderr) is expected
+
+
+def test_is_accessibility_denial_is_case_insensitive():
+    assert dictate._is_accessibility_denial(b"NOT ALLOWED TO SEND KEYSTROKES") is True
+
+
+def test_run_paste_skips_osascript_when_denial_is_marked(state, monkeypatch):
+    """A toggle after a denial skips the keystroke path entirely — no subprocess is run."""
+    (state / "dictate-paste-denied").write_text("denied", encoding="utf-8")
+    spawned = []
+
+    def no_spawn(*_args, **_kw):
+        raise AssertionError("a denied paste must not spawn osascript")
+
+    monkeypatch.setattr(dictate.subprocess, "run", no_spawn)
+    assert dictate._run_paste("osascript", "cmd+v", enter=False, ydotool_socket="") is False
+
+
+def test_run_paste_marks_denial_on_accessibility_error(state, monkeypatch):
+    """The first osascript failure with a denial-shaped error creates the marker and returns False."""
+    denial_stderr = b"execution error: System Events got an error: osascript is not allowed to send keystrokes. (-1743)"
+
+    class Failed:
+        returncode = 1
+        stderr = denial_stderr
+
+    monkeypatch.setattr(dictate.subprocess, "run", lambda *args, **kw: Failed)
+    monkeypatch.setattr(dictate, "_log_stderr", lambda stderr_bytes: None)
+
+    assert not (state / "dictate-paste-denied").exists()
+    assert dictate._run_paste("osascript", "cmd+v", enter=False, ydotool_socket="") is False
+    assert (state / "dictate-paste-denied").exists()
+    log = (state / "dictate.log").read_text(encoding="utf-8")
+    assert "accessibility permission denied" in log
+
+
+def test_run_paste_does_not_mark_denial_on_non_accessibility_error(state, monkeypatch):
+    """A transient osascript failure (e.g. a badly formed argument) must not create the denial
+    marker — otherwise one legitimate error retires the keystroke path forever."""
+    non_denial_stderr = b"0:1: syntax error: A identifier can't go after this identifier. (-2740)"
+
+    class Failed:
+        returncode = 1
+        stderr = non_denial_stderr
+
+    monkeypatch.setattr(dictate.subprocess, "run", lambda *args, **kw: Failed)
+    monkeypatch.setattr(dictate, "_log_stderr", lambda stderr_bytes: None)
+
+    assert dictate._run_paste("osascript", "cmd+v", enter=False, ydotool_socket="") is False
+    assert not (state / "dictate-paste-denied").exists()  # marker NOT created
+    log_path = state / "dictate.log"
+    if log_path.exists():
+        assert "permission denied" not in log_path.read_text(encoding="utf-8")
+
+
+def test_run_paste_marks_denial_only_on_required_steps(state, monkeypatch):
+    """The Enter-key step is best-effort (required=False); a denial-shaped error there must not
+    create the marker — only the required paste-keystroke step counts."""
+    denial_stderr = b"osascript is not allowed to send keystrokes. (1002)"
+
+    class Failed:
+        returncode = 1
+        stderr = denial_stderr
+
+    monkeypatch.setattr(dictate.subprocess, "run", lambda *args, **kw: Failed)
+    monkeypatch.setattr(dictate, "_log_stderr", lambda stderr_bytes: None)
+
+    # Enter-only plan: a single step, required=False (key code 36).
+    # _run_paste with enter=True builds a two-step plan: the required paste keystroke first,
+    # then the best-effort Enter press. We patch subprocess to fail ONLY the Enter step.
+    call_count = [0]
+
+    class PasteOkEnterFailed:
+        returncode = 1
+        stderr = denial_stderr
+
+    class PasteOk:
+        returncode = 0
+        stderr = b""
+
+    def staged_run(argv, **kw):
+        call_count[0] += 1
+        if call_count[0] == 2:  # the Enter step, required=False
+            return PasteOkEnterFailed()
+        return PasteOk()
+
+    monkeypatch.setattr(dictate.subprocess, "run", staged_run)
+    monkeypatch.setattr(dictate, "_log_stderr", lambda stderr_bytes: None)
+
+    # enter=True builds two steps: the paste keystroke (required) + Enter (best-effort)
+    result = dictate._run_paste("osascript", "cmd+v", enter=True, ydotool_socket="")
+    # The paste keystroke succeeded, so the function returns True — the Enter step is ignored
+    assert result is True
+    assert not (state / "dictate-paste-denied").exists()
+
+
+def test_stop_and_transcribe_shows_denial_note_on_first_denial(state, monkeypatch, paste_run):
+    """The first time paste is denied, the notification says why rather than the generic
+    'copied — press …' message. Subsequent toggles get the generic message because the
+    denial was already explained."""
+    (state / "dictate.wav").write_bytes(b"\0" * (dictate.WAV_HEADER_BYTES + dictate.BYTES_PER_SECOND))
+    monkeypatch.setattr(dictate, "transcribe", lambda s: "hello agent")
+    monkeypatch.setattr(dictate, "_pid_alive", lambda pid: False)
+    monkeypatch.setattr(dictate.os, "kill", lambda pid, sig: None)
+    monkeypatch.setattr(dictate.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(dictate.subprocess, "run", lambda argv, **kw: paste_run.clipboard.append(kw["input"]))
+    # The test runs on Linux where osascript is not installed; force the paste tool to osascript
+    monkeypatch.setattr(dictate, "pick_paste_tool", lambda system, have, sock_ok, display: "osascript")
+
+    notes: list[str] = []
+    monkeypatch.setattr(dictate, "note", lambda message, system: notes.append(message))
+
+    # First toggle: _run_paste detects denial AND marks it
+    def deny_then_return(_tool, _key, _enter, _sock):
+        dictate._mark_paste_denied()
+        return False
+
+    monkeypatch.setattr(dictate, "_run_paste", deny_then_return)
+    s = dictate.resolve_settings({"dictate": {"auto_paste": True, "clipboard": "xclip"}}, "Darwin")
+    assert dictate.stop_and_transcribe(s, "Darwin", "send", 12345) == 0
+    assert notes[-1] == "accessibility permission denied — text is on the clipboard"
+    assert "Accessibility permission not granted" in (state / "dictate.log").read_text(encoding="utf-8")
+
+
+def test_subsequent_denial_shows_regular_clipboard_note(state, monkeypatch, paste_run):
+    """Once the denial has been explained, further toggles get the normal clipboard message."""
+    (state / "dictate.wav").write_bytes(b"\0" * (dictate.WAV_HEADER_BYTES + dictate.BYTES_PER_SECOND))
+    monkeypatch.setattr(dictate, "transcribe", lambda s: "hello agent")
+    monkeypatch.setattr(dictate, "_pid_alive", lambda pid: False)
+    monkeypatch.setattr(dictate.os, "kill", lambda pid, sig: None)
+    monkeypatch.setattr(dictate.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(dictate.subprocess, "run", lambda argv, **kw: paste_run.clipboard.append(kw["input"]))
+    monkeypatch.setattr(dictate, "pick_paste_tool", lambda system, have, sock_ok, display: "osascript")
+
+    notes: list[str] = []
+    monkeypatch.setattr(dictate, "note", lambda message, system: notes.append(message))
+
+    # The denial marker already exists — _run_paste returns False immediately
+    (state / "dictate-paste-denied").write_text("denied", encoding="utf-8")
+
+    def already_denied(_tool, _key, _enter, _sock):
+        return False
+
+    monkeypatch.setattr(dictate, "_run_paste", already_denied)
+    s = dictate.resolve_settings({"dictate": {"auto_paste": True, "clipboard": "xclip"}}, "Darwin")
+    assert dictate.stop_and_transcribe(s, "Darwin", "send", 12345) == 0
+    assert notes[-1] == "copied — press cmd+v to paste"
 
 
 # --- the PID-reuse identity check (duplicated helper — kept in sync with speak.py) --------------

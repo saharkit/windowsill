@@ -223,7 +223,8 @@ prompt the setup causes.
 | # | check | expected | observed | pass |
 |---|---|---|---|---|
 | 5.1 | `/voice-setup` picks the macOS adapters | `afplay` / `pbcopy` / `osascript`, Homebrew for anything missing | | |
-| 5.2 | Accessibility consent is requested once, explained before it appears | one dialog, then auto-paste works | | |
+| 5.2 | `/voice-setup` explains the Accessibility dialog BEFORE it appears — the explanation names the dialog text verbatim ("Claude wants to control this computer"), says the dialog fires at FIRST actual dictation not during setup, and states what Allow/Decline each cost | setup presents the macOS auto-paste question with the full explanation; the dialog appears ONLY during the first actual dictation, *after* the explanation | | |
+| 5.2a | **Decline** the Accessibility permission when it appears during dictation | the notification says "accessibility permission denied — text is on the clipboard"; the text IS on the clipboard and pastes with Cmd+V; the next toggle falls back to clipboard silently (no second dialog, no second denial notification) — the script detected the osascript error once and stopped retrying | | |
 | 5.3 | `say -v <voice>` fallback path | speaks with the built-in voice when configured | | |
 | 5.4 | Apple Silicon: whisper.cpp path if chosen | transcription is noticeably fast; `stt.command` wired correctly | | |
 | 5.5 | Nothing in the install required root | true / false | | |
