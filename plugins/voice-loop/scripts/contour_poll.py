@@ -143,6 +143,44 @@ EXIT_PAGE = 1
 EXIT_USAGE = 64
 
 
+# --- device alias table ---------------------------------------------------------------------------
+#
+# Real GPU services report different device strings (cuda, cuda:0, mps, rocm, hip) that all mean
+# "the fast path". The operator should not need to guess the exact vocabulary the service prints;
+# the README example uses "gpu", and a real service saying "cuda" should match it.
+# The alias table normalizes both sides before comparison: known GPU types -> "gpu", CPU -> "cpu",
+# unknown strings compare verbatim (to catch typos or new device types the table doesn't know yet).
+
+_DEVICE_ALIASES = {
+    # GPU types (all mean "the fast path")
+    "cuda": "gpu",
+    "cuda:0": "gpu",
+    "cuda:1": "gpu",
+    "cuda:2": "gpu",
+    "cuda:3": "gpu",
+    "mps": "gpu",
+    "rocm": "gpu",
+    "hip": "gpu",
+    # CPU types (all mean "slow path")
+    "cpu": "cpu",
+    "cpu:0": "cpu",
+    "cpu:1": "cpu",
+    "cpu:2": "cpu",
+    "cpu:3": "cpu",
+}
+
+
+def _normalize_device(device: str | None) -> str | None:
+    """Normalize a device string through the alias table.
+
+    Returns None for None, and a normalized string for known types.
+    Unknown device strings are returned unchanged for verbatim comparison (to catch typos).
+    """
+    if device is None:
+        return None
+    return _DEVICE_ALIASES.get(device, device)
+
+
 def _default_clock() -> datetime:
     """UTC now. Time is an INPUT here — injected so a test needs no sleep and no real wall clock."""
     return datetime.now(timezone.utc)
@@ -428,9 +466,11 @@ def evaluate_service(service: dict, sample: dict, previous: dict) -> list[dict]:
         # foreign /health with its own vocabulary is answering, and a monitor that reads "does not
         # use my key" as "is down" pages forever about a service that never had a fault.
         add("not-ok", f"{name} answers its health endpoint but reports ok=false")
+    # Normalize both sides through the alias table before comparison: known GPU types
+    # (cuda, mps, rocm, hip) -> "gpu", CPU types -> "cpu", unknown strings compare verbatim.
     expected = service["expect_device"]
     device = sample["device"]
-    if expected and device and device != expected:
+    if expected and device and _normalize_device(device) != _normalize_device(expected):
         # THE alert of #40: a service that demoted itself off the fast path keeps serving
         # correctly — nothing breaks loudly, it just gets an order of magnitude slower and stays
         # that way until a human looks. expect_device is set exactly when a client depends on it.
