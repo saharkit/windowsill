@@ -42,12 +42,12 @@ marketplace. To list windowsill's reach here, submit each plugin individually.
 |---|---|
 | name | voice-loop |
 | source | <https://github.com/saharkit/windowsill/tree/main/plugins/voice-loop> |
-| description | Talk to Claude Code and hear it answer: a Stop hook speaks marker-tagged lines, a push-to-talk script dictates into the prompt, and /voice-setup installs the whole contour (local, LAN, or cloud speech). Ships its own self-hostable speech server with STT (faster-whisper) and TTS (Silero, XTTS-v2, Ukrainian dedicated voices). |
+| description | Two-way voice for Claude Code with pluggable speech providers: a config registry picks OpenAI, ElevenLabs or Deepgram per direction, or keeps every clip local/self-hosted (faster-whisper STT; Silero, XTTS-v2 or Ukrainian TTS on the bundled server) — switching backends is a config entry, never a code change. A Stop hook speaks the lines Claude marks, a push-to-talk hotkey dictates into your prompt, and /voice-setup installs it all. |
 | license | MIT |
 | author | Sahar |
-| version | 0.5.0 |
+| version | 0.6.0 |
 | validation | `claude plugin validate ./plugins/voice-loop` must pass before submission |
-| keywords | voice, tts, stt, speech, dictation, hook |
+| keywords | voice, speech, tts, stt, dictation, provider-registry, deepgram, elevenlabs, openai, whisper, silero, self-hosted, accessibility |
 
 #### sill-core
 
@@ -87,7 +87,7 @@ generated files. Format:
   "surfaces": ["Claude Code"],
   "anthropic": false,
   "slug": "voice-loop",
-  "description": "Two-way voice for Claude Code: TTS, STT, and dictation through a self-hostable speech server.",
+  "description": "Two-way voice for Claude Code: TTS, STT and dictation through pluggable speech providers — OpenAI, ElevenLabs or Deepgram by config entry, or a self-hostable local server.",
   "use_case": "Hands-free coding sessions, voice-driven prompts, hearing Claude Code's responses aloud."
 }
 ```
@@ -107,7 +107,7 @@ config. The expected entry format (from the studiomeyer-marketplace precedent):
 ```json
 "saharkit/windowsill": {
   "name": "windowsill",
-  "description": "Plugins and skills the saharkit agent school shares with everyone: voice-loop (two-way voice with STT/TTS) and sill-core (assistant state store with atomic writes). Install with: claude plugin marketplace add saharkit/windowsill",
+  "description": "Plugins and skills the saharkit agent school shares with everyone: voice-loop (two-way voice with pluggable STT/TTS providers — OpenAI, ElevenLabs, Deepgram or fully local) and sill-core (assistant state store with atomic writes). Install with: claude plugin marketplace add saharkit/windowsill",
   "enabled": true,
   "type": "marketplace",
   "repoOwner": "saharkit",

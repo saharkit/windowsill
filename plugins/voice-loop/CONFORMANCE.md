@@ -1,4 +1,4 @@
-# voice-loop conformance — v0.5.0
+# voice-loop conformance — v0.6.0
 
 A versioned acceptance checklist for the voice-loop plugin. This file is pinned to the
 plugin version it tests: a release that changes behaviour changes this checklist, and a
@@ -15,7 +15,7 @@ In a Claude Code session with voice-loop installed:
 
 The skill walks this checklist interactively: it asks you for the physical acts (tap the
 hotkey, confirm you heard the sound) and probes the machine for everything else. The result
-is one report file (`conformance-v0.5.0-YYYYMMDD.md`) with every row adjudicated. The
+is one report file (`conformance-v0.6.0-YYYYMMDD.md`) with every row adjudicated. The
 report is then offered through the same three transports as `/report-bug` — a GitHub issue
 (with the `conformance` label), a pre-filled new-issue URL, or a mailto:.
 
@@ -31,7 +31,7 @@ SKIP needs a reason in the evidence cell (e.g. "Wayland-only guard, tested on X1
 | tester | _(filled at runtime)_ |
 | OS / version | _(filled at runtime)_ |
 | desktop / session (GNOME-Wayland, KDE, X11, macOS) | _(filled at runtime)_ |
-| plugin version | 0.5.0 |
+| plugin version | 0.6.0 |
 | backends chosen (stt / tts) | _(filled at runtime)_ |
 | language | _(filled at runtime)_ |
 
@@ -66,6 +66,8 @@ SKIP needs a reason in the evidence cell (e.g. "Wayland-only guard, tested on X1
 | 2.8 | Same-window guard (auto-paste on, `paste_target: same-window`, macOS/X11 only) | Same as 2.7 but with the guard on | NOTHING is pasted anywhere; notification says "focus moved — text is in the clipboard"; `dictate.log` records the focus start and the suppression | | |
 | 2.9 | Same-window guard, no switch | `paste_target: same-window`, stay in the same window | pastes exactly as normal — the guard is invisible when you stay put | | |
 | 2.10 | Same-window guard on Wayland | Enable `paste_target: same-window` on a Wayland session | it pastes anyway (degrades to `any`); `dictate.log` says `focus at start: unknown …` — a suppressed paste here would be the bug | | |
+| 2.11 | Cloud provider is a config entry | With a cloud STT key configured, set `stt.cloud.provider` to a second registry provider (`openai`, `elevenlabs` or `deepgram`) and dictate again — no other edit | the transcript arrives, from that provider's API, with no code change anywhere | | |
+| 2.12 | Unknown provider says so | Set `stt.cloud.provider` to a name the registry does not carry (e.g. `"nosuchvendor"`), then dictate | `dictate.log` says the provider is not a known one and names the default it used instead — a silent fall-through would be the bug | | |
 
 ## 3. Speak-back — the assistant's voice
 
@@ -123,5 +125,5 @@ SKIP needs a reason in the evidence cell (e.g. "Wayland-only guard, tested on X1
 
 ---
 
-**Checklist version:** 0.5.0 — pinned to `plugins/voice-loop/.claude-plugin/plugin.json`.
+**Checklist version:** 0.6.0 — pinned to `plugins/voice-loop/.claude-plugin/plugin.json`.
 A mismatch between this version and the plugin version is a stale checklist.
