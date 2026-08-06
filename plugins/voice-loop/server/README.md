@@ -273,9 +273,26 @@ faster but robotic in the same way Silero is; the final call is the same kind th
 came from — a native listener rating the new voice against the old one. That A/B is the acceptance
 check for this engine; the wiring below is what makes it one environment variable away.
 
+**Install the ordered recipe, not a bare `pip install ukrainian-tts`.** A bare install of
+ukrainian-tts (6.0.2) bites twice: it hard-pins `ukrainian-word-stress==1.1.0`, downgrading the
+`>=2.0` the server requires and breaking the Silero uk path's dictionary-only stress mode along
+with it; and it declares `torchaudio`, which nothing else here needs — resolved off the default
+index, that pull arrives CUDA-flavoured, gigabytes of nvidia libraries and all. Same medicine as
+XTTS, verified end to end in a clean venv (and re-verified weekly by the `ukrainian-install` job
+of the `xtts-install-probe` workflow):
+
 ```sh
-pip install ukrainian-tts   # torch is already installed; the MIT-licensed voices download on first use
+# CPU — torch AND torchaudio go in FIRST, from the index you want them from, so the second
+# command finds them satisfied instead of resolving its own (default-index, CUDA-flavoured) wheels
+pip install --index-url https://download.pytorch.org/whl/cpu torch torchaudio
+pip install ukrainian-tts
+# then put the stress pin back — pip WARNS that ukrainian-tts wants ==1.1.0; that warning is
+# expected. The engine only touches Stressifier/StressSymbol, which 2.x keeps, and its import
+# builds that Stressifier — the weekly probe exercises exactly this pairing.
+pip install 'ukrainian-word-stress>=2.0'
 ```
+
+The MIT-licensed voices download from Hugging Face on first use.
 
 Then route Ukrainian at it — per language, which is the shape you want, or globally:
 
@@ -297,8 +314,8 @@ What to know:
 - **Licensing**: unlike the XTTS-v2 weights (CPML, non-commercial), the ukrainian-tts package and
   its voices are **MIT-licensed** per the upstream project — commercial use is fine. They are still
   **never bundled**: the package downloads them from Hugging Face on **your** first request.
-- **Import failures** read exactly like the xtts ones: a genuinely absent package says
-  `pip install ukrainian-tts`; a package that is installed but cannot import names the exception
+- **Import failures** read exactly like the xtts ones: a genuinely absent package hands you the
+  ordered recipe above; a package that is installed but cannot import names the exception
   class and the missing dependency, with the message kept in the server log.
 - **Stress**: the engine runs its **own** stress pass (ukrainian-word-stress in dictionary mode —
   the same dictionary the Silero path uses), so the Silero stress pipeline and your `stress.json`

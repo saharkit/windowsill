@@ -76,15 +76,18 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: install the documented recipe into a clean venv (CPU torch first)
+      - name: install the documented recipe into a clean venv (CPU torch/torchaudio first)
         run: |
           python3 -m venv /tmp/ukrainian-probe
           /tmp/ukrainian-probe/bin/pip install --upgrade pip
-          /tmp/ukrainian-probe/bin/pip install --index-url https://download.pytorch.org/whl/cpu torch
+          /tmp/ukrainian-probe/bin/pip install --index-url https://download.pytorch.org/whl/cpu torch torchaudio
           /tmp/ukrainian-probe/bin/pip install ukrainian-tts
+          # 6.0.2 hard-pins ukrainian-word-stress==1.1.0, downgrading the >=2.0 the server needs —
+          # the documented recipe's last step puts it back (pip warns about the pin; that is expected)
+          /tmp/ukrainian-probe/bin/pip install 'ukrainian-word-stress>=2.0'
 
       - name: what actually resolved
-        run: /tmp/ukrainian-probe/bin/pip list | grep -Ei "^(torch|ukrainian-tts|ukrainian-word-stress) "
+        run: /tmp/ukrainian-probe/bin/pip list | grep -Ei "^(torch|torchaudio|ukrainian-tts|ukrainian-word-stress) "
 
       - name: import it and pin the API surface the server calls (no model download)
         run: |
@@ -93,11 +96,19 @@ jobs:
           from ukrainian_tts.tts import TTS, Voices, Stress
 
           # The server's UKRAINIAN_VOICES / UKRAINIAN_STRESS constants and the positional
-          # model.tts(text, voice, stress, file) call in ukrainian_pieces() are this contract;
+          # model.tts(text, voice, stress, buffer) call in ukrainian_pieces() are this contract;
           # constructing TTS() would download the voices, so the signature stands in for the call.
           assert Stress.Dictionary.value == "dictionary", list(Stress)
           assert {voice.value for voice in Voices} >= {"tetiana", "mykyta", "lada"}, list(Voices)
-          params = list(inspect.signature(TTS.tts).parameters)
-          assert params[:5] == ["self", "text", "voice", "stress", "file"], params
+          sig = inspect.signature(TTS.tts)
+          params = list(sig.parameters)
+          # The call is POSITIONAL, so the honest contract is the arity, the first four names, and
+          # a 5th parameter that takes the writable buffer by position — its NAME is upstream's
+          # own business (6.0.2 says output_fp; earlier releases said file). A rename that keeps
+          # the position breaks nothing the server does and must not red this probe; a positional
+          # change — a reorder, an insertion, the buffer going keyword-only — still must.
+          assert params[:4] == ["self", "text", "voice", "stress"], params
+          assert len(params) >= 5 and params[4] in ("file", "output_fp"), params
+          assert sig.parameters[params[4]].kind is inspect.Parameter.POSITIONAL_OR_KEYWORD, params
           print("ukrainian-tts import ok; the API surface matches what the server fakes")
           EOF

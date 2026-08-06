@@ -907,7 +907,9 @@ def ukrainian_import_error(err: ImportError) -> JSONResponse:
             {
                 "error": "ukrainian import failed: ModuleNotFoundError for 'ukrainian_tts' — the optional "
                 "ukrainian-tts package is not installed",
-                "hint": "pip install ukrainian-tts — its MIT-licensed voices download from Hugging Face "
+                "hint": "install the documented recipe (server/README.md → Ukrainian engine): CPU "
+                "torch/torchaudio first, then pip install ukrainian-tts, then pip install "
+                "'ukrainian-word-stress>=2.0' — its MIT-licensed voices download from Hugging Face "
                 "on first use",
             },
             status_code=500,
