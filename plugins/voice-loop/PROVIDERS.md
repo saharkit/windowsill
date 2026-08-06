@@ -26,7 +26,7 @@ the cloud rows below are the path that works today.
 | provider | default model | latency | cost per minute | language coverage | privacy posture |
 |---|---|---|---|---|---|
 | `openai` (STT) | `whisper-1` | a second or two for a short clip; the whole clip uploads before work starts | list price **$0.006/min** | ~99 languages, **Russian ✅ Ukrainian ✅** | audio leaves the machine; retention follows the account's API data policy |
-| `elevenlabs` (STT) | `scribe_v1` | a second or two; accuracy-first rather than latency-first | ≈**$0.0067/min** (≈$0.40/hour) on the paid tiers | 99 languages, **Russian ✅ Ukrainian ✅**; auto-detected, so `stt.language` does not reach it ([#93](https://github.com/saharkit/windowsill/issues/93)) | audio leaves the machine; zero-retention is an account/enterprise setting |
+| `elevenlabs` (STT) | `scribe_v1` | a second or two; accuracy-first rather than latency-first | ≈**$0.0067/min** (≈$0.40/hour) on the paid tiers | 99 languages, **Russian ✅ Ukrainian ✅**; `stt.language` rides as Scribe's `language_code`, and an empty one lets it auto-detect | audio leaves the machine; zero-retention is an account/enterprise setting |
 | `deepgram` (STT) | `nova-3` | the quickest of the three on short clips | ≈**$0.0043/min** pre-recorded; new accounts start with a **$200 credit** | **Russian ✅** via nova-3 multilingual (set `stt.language: "multi"`); **Ukrainian ⚠️** — nova-3 multilingual does not cover it, use `stt.model: "nova-2"` and check the vendor's model/language matrix | audio leaves the machine; a self-hosted deployment is offered, and `stt.cloud.endpoint` points at one |
 
 ## Text-to-speech — `tts.cloud.provider`
