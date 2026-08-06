@@ -26,6 +26,28 @@ Then install what you want — this one is typed **inside a session**, not in yo
 /plugin install <plugin>@windowsill
 ```
 
+## Windows: WSL2 + WSLg
+
+On Windows, the supported path is **WSL2 with WSLg** (Windows 11). From an elevated PowerShell:
+
+```sh
+wsl --install
+```
+
+Then open your WSL distribution and follow the ordinary Linux quickstart above, unchanged —
+the marketplace add and the `/plugin install` work exactly as written inside the distro.
+
+**WSLg** — the GUI/audio layer built into WSL2 on Windows 11 — carries microphone and audio
+passthrough into the distro, so a voice plugin can record and play back without extra setup.
+
+Server-style contours are unaffected: a local server runs fine inside WSL itself, and a LAN
+server is trivial — the server lives elsewhere on the network, and WSL reaches it like any
+other Linux host.
+
+**Status:** a real-WSL2 verification pass is pending and tracked in
+[#41](https://github.com/saharkit/windowsill/issues/41) — until it lands, this section is the
+supported *path*, not a tested guarantee.
+
 ## What is on the sill
 
 | plugin | version | what it does | |
