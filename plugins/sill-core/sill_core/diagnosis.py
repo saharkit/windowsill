@@ -159,6 +159,14 @@ def _run_config_check(check: dict[str, Any], config: dict[str, Any]) -> dict[str
     if value is _MISSING:
         return None  # path not present → check passes
 
+    # Reject manifests that specify both equals and not_equals — the precedence
+    # is non-obvious and either would suppress the other silently.
+    if "equals" in check and "not_equals" in check:
+        raise ValueError(
+            f"check for path '{path}' specifies both 'equals' and 'not_equals'; "
+            "specify only one condition"
+        )
+
     if "equals" in check:
         triggered = value == check["equals"]
     elif "not_equals" in check:
@@ -203,11 +211,15 @@ def _run_log_check(check: dict[str, Any], logs: dict[str, list[str]]) -> dict[st
     matches = [line for line in lines if pattern in line]
     if len(matches) < min_count:
         return None
+    # When count is 0, the check triggers on zero matches (not intended) but we
+    # still want to show all matches in evidence. For count > 0, show the last N.
+    # Use min(len(matches), max(1, min_count)) to avoid the matches[-0:] edge case.
+    shown = matches[-min_count:] if min_count > 0 else matches
     return {
         "source": source,
         "pattern": pattern,
         "match_count": len(matches),
-        "matches": matches[-min_count:],  # last N matches only
+        "matches": shown,
     }
 
 
@@ -288,5 +300,5 @@ def diagnose(
     # Sort by bin order: CONSEQUENCE_OF_CHOICE first, then UNFINISHED_INSTALL,
     # then REAL_ANOMALY.  Within each bin preserve manifest order.
     _bin_order = {b: i for i, b in enumerate(Bin)}
-    findings.sort(key=lambda f: (_bin_order.get(f.bin, 99), 0))
+    findings.sort(key=lambda f: _bin_order.get(f.bin))
     return findings
