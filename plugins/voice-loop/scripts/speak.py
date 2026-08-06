@@ -24,10 +24,16 @@ Deliberate behaviours, found by live debugging — do not "simplify" them away:
   ran out, with no older clip playing to extend the wait, was dropped in silence. So where the
   ladder ends with nothing new, the TRANSCRIPT'S OWN ACTIVITY extends it — while (size, mtime_ns)
   keeps ADVANCING somebody is still appending, and each advance buys one more poll, bounded by
-  FLUSH_POLLS (12.5 s, so ~15 s all told) so a wedged writer can never hold the turn open. The
-  entry condition is unchanged and so is the cost of an IDLE transcript: a file that did not move
-  while the ladder ran is answered on the first stat, with zero extra sleep, which is exactly
-  today's behaviour for a turn that genuinely had nothing to say.
+  FLUSH_POLLS (12.5 s) so a wedged writer can never hold the turn open. The entry condition is
+  unchanged and so is the cost of an IDLE transcript: a file that did not move while the ladder ran
+  is answered on the first stat, with zero extra sleep, which is exactly today's behaviour for a
+  turn that genuinely had nothing to say.
+  THE WORST CASE IS THE COMPOSITION, and it is worth stating plainly because the three waits run in
+  SEQUENCE from one main(): 2.65 s of ladder, then up to PLAYBACK_POLLS * PLAYBACK_POLL = 20 s of
+  waiting out a wedged player, then up to FLUSH_POLLS * FLUSH_POLL = 12.5 s of a transcript that
+  keeps growing — **35.15 s** in all, against a Stop hook the harness gives 60 s. Reaching it needs
+  BOTH pathologies at once (a player that never exits AND a file appended to throughout); either
+  alone is 22.65 s or 15.15 s, and the overwhelming common case is still 0 s.
 * queued, not dropped — that backoff is 2.65 s all told, and one cloud clip runs ~10 s. A Stop that
   ran out of ladder while the PREVIOUS line was still playing used to give up, and the line was
   never spoken at all: the voice appeared to lag turns behind. So when the ladder runs out with
@@ -39,8 +45,10 @@ Deliberate behaviours, found by live debugging — do not "simplify" them away:
 * never a silent drop — a hook that stops without speaking says why in the log. This one cost a
   session of log archaeology: speak.log held NO entry at all for lines the user never heard.
   Every path that abandons a line logs its reason, and since #106 so does every path that abandons
-  NOTHING: a Stop firing writes EXACTLY ONE reason line whatever it decides — nothing marked, the
-  ledger's veto, the dedup drop, the give-up after the ladder, speech switched off. That is what
+  NOTHING: a Stop firing ALWAYS writes a reason line — nothing marked, the ledger's veto, the dedup
+  drop, the give-up after the ladder, speech switched off. Never zero, and not always exactly one:
+  a firing that waited says what it waited for as well as what it decided (a wedged player and a
+  growing transcript each leave their own line before the verdict). That is what
   makes conformance row 3.12 ("a turn with NO log line at all is a FAIL") literally checkable
   instead of nearly true; the forensics that reopened it were a manual replay of the silent turn
   exiting 0 with no log line at all, which left the log unable to tell "the hook gave up" from
@@ -188,9 +196,14 @@ PLAYBACK_POLLS = 80
 # What happens where the ladder runs out and the TRANSCRIPT is still being appended to (#106):
 # every poll that sees the file advance buys another one, so a long turn's flush is waited out
 # rather than dropped. The bound is a COUNT of polls for the same reason PLAYBACK_POLLS is — that
-# is the bound a test can drive with a fake sleep — and FLUSH_POLLS * FLUSH_POLL is 12.5 s, which
-# past the 2.65 s ladder puts the ceiling at ~15 s. An idle transcript costs ZERO polls: the first
-# stat already answers "nobody is writing", which is why a quiet turn is as cheap as it ever was.
+# is the bound a test can drive with a fake sleep — and FLUSH_POLLS * FLUSH_POLL is 12.5 s.
+#
+# THE THREE WAITS COMPOSE, in sequence, inside one main(): sum(BACKOFF) 2.65 s + PLAYBACK_POLLS *
+# PLAYBACK_POLL 20 s + FLUSH_POLLS * FLUSH_POLL 12.5 s = 35.15 s, which is the honest ceiling of a
+# Stop firing (the harness allows 60 s) and is pinned by a test rather than left to arithmetic in a
+# comment. It needs a wedged player AND a file appended to throughout; neither is the common case,
+# and an idle transcript costs ZERO polls here — the first stat already answers "nobody is
+# writing", which is why a quiet turn is as cheap as it ever was.
 FLUSH_POLL = 0.25
 FLUSH_POLLS = 50
 

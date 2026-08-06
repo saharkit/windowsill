@@ -1855,6 +1855,107 @@ class TestALineThatLandsPastTheLadder:
         assert "gave up with nothing new in the transcript" in _speak_log(state)
 
 
+class TestTheComposedCeiling:
+    """What ONE firing can cost when everything goes wrong at once.
+
+    The three waits run in SEQUENCE inside one main(), and a bound nobody measured is a bound
+    nobody has: the ladder, then the wedged-player wait, then the growing-transcript wait. This
+    pins their SUM, so a future poll-count change cannot quietly walk the Stop hook past the 60 s
+    the harness allows it.
+    """
+
+    def test_a_wedged_player_and_a_growing_transcript_cost_exactly_the_three_bounds(
+        self, state, monkeypatch
+    ):
+        transcript = state / "transcript.jsonl"
+        transcript.write_text("", encoding="utf-8")
+        _write_config(state, monkeypatch)
+        # A player that never exits: playback_is_live stays true for every poll of the first wait.
+        monkeypatch.setattr(speak, "playback_is_live", lambda: True)
+
+        sleeps: list[float] = []
+
+        def fake_sleep(seconds: float) -> None:
+            # …and a transcript somebody keeps appending to, so the second wait runs to ITS bound
+            # too. Nothing marked ever lands, so no read can settle and cut either wait short.
+            sleeps.append(seconds)
+            with transcript.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps({"type": "user", "message": {"content": []}}) + "\n")
+
+        payload = json.dumps({"transcript_path": str(transcript), "hook_event_name": "Stop"})
+        monkeypatch.setattr(speak.sys, "stdin", _Stdin(payload))
+        monkeypatch.setattr(speak.time, "sleep", fake_sleep)
+        assert speak.main() == 0
+
+        expected = (
+            sum(speak.BACKOFF)
+            + speak.PLAYBACK_POLLS * speak.PLAYBACK_POLL
+            + speak.FLUSH_POLLS * speak.FLUSH_POLL
+        )
+        assert sum(sleeps) == pytest.approx(expected)
+        assert expected == pytest.approx(35.15)  # the number the docs state, held to the code
+        log_text = _speak_log(state)
+        # and it says what it waited for, twice, before saying what it decided — the docs claim a
+        # reason line always, never that there is exactly one
+        assert "still playing after" in log_text
+        assert "still growing after" in log_text
+        assert "gave up with nothing new in the transcript" in log_text
+
+
+class TestARepeatedLineIsStillTheRaceSignature:
+    """THE DECISION behind Q-2, pinned so a future change has to argue with a red test.
+
+    `settled()` is False for a read identical to the last spoken line, and that single signature
+    covers two different worlds: a genuine repeat («Done.» twice), and #106's OWN reported failure
+    — the ladder reading the PREVIOUS message because this turn's has not been flushed yet. The
+    forensics say it plainly: "the ladder read only the PREVIOUS message ('Ура …', already spoken
+    → the race signature held)".
+
+    Nothing in an eager-off read can tell those apart (the pre-0.3.2 memory is one last-spoken
+    STRING, with no message index behind it), so treating the signature as a decided answer would
+    make the whole (b) half of this ticket inert for exactly the turn that opened it. The wait
+    therefore STAYS for it. What it costs is bounded and rare — a repeat AND a file somebody is
+    still appending to — and the dedup verdict is logged the moment the wait ends.
+    """
+
+    def test_a_repeat_arriving_while_the_transcript_grows_is_waited_out_not_decided(
+        self, state, monkeypatch
+    ):
+        transcript = state / "transcript.jsonl"
+        transcript.write_text("", encoding="utf-8")
+        spoken = _record_speech(monkeypatch)
+        _write_config(state, monkeypatch)
+        _append_message(transcript, "🔊 Done.")
+        assert _fire(state, monkeypatch, transcript, "Stop")[0] == 0
+        assert spoken == ["Done."]
+
+        # The SAME message still being the last one, and a transcript that keeps growing: this is
+        # the reported shape, and the hook must keep looking rather than call it a repeat at once.
+        (state / "speak.log").write_text("", encoding="utf-8")
+
+        def fake_sleep(seconds: float) -> None:
+            with transcript.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps({"type": "user", "message": {"content": []}}) + "\n")
+
+        payload = json.dumps({"transcript_path": str(transcript), "hook_event_name": "Stop"})
+        monkeypatch.setattr(speak.sys, "stdin", _Stdin(payload))
+        monkeypatch.setattr(speak.time, "sleep", fake_sleep)
+        assert speak.main() == 0
+
+        assert spoken == ["Done."]  # nothing said twice
+        log_text = _speak_log(state)
+        assert "the transcript stopped growing" not in log_text  # it really did keep growing
+        assert "still growing after" in log_text  # the wait ran to its bound
+        assert "dropped a read identical to the last spoken line (dedup): Done." in log_text
+
+    def test_a_repeat_on_a_quiet_transcript_still_costs_only_the_ladder(self, state, monkeypatch):
+        """The cost the decision above is bounded BY: with nobody appending, the give-up is the
+        ladder and one stat, exactly as before #106."""
+        _write_config(state, monkeypatch)
+        assert _speak_turns(state, monkeypatch, ["Done.", "Done."]) == ["Done."]
+        assert "dropped a read identical to the last spoken line (dedup): Done." in _speak_log(state)
+
+
 class TestEveryStopExitSaysWhy:
     """Conformance 3.12, made literally true: a Stop firing writes exactly one reason line
     whatever it decides. A turn with NO log line at all is what made the live drop invisible."""
