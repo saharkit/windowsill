@@ -1710,6 +1710,23 @@ def test_an_eager_firing_with_nothing_new_stays_out_of_the_log(state, monkeypatc
 # Four seconds in — past the whole 2.65 s ladder, which is what made the live turn unrecoverable.
 FLUSH_SECONDS_LATE = 4.0
 
+# The budget the composed ceiling has to fit inside, mirrored from THIS plugin's own manifest:
+# hooks/hooks.json declares "timeout": 90 on both registrations. Mirrored rather than imported
+# because the test is about the RELATION, and asserted against the manifest below so the mirror
+# cannot quietly drift from the file it claims to quote.
+HOOK_TIMEOUT_S = 90
+
+
+def test_the_mirrored_hook_timeout_is_the_one_the_manifest_declares():
+    manifest = json.loads((Path(__file__).resolve().parents[1] / "hooks" / "hooks.json").read_text(encoding="utf-8"))
+    declared = {
+        entry["timeout"]
+        for registrations in manifest["hooks"].values()
+        for registration in registrations
+        for entry in registration["hooks"]
+    }
+    assert declared == {HOOK_TIMEOUT_S}
+
 
 class _FakeStat:
     """What os.stat gives wait_out_flush, and the only two fields it reads."""
@@ -1774,6 +1791,24 @@ class TestWaitOutFlush:
         assert text == "the line the flush was still writing"
         assert sleeps == [speak.FLUSH_POLL] * 3
         assert "landed 0.75s past the ladder" in _speak_log(state)
+
+    def test_a_message_that_marked_nothing_is_not_called_a_line(self, state, sleeps):
+        """settled() is true for '' as well — a message that parsed and marked NOTHING is a final
+        answer and lands here exactly like a line does. Saying "the line landed" over it would put
+        a line in the log that was never in the transcript."""
+        sizes = iter([20, 30])
+        answers = iter([""])
+        text = speak.wait_out_flush(
+            "transcript.jsonl",
+            lambda: next(answers),
+            lambda value: value == "" or bool(value),
+            None,
+            (10, 5),
+            stat=lambda path: _FakeStat(next(sizes), 5),
+        )
+        assert text == ""
+        assert "a message with nothing marked landed 0.25s past the ladder" in _speak_log(state)
+        assert "the line landed" not in _speak_log(state)
 
     def test_the_wait_ends_the_moment_the_file_stops_growing(self, state, sleeps):
         """A writer that fell quiet has answered the question: whatever was coming is not coming."""
@@ -1893,13 +1928,65 @@ class TestTheComposedCeiling:
             + speak.FLUSH_POLLS * speak.FLUSH_POLL
         )
         assert sum(sleeps) == pytest.approx(expected)
-        assert expected == pytest.approx(35.15)  # the number the docs state, held to the code
+        # THE RELATION, not the arithmetic: what matters is that the composed ceiling fits inside
+        # the budget this plugin declares for its own hooks. A future poll-count change is free to
+        # move the sum; it is not free to walk the Stop hook past its own timeout.
+        assert expected < HOOK_TIMEOUT_S
         log_text = _speak_log(state)
         # and it says what it waited for, twice, before saying what it decided — the docs claim a
         # reason line always, never that there is exactly one
         assert "still playing after" in log_text
         assert "still growing after" in log_text
         assert "gave up with nothing new in the transcript" in log_text
+
+
+class TestTheFlushWaitIsEagerOffOnly:
+    """The gate: a Stop firing with `speak.eager` ON never waits on a growing transcript.
+
+    Not a performance nicety — the whole read-claim-speak sequence runs under speaking.lock, so a
+    Stop that waits 12.5 s is 12.5 s in which no eager firing can speak at all. And it buys
+    nothing: the next PostToolUse firing reads EVERY message, so the late line is said for free one
+    tool call later. #106 was reported on the default (eager-off) install, which is exactly the
+    configuration with no successor to fall back on.
+    """
+
+    def _growing(self, monkeypatch, state) -> None:
+        """A transcript that advances on every single look — the condition the wait polls on."""
+        counter = itertools.count()
+        monkeypatch.setattr(speak, "transcript_activity", lambda path, stat=os.stat: (next(counter), 0))
+
+    def test_an_eager_stop_with_nothing_marked_at_all_never_polls_the_transcript(
+        self, state, monkeypatch
+    ):
+        """Nothing vetoed, nothing spoken, a file that keeps growing: pre-gate this cost the full
+        12.5 s under the lock, and the ledger check could not have prevented it."""
+        _write_config(state, monkeypatch, eager=True)
+        transcript = state / "transcript.jsonl"
+        transcript.write_text("{not json yet\n", encoding="utf-8")  # no assistant message: read is None
+        _record_speech(monkeypatch)
+        self._growing(monkeypatch, state)
+
+        rc, sleeps = _fire(state, monkeypatch, transcript, "Stop")
+
+        assert rc == 0
+        assert sleeps == list(speak.BACKOFF)  # the ladder, and not one flush poll more
+        assert "still growing" not in _speak_log(state)
+        assert "gave up with nothing new in the transcript" in _speak_log(state)
+
+    def test_an_eager_off_stop_in_the_same_position_still_waits(self, state, monkeypatch):
+        """The other side of the gate, so it is a GATE and not a removal: the default install —
+        the one #106 was reported on — keeps the wait it was given."""
+        _write_config(state, monkeypatch)  # eager off
+        transcript = state / "transcript.jsonl"
+        transcript.write_text("{not json yet\n", encoding="utf-8")
+        _record_speech(monkeypatch)
+        self._growing(monkeypatch, state)
+
+        rc, sleeps = _fire(state, monkeypatch, transcript, "Stop")
+
+        assert rc == 0
+        assert len(sleeps) == len(speak.BACKOFF) + speak.FLUSH_POLLS
+        assert "still growing after 12.5s" in _speak_log(state)
 
 
 class TestARepeatedLineIsStillTheRaceSignature:

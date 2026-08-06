@@ -24,16 +24,19 @@ Deliberate behaviours, found by live debugging — do not "simplify" them away:
   ran out, with no older clip playing to extend the wait, was dropped in silence. So where the
   ladder ends with nothing new, the TRANSCRIPT'S OWN ACTIVITY extends it — while (size, mtime_ns)
   keeps ADVANCING somebody is still appending, and each advance buys one more poll, bounded by
-  FLUSH_POLLS (12.5 s) so a wedged writer can never hold the turn open. The entry condition is
-  unchanged and so is the cost of an IDLE transcript: a file that did not move while the ladder ran
-  is answered on the first stat, with zero extra sleep, which is exactly today's behaviour for a
-  turn that genuinely had nothing to say.
+  FLUSH_POLLS (12.5 s) so a wedged writer can never hold the turn open. Its entry condition is the
+  ladder's NARROWED: eager-off only (an eager Stop has a successor one tool call away and holds
+  speaking.lock while it waits, so waiting there buys nothing and mutes everything), which also
+  subsumes the ledger's decided veto. The cost of an IDLE transcript is unchanged: a file that did
+  not move while the ladder ran is answered on the first stat, with zero extra sleep, which is
+  exactly today's behaviour for a turn that genuinely had nothing to say.
   THE WORST CASE IS THE COMPOSITION, and it is worth stating plainly because the three waits run in
   SEQUENCE from one main(): 2.65 s of ladder, then up to PLAYBACK_POLLS * PLAYBACK_POLL = 20 s of
   waiting out a wedged player, then up to FLUSH_POLLS * FLUSH_POLL = 12.5 s of a transcript that
-  keeps growing — **35.15 s** in all, against a Stop hook the harness gives 60 s. Reaching it needs
-  BOTH pathologies at once (a player that never exits AND a file appended to throughout); either
-  alone is 22.65 s or 15.15 s, and the overwhelming common case is still 0 s.
+  keeps growing — **35.15 s** in all, inside the timeout this plugin declares for its own hooks
+  (see the FLUSH_POLL constants below, and hooks/hooks.json for the number). Reaching it needs BOTH
+  pathologies at once (a player that never exits AND a file appended to throughout); either alone
+  is 22.65 s or 15.15 s, and the overwhelming common case is still 0 s.
 * queued, not dropped — that backoff is 2.65 s all told, and one cloud clip runs ~10 s. A Stop that
   ran out of ladder while the PREVIOUS line was still playing used to give up, and the line was
   never spoken at all: the voice appeared to lag turns behind. So when the ladder runs out with
@@ -52,9 +55,12 @@ Deliberate behaviours, found by live debugging — do not "simplify" them away:
   makes conformance row 3.12 ("a turn with NO log line at all is a FAIL") literally checkable
   instead of nearly true; the forensics that reopened it were a manual replay of the silent turn
   exiting 0 with no log line at all, which left the log unable to tell "the hook gave up" from
-  "the hook was never called". The three earlier silences went with it: the two that carry no
-  successor are now logged, and the volume argument died with them, because an enabled install
-  writes a line per turn anyway.
+  "the hook was never called". Two of the three earlier silences went with it — the ones with no
+  successor to catch the line — and the volume argument goes with them: one line per turn in a log
+  that rotates at 1 MB is the price of a "speech is switched off" diagnosis anybody can read, and
+  that trade is worth making once per turn. It costs one thing worth naming: the ``speak.enabled``
+  check now runs AFTER the stdin read (the event has to be known first), so a disabled install
+  reads the hook payload it used to skip — one read of a string the harness already wrote.
   ONE deliberate silence is left, and it is the EAGER path's: a PostToolUse firing with nothing new
   (or nothing marked) has claimed nothing, its line waits one tool call, and it fires after EVERY
   tool call — a line per firing would drown the drops the log exists to make visible.
@@ -199,11 +205,14 @@ PLAYBACK_POLLS = 80
 # is the bound a test can drive with a fake sleep — and FLUSH_POLLS * FLUSH_POLL is 12.5 s.
 #
 # THE THREE WAITS COMPOSE, in sequence, inside one main(): sum(BACKOFF) 2.65 s + PLAYBACK_POLLS *
-# PLAYBACK_POLL 20 s + FLUSH_POLLS * FLUSH_POLL 12.5 s = 35.15 s, which is the honest ceiling of a
-# Stop firing (the harness allows 60 s) and is pinned by a test rather than left to arithmetic in a
-# comment. It needs a wedged player AND a file appended to throughout; neither is the common case,
-# and an idle transcript costs ZERO polls here — the first stat already answers "nobody is
-# writing", which is why a quiet turn is as cheap as it ever was.
+# PLAYBACK_POLL 20 s + FLUSH_POLLS * FLUSH_POLL 12.5 s = 35.15 s. That is the honest ceiling of a
+# Stop firing, and the budget it has to fit inside is THIS PLUGIN'S OWN: hooks/hooks.json declares
+# `"timeout": 90` on both registrations — the one number to check this against, stated here once so
+# nothing else in the tree has to repeat it. The test asserts the RELATION (ceiling < timeout)
+# rather than the arithmetic, because what matters is the fit, not the sum.
+# It needs a wedged player AND a file appended to throughout; neither is the common case, and an
+# idle transcript costs ZERO polls here — the first stat already answers "nobody is writing", which
+# is why a quiet turn is as cheap as it ever was.
 FLUSH_POLL = 0.25
 FLUSH_POLLS = 50
 
@@ -962,7 +971,11 @@ def wait_out_flush(path, read, settled, text, mark, *, stat=os.stat):
         text = read()
         if settled(text):
             waited = polls * FLUSH_POLL
-            log(f"stop: the transcript was still being written — the line landed {waited:.2f}s past the ladder")
+            # settled() is true for '' as well: a message that parsed and marked NOTHING is a final
+            # answer too, and it arrives here exactly like a line does. Saying "the line landed"
+            # over it would put a line in the log that was never in the transcript.
+            landed = "the line" if text else "a message with nothing marked"
+            log(f"stop: the transcript was still being written — {landed} landed {waited:.2f}s past the ladder")
             return text
 
 
@@ -1527,12 +1540,19 @@ def main() -> int:
                 # because there is still nothing new — so waiting out the line in front costs a
                 # ready line nothing and buys a late one its turn.
                 text = wait_out_playback(read_fresh, settled, text)
-            if not settled(text) and not vetoed:
+            if not ledger_on and not settled(text):
                 # …and the other reason a line can be missing: nobody is playing, the ladder simply
                 # ended before this turn's own message finished being written (#106). Waited out on
-                # the file's own evidence, and free when there is none. Not entered when the ledger
-                # vetoed what it read: that is a DECIDED "eager already said it", not a race, and
-                # waiting on a growing transcript for it would hold every eager turn open.
+                # the file's own evidence, and free when there is none.
+                #
+                # EAGER-OFF ONLY, and that is the whole gate. With eager ON this Stop has a
+                # successor — the next PostToolUse firing reads EVERY message and will say the late
+                # line for free — so waiting here buys nothing and costs everything: the whole
+                # read-claim-speak sequence runs under speaking.lock, and a Stop holding it for up
+                # to 35 s is 35 s in which no eager firing can speak at all. (It also subsumes the
+                # ledger's veto, which only exists with the ledger on: "eager already said it" is a
+                # decided answer, never a race.) #106 was reported on the default, eager-off
+                # install, which is exactly the configuration that has no successor to fall back on.
                 text = wait_out_flush(transcript, read_fresh, settled, text, activity)
         if not text:
             if not eager:

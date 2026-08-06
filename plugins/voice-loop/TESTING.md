@@ -79,10 +79,13 @@ the real runtime. So the guarantee is layered differently:
    all), a file that stops growing ends the wait, an idle one costs a single `stat` and keeps the
    2.65 s exactly, and the whole extension is bounded by a poll count like the queue's is. The
    three waits **compose in sequence** inside one firing — 2.65 s of ladder + up to 20 s of waiting
-   out a wedged player + up to 12.5 s of a still-growing transcript = **35.15 s**, against the 60 s
-   the harness allows a `Stop` hook — and that ceiling is a test (`sum(sleeps)` under both
-   pathologies at once) rather than arithmetic in a comment, because a composed bound nobody
-   measured is a bound nobody has. The
+   out a wedged player + up to 12.5 s of a still-growing transcript = **35.15 s** — and that
+   ceiling is a test (`sum(sleeps)` under both pathologies at once, asserted to fit inside the
+   `timeout` this plugin declares for its own hooks in `hooks/hooks.json`) rather than arithmetic
+   in a comment, because a composed bound nobody measured is a bound nobody has. The wait is
+   **eager-off only**: with `speak.eager` on, the Stop firing has a successor one tool call away
+   and holds `speaking.lock` while it waits, so waiting there would mute the very path that would
+   have said the line. The
    other half of that ticket is asserted as an absence of silence: **every** `Stop` exit writes one
    reason line — nothing marked, a bare marker, the ledger's veto, `speak.enabled: false` — which
    is conformance row 3.12 ("a turn with NO log line at all is a FAIL") stated as tests, and the
