@@ -211,21 +211,14 @@ def _run_log_check(check: dict[str, Any], logs: dict[str, list[str]]) -> dict[st
     }
 
 
-# Runners dispatched by type — a plugin author never touches this dict.
+# Runners dispatched by check type — a plugin author never touches this dict.
+# The same key selects the source ``diagnose()`` hands the runner, so a runner
+# registered here without a matching source fails loudly (KeyError) on its first
+# check instead of silently producing no finding.
 _CHECK_RUNNERS = {
     "config": _run_config_check,
     "ledger": _run_ledger_check,
     "log": _run_log_check,
-}
-
-# Which source each runner is handed, by the source names ``diagnose()`` uses.
-# Every key of ``_CHECK_RUNNERS`` must appear here: the lookup is unconditional,
-# so a runner registered without a source fails loudly (KeyError) on its first
-# check instead of silently producing no finding.
-_CHECK_SOURCES = {
-    "config": "config",
-    "ledger": "ledger",
-    "log": "logs",
 }
 
 
@@ -252,10 +245,12 @@ def diagnose(
     unfinished install, then real anomaly.  Within each bin the manifest order
     is preserved.
     """
+    # Keyed by CHECK TYPE, not by parameter name — the same key that selects
+    # the runner selects the source it is handed.
     sources: dict[str, Any] = {
         "config": config or {},
         "ledger": ledger or {},
-        "logs": logs or {},
+        "log": logs or {},
     }
 
     findings: list[Finding] = []
@@ -273,7 +268,7 @@ def diagnose(
         if runner is None:
             continue  # unknown check type → skip
 
-        evidence = runner(check_def, sources[_CHECK_SOURCES[check_type]])
+        evidence = runner(check_def, sources[check_type])
 
         if evidence is not None:
             findings.append(

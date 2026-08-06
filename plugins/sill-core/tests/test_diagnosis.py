@@ -23,8 +23,6 @@ import pytest
 from sill_core.diagnosis import (
     Bin,
     Finding,
-    _CHECK_RUNNERS,
-    _CHECK_SOURCES,
     _MISSING,
     _resolve_path,
     _run_config_check,
@@ -265,11 +263,77 @@ class TestDiagnose:
         }]
         assert diagnose(manifest) == []
 
-    def test_every_runner_declares_a_source(self) -> None:
-        """Dispatch is data-driven: ``diagnose()`` looks a runner's source up
-        unconditionally, so a runner registered without one would raise KeyError
-        on its first check.  Pin the two tables to the same key set."""
-        assert _CHECK_RUNNERS.keys() == _CHECK_SOURCES.keys()
+
+# ---------------------------------------------------------------------------
+# Routing — each check type reaches its OWN source
+#
+# Dispatch is a table lookup, so a mis-wired type is no longer visible as an
+# uncovered branch and the coverage gate cannot protect the property.  These
+# tests do: every call below passes ALL THREE sources, each carrying a marker
+# that appears in no other source, so a check handed the wrong dict either
+# produces no finding at all or produces evidence without its marker.
+# ---------------------------------------------------------------------------
+
+
+def _routing_sources() -> dict[str, Any]:
+    """All three sources, each holding a marker unique to it."""
+    return {
+        "config": {"marker": {"config": "config-marker"}},
+        "ledger": {
+            "state": "ledger-marker",
+            "current_step": "step-pending",
+            "completed_steps": ["step-done"],
+        },
+        "logs": {"marker.log": ["a line carrying log-marker"]},
+    }
+
+
+def _routing_manifest(check: dict[str, Any]) -> list[dict[str, Any]]:
+    return [{
+        "bin": "real_anomaly",
+        "key": "routing",
+        "title": "Routing",
+        "explanation": "...",
+        "check": check,
+    }]
+
+
+class TestRouting:
+    def test_config_check_reads_the_config_source(self) -> None:
+        manifest = _routing_manifest(
+            {"type": "config", "path": "marker.config", "equals": "config-marker"}
+        )
+        findings = diagnose(manifest, **_routing_sources())
+        assert len(findings) == 1
+        assert findings[0].evidence == {
+            "path": "marker.config",
+            "value": "config-marker",
+        }
+
+    def test_ledger_check_reads_the_ledger_source(self) -> None:
+        manifest = _routing_manifest(
+            {"type": "ledger", "steps": ["step-done", "step-pending"]}
+        )
+        findings = diagnose(manifest, **_routing_sources())
+        assert len(findings) == 1
+        assert findings[0].evidence == {
+            "incomplete_steps": ["step-pending"],
+            "current_step": "step-pending",
+            "ledger_state": "ledger-marker",
+        }
+
+    def test_log_check_reads_the_log_source(self) -> None:
+        manifest = _routing_manifest(
+            {"type": "log", "source": "marker.log", "pattern": "log-marker"}
+        )
+        findings = diagnose(manifest, **_routing_sources())
+        assert len(findings) == 1
+        assert findings[0].evidence == {
+            "source": "marker.log",
+            "pattern": "log-marker",
+            "match_count": 1,
+            "matches": ["a line carrying log-marker"],
+        }
 
 
 # ---------------------------------------------------------------------------
