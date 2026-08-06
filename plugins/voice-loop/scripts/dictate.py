@@ -216,6 +216,9 @@ def resolve_paste_target(value) -> str:
 
 def resolve_settings(config: dict, system: str) -> dict:
     """Every knob dictate-toggle.sh honoured, same names, same defaults, same precedence."""
+    stt_provider = str(cfg(config, "stt.cloud.provider", "openai"))
+    # provider-specific default model: "scribe_v1" for ElevenLabs Scribe, "whisper-1" for OpenAI
+    default_stt_model = "scribe_v1" if stt_provider == "elevenlabs" else "whisper-1"
     return {
         "mode": str(cfg(config, "dictate.mode", "send")),
         "paste_key": str(cfg(config, "dictate.paste_key", "cmd+v" if system == "Darwin" else "ctrl+shift+v")),
@@ -237,8 +240,10 @@ def resolve_settings(config: dict, system: str) -> dict:
         # top-level "language" is the one the user sets; ".stt.language" is the advanced escape
         # for people who dictate in one language and listen in another.
         "language": str(cfg(config, "stt.language", cfg(config, "language", "en"))),
-        "stt_model": str(cfg(config, "stt.model", "whisper-1")),
+        "stt_model": str(cfg(config, "stt.model", default_stt_model)),
         "stt_command": str(cfg(config, "stt.command", "")),
+        "stt_provider": stt_provider,
+        "cloud_endpoint": str(cfg(config, "stt.cloud.endpoint", "")),
         "key_env": str(cfg(config, "stt.cloud.api_key_env", cfg(config, "stt.api_key_env", "VOICE_LOOP_STT_API_KEY"))),
         "key_file": str(cfg(config, "stt.cloud.key_file", "")),
         "timeout": float(cfg(config, "stt.timeout", 60)),
@@ -613,7 +618,12 @@ def _post_multipart(url: str, headers: dict, body: bytes, boundary: str, timeout
 
 
 def transcribe(s: dict) -> str:
-    """The recorded WAV -> text, by whichever backend is configured."""
+    """The recorded WAV -> text, by whichever backend is configured.
+
+    When the cloud backend fails (network, auth, quota, API error) the call degrades to
+    the local whisper server — a logged fallback, never a silent dead mic. The degrade
+    is one-shot: it does not retry the cloud, and it does not retry the fallback.
+    """
     if s["stt_command"]:
         # local engine without a server: the command gets the wav path as its last argument
         # and prints the transcript (e.g. whisper.cpp: "whisper-cli -m model.bin -nt -f").
@@ -637,23 +647,82 @@ def transcribe(s: dict) -> str:
             wav_bytes = fh.read()
     except OSError:
         return ""
-    boundary = uuid.uuid4().hex
     if s["backend"] == "cloud":
+        boundary = uuid.uuid4().hex
+        text = _transcribe_cloud(s, wav_bytes, boundary)
+        if text is not None:
+            return text
+        # Cloud failed — degrade to the local whisper server.  Logged so the operator
+        # can see that a transcription happened at all and that it came from the fallback.
+        log("cloud stt failed — falling back to local whisper")
+        # The degrade always goes to the localhost server, not to the configured cloud
+        # endpoint: a cloud user's ``stt.endpoint`` may point at a remote API.
+        return _transcribe_lan("http://127.0.0.1:8355", s["language"], wav_bytes, s["timeout"])
+    return _transcribe_lan(s["endpoint"], s["language"], wav_bytes, s["timeout"])
+
+
+def _transcribe_lan(endpoint: str, language: str, wav_bytes: bytes, timeout: float) -> str:
+    """POST the WAV to a voice-loop server's /stt endpoint — the LAN path and the
+    cloud-degrade target both use this."""
+    boundary = uuid.uuid4().hex
+    body = multipart_form({}, "audio", "dictate.wav", wav_bytes, boundary)
+    url = f"{endpoint}/stt?language={urllib.parse.quote(language)}"
+    raw = _post_multipart(url, {}, body, boundary, timeout)
+    return transcript_from_response(raw)
+
+
+def _transcribe_cloud(s: dict, wav_bytes: bytes, boundary: str) -> str | None:
+    """Try cloud transcription. Returns the transcript on success, or None when the
+    caller should degrade to the local whisper path.
+
+    The caller logs the degrade reason — this function only logs the specific failure
+    that made the cloud path unusable (missing key, network error, API error document).
+    """
+    if s["stt_provider"] == "elevenlabs":
+        key = read_key(s["key_file"], s["key_env"], os.environ)
+        if not key:
+            # One credentials home: re-use the existing ElevenLabs key from the TTS side
+            # so a user who already configured voice-design has dictation working too.
+            key = read_key(s.get("key_file", ""), "VOICE_LOOP_TTS_API_KEY", os.environ)
+        if not key:
+            log(f"elevenlabs stt: no key (key_file unset/unreadable, ${s['key_env']} empty, "
+                "and $VOICE_LOOP_TTS_API_KEY empty)")
+            return None
+        cloud_endpoint = s.get("cloud_endpoint") or "https://api.elevenlabs.io"
+        body = multipart_form(
+            {"model_id": s["stt_model"]}, "file", "dictate.wav", wav_bytes, boundary
+        )
+        raw = _post_multipart(
+            f"{cloud_endpoint}/v1/speech-to-text",
+            {"xi-api-key": key}, body, boundary, s["timeout"],
+        )
+    else:
+        # OpenAI-compatible speech-to-text (the existing cloud path).
         key = read_key(s["key_file"], s["key_env"], os.environ)
         if not key:
             log(f"cloud stt: no key (key_file unset/unreadable and ${s['key_env']} empty)")
-            return ""
+            return None
+        cloud_endpoint = s.get("cloud_endpoint") or s["endpoint"]
         body = multipart_form(
             {"model": s["stt_model"], "language": s["language"]}, "file", "dictate.wav", wav_bytes, boundary
         )
         raw = _post_multipart(
-            f"{s['endpoint']}/v1/audio/transcriptions", {"Authorization": f"Bearer {key}"}, body, boundary, s["timeout"]
+            f"{cloud_endpoint}/v1/audio/transcriptions",
+            {"Authorization": f"Bearer {key}"}, body, boundary, s["timeout"],
         )
-    else:
-        body = multipart_form({}, "audio", "dictate.wav", wav_bytes, boundary)
-        url = f"{s['endpoint']}/stt?language={urllib.parse.quote(s['language'])}"
-        raw = _post_multipart(url, {}, body, boundary, s["timeout"])
-    return transcript_from_response(raw)
+    if raw is None:
+        return None  # network error — already logged by _post_multipart
+    text = transcript_from_response(raw)
+    if not text and raw:
+        # Got a response but no recognised text — could be an API error document.
+        # Log its shape so the operator can tell a quota error from a bad model name.
+        try:
+            err = json.loads(raw)
+            log(f"cloud stt returned an error: {str(err.get('detail', err))[:200]}")
+        except ValueError:
+            log(f"cloud stt returned undecodable response: {raw[:200]!r}")
+        return None
+    return text
 
 
 def _pid_alive(pid: int) -> bool:

@@ -79,6 +79,39 @@ reasonable mix.
 | `lan` | another box you own, over HTTP or an ssh tunnel | free | stays on your network | the honest sweet spot if you have a GPU machine — `server/` is that server |
 | `cloud` | a hosted speech API | per-use billing | **your audio and text leave your machine** | off by default; keys live in a file the config points at, never in the config |
 
+### Cloud STT — OpenAI and ElevenLabs
+
+The `cloud` backend for dictation sends your recorded audio to a hosted API. Two providers are
+supported, selected by `stt.cloud.provider` in your config:
+
+| provider | what it is | config key | default model |
+|---|---|---|---|
+| `openai` | OpenAI-compatible speech-to-text (the default) | `stt.cloud.provider: "openai"` | `whisper-1` |
+| `elevenlabs` | [ElevenLabs Scribe](https://elevenlabs.io/docs/api-reference/speech-to-text) — high-accuracy transcription | `stt.cloud.provider: "elevenlabs"` | `scribe_v1` |
+
+**ElevenLabs STT reuses your existing ElevenLabs API key.** If you already configured
+`/voice-design` (or set `VOICE_LOOP_TTS_API_KEY`), dictation works without a second key. When
+`stt.cloud.provider` is `elevenlabs`, the script looks for a key in this order:
+
+1. Your configured STT key (`stt.cloud.api_key_env` or `stt.cloud.key_file`)
+2. The TTS key (`VOICE_LOOP_TTS_API_KEY`) — one credentials home, not a second one
+
+**Privacy note: with `stt.cloud.provider` set to `elevenlabs`, your recorded audio clips leave
+your machine and are sent to ElevenLabs' servers for transcription.** The same is true of any
+cloud STT provider — that is the trade the `cloud` row above states. If you would rather keep
+your audio local, `stt.backend: "lan"` (the default) transcribes on your own hardware.
+
+### Degrade — what happens when the cloud is down
+
+When the cloud backend fails — a network error, an expired key, a quota limit — dictation does
+not go silent. The failure is **logged** (so you can see what happened), and the script
+**degrades to the local whisper server** at `http://127.0.0.1:8355` for that clip. The next
+clip tries the cloud again — the degrade is one-shot, not a permanent switch.
+
+This means: kill your network mid-session, and your next dictation still transcribes through
+local whisper with a log line marking the fallback. Nothing about your config changes, and you
+never stare at a dead microphone wondering why.
+
 ## Languages
 
 Recognition (whisper) is multilingual. Local synthesis ships the Silero voices below; **English is a
