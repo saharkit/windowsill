@@ -49,3 +49,26 @@ ukrainian-word-stress>=2.0       # 2.0 added the dictionary-only mode the server
 #
 # The XTTS-v2 WEIGHTS are CPML-licensed (personal/non-commercial use) and are downloaded by YOU on
 # first request (set COQUI_TOS_AGREED=1) — never bundled. See README.md → "XTTS engine".
+#
+# Dedicated Ukrainian voices (VOICE_LOOP_TTS_ENGINE_UK=ukrainian — or the global
+# VOICE_LOOP_TTS_ENGINE=ukrainian) — robinhad/ukrainian-tts, deliberately NOT installed here either.
+#
+# `pip install ukrainian-tts` on its own is hazardous as of ukrainian-tts 6.0.2, in TWO ways: it
+# hard-pins ukrainian-word-stress==1.1.0, which DOWNGRADES the >=2.0 this file requires and takes
+# the Silero uk path's dictionary-only stress mode down with it; and it declares torchaudio, which
+# nothing else here needs — an unresolved torch/torchaudio pair resolves off the default index,
+# i.e. the CUDA-flavoured wheels and their gigabytes of nvidia-* libraries. Same medicine as
+# [xtts]: torch AND torchaudio go in FIRST, from the index you want them from, then the engine,
+# then the stress pin is put back. Verified end to end in a clean venv, and re-verified weekly by
+# the ukrainian-install job of the xtts-install-probe workflow:
+#
+#   [ukrainian]  CPU:
+#                  pip install --index-url https://download.pytorch.org/whl/cpu torch torchaudio
+#                  pip install ukrainian-tts
+#                  pip install 'ukrainian-word-stress>=2.0'
+#
+# The last step is not decorative: pip WARNS that ukrainian-tts wants ==1.1.0, but the engine only
+# touches Stressifier/StressSymbol, which 2.x keeps — its import builds that Stressifier, so the
+# weekly probe exercises exactly the pairing the pin warns about. torch itself is already satisfied
+# by this file; the MIT-licensed voices download from Hugging Face on first use.
+# See README.md → "Ukrainian engine".

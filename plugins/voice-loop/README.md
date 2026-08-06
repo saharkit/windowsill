@@ -128,7 +128,11 @@ first-class language, not a fallback** — it has its own selftest phrase and it
 | `fr` French | `v3_fr` | `fr_0` | — |
 
 Any other language: recognition still works; for synthesis use a cloud backend or the macOS built-in
-`say` voice. Details in [`server/README.md`](server/README.md).
+`say` voice. Details in [`server/README.md`](server/README.md). Ukrainian also has an optional
+**dedicated engine** ([robinhad/ukrainian-tts](https://github.com/robinhad/ukrainian-tts), MIT
+voices trained for Ukrainian) for listeners who find the Silero uk voice too robotic —
+`VOICE_LOOP_TTS_ENGINE_UK=ukrainian` on the server, see
+[`server/README.md` — Ukrainian engine](server/README.md#ukrainian-engine-dedicated-uk-voices).
 
 ## A voice of your own
 

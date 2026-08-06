@@ -193,7 +193,7 @@ def test_tts_unknown_engine_is_a_clear_500(client, monkeypatch):
     assert response.status_code == 500
     body = response.json()
     assert "espeak" in body["error"]
-    assert body["supported"] == ["silero", "xtts"]
+    assert body["supported"] == ["silero", "xtts", "ukrainian"]
 
 
 def test_stt_works_with_the_xtts_engine_misconfigured(client, fake_whisper, monkeypatch, import_raises):

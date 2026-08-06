@@ -38,8 +38,11 @@ What makes 100% honest rather than decorative:
   TTS` is what keeps the suite model-free — and it means a green 100% says nothing about whether the
   XTTS install we document still works. It stopped working upstream with no change in this repo
   (#34). So `.github/workflows/xtts-install-probe.yml` installs the pinned recipe into a clean venv
-  weekly and imports it for real (no model download, no license prompt). Coverage cannot substitute
-  for that probe, and nothing else in CI would notice the break.
+  weekly and imports it for real (no model download, no license prompt). The same file's second job
+  does the same for the `ukrainian` engine: installs `ukrainian-tts`, imports it, and asserts the
+  API surface the server fakes (`Stress.Dictionary.value`, the voice names, the `tts(text, voice,
+  stress, file)` signature) — no voice download. Coverage cannot substitute for those probes, and
+  nothing else in CI would notice the break.
 
 ### The hook scripts — shellcheck, a pytest for the pure parts, and a real invocation
 

@@ -181,7 +181,8 @@ the provider's. Nothing else in the system changes when you switch backends.
 
 `server/voice_server.py` (this plugin's own, one directory up) is a single FastAPI file: `POST /stt`
 (faster-whisper), `POST /tts` (Silero
-+ per-language accentuation by default, or XTTS-v2 voice cloning via `VOICE_LOOP_TTS_ENGINE=xtts`),
++ per-language accentuation by default, XTTS-v2 voice cloning via `VOICE_LOOP_TTS_ENGINE=xtts`, or
+the dedicated robinhad/ukrainian-tts voices for `uk` via `VOICE_LOOP_TTS_ENGINE_UK=ukrainian`),
 `POST /tts/stream` (the same synthesis as server-sent events, one WAV segment per sentence chunk),
 `GET /health`. Models load lazily on first use, through seams that the unit tests replace with
 fakes — which is why the whole file is testable without a model on disk.

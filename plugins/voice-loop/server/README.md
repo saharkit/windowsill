@@ -13,10 +13,12 @@ STT is [faster-whisper](https://github.com/SYSTRAN/faster-whisper) (multilingual
 [Silero](https://github.com/snakers4/silero-models) by default, with automatic stress marking for
 Russian ([RUAccent](https://github.com/Den4ikAI/ruaccent)) and Ukrainian
 ([ukrainian-word-stress](https://github.com/lang-uk/ukrainian-word-stress)) — that stress pass is the
-difference between a voice that reads and a voice that stumbles. An optional second engine,
-[XTTS-v2](https://huggingface.co/coqui/XTTS_v2) voice cloning, is one environment variable away — see
-[XTTS engine](#xtts-engine-voice-cloning). When an engine breaks, synthesis degrades to the other
-one instead of failing — see [Engine fallback](#engine-fallback).
+difference between a voice that reads and a voice that stumbles. Two optional engines are one
+environment variable away: [XTTS-v2](https://huggingface.co/coqui/XTTS_v2) voice cloning — see
+[XTTS engine](#xtts-engine-voice-cloning) — and, for Ukrainian, the dedicated
+[robinhad/ukrainian-tts](https://github.com/robinhad/ukrainian-tts) voices — see
+[Ukrainian engine](#ukrainian-engine-dedicated-uk-voices). When an engine breaks, synthesis degrades
+to another one instead of failing — see [Engine fallback](#engine-fallback).
 
 ## Requirements
 
@@ -66,7 +68,8 @@ because the GPU and the CPU are disjoint hardware: Silero synthesis is pinned to
 it does not compete with recognition on the card, and a single global queue would hand that
 separation straight back — one user dictating would block another user's playback for no physical
 reason. So a call queues on the device it actually runs on, and the two queues never touch. Whisper
-follows `VOICE_LOOP_DEVICE`, Silero is always on the CPU, XTTS goes wherever it managed to load
+follows `VOICE_LOOP_DEVICE`, Silero and the ukrainian engine are always on the CPU, XTTS goes
+wherever it managed to load
 (a card too small for it drops it to the CPU, and its queue follows).
 
 `VOICE_LOOP_MODEL_CONCURRENCY` sizes the queue of the device this server runs its models on. The
@@ -116,8 +119,9 @@ Three caps keep any single request from monopolizing an executor:
 | `VOICE_LOOP_STT_MODEL` | `small` | `tiny` / `base` / `small` / `medium` / `large-v3-turbo` … |
 | `VOICE_LOOP_COMPUTE_TYPE` | `auto` | faster-whisper compute type |
 | `VOICE_LOOP_STT_HINT` | — | lexicon hint: a comma-separated list of names/jargon you want recognized |
-| `VOICE_LOOP_TTS_ENGINE` | `silero` | `silero` or `xtts` (XTTS-v2 voice cloning, optional dependency) |
-| `VOICE_LOOP_TTS_FALLBACK_ENGINE` | `silero` when the engine is `xtts`, else `none` | `silero` / `xtts` / `none` — engine a failed synthesis retries on, see [Engine fallback](#engine-fallback) |
+| `VOICE_LOOP_TTS_ENGINE` | `silero` | `silero`, `xtts` (XTTS-v2 voice cloning) or `ukrainian` (dedicated uk voices) — both optional dependencies |
+| `VOICE_LOOP_TTS_ENGINE_<LANG>` | — | per-language engine override: `VOICE_LOOP_TTS_ENGINE_UK=ukrainian` routes only `uk` requests, everything else stays on the global engine (`-` → `_`, so `zh-cn` is `VOICE_LOOP_TTS_ENGINE_ZH_CN`) |
+| `VOICE_LOOP_TTS_FALLBACK_ENGINE` | `silero` when any primary is not `silero`, else `none` | `silero` / `xtts` / `ukrainian` / `none` — engine a failed synthesis retries on, see [Engine fallback](#engine-fallback) |
 | `VOICE_LOOP_TTS_MODEL` | per language | override the Silero model for the default language |
 | `VOICE_LOOP_TTS_SPEAKER` | per language | override the default speaker |
 | `VOICE_LOOP_XTTS_REFERENCE` | — | wav of the voice to clone — the `xtts` engine refuses requests without it |
@@ -132,7 +136,7 @@ Three caps keep any single request from monopolizing an executor:
 | `VOICE_LOOP_MAX_TTS_TEXT_BLOB` | `3000` | `/tts` single-blob text cap — longer text gets `400` pointing at `/tts/stream` |
 | `VOICE_LOOP_MODEL_CONCURRENCY` | `1` on a GPU, else up to `2` | concurrent model calls on the primary device — see [Capacity](#capacity) |
 
-`GET /health` also reports a `version` field (`"0.4.1"`). It is for diagnostics and bug reports;
+`GET /health` also reports a `version` field (`"0.5.0"`). It is for diagnostics and bug reports;
 clients should detect features through the capability flags (`"streaming": true` and friends), not
 by comparing version strings.
 
@@ -158,7 +162,9 @@ state dir.
 
 Recognition works for every language whisper supports. A `/tts` request for a language not in the
 table returns `400` with the supported list — use a cloud TTS backend for those, or add the model to
-`SILERO_VOICES` in `voice_server.py`.
+`SILERO_VOICES` in `voice_server.py`. `uk` also has an optional **dedicated engine** with its own
+trained voices (the Silero `v4_ua` voice reads Ukrainian with a noticeably Russian accent) — see
+[Ukrainian engine](#ukrainian-engine-dedicated-uk-voices).
 
 ### Stress overrides (`stress.json`)
 
@@ -265,6 +271,68 @@ What to know:
 - **Model dir** (`VOICE_LOOP_XTTS_MODEL_DIR`): point at a directory containing the downloaded model
   (`config.json` next to the weights) to load from disk instead of coqui's cache.
 
+## Ukrainian engine (dedicated uk voices)
+
+The first native-Ukrainian listener verdict on the default uk path was blunt: Silero's
+`v4_ua`/`mykyta` is noticeably robotic and the accent is off — the stress pass (fixed in #26) helps,
+but the source model is the ceiling, and XTTS-v2 cannot step in (its 17 languages do not include
+Ukrainian). The `ukrainian` engine is [robinhad/ukrainian-tts](https://github.com/robinhad/ukrainian-tts):
+voices **trained for Ukrainian** — `tetiana` (the default), `mykyta`, `lada`, `oleksa` — with
+community-reported natural prosody. It was chosen over Piper's uk voices, which are lighter and
+faster but robotic in the same way Silero is; the final call is the same kind the Silero verdict
+came from — a native listener rating the new voice against the old one. That A/B is the acceptance
+check for this engine; the wiring below is what makes it one environment variable away.
+
+**Install the ordered recipe, not a bare `pip install ukrainian-tts`.** A bare install of
+ukrainian-tts (6.0.2) bites twice: it hard-pins `ukrainian-word-stress==1.1.0`, downgrading the
+`>=2.0` the server requires and breaking the Silero uk path's dictionary-only stress mode along
+with it; and it declares `torchaudio`, which nothing else here needs — resolved off the default
+index, that pull arrives CUDA-flavoured, gigabytes of nvidia libraries and all. Same medicine as
+XTTS, verified end to end in a clean venv (and re-verified weekly by the `ukrainian-install` job
+of the `xtts-install-probe` workflow):
+
+```sh
+# CPU — torch AND torchaudio go in FIRST, from the index you want them from, so the second
+# command finds them satisfied instead of resolving its own (default-index, CUDA-flavoured) wheels
+pip install --index-url https://download.pytorch.org/whl/cpu torch torchaudio
+pip install ukrainian-tts
+# then put the stress pin back — pip WARNS that ukrainian-tts wants ==1.1.0; that warning is
+# expected. The engine only touches Stressifier/StressSymbol, which 2.x keeps, and its import
+# builds that Stressifier — the weekly probe exercises exactly this pairing.
+pip install 'ukrainian-word-stress>=2.0'
+```
+
+The MIT-licensed voices download from Hugging Face on first use.
+
+Then route Ukrainian at it — per language, which is the shape you want, or globally:
+
+```sh
+# Recommended: uk gets the dedicated voices, every other language stays on your configured engine.
+# A broken ukrainian engine degrades back to Silero's uk voice — that pairing is the DEFAULT
+# fallback once any primary is not silero (see Engine fallback).
+VOICE_LOOP_TTS_ENGINE_UK=ukrainian python voice_server.py
+
+# Or make it the global engine: VOICE_LOOP_TTS_ENGINE=ukrainian — but it speaks 'uk' ONLY,
+# so every other language then 400s (with a hint pointing back at silero).
+```
+
+What to know:
+
+- **Voices**: the request's `speaker` field picks `tetiana` / `mykyta` / `lada` / `oleksa`
+  (default `tetiana`). Output is 22050 Hz, synthesized on the **CPU** — the model is small and
+  real-time there; the GPU stays free for recognition.
+- **Licensing**: unlike the XTTS-v2 weights (CPML, non-commercial), the ukrainian-tts package and
+  its voices are **MIT-licensed** per the upstream project — commercial use is fine. They are still
+  **never bundled**: the package downloads them from Hugging Face on **your** first request.
+- **Import failures** read exactly like the xtts ones: a genuinely absent package hands you the
+  ordered recipe above; a package that is installed but cannot import names the exception
+  class and the missing dependency, with the message kept in the server log.
+- **Stress**: the engine runs its **own** stress pass (ukrainian-word-stress in dictionary mode —
+  the same dictionary the Silero path uses), so the Silero stress pipeline and your `stress.json`
+  overrides are **skipped**, and `+` markers or combining acutes in the text are stripped — the same
+  rule as XTTS. The accentuator comparison to listen for in the A/B is therefore the engine's own
+  dictionary stress against Silero-plus-accentuator, which is the honest pairing.
+
 ## Engine fallback
 
 A down engine should degrade a voice, not silence it. When the primary engine cannot speak —
@@ -277,10 +345,12 @@ is retried on `VOICE_LOOP_TTS_FALLBACK_ENGINE`, and the response says who spoke:
 | `/tts` fallback | `X-Voice-Loop-Engine: silero (fallback)` | the primary failed; you are hearing the other voice |
 | `/tts/stream` | terminal `end` event: `{"chunks": N, "engine": "silero (fallback)"}` | same, in the stream's own contract |
 
-The default is `silero` when the engine is `xtts`, and `none` otherwise — a Silero-primary server
-has nothing lighter to fall to, and a fallback that is the primary engine, or an unrecognized name,
-means `none` as well. `GET /health` reports the **effective** setting as `tts_fallback_engine` plus
-a per-process `tts_fallbacks` counter (how many requests a broken primary handed over).
+The default is `silero` behind any non-Silero primary — the global engine or a per-language
+override — and `none` behind a silero-everywhere setup: a Silero-primary server has nothing lighter
+to fall to, and a fallback that is the request's primary engine, or an unrecognized name, means
+`none` as well. `GET /health` reports the **effective** setting behind the global engine as
+`tts_fallback_engine` (plus the per-language routing as `tts_engine_overrides`) and a per-process
+`tts_fallbacks` counter (how many requests a broken primary handed over).
 
 What it is deliberately *not*: a router. A `400` refusal is the request's problem and no engine can
 fix it, so it is never retried — including an unsupported language, even when the other engine
@@ -297,7 +367,8 @@ traceback, always stays in the server log.
 `200` and the first audio have left, and a client mid-playback is not handed a different voice in
 the middle of a sentence: a later failure ends the stream with today's terminal `error` event,
 exactly as before. A restart re-synthesizes the whole text from chunk `0`, so one stream is always
-one engine end to end — and its chunks carry that engine's sample rate (48 kHz Silero, 24 kHz XTTS).
+one engine end to end — and its chunks carry that engine's sample rate (48 kHz Silero, 24 kHz XTTS,
+22.05 kHz ukrainian).
 
 Fallback synthesis takes the same one model slot the primary took — sequentially, after the failed
 attempt released it (see [Capacity](#capacity)). A retry never doubles the concurrency.
@@ -329,14 +400,14 @@ Three event types, in this order:
 
 | event | data | meaning |
 |---|---|---|
-| `chunk` | `{"index": 0, "audio": "<base64>"}` | one **complete, standalone WAV file** (own header, engine sample rate: 48 kHz Silero / 24 kHz XTTS). Decode base64, play, done. `index` counts from 0 in order. |
+| `chunk` | `{"index": 0, "audio": "<base64>"}` | one **complete, standalone WAV file** (own header, engine sample rate: 48 kHz Silero / 24 kHz XTTS / 22.05 kHz ukrainian). Decode base64, play, done. `index` counts from 0 in order. |
 | `end` | `{"chunks": N, "engine": "silero"}` | terminal success — N `chunk` events were sent. `engine` names who synthesized them, `"<engine> (fallback)"` when the primary was broken (see [Engine fallback](#engine-fallback)); it is reported here rather than in a header because the headers leave before the first chunk |
 | `error` | `{"error": "synthesis failed (<ExceptionClass>)", "chunks": N}` | terminal failure **mid-stream** (the `200` already left with the first bytes, so a late failure becomes the last event, never a 500). N chunks were already sent and are valid. The message is deliberately generic — the exception class name at most; the full detail stays in the server log. |
 
 A stream always ends with exactly one `end` **or** one `error` event. Requests refused *before*
-synthesis starts (empty text, unsupported language, misconfigured xtts) return plain JSON `400`/`500`
-exactly like `/tts`. Chunk granularity is the sentence chunker for **both** engines (XTTS-v2's
-internal `inference_stream` generator sits below coqui's public API, so it is not used).
+synthesis starts (empty text, unsupported language, a misconfigured optional engine) return plain
+JSON `400`/`500` exactly like `/tts`. Chunk granularity is the sentence chunker for **every** engine
+(XTTS-v2's internal `inference_stream` generator sits below coqui's public API, so it is not used).
 
 **Pacing.** `/tts` inserts a short silence (0.4 s) between sentence chunks; the stream carries the
 **same** silence so back-to-back playback of the chunks sounds identical, not rushed. It is placed
