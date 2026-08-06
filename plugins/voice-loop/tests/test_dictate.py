@@ -1321,6 +1321,9 @@ def test_elevenlabs_scribe_posts_the_documented_shape(state, monkeypatch, opener
     assert timeout == 60.0
     body = request.data
     assert b'name="model_id"\r\n\r\nscribe_v1\r\n' in body
+    # windowsill#93: the configured language reaches Scribe under ITS name, the way the OpenAI
+    # request above carries the same value as `language`
+    assert b'name="language_code"\r\n\r\nen\r\n' in body
     assert b'name="file"; filename="dictate.wav"' in body
 
 
@@ -1487,6 +1490,140 @@ def test_cloud_error_response_degrades_to_local_whisper(state, monkeypatch, open
     assert len(opener_seq.requests) == 2
     log_text = (state / "dictate.log").read_text(encoding="utf-8")
     assert "cloud stt failed — falling back to local whisper" in log_text
+
+
+# --- the degrade, on every shape of answer that is not a transcript -----------------------------
+#
+# The whole design of the cloud path is: cloud fails -> degrade to local whisper, logged, never a
+# silent dead mic. These cases are the ones where it used to do something else.
+
+
+def _log_of(state) -> str:
+    """The log as text — '' when the run never wrote one, which is itself an assertion some of the
+    cases below make (a silent clip must not produce a line at all)."""
+    path = state / "dictate.log"
+    return path.read_text(encoding="utf-8") if path.exists() else ""
+
+
+@pytest.mark.parametrize(
+    "provider, body",
+    [
+        ("openai", b'["insufficient_quota", "billing"]'),
+        ("elevenlabs", b'"rate limited"'),
+        ("deepgram", b'[{"err_msg": "nope"}]'),
+    ],
+)
+def test_a_non_dict_error_document_degrades_rather_than_raising(state, monkeypatch, opener, provider, body):
+    """A JSON error document that decodes to a LIST (or a bare string) has no `.get`, and the
+    reader that called one raised AttributeError — which `except ValueError` never caught, so
+    transcribe() ABORTED on the one path whose whole promise is that it degrades instead.
+
+    Every entry's parsers isinstance-guard now, and this is that promise as a test: a body no
+    provider can read still ends at the local whisper server, under a log line naming what came
+    back."""
+    (state / "dictate.wav").write_bytes(b"RIFFfakewav")
+    fake = opener(body)
+    monkeypatch.setenv("VOICE_LOOP_STT_API_KEY", "sk-secret")
+    s = dictate.resolve_settings({"stt": {"backend": "cloud", "cloud": {"provider": provider}}}, "Linux")
+
+    assert dictate.transcribe(s) == ""  # no whisper server in this test — but it was ASKED
+
+    log_text = _log_of(state)
+    assert "cloud stt returned an error" in log_text
+    assert "cloud stt failed — falling back to local whisper" in log_text
+    assert len(fake.requests) == 2  # the cloud attempt, then the one-shot degrade
+    assert fake.requests[1][0].full_url == "http://127.0.0.1:8355/stt?language=en"
+
+
+@pytest.mark.parametrize("body", [b"", b"null", b"<html>502 Bad Gateway</html>"])
+def test_a_body_with_no_document_in_it_degrades_and_says_what_came_back(state, monkeypatch, opener, body):
+    """Nothing decodable — an empty body, a JSON `null`, an HTML page from a proxy. All three are
+    "the cloud did not answer with a transcript", so all three degrade; the log carries the first
+    200 bytes so the operator can tell a proxy page from a null."""
+    (state / "dictate.wav").write_bytes(b"RIFFfakewav")
+    fake = opener(body)
+    monkeypatch.setenv("VOICE_LOOP_STT_API_KEY", "sk-secret")
+    s = dictate.resolve_settings({"stt": {"backend": "cloud"}}, "Linux")
+
+    assert dictate.transcribe(s) == ""
+    log_text = _log_of(state)
+    assert f"cloud stt returned undecodable response: {body[:200]!r}" in log_text
+    assert "cloud stt failed — falling back to local whisper" in log_text
+    assert len(fake.requests) == 2
+
+
+@pytest.mark.parametrize(
+    "provider, body",
+    [
+        ("openai", b'{"text": ""}'),
+        ("elevenlabs", b'{"text": "   "}'),
+        ("deepgram", b'{"results": {"channels": [{"alternatives": [{"transcript": ""}]}]}}'),
+    ],
+)
+def test_a_silent_clip_is_an_empty_transcript_not_a_cloud_failure(state, monkeypatch, opener, provider, body):
+    """windowsill#93: a toggle that recorded silence gets `{"text": ""}` back, and that is the
+    cloud working. Reading it as an error logged a failure that never happened AND posted the clip
+    a second time — a spurious localhost round trip on every empty toggle."""
+    (state / "dictate.wav").write_bytes(b"RIFFfakewav")
+    fake = opener(body)
+    monkeypatch.setenv("VOICE_LOOP_STT_API_KEY", "sk-secret")
+    s = dictate.resolve_settings({"stt": {"backend": "cloud", "cloud": {"provider": provider}}}, "Linux")
+
+    assert dictate.transcribe(s) == ""
+
+    assert len(fake.requests) == 1  # the cloud answered; there is nothing to degrade to
+    log_text = _log_of(state)
+    assert "cloud stt returned an error" not in log_text
+    assert "cloud stt failed" not in log_text
+
+
+@pytest.mark.parametrize(
+    "provider, path",
+    [
+        ("openai", "/v1/audio/transcriptions"),
+        ("elevenlabs", "/v1/speech-to-text"),
+        ("deepgram", "/v1/listen"),
+    ],
+)
+def test_stt_cloud_endpoint_redirects_the_post_for_every_provider(state, monkeypatch, opener, provider, path):
+    """The knob exists for the self-hosted and gateway cases, and a wiring break in it is invisible
+    without this: the request still succeeds, it just goes to the vendor instead of where the user
+    pointed it. Asserted per provider because the host is resolved on the ENTRY (an explicit
+    endpoint beats the provider's own default host, which openai does not even have)."""
+    (state / "dictate.wav").write_bytes(b"RIFFfakewav")
+    fake = opener(b'{"text": "hi", "results": {"channels": [{"alternatives": [{"transcript": "hi"}]}]}}')
+    monkeypatch.setenv("VOICE_LOOP_STT_API_KEY", "sk-secret")
+    s = dictate.resolve_settings(
+        {"stt": {"backend": "cloud", "cloud": {"provider": provider, "endpoint": "https://gateway.internal"}}},
+        "Linux",
+    )
+    assert s["cloud_endpoint"] == "https://gateway.internal"
+    assert dictate.transcribe(s) == "hi"
+
+    request, _ = fake.requests[0]
+    assert request.full_url.startswith(f"https://gateway.internal{path}")
+    assert len(fake.requests) == 1  # it landed: no degrade
+
+
+def test_openai_stt_with_no_key_at_all_degrades_to_whisper(state, monkeypatch, opener):
+    """The ElevenLabs no-key degrade has been covered since #54; this is the other provider's, and
+    it is not the same code path — openai has no `key_env_fallbacks`, so the loop that tries the
+    shared TTS key ends after one name. The behaviour it must reach is identical: return None, log
+    which env vars were tried, and let transcribe() fall back."""
+    (state / "dictate.wav").write_bytes(b"RIFFfakewav")
+    monkeypatch.delenv("VOICE_LOOP_STT_API_KEY", raising=False)
+    monkeypatch.setenv("VOICE_LOOP_TTS_API_KEY", "an-elevenlabs-key-that-openai-must-not-be-handed")
+    fake = opener(b'{"text": "whisper fallback"}')
+    s = dictate.resolve_settings({"stt": {"backend": "cloud"}}, "Linux")
+
+    assert dictate.transcribe(s) == "whisper fallback"
+
+    assert len(fake.requests) == 1  # only the LAN degrade got past the key check
+    assert fake.requests[0][0].full_url == "http://127.0.0.1:8355/stt?language=en"
+    log_text = _log_of(state)
+    assert "cloud stt: no key for openai" in log_text
+    assert "$VOICE_LOOP_STT_API_KEY" in log_text
+    assert "VOICE_LOOP_TTS_API_KEY" not in log_text  # not this provider's key to borrow
 
 
 # --- the cross-module framing loop: dictate's multipart through the real /stt -------------------

@@ -118,9 +118,18 @@ def test_decode_answers_none_for_every_shape_of_no_document():
 
 def test_text_field_reads_the_openai_and_elevenlabs_shape():
     assert providers.text_field({"text": " hello \n"}) == "hello"
-    assert providers.text_field({"detail": "no text key"}) == ""
-    assert providers.text_field(["not", "a", "dict"]) == ""
-    assert providers.text_field(None) == ""
+    assert providers.text_field({"detail": "no text key"}) is None
+    assert providers.text_field(["not", "a", "dict"]) is None
+    assert providers.text_field(None) is None
+
+
+def test_an_empty_transcript_is_a_transcript_and_a_missing_one_is_not():
+    """The distinction windowsill#93 turns on: `{"text": ""}` is what a silent clip transcribes to
+    and it is a SUCCESS, while a document with no `text` field at all is the degrade signal. Read
+    as one value ('' for both), a silent toggle logged a cloud error and posted the clip twice."""
+    assert providers.text_field({"text": ""}) == ""
+    assert providers.text_field({"text": "   "}) == ""
+    assert providers.text_field({}) is None
 
 
 def test_an_error_document_that_is_a_list_does_not_explode():
@@ -171,7 +180,14 @@ def test_the_deepgram_parser_reads_no_transcript_out_of_every_way_the_walk_can_f
         {"err_code": "INVALID_AUTH", "err_msg": "Token is invalid"},
         ["not", "a", "dict"],
     ):
-        assert entry.transcript(body) == ""
+        assert entry.transcript(body) is None
+
+
+def test_a_deepgram_walk_that_succeeds_on_an_empty_transcript_is_a_silent_clip():
+    """Same distinction as text_field's, at the other parser: the walk COMPLETED, so this is a
+    clip with no speech in it — not a document Deepgram failed to answer with."""
+    entry = providers.STT_PROVIDERS["deepgram"]
+    assert entry.transcript({"results": {"channels": [{"alternatives": [{"transcript": ""}]}]}}) == ""
 
 
 def test_the_deepgram_stt_request_is_a_raw_wav_body_with_query_parameters():
@@ -187,6 +203,26 @@ def test_the_deepgram_stt_request_is_a_raw_wav_body_with_query_parameters():
     assert request.headers == {"Authorization": "Token dg-secret"}
     assert request.body == b"RIFFfakewav"  # the WAV IS the body — no form framing at all
     assert request.content_type == "audio/wav"
+
+
+def test_the_scribe_request_carries_the_configured_language_as_language_code():
+    """windowsill#93: the language axis is a per-provider SPELLING, not a per-provider silence.
+    OpenAI takes `language`, Scribe takes `language_code`, Deepgram takes a query parameter — and
+    a user who configured `stt.language: "ru"` gets the hint through all three."""
+    entry = providers.STT_PROVIDERS["elevenlabs"]
+    s = {"cloud_endpoint": "", "endpoint": "", "stt_model": "scribe_v1", "language": "ru"}
+    request = entry.request(s, "xi-secret", b"RIFFfakewav", "BOUND")
+    assert request.url == "https://api.elevenlabs.io/v1/speech-to-text"
+    assert b'name="language_code"\r\n\r\nru\r\n' in request.body
+    assert b'name="model_id"\r\n\r\nscribe_v1\r\n' in request.body
+
+
+def test_an_empty_language_leaves_scribe_to_auto_detect():
+    """The escape hatch the old unconditional silence gave everybody for free: no language_code
+    field at all, which is what asks Scribe to detect the language itself."""
+    entry = providers.STT_PROVIDERS["elevenlabs"]
+    s = {"cloud_endpoint": "", "endpoint": "", "stt_model": "scribe_v1", "language": ""}
+    assert b"language_code" not in entry.request(s, "xi-secret", b"RIFFfakewav", "BOUND").body
 
 
 def test_the_deepgram_tts_request_asks_for_wav_because_aplay_cannot_play_mp3():

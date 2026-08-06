@@ -19,8 +19,9 @@ knob instead. One module, two entry shapes.
 The axes that vary per provider, all seven of them in the entry and nowhere else:
 
 1. **default model** — ``default_model``
-2. **request build** — host, URL path, body encoding, and where ``language`` goes (a form field for
-   OpenAI, ignored by ElevenLabs today (windowsill#93), a query parameter for Deepgram)
+2. **request build** — host, URL path, body encoding, and where ``language`` goes (a ``language``
+   form field for OpenAI, a ``language_code`` form field for ElevenLabs, a query parameter for
+   Deepgram)
 3. **auth** — the header name and its scheme (``Authorization: Bearer``, ``xi-api-key``,
    ``Authorization: Token``)
 4. **response parse** — where the transcript lives in the body
@@ -115,7 +116,9 @@ class SttProvider:
     # env var names tried AFTER the configured one, in order — the "one credentials home" rule
     key_env_fallbacks: tuple[str, ...]
     build: Callable[["SttProvider", dict, str, bytes, str], SttRequest]
-    transcript: Callable[[object], str]
+    # a transcript, '' included (a silent clip IS an empty transcript), or None when the document
+    # carries no transcript at all — which is the caller's degrade signal. See ``text_field``.
+    transcript: Callable[[object], str | None]
     error_summary: Callable[[object], str]
     comparison: Comparison
 
@@ -175,21 +178,28 @@ def decode(raw: bytes | None) -> object:
         return None
 
 
-def text_field(data: object) -> str:
+def text_field(data: object) -> str | None:
     """``{"text": "..."}`` — OpenAI's transcription shape, ElevenLabs Scribe's, and this plugin's
-    own server's. '' for anything else, which is what makes a malformed body a degrade rather than
-    a traceback."""
-    return str(data.get("text", "")).strip() if isinstance(data, dict) else ""
+    own server's. None for anything without a ``text`` field, which is what makes a malformed body
+    (or an error document) a degrade rather than a traceback.
+
+    None and '' are DIFFERENT answers and the difference is load-bearing: a silent clip transcribes
+    to an empty string, and that is a success. Reading '' as "no transcript" logged a cloud error
+    and posted the clip a second time on every silent toggle (windowsill#93)."""
+    if isinstance(data, dict) and "text" in data:
+        return str(data["text"]).strip()
+    return None
 
 
-def _deepgram_transcript(data: object) -> str:
+def _deepgram_transcript(data: object) -> str | None:
     """Deepgram nests the transcript under the first alternative of the first channel:
     ``results.channels[0].alternatives[0].transcript``. Every way that walk can fail — a dict that
-    is an error document, an empty channel list — reads as "no transcript", i.e. degrade."""
+    is an error document, an empty channel list — reads as None, i.e. degrade. A walk that SUCCEEDS
+    on an empty string is a silent clip, and returns that empty string (see ``text_field``)."""
     try:
         return str(data["results"]["channels"][0]["alternatives"][0]["transcript"]).strip()  # type: ignore[index]
     except (TypeError, KeyError, IndexError):
-        return ""
+        return None
 
 
 def _detail_or_document(data: object) -> str:
@@ -252,9 +262,15 @@ def _openai_stt(entry: SttProvider, s: dict, key: str, wav_bytes: bytes, boundar
 
 
 def _elevenlabs_stt(entry: SttProvider, s: dict, key: str, wav_bytes: bytes, boundary: str) -> SttRequest:
-    """ElevenLabs Scribe: multipart with ``model_id``, and no language field at all — Scribe
-    auto-detects, so a configured ``stt.language`` does not reach it (windowsill#93)."""
-    body = multipart_form({"model_id": s["stt_model"]}, "file", "dictate.wav", wav_bytes, boundary)
+    """ElevenLabs Scribe: multipart with ``model_id``, plus ``language_code`` when a language is
+    configured — Scribe's spelling of the hint OpenAI takes as ``language``, so the two providers
+    agree rather than one of them silently dropping ``stt.language`` (windowsill#93).
+
+    An EMPTY ``stt.language`` omits the field, which is how a user asks Scribe to auto-detect."""
+    fields = {"model_id": s["stt_model"]}
+    if s["language"]:
+        fields["language_code"] = s["language"]
+    body = multipart_form(fields, "file", "dictate.wav", wav_bytes, boundary)
     return SttRequest(
         f"{entry.endpoint(s)}/v1/speech-to-text",
         {"xi-api-key": key},
@@ -363,7 +379,8 @@ STT_PROVIDERS: dict[str, SttProvider] = {
         comparison=Comparison(
             latency="a second or two for a short clip; accuracy-first rather than latency-first",
             cost="Scribe list price ≈$0.40/hour (≈$0.0067/min) on the paid tiers",
-            languages="99 languages including Russian and Ukrainian; auto-detected, stt.language is ignored (#93)",
+            languages="99 languages including Russian and Ukrainian; stt.language rides as "
+            "language_code, and an empty one lets Scribe auto-detect",
             privacy="audio leaves the machine; zero-retention is an account/enterprise setting",
         ),
     ),

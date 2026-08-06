@@ -501,8 +501,10 @@ def transcript_from_response(raw: bytes | None) -> str:
     the shell's ``python3 -c 'json.load(...).get("text","")'`` tail, which printed '' on error).
 
     This is the LOCAL server's shape, which is also what the OpenAI and ElevenLabs entries parse
-    with; a cloud response goes through its own entry's ``transcript`` instead."""
-    return providers.text_field(providers.decode(raw))
+    with; a cloud response goes through its own entry's ``transcript`` instead — and it reads the
+    reader's None ("no transcript field") as the degrade signal, where this path has nothing to
+    degrade to and flattens it to ''."""
+    return providers.text_field(providers.decode(raw)) or ""
 
 
 def applescript_escape(text: str) -> str:
@@ -715,9 +717,14 @@ def _transcribe_cloud(s: dict, wav_bytes: bytes, boundary: str) -> str | None:
         return None  # network error — already logged by _post_bytes
     data = providers.decode(raw)
     text = entry.transcript(data)
-    if not text and raw:
-        # Got a response but no recognised text — could be an API error document.
-        # Log its shape so the operator can tell a quota error from a bad model name.
+    if text is None:
+        # The body carries no transcript field at all — an API error document, an empty body, or
+        # something this provider's parser does not recognise. Log its shape so the operator can
+        # tell a quota error from a bad model name.
+        #
+        # An EMPTY transcript is deliberately NOT this case: a silent clip transcribes to "" and
+        # that is a success. Treating it as a failure logged a cloud error that never happened and
+        # posted the clip a second time, at localhost, on every silent toggle (windowsill#93).
         if data is None:
             log(f"cloud stt returned undecodable response: {raw[:200]!r}")
         else:
