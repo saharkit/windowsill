@@ -1,11 +1,13 @@
 # Publishing — listing windowsill in public plugin directories
 
-Tracker: issue [#20](https://github.com/saharkit/windowsill/issues/20) (`shelf-catalog` rung).
-Prepared: 2026-08-05, as STEP-DAG step #1403 (work-item 231).
+Tracker: issue [#20](https://github.com/saharkit/windowsill/issues/20).
+Prepared: 2026-08-05.
 
 ## Scout verification
 
-The operator scouted two candidate targets. Each was verified at execution time (2026-08-05).
+Two candidate targets were scouted and cross-checked against the public repos (2026-08-05). The two
+in-app submission-form URLs below must be re-confirmed at actual submission time — this document was
+prepared without submission credentials.
 
 ### Candidate 1: `anthropics/claude-plugins-official`
 
@@ -98,8 +100,9 @@ This curated list tracks **77 marketplaces and 1,275 plugins**. It is the only c
 found that explicitly catalogs marketplaces alongside plugins. Windowsill fits here as a marketplace
 source.
 
-Contribution goes through the companion repo `Chat2AnyLLM/code-assistant-manager`. The expected
-entry format (from the studiomeyer-marketplace precedent):
+Contribution goes through the companion config repo `Chat2AnyLLM/awesome-repo-configs` — the repo
+every actionable step and reference link below points at; the catalog rebuilds from its merged
+config. The expected entry format (from the studiomeyer-marketplace precedent):
 
 ```json
 "saharkit/windowsill": {
@@ -113,7 +116,7 @@ entry format (from the studiomeyer-marketplace precedent):
 }
 ```
 
-**Contribution process** (verified 2026-08-05):
+**Contribution process** (scouted 2026-08-05):
 
 1. Fork `Chat2AnyLLM/awesome-repo-configs`
 2. Add the entry above to `plugin_repos.json`
@@ -142,17 +145,20 @@ they're in the community marketplace.
 
 The targets form a dependency chain:
 
+0. **Confirm the gate**: issue #20 makes submission conditional on the v0.2 wave (XTTS engine #12,
+   streaming #18, dictate rewrite #19) being merged — confirm that before anything below
 1. **Validate**: `claude plugin validate ./plugins/voice-loop` and `./plugins/sill-core`
 2. **Anthropic community marketplace** — submit voice-loop and sill-core via the Console form
 3. **`rdmgator12/awesome-claude-plugins`** — once plugins appear at claude.com/plugins, add entries
 4. **`Chat2AnyLLM/awesome-claude-plugins`** — submit windowsill as a marketplace source
-5. **Link back** — record the accepted submissions here and in ACHIEVEMENTS.md (`shelf-catalog`)
+5. **Link back** — record the accepted submissions here and in ACHIEVEMENTS.md, and add each
+   accepted directory listing (badge or link) to the README — the ticket names that deliverable
 
 ## Credentials needed
 
 Every submission above requires GitHub credentials and/or a claude.ai/platform.claude.com account.
-This step (#1403) is credential-less — it verified the targets and prepared the content. The actual
-PRs and form submissions must be executed by an operator with the required access.
+This document was prepared credential-less — it scouted the targets and prepared the content. The
+actual PRs and form submissions must be executed by an operator with the required access.
 
 ## Links
 
