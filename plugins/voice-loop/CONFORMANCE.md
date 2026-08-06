@@ -30,6 +30,7 @@ SKIP needs a reason in the evidence cell (e.g. "Wayland-only guard, tested on X1
 | date | _(filled at runtime)_ |
 | tester | _(filled at runtime)_ |
 | OS / version | _(filled at runtime)_ |
+| WSL | _(if Windows: WSL2 kernel + WSLg versions, else n/a — see TESTING §8)_ |
 | desktop / session (GNOME-Wayland, KDE, X11, macOS) | _(filled at runtime)_ |
 | plugin version | 0.6.0 |
 | backends chosen (stt / tts) | _(filled at runtime)_ |

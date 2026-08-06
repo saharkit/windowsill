@@ -62,7 +62,15 @@ through) it is the **ear-check** — the agent speaks a line and you confirm you
 custom synthetic voice afterwards: `/voice-design`. To take the whole contour back off:
 [`/voice-remove`](#uninstall).
 
-Supported platforms: Linux and macOS. Windows/WSL is untested — we would rather say so than guess.
+Supported platforms: Linux and macOS. On Windows, WSL2 + WSLg is the recommended route (see
+the [shelf README](../../README.md#running-on-windows)) — still unverified on real hardware,
+tracked in [#41](https://github.com/saharkit/windowsill/issues/41). Two things that pass has
+to establish before we claim them: **audio** — WSLg routes sound through a PulseAudio server
+on the Windows side, and whether the default recorder/player chain (`pw-record` / `arecord` /
+`aplay`) picks that up unchanged is exactly the open question; and **`lan` topology** — a
+separate Linux box on the network is reached unchanged, but a server on the Windows host
+itself is not `localhost` from inside WSL (use the host's IP), and exposing a server running
+*inside* WSL to the LAN needs a port proxy or mirrored networking.
 
 **On macOS, one trap is worth knowing about even though setup now handles it.** python.org-installer
 Python ships an **empty certificate store**, so until `/Applications/Python 3.x/Install

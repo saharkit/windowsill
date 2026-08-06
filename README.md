@@ -26,27 +26,28 @@ Then install what you want — this one is typed **inside a session**, not in yo
 /plugin install <plugin>@windowsill
 ```
 
-## Windows: WSL2 + WSLg
+## Running on Windows
 
-On Windows, the supported path is **WSL2 with WSLg** (Windows 11). From an elevated PowerShell:
+The recommended route is **WSL2 with WSLg** on Windows 11 — and honesty first: nobody has run
+this end to end on a real Windows machine yet.
+[#41](https://github.com/saharkit/windowsill/issues/41) tracks that verification pass; until
+it lands, this is the route we recommend, not a tested guarantee.
 
-```sh
+From an elevated PowerShell:
+
+```powershell
 wsl --install
 ```
 
-Then open your WSL distribution and follow the ordinary Linux quickstart above, unchanged —
-the marketplace add and the `/plugin install` work exactly as written inside the distro.
+Restart when it asks; on first launch the distro prompts for a UNIX username and password. If
+the install fails with a virtualization error, enable virtualization in your UEFI/BIOS first.
+(Windows 10 21H2+ can also run WSLg via the Store WSL package, but Windows 11 is the route we
+intend to verify.)
 
-**WSLg** — the GUI/audio layer built into WSL2 on Windows 11 — carries microphone and audio
-passthrough into the distro, so a voice plugin can record and play back without extra setup.
-
-Server-style contours are unaffected: a local server runs fine inside WSL itself, and a LAN
-server is trivial — the server lives elsewhere on the network, and WSL reaches it like any
-other Linux host.
-
-**Status:** a real-WSL2 verification pass is pending and tracked in
-[#41](https://github.com/saharkit/windowsill/issues/41) — until it lands, this section is the
-supported *path*, not a tested guarantee.
+Inside the distro, **Add the marketplace** above works exactly as written — the marketplace
+add and the `/plugin install` both. A plugin's own setup may have platform-specific steps;
+its README is the place to check — for voice-loop's audio and server notes on WSL, see
+[its README](plugins/voice-loop/README.md).
 
 ## What is on the sill
 
