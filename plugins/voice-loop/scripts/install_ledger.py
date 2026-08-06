@@ -28,7 +28,7 @@ Usage:
   python3 install_ledger.py reset             — delete the ledger (for a restart)
   python3 install_ledger.py completed-steps   — print JSON array of completed step ids
 
-Exit codes: 0 on success (check: none or complete), 1 on in_progress/cancelled, 2 on error.
+Exit codes: 0 on success (check: none/complete/cancelled), 1 on in_progress, 2 on error.
 """
 
 from __future__ import annotations
@@ -186,7 +186,7 @@ def check_state(
         result["current_step"] = in_flight[0]  # at most one at a time
 
     # Next pending step (useful for "resume")
-    if state == "in_progress":
+    if state in ("in_progress", "cancelled"):
         next_step = _next_pending(steps)
         if next_step is not None:
             result["next_step"] = next_step
@@ -218,7 +218,10 @@ def start_install(
         clock = _default_clock
 
     existing = read_ledger(ledger_path)
-    if existing is not None and existing.get("state") in ("in_progress", "complete"):
+    if existing is not None:
+        # If an install exists (in_progress, complete, or cancelled), return it.
+        # A cancelled ledger should not be silently overwritten; the skill
+        # should first reset it before starting a fresh install.
         return check_state(ledger_path)
 
     now_ts = _ts(clock)
@@ -290,6 +293,8 @@ def step_done(
 
     steps: dict[str, Any] = ledger.setdefault("steps", {})
     entry = steps.setdefault(step_id, {})
+    if entry.get("status") == "complete":
+        return check_state(ledger_path)  # already done — truly idempotent
     entry["status"] = "complete"
     entry["completed_at"] = now_ts
 
@@ -413,7 +418,7 @@ commands:
   completed-steps    print JSON array of completed step ids
   steps              print JSON array of all known step ids (in order)
 
-exit codes: 0 on success, 1 for in_progress/cancelled (check only), 2 on error
+exit codes: 0 on success (none/complete/cancelled), 1 for in_progress (check only), 2 on error
 """
 
 
@@ -433,7 +438,9 @@ def main(argv: list[str] | None = None) -> int:
             result = check_state(ledger_path or None)
             _print_json(result)
             state = result.get("state", "none")
-            return 0 if state in ("none", "complete") else 1
+            # Exit 0 for none/complete/cancelled (all are terminal states)
+            # Exit 1 only for in_progress (install is mid-flight)
+            return 0 if state in ("none", "complete", "cancelled") else 1
 
         elif cmd == "start":
             result = start_install(ledger_path or None)

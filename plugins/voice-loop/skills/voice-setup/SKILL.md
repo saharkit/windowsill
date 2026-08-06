@@ -41,8 +41,8 @@ the pieces it names actually exist, and finish with a **passing selftest**. Scri
 Before anything else, check whether an install was already started or completed:
 
 ```sh
-LEDGER_CMD="python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/install_ledger.py\""
-eval "$LEDGER_CMD check"
+LEDGER_CMD="${CLAUDE_PLUGIN_ROOT}/scripts/install_ledger.py"
+python3 "$LEDGER_CMD" check
 ```
 
 The exit code and JSON tell you the state:
@@ -50,7 +50,7 @@ The exit code and JSON tell you the state:
 **Exit 0, `{"state": "none"}`** — fresh install. Create the ledger and proceed:
 
 ```sh
-eval "$LEDGER_CMD start"
+python3 "$LEDGER_CMD" start
 ```
 
 Proceed to Step 0.
@@ -61,21 +61,21 @@ Proceed to Step 0.
 > Steps completed: <names>. Step in flight: <name>.
 >
 > 1. **Resume** — continue from the next pending step (`next_step`). Steps already done are skipped.
-> 2. **Restart** — clean slate. First undo what the completed steps did (reverse order: remove hotkey
->    bindings, remove the CLAUDE.md line, remove config, disable service, delete copied server files —
->    the list of completed steps tells you exactly what to undo), then run `start` to create a fresh
->    ledger and proceed from Step 0.
-> 3. **Cancel** — leave everything as-is and exit. Run `eval "$LEDGER_CMD cancel"` and stop.
+> 2. **Restart** — clean slate. First run `reset` to delete the ledger, then undo what the completed
+>    steps did (reverse order: remove hotkey bindings, remove the CLAUDE.md line, remove config,
+>    disable service, delete copied server files — the list of completed steps tells you exactly
+>    what to undo), then run `start` to create a fresh ledger and proceed from Step 0.
+> 3. **Cancel** — leave everything as-is and exit. Run `python3 "$LEDGER_CMD" cancel` and stop.
 
 If they pick **resume**: look at `completed_steps` and `next_step`. Skip every step whose id is in
 `completed_steps`. Start at `next_step`. Do NOT run `start` — the existing ledger stays. If
 `current_step` is set (a step was begun but not finished), re-run that step from the beginning
 because it might be in a partial state (half-installed packages, half-written config).
 
-If they pick **restart**: run `eval "$LEDGER_CMD reset"` to delete the ledger, then undo the
-completed work using the list you just read, then run `start` and proceed from Step 0.
+If they pick **restart**: run `python3 "$LEDGER_CMD" reset` to delete the ledger, then undo the
+completed work using the list you just read, then run `python3 "$LEDGER_CMD" start` and proceed from Step 0.
 
-If they pick **cancel**: run `eval "$LEDGER_CMD cancel"` and stop. Say that re-running
+If they pick **cancel**: run `python3 "$LEDGER_CMD" cancel` and stop. Say that re-running
 `/voice-setup` will offer the same three choices.
 
 **Exit 0, `{"state": "complete"}`** — install is already done. Verify idempotently:
@@ -100,7 +100,7 @@ After every step that completes (including on resume), write the checkpoint mark
 python3 "${CLAUDE_PLUGIN_ROOT}/scripts/install_ledger.py" step-done <step-id>
 ```
 
-Before a step that has irreversible side effects (3, 4, 6, 7), mark it as in flight:
+Before a step that has irreversible side effects (3, 4, 5, 6, 7), mark it as in flight:
 
 ```sh
 python3 "${CLAUDE_PLUGIN_ROOT}/scripts/install_ledger.py" step-begin <step-id>
