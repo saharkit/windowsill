@@ -97,6 +97,7 @@ branching on it must never be handed a config typo instead:
 
 from __future__ import annotations
 
+import http.client
 import json
 import os
 import shlex
@@ -248,8 +249,14 @@ def normalize_service(entry) -> dict | None:
         return None
     if parts.scheme not in ("http", "https") or not parts.netloc or not _url_is_fetchable(parts):
         return None
+    # Control characters and newlines are stripped from the NAME because it is embedded verbatim in
+    # line-based surfaces: the announced-ledger key ("<kind>:<name>", one per line) and the single-line
+    # log format report_bug's cut markers match on. A "\n" in a name would split the ledger entry on
+    # read-back — the same truncate-and-re-voice failure the whitespace fix closed for spaces.
+    raw_name = str(entry.get("name") or "")
+    name = " ".join("".join(ch if ch.isprintable() else " " for ch in raw_name).split())
     return {
-        "name": str(entry.get("name") or _name_from_url(health)),
+        "name": name or _name_from_url(health),
         "health": health,
         "expect_device": str(entry.get("expect_device") or ""),
     }
@@ -348,7 +355,12 @@ def fetch_health(url: str, timeout: float, opener=urllib.request.urlopen) -> dic
             body = resp.read(BODY_CAP + 1)
     except urllib.error.HTTPError as err:
         raise FetchError(f"http {err.code}") from err
-    except (urllib.error.URLError, OSError) as err:
+    except (urllib.error.URLError, OSError, http.client.HTTPException) as err:
+        # HTTPException covers the FRAMING failures (BadStatusLine, LineTooLong, IncompleteRead …)
+        # that are neither URLError nor OSError — a service speaking garbage on its health port is
+        # an unreachable-shaped answer for THIS service, and must not abort the whole poll (#40
+        # Gate B finding 10546: one malformed neighbour left every other service and the VRAM
+        # sample unsampled for the cycle).
         raise FetchError(type(err).__name__) from err
     if len(body) > BODY_CAP:
         raise FetchError(f"body over {BODY_CAP} bytes")
@@ -566,7 +578,15 @@ def poll(settings: dict, status_path: str, *, fetch=None, runner=None, clock=Non
                 # permanent page — see the module docstring.
                 "ok": health["ok"] if isinstance(health.get("ok"), bool) else None,
                 "device": str(health["device"]) if health.get("device") is not None else None,
-                "oom_overflows": health.get("oom_overflows") if isinstance(health.get("oom_overflows"), (int, float)) else None,
+                # bool is EXCLUDED exactly as _number excludes it: a foreign /health publishing
+                # "oom_overflows": true would otherwise pass isinstance(int) and page "rose to 1" —
+                # the same different-vocabulary trap the ok tri-state above closes.
+                "oom_overflows": (
+                    health.get("oom_overflows")
+                    if isinstance(health.get("oom_overflows"), (int, float))
+                    and not isinstance(health.get("oom_overflows"), bool)
+                    else None
+                ),
                 "detail": "",
             }
         services[name] = sample

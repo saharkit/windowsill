@@ -15,6 +15,7 @@ server the loopback job starts, including a REAL demotion alert on a GPU-less ru
 
 from __future__ import annotations
 
+import http.client
 import importlib.util
 import json
 import os
@@ -54,6 +55,17 @@ def test_a_full_entry_keeps_its_name_and_its_expectation():
     )
     assert service["name"] == "rvc"
     assert service["expect_device"] == "gpu"
+
+
+def test_a_control_character_in_a_service_name_is_stripped_before_it_meets_the_line_based_ledger():
+    # The announced-ledger is one key per line and the log format is single-line; a "\n" embedded in
+    # a name would split both on read-back — the same truncate-and-re-voice failure the whitespace
+    # fix closed for spaces, one character over.
+    service = contour_poll.normalize_service({"name": "voice\nserver", "health": "http://127.0.0.1:8358/health"})
+    assert service["name"] == "voice server"
+    # a name that is NOTHING BUT control characters falls back to the URL-derived name, never ""
+    blank = contour_poll.normalize_service({"name": "\x00\n\t", "health": "http://127.0.0.1:8358/health"})
+    assert blank["name"] == "127.0.0.1:8358"
 
 
 def test_an_entry_without_a_usable_url_is_not_a_service():
@@ -228,6 +240,18 @@ def test_a_refused_connection_is_a_fetch_error():
         raise urllib.error.URLError(OSError("refused"))
 
     with pytest.raises(contour_poll.FetchError):
+        contour_poll.fetch_health("http://x/health", 1.0, raising)
+
+
+def test_a_framing_error_on_the_health_port_is_this_services_fetch_error_not_a_poll_abort():
+    # http.client.HTTPException (BadStatusLine, LineTooLong, IncompleteRead) is neither URLError nor
+    # OSError — before the catch widened (#40 Gate B finding 10546), one neighbour speaking garbage
+    # on its health port escaped fetch_health, blew past poll()'s FetchError-only per-service try,
+    # and cost every OTHER service and the VRAM sample their samples for the cycle.
+    def raising(url, timeout):
+        raise http.client.BadStatusLine("garbage on the wire")
+
+    with pytest.raises(contour_poll.FetchError, match="BadStatusLine"):
         contour_poll.fetch_health("http://x/health", 1.0, raising)
 
 
@@ -409,6 +433,26 @@ def test_oom_overflows_page_on_the_rise_not_on_the_level():
     # a counter of zero, or none reported, is not an alert
     assert contour_poll.evaluate_service(service, _sample(oom_overflows=0), {}) == []
     assert contour_poll.evaluate_service(service, _sample(oom_overflows=None), {}) == []
+
+
+def test_a_boolean_oom_overflows_is_a_foreign_vocabulary_not_a_counter(tmp_path):
+    """Same class as the ok tri-state: a foreign /health publishing "oom_overflows": true used to
+    pass isinstance(int) — bool is an int — and page "rose to 1" about a service speaking a
+    different language. bool is excluded at the sample builder exactly as _number excludes it."""
+    settings = contour_poll.resolve_settings(
+        {
+            "contour": {
+                "services": [{"name": "converter", "health": "http://192.0.2.10:8358/health"}],
+                "vram": {"command": False},
+            }
+        }
+    )
+    path = str(tmp_path / "contour.json")
+    status = contour_poll.poll(
+        settings, path, fetch=lambda url, timeout: {"ok": True, "oom_overflows": True}, clock=lambda: _T0
+    )
+    assert status["services"]["converter"]["oom_overflows"] is None
+    assert status["alerts"] == []
 
 
 def test_a_counter_that_went_backwards_is_a_restart_and_pages_rather_than_going_quiet():
