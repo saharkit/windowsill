@@ -116,7 +116,7 @@ jobs:
           rc=$?
           set -e
           [ "$rc" = "64" ] || { echo "a config with no usable service exited $rc, not 64"; exit 1; }
-          grep -q "no usable service" /tmp/contour-cfg.txt \
+          grep -q "has no fetchable" /tmp/contour-cfg.txt \
             || { echo "the config error lost its diagnostic"; cat /tmp/contour-cfg.txt; exit 1; }
 
       - name: contour-poll.sh fails closed when its preconditions are missing

@@ -233,8 +233,9 @@ def normalize_service(entry) -> dict | None:
     """One config entry → {name, health, expect_device}, or None when unusable.
 
     A bare string is a health URL; an object takes the keys in the docstring. None means the
-    entry cannot ever be polled (no usable URL) — the caller skips it loudly, because a service
-    that is configured but never polled is a monitoring hole that looks like coverage.
+    entry cannot ever be polled (no usable URL) — the caller treats that as a ConfigError (exit
+    64), because a service that is configured but never polled is a monitoring hole that looks
+    like coverage, and silently skipping it would be exactly that hole.
     """
     if isinstance(entry, str):
         entry = {"health": entry}
