@@ -128,6 +128,7 @@ def install(tmp_path, monkeypatch):
     monkeypatch.setattr(report_bug, "_HOME", str(home))
     monkeypatch.setenv("USER", SECRETS["username"])
     monkeypatch.setenv("LOGNAME", SECRETS["username"])
+    monkeypatch.setenv("USERNAME", SECRETS["username"])
     monkeypatch.setenv("VOICE_LOOP_TTS_API_KEY", SECRETS["openai_key"])
     monkeypatch.setenv("VOICE_LOOP_STT_MODEL", "small")
     monkeypatch.delenv("VOICE_LOOP_REPORT_MAILBOX", raising=False)
@@ -282,6 +283,17 @@ def test_a_bare_address_in_a_log_line_is_a_host_too():
     )
     assert report_bug.redact("bound to 127.0.0.1 as always") == "bound to 127.0.0.1 as always"
     assert report_bug.redact("plugin 0.3.2 python 3.10.12") == "plugin 0.3.2 python 3.10.12"
+
+
+def test_usernames_returns_only_the_fixture_set(monkeypatch):
+    """The fixture must pin every name source so `usernames()` is deterministic on any host."""
+    monkeypatch.setattr(report_bug, "_HOME", "/home/vasilisa")
+    monkeypatch.setenv("USER", "vasilisa")
+    monkeypatch.setenv("LOGNAME", "vasilisa")
+    monkeypatch.setenv("USERNAME", "vasilisa")
+    # Also mock getpass.getuser to ensure determinism
+    monkeypatch.setattr(report_bug.getpass, "getuser", lambda: "vasilisa")
+    assert report_bug.usernames() == ("vasilisa",)
 
 
 # --- the log vocabulary ------------------------------------------------------------------------------
