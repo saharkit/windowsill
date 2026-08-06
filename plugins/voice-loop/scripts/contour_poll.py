@@ -30,6 +30,10 @@ any real host is baked into this file:
                         {name, health, expect_device, latency_fields}
                         Default: the local speech server only,
                         http://127.0.0.1:8355/health — loopback, no host named.
+                        A value that is not a list, an entry with no usable health URL, and two
+                        entries resolving to the SAME name are all CONFIG ERRORS (exit 64): a
+                        service the operator configured and this poller silently never polls is a
+                        monitoring hole wearing the word "ok".
     expect_device       the device a client depends on (e.g. "gpu"). Only when this is set does a
                         service reporting anything else raise the demotion alert — the alert means
                         "a client depends on the fast path", and that dependency is the operator's
@@ -42,8 +46,17 @@ any real host is baked into this file:
   contour.vram.min_free_mib  the floor that pages (default 200 — below it the live contour's
                         transient allocations start being at risk).
   contour.history       samples kept per service (default 2016 — a week at a 5-minute cadence).
+  contour.max_age       seconds after which a status file is STALE — nobody is polling (default
+                        900, three missed polls at the documented five-minute cadence). The
+                        poller writes it into the file; the hook reads it and pages on it, so
+                        "the contour is fine" and "nobody looked" are different answers.
 
 Scheduling is the operator's cron or a systemd --user timer; the poller itself is one shot.
+
+``ok`` in a health document is the service's own OPTIONAL self-assessment: True is healthy, False
+is the not-ok alert, and ABSENT (or non-boolean) is "this document does not say" — recorded as
+None, never paged on. A third-party /health that publishes {"status": "healthy"} and no ``ok`` is
+answering, and a monitor that calls it down for using a different vocabulary cries wolf forever.
 
 Stdlib only, Python 3.10+. ``contour-poll.sh`` is the thin entry point, exactly as ``speak.sh``
 is for ``speak.py``.
@@ -54,9 +67,14 @@ Usage:
   --json     print the whole status object instead of the one-line summary.
   --status   write somewhere other than the default state-dir path (a probe, a test).
 
-Exit codes: 0 polled, no alert active · 1 polled, at least one alert active (the status file says
-which) · 64 called wrong or the config names services none of which is usable — a caller that
-branches on "1 means page" must never be handed a typo instead.
+Exit codes, and the vocabulary is CLOSED — 1 means a page and nothing else, because a scheduler
+branching on it must never be handed a config typo instead:
+  0   polled, no alert active
+  1   polled, at least one alert active (the status file says which)
+  64  called wrong, or the config cannot be read as a poller config (unparseable, a mistyped
+      knob, a services value that is not a list, an unusable or duplicated entry), or the poll
+      itself failed. Every one of those ALSO writes the status file, carrying a ``poller-error``
+      alert, so the hook pages about the broken monitor instead of reading a stale "all quiet".
 """
 
 from __future__ import annotations
@@ -92,12 +110,23 @@ DEFAULT_VRAM_COMMAND = "nvidia-smi --query-gpu=memory.free --format=csv,noheader
 # anyone writes an SLO, small enough that the status file stays a file.
 DEFAULT_HISTORY = 2016
 
+# Three missed polls at the documented five-minute cadence. Written into the status file so the
+# hook can tell a healthy contour from a poller nobody scheduled — the distinction #40 opens with.
+DEFAULT_MAX_AGE = 900
+
 # A /health body is small by design. The cap is for the day a neighbour answers with something
 # that is not its health endpoint at all — the poller bounds what it reads rather than finding out.
 BODY_CAP = 1 << 20
 
 _STATE_DIR = os.path.join(os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state")), "voice-loop")
 STATUS_PATH = os.path.join(_STATE_DIR, "contour.json")
+
+# The exit-code vocabulary, named rather than sprinkled — see the module docstring. EXIT_PAGE is
+# the only code a scheduler may read as "an alert is active"; everything that is not a diagnosis
+# of the contour leaves through EXIT_USAGE.
+EXIT_QUIET = 0
+EXIT_PAGE = 1
+EXIT_USAGE = 64
 
 
 def _default_clock() -> datetime:
@@ -109,13 +138,35 @@ def _default_clock() -> datetime:
 # --- file can be copied out and still run — keep the semantics in sync with speak.py) ------------
 
 
+class ConfigError(Exception):
+    """This config cannot be read as a poller config. A CALLER error (64), never a page (1).
+
+    The one place this reader deliberately diverges from ``speak.py``'s: the hook swallows a bad
+    config because it must never fail a turn, and falling back to defaults there costs a spoken
+    line. Here the fallback costs the operator's whole contour — a poller that quietly narrows to
+    the shipped default and then prints "contour ok" has claimed coverage it does not have.
+    """
+
+
 def load_config(path: str) -> dict:
+    """The config file, or {} when there is none. Anything else is a ConfigError, not a default.
+
+    A MISSING file is the documented install that never configured a contour, and it defaults.
+    A file that is there and unreadable, or there and not JSON, is a typo somebody has to be told
+    about — silently polling loopback instead is the monitoring hole this poller exists to close.
+    """
     try:
         with open(path, encoding="utf-8") as fh:
             loaded = json.load(fh)
-        return loaded if isinstance(loaded, dict) else {}
-    except (OSError, ValueError):
+    except FileNotFoundError:
         return {}
+    except OSError as err:
+        raise ConfigError(f"cannot read {path}: {err}") from err
+    except ValueError as err:
+        raise ConfigError(f"{path} is not valid JSON: {err}") from err
+    if not isinstance(loaded, dict):
+        raise ConfigError(f"{path} must hold a JSON object, not {type(loaded).__name__}")
+    return loaded
 
 
 def cfg(config: dict, dotted: str, default):
@@ -142,6 +193,29 @@ def _name_from_url(url: str) -> str:
     return urllib.parse.urlsplit(url).netloc or url
 
 
+def _url_is_fetchable(parts: urllib.parse.SplitResult) -> bool:
+    """Can urllib actually turn this into a request at all?
+
+    Beyond scheme and netloc there are two shapes that parse fine and then raise out of the
+    OPENER rather than out of the config: a port that is not a number, and a host the idna codec
+    refuses (an empty label, a label over 63 bytes, non-ASCII that will not encode). Both are
+    config typos; asked at fetch time they surface as an uncaught UnicodeError/ValueError, which
+    is how a typo used to exit 1 — the page code. Asked HERE they are what they are: exit 64.
+    """
+    try:
+        host = parts.hostname
+        parts.port  # noqa: B018 — the parse IS the check; a bad port raises ValueError
+    except ValueError:
+        return False
+    if not host:
+        return False
+    try:
+        host.encode("idna")
+    except UnicodeError:
+        return False
+    return True
+
+
 def normalize_service(entry) -> dict | None:
     """One config entry → {name, health, expect_device, latency_fields}, or None when unusable.
 
@@ -154,8 +228,11 @@ def normalize_service(entry) -> dict | None:
     if not isinstance(entry, dict):
         return None
     health = str(entry.get("health") or "")
-    parts = urllib.parse.urlsplit(health)
-    if parts.scheme not in ("http", "https") or not parts.netloc:
+    try:
+        parts = urllib.parse.urlsplit(health)
+    except ValueError:  # an unbalanced IPv6 literal never even parses
+        return None
+    if parts.scheme not in ("http", "https") or not parts.netloc or not _url_is_fetchable(parts):
         return None
     fields = entry.get("latency_fields") or []
     return {
@@ -166,21 +243,60 @@ def normalize_service(entry) -> dict | None:
     }
 
 
+def _number(config: dict, dotted: str, default, cast):
+    """One numeric knob, or a ConfigError NAMING it. A mistyped scalar used to raise a bare
+    ValueError out of here and out of main, and Python's exit for an uncaught exception is 1 —
+    the page code. The knob's own name is what the operator needs, so it rides the message."""
+    value = cfg(config, dotted, default)
+    try:
+        return cast(value)
+    except (TypeError, ValueError) as err:
+        raise ConfigError(f"{dotted} must be a number, not {value!r}") from err
+
+
+def _resolve_services(raw) -> list[dict]:
+    """The configured services, or a ConfigError. Nothing here EVER falls back silently.
+
+    Three shapes are errors rather than defaults, and all three have the same failure: the poller
+    would go on printing "contour ok" for a contour it is not watching — a mis-shaped
+    ``contour.services``, an entry with no fetchable health URL, and two entries that collapse to
+    one name (same slot, same key, one history sample lost per poll, and the page says "X; X").
+    """
+    if raw is None:
+        return [normalize_service(entry) for entry in DEFAULT_SERVICES]
+    if not isinstance(raw, list):
+        raise ConfigError(f"contour.services must be a list of entries, not {type(raw).__name__}")
+    services = []
+    seen: dict[str, str] = {}
+    for entry in raw:
+        service = normalize_service(entry)
+        if service is None:
+            raise ConfigError(f"contour.services entry {entry!r} has no fetchable http(s) health URL")
+        name = service["name"]
+        if name in seen:
+            raise ConfigError(
+                f"contour.services has two entries named {name!r} ({seen[name]} and "
+                f"{service['health']}) — give one of them its own \"name\""
+            )
+        seen[name] = service["health"]
+        services.append(service)
+    return services
+
+
 def resolve_settings(config: dict) -> dict:
-    """Every knob, one place, same precedence as the rest of the plugin."""
+    """Every knob, one place, same precedence as the rest of the plugin. Raises ConfigError."""
     raw = cfg(config, "contour.services", None)
-    entries = raw if isinstance(raw, list) else DEFAULT_SERVICES
-    services = [normalized for entry in entries if (normalized := normalize_service(entry)) is not None]
     # cfg() treats "" as unset (bash-cfg parity), so the probe is disabled with JSON false —
     # the one knob where "nothing" is a meaningful answer rather than a missing one.
     vram_command = cfg(config, "contour.vram.command", DEFAULT_VRAM_COMMAND)
     return {
-        "services": services,
-        "services_configured": isinstance(raw, list),
-        "timeout": float(cfg(config, "contour.timeout", DEFAULT_TIMEOUT)),
+        "services": _resolve_services(raw),
+        "services_configured": raw is not None,
+        "timeout": _number(config, "contour.timeout", DEFAULT_TIMEOUT, float),
         "vram_command": "" if vram_command is False else str(vram_command),
-        "vram_min_free_mib": int(cfg(config, "contour.vram.min_free_mib", DEFAULT_VRAM_MIN_FREE_MIB)),
-        "history": max(1, int(cfg(config, "contour.history", DEFAULT_HISTORY))),
+        "vram_min_free_mib": _number(config, "contour.vram.min_free_mib", DEFAULT_VRAM_MIN_FREE_MIB, int),
+        "history": max(1, _number(config, "contour.history", DEFAULT_HISTORY, int)),
+        "max_age": max(1, _number(config, "contour.max_age", DEFAULT_MAX_AGE, int)),
     }
 
 
@@ -296,6 +412,9 @@ def evaluate_service(service: dict, sample: dict, previous: dict) -> list[dict]:
         add("unreachable", f"{name} is not answering its health endpoint ({sample['detail']})")
         return alerts  # nothing below can be known of a service that did not answer
     if sample["ok"] is False:
+        # ONLY an explicit false. None means the document published no ``ok`` we can read — a
+        # foreign /health with its own vocabulary is answering, and a monitor that reads "does not
+        # use my key" as "is down" pages forever about a service that never had a fault.
         add("not-ok", f"{name} answers its health endpoint but reports ok=false")
     expected = service["expect_device"]
     device = sample["device"]
@@ -397,7 +516,10 @@ def poll(settings: dict, status_path: str, *, fetch=None, runner=None, clock=Non
             }
             sample = {
                 "reachable": True,
-                "ok": health.get("ok") is True,
+                # Tri-state on purpose: True healthy, False the not-ok alert, None "this document
+                # does not say". A bool() here is what turned every third-party /health into a
+                # permanent page — see the module docstring.
+                "ok": health["ok"] if isinstance(health.get("ok"), bool) else None,
                 "device": str(health["device"]) if health.get("device") is not None else None,
                 "oom_overflows": health.get("oom_overflows") if isinstance(health.get("oom_overflows"), (int, float)) else None,
                 "fields": fields,
@@ -407,7 +529,7 @@ def poll(settings: dict, status_path: str, *, fetch=None, runner=None, clock=Non
         alerts.extend(evaluate_service(service, sample, previous_services.get(name, {})))
 
         entries = list(previous_history.get(name, [])) if isinstance(previous_history.get(name), list) else []
-        entries.append({"at": at, "ok": bool(sample["ok"]), "device": sample["device"], "fields": sample["fields"]})
+        entries.append({"at": at, "ok": sample["ok"], "device": sample["device"], "fields": sample["fields"]})
         history[name] = entries[-settings["history"] :]
 
     free_mib = sample_vram(settings["vram_command"], settings["timeout"], runner)
@@ -415,6 +537,10 @@ def poll(settings: dict, status_path: str, *, fetch=None, runner=None, clock=Non
 
     status = {
         "at": at,
+        # The freshness bound travels WITH the file: a reader cannot know this poller's cadence,
+        # and a status file with no expiry is why a poller nobody scheduled reads as a green
+        # contour forever. The hook pages on it (speak.py: contour_alerts).
+        "max_age": settings["max_age"],
         "alerts": alerts,
         "services": services,
         "vram": {"free_mib": free_mib, "min_free_mib": settings["vram_min_free_mib"]},
@@ -435,6 +561,33 @@ def poll(settings: dict, status_path: str, *, fetch=None, runner=None, clock=Non
 USAGE = "contour-poll [--json] [--status PATH]  (--help describes what a poll does)"
 
 
+def record_poller_error(status_path: str, message: str, clock=None) -> None:
+    """A poller that could not poll says so IN THE STATUS FILE, then leaves through 64.
+
+    Without this, every 64 left the previous file untouched and the hook went on reading an "all
+    quiet" nobody had refreshed. The previous history, samples and p95 are kept verbatim — they
+    are still the last true thing known — while ``at`` and ``alerts`` become this run's: a
+    ``poller-error`` page the hook voices exactly once, keyed on the condition like every other.
+    """
+    clock = _default_clock if clock is None else clock
+    status = read_status(status_path)
+    status["at"] = clock().isoformat()
+    status.setdefault("max_age", DEFAULT_MAX_AGE)
+    status["alerts"] = [
+        {
+            "key": "poller-error",
+            "kind": "poller-error",
+            "service": "",
+            "message": f"the contour poller could not run: {message}",
+        }
+    ]
+    try:
+        os.makedirs(os.path.dirname(status_path) or ".", exist_ok=True)
+        write_status(status_path, status)
+    except OSError:
+        pass  # an unwritable state dir costs the page, never a second traceback on the way out
+
+
 def main(argv: list[str] | None = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
     as_json = False
@@ -446,28 +599,35 @@ def main(argv: list[str] | None = None) -> int:
         elif arg == "--status":
             if not args:
                 print("contour-poll: --status needs a path", file=sys.stderr)
-                return 64
+                return EXIT_USAGE
             status_path = args.pop(0)
         elif arg in ("--help", "-h"):
             print(USAGE)
-            return 0
+            return EXIT_QUIET
         else:
             print(f"contour-poll: unknown argument {arg!r} (--help lists them)", file=sys.stderr)
-            return 64
+            return EXIT_USAGE
 
-    settings = resolve_settings(load_config(config_path()))
-    if not settings["services"]:
-        # A contour.services key that names nothing pollable is a config error, not an empty
-        # contour: answering "ok" here would page nobody about a contour nobody watches.
-        print("contour-poll: contour.services names no usable service (each needs an http(s) health URL)", file=sys.stderr)
-        return 64
-
+    # THE closed vocabulary, and this is the whole of it: everything from here down that is not a
+    # diagnosis of the contour — a config that will not read, a knob that is not a number, an
+    # entry urllib cannot fetch, a state dir that will not write, any internal error at all —
+    # leaves as 64 with the status file updated. Only the last line can return 1.
     try:
+        settings = resolve_settings(load_config(config_path()))
+        if not settings["services"]:
+            # A contour.services key that names nothing pollable is a config error, not an empty
+            # contour: answering "ok" here would page nobody about a contour nobody watches.
+            raise ConfigError("contour.services names no usable service (each needs an http(s) health URL)")
         os.makedirs(os.path.dirname(status_path) or ".", exist_ok=True)
         status = poll(settings, status_path)
-    except OSError as err:
-        print(f"contour-poll: cannot write the status file: {err}", file=sys.stderr)
-        return 64
+    except ConfigError as err:
+        print(f"contour-poll: {err}", file=sys.stderr)
+        record_poller_error(status_path, str(err))
+        return EXIT_USAGE
+    except Exception as err:  # noqa: BLE001 — an uncaught one would exit 1, and 1 means PAGE
+        print(f"contour-poll: the poll failed: {type(err).__name__}: {err}", file=sys.stderr)
+        record_poller_error(status_path, f"{type(err).__name__}: {err}")
+        return EXIT_USAGE
 
     if as_json:
         print(json.dumps(status, indent=2, sort_keys=True))
@@ -475,9 +635,15 @@ def main(argv: list[str] | None = None) -> int:
         for alert in status["alerts"]:
             print(f"ALERT {alert['message']}")
     else:
+        # The success line names WHAT was polled, not just how many answered: "contour ok" over
+        # the shipped default while the operator believes their own list is being watched is the
+        # coverage lie this poller exists to prevent, so services_configured is said out loud.
         reachable = sum(1 for sample in status["services"].values() if sample["reachable"])
-        print(f"contour ok — {reachable}/{len(status['services'])} services answered")
-    return 1 if status["alerts"] else 0
+        scope = "" if settings["services_configured"] else " (contour.services unset — the default local service only)"
+        silent = sum(1 for sample in status["services"].values() if sample["reachable"] and sample["ok"] is None)
+        unread = f", {silent} publishing no ok field" if silent else ""
+        print(f"contour ok — {reachable}/{len(status['services'])} services answered{unread}{scope}")
+    return EXIT_PAGE if status["alerts"] else EXIT_QUIET
 
 
 if __name__ == "__main__":

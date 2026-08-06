@@ -250,8 +250,21 @@ No Prometheus, no root.
 - **Alerts.** A service that does not answer (or reports `ok: false`); a service serving on a
   device other than its `expect_device` — set that key exactly when a client depends on the fast
   path, because that dependency is yours to declare and the alert means "the fast path is gone";
-  free VRAM under `vram.min_free_mib` (default 200); a rising `oom_overflows` counter. Exit code is
-  `0` quiet, `1` an alert is active, `64` called wrong or a config naming nothing usable.
+  free VRAM under `vram.min_free_mib` (default 200); a rising `oom_overflows` counter; and, read
+  by the hook rather than the poller, **a status file nobody has refreshed** (see `max_age`).
+  `ok` is a service's *optional* self-assessment: `false` alerts, and **absent does not** — a
+  third-party `/health` with its own vocabulary (the `converter` above) is answering, not down.
+- **Exit codes, and the vocabulary is closed.** `0` quiet, `1` an alert is active, `64` everything
+  else — called wrong, a config that will not parse, a knob that is not a number, a `services`
+  value that is not a list, an entry with no fetchable URL, two entries resolving to one name, or
+  a poll that failed. **`1` never means anything but "page"**, so a cron line or scheduler can
+  branch on it. Every `64` still writes the status file, carrying a `poller-error` alert, so a
+  broken poller is heard rather than leaving the hook to read a stale "all quiet".
+- **`max_age`** (default 900 s — three missed polls at a five-minute cadence) is written into
+  `contour.json`, and the hook pages when the file is older than it. Remove the cron entry and the
+  status file freezes at its last green poll; without this bound "the contour is fine" and "nobody
+  looked" are the same silence. A stale file's own alerts are dropped with it — a reading nobody
+  refreshed says nothing about now.
 - **The SLI.** Every sample is appended to a bounded history (default a week at a five-minute
   cadence), and any numeric health field named in `latency_fields` gets a **p95 split by device** —
   the CPU/GPU split is a cliff, so an average across both would be meaningless. That history is
