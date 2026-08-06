@@ -438,3 +438,12 @@ class TestTheStreamingVariantIsDocumented:
         for name, entry in providers.STT_PROVIDERS.items():
             if entry.streaming is not None:
                 assert f"`{name}` (STT) | **yes**" in doc, f"{name} streams but the table does not say so"
+
+    def test_and_nothing_claims_to_stream_that_does_not(self):
+        """The other direction, the LOG_RULES way. A row promising a live socket that the registry
+        cannot open is worse than a missing row: the first sends a user to change a setting that
+        does nothing, the second only fails to advertise. Both directions or neither."""
+        doc = (Path(__file__).resolve().parents[1] / "PROVIDERS.md").read_text(encoding="utf-8")
+        claimed = set(re.findall(r"`([a-z0-9-]+)` \(STT\) \| \*\*yes\*\*", doc))
+        streams = {name for name, entry in providers.STT_PROVIDERS.items() if entry.streaming is not None}
+        assert claimed == streams, f"PROVIDERS.md claims {sorted(claimed)} stream; the registry says {sorted(streams)}"

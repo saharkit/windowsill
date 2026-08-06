@@ -1531,6 +1531,9 @@ def stop_and_transcribe(s: dict, system: str, mode: str, recorder_pid: int) -> i
     if not text:
         note("nothing recognized", system)
         log("empty transcription")
+        # A silent clip is a RESULT, and a streaming one is the fastest result this file produces —
+        # leaving it out of the latency ledger is how a path gets a reputation it never earned.
+        latency("nothing")
         return 0
 
     tool = resolve_clipboard(

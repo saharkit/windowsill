@@ -1108,6 +1108,34 @@ jobs:
             echo "a stream worker is still running after the stop toggle"; exit 1
           fi
 
+          # THE DEGRADE, in the same real processes: the same toggle pair with the streaming
+          # endpoint pointed at a port nothing listens on. The recording must still become text —
+          # by the batch path, through the live server this job already started — because "a
+          # recording is never lost to the live path" is the promise, and a promise only unit tests
+          # have made is a promise nobody has kept.
+          export XDG_STATE_HOME="$RUNNER_TEMP/stream-degrade-state"
+          state="$XDG_STATE_HOME/voice-loop"
+          export FAKE_CLIP_FILE="$RUNNER_TEMP/stream-degrade-clip.txt"
+          python3 -c "
+          import json, os
+          path = os.environ['VOICE_LOOP_CONFIG']
+          config = json.load(open(path))
+          config['stt']['cloud']['endpoint'] = 'http://127.0.0.1:9'   # discard: never listening
+          json.dump(config, open(path, 'w'))
+          "
+          python3 plugins/voice-loop/scripts/dictate.py paste
+          sleep 2
+          python3 plugins/voice-loop/scripts/dictate.py paste
+          echo "--- dictate.log (degrade)"; cat "$state/dictate.log"
+          grep -q "streaming stt failed" "$state/dictate.log" \
+            || { echo "the dead endpoint did not produce a streaming failure"; exit 1; }
+          grep -q "via=batch" "$state/dictate.log" \
+            || { echo "the degrade did not reach the batch path"; exit 1; }
+          [ -s "$FAKE_CLIP_FILE" ] \
+            || { echo "the recording was LOST to the failed stream — nothing reached the clipboard"; exit 1; }
+          [ -s "$state/dictate-last.wav" ] \
+            || { echo "the clip was not kept for salvage"; exit 1; }
+
       - name: server log on failure
         if: failure()
         run: kill "$(cat /tmp/voice-loop.pid)" 2>/dev/null || true
