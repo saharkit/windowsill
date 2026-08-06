@@ -117,7 +117,17 @@ def _default_runner(argv: Sequence[str], timeout: float) -> "subprocess.Complete
 
 _HOME = os.path.expanduser("~")
 _OTHER_HOME_RE = re.compile(r"(/(?:home|Users)/)[^/\s:\"']+")
-_URL_RE = re.compile(r"\b(https?://)([^\s/\"'<>)\]]+)")
+# URL rule: matches http/https/ws/wss with their hosts, plus bare host:port combinations
+# (e.g. "Connection refused to deepgram.corp.internal:443" or "TLS failed for api.example.com:443")
+_URL_RE = re.compile(r"\b((?:https?|wss?)://)([^\s/\"'<>)\]]+)")
+# A bare *host:port* without scheme: "Connection refused to deepgram.corp.internal:443"
+# This catches what _URL_RE does not: URLs without a scheme, or just host:port in prose.
+# We need to match:
+#   - hostname:port (e.g. deepgram.corp.internal:443, api.example.com:8080)
+#   - IPv4:port (e.g. 192.168.7.31:8355) - but loopback IPs are preserved
+#   - IPv6:port (e.g. [::1]:8080)
+# We use a more permissive host pattern that catches word-char sequences.
+_BARE_HOST_PORT_RE = re.compile(r"\b([^\s/:\"'<>)\]]+):(\d{1,5})\b")
 # An address also reaches the logs bare, with no scheme in front of it: "Connection refused to
 # 192.168.7.31" is a urllib reason string, and it names the user's network just as precisely as a
 # URL does. A dotted quad is unambiguous enough to rewrite on sight (a version number has three
@@ -158,6 +168,7 @@ def usernames() -> tuple[str, ...]:
 
 
 def _redact_host(match: "re.Match[str]") -> str:
+    """Redact the host in a URL match, preserving loopback addresses."""
     netloc = match.group(2)
     host, sep, port = netloc.rpartition(":")
     if not sep or not port.isdigit():  # no port: the whole netloc is the host
@@ -165,6 +176,26 @@ def _redact_host(match: "re.Match[str]") -> str:
     if host.lower() in _LOOPBACK_HOSTS:
         return match.group(0)  # loopback is the fact worth keeping, and it names nobody
     return f"{match.group(1)}<host>{sep}{port}"
+
+
+def _redact_bare_host_port(match: "re.Match[str]") -> str:
+    """Redact the host in a bare host:port match, preserving loopback addresses.
+
+    Matches things like "Connection refused to deepgram.corp.internal:443"
+    or "TLS failed for api.example.com:8080".
+    """
+    host, port = match.group(1), match.group(2)
+    # Preserve loopback hosts (like 127.0.0.1 or localhost)
+    # Note: we can't easily identify IPv4 vs hostname here, so we use a simpler check
+    # - IP addresses: 127.x.x.x, localhost, ::1 are loopback
+    # - We don't want to redact localhost:443 as <host>:443, that's useful info
+    if host.lower() in _LOOPBACK_HOSTS:
+        return match.group(0)  # preserve loopback
+    # For IPv4 addresses, keep as <host>:port (IP address is fine to redact as host)
+    if re.match(r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$", host):
+        return f"<host>:{port}"
+    # For hostnames, keep just the port - the hostname is what we're trying to hide
+    return f"<host>:{port}"
 
 
 def redact(text: str) -> str:
@@ -183,6 +214,9 @@ def redact(text: str) -> str:
     for name in usernames():
         text = re.sub(rf"\b{re.escape(name)}\b", "<user>", text)
     text = _URL_RE.sub(_redact_host, text)
+    # Redact bare host:port combinations (e.g. "Connection refused to deepgram.corp.internal:443")
+    # Run this before _IPV4_RE so the loopback check works correctly
+    text = _BARE_HOST_PORT_RE.sub(_redact_bare_host_port, text)
     text = _IPV4_RE.sub(lambda m: m.group(0) if m.group(0) in _LOOPBACK_HOSTS else "<host>", text)
     for pattern, replacement in _SECRET_PATTERNS:
         text = pattern.sub(replacement, text)

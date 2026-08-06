@@ -296,6 +296,36 @@ def test_usernames_returns_only_the_fixture_set(monkeypatch):
     assert report_bug.usernames() == ("vasilisa",)
 
 
+def test_bare_host_port_without_scheme_is_redacted():
+    """bare host:port in failure reasons (like urllib's Connection refused) must be redacted.
+
+    This catches the security issue where private hostnames like deepgram.corp.internal:443
+    would escape the redactor and appear in a public GitHub issue.
+    """
+    # Bare hostname:port should be redacted
+    assert report_bug.redact("Connection refused to deepgram.corp.internal:443") == (
+        "Connection refused to <host>:443"
+    )
+    # Bare IP:port should be redacted
+    assert report_bug.redact("Connection refused to 192.168.7.31:8355") == (
+        "Connection refused to <host>:8355"
+    )
+    # Loopback host:port should be preserved (useful info for diagnosis)
+    assert report_bug.redact("Connection refused to 127.0.0.1:8355") == (
+        "Connection refused to 127.0.0.1:8355"
+    )
+    assert report_bug.redact("Connection refused to localhost:8355") == (
+        "Connection refused to localhost:8355"
+    )
+    # TLS failure messages with bare host:port
+    assert report_bug.redact("TLS failed for deepgram.corp.internal:443") == (
+        "TLS failed for <host>:443"
+    )
+    # WebSocket URLs should also work
+    assert report_bug.redact("ws://voicebox.lan:8355/socket") == "ws://<host>:8355/socket"
+    assert report_bug.redact("wss://secure.example.com:443/socket") == "wss://<host>:443/socket"
+
+
 # --- the log vocabulary ------------------------------------------------------------------------------
 
 
