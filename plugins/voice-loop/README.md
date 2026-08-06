@@ -120,7 +120,8 @@ with one account here: a `deepgram` STT config is never handed an ElevenLabs key
 **Privacy note: with any cloud `stt.cloud.provider`, your recorded audio clips leave your machine
 and are sent to that provider's servers for transcription** — that is the trade the `cloud` row
 above states. If you would rather keep your audio local, `stt.backend: "lan"` (the default)
-transcribes on your own hardware.
+transcribes on your own hardware. The shelf-wide privacy page — what is collected (nothing),
+where your voice goes, what `/report-bug` strips — is [PRIVACY.md](../../PRIVACY.md).
 
 **Adding a provider is one entry** in [`scripts/providers.py`](scripts/providers.py) plus its row
 in `PROVIDERS.md` — no dispatch path in the plugin compares a provider name against a literal, and
