@@ -300,6 +300,28 @@ def test_speech_bearing_lines_keep_their_event_and_lose_their_words():
     )
 
 
+def test_the_contour_page_travels_as_its_count_and_never_as_the_operators_service_names():
+    """The drift guard proves every log call HAS a row; it cannot prove the row's cut marker still
+    matches the line. This one does, against the real format string: the count is metadata a
+    maintainer needs, and everything from "alert(s): " on is alert text — which is built out of the
+    operator's own service names, i.e. the host:port of machines that are not in this repository.
+    A cut marker that no longer occurs in the line would send the whole tail through untouched.
+    """
+    line = "contour: voicing 2 alert(s): Voice contour: rvc-gpu-01.internal:8358 is serving on cpu, expected gpu"
+    scrubbed, classified = report_bug.scrub_message(line)
+    assert classified is True
+    assert scrubbed.startswith("contour: voicing 2 alert(s): ")
+    assert "rvc-gpu-01" not in scrubbed and "8358" not in scrubbed
+    assert scrubbed.endswith(" chars>")
+    # the two contour lines that are metadata whole, and the dedup's own marker among them
+    for message in (
+        "contour: another firing is speaking — alert left unannounced for the next firing",
+        "contour: the page reached no player — left unannounced, to be retried",
+        "contour: already announced — nothing to voice (1 alert(s) still active)",
+    ):
+        assert report_bug.scrub_message(message) == (message, True)
+
+
 def test_metadata_lines_travel_whole():
     for message in (
         "played rc=0 bytes=88200 chunks=3 via=stream",

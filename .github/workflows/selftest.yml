@@ -94,6 +94,56 @@ jobs:
           grep -q "tls-probe.py is missing" /tmp/tls-nopy2.txt \
             || { echo "the missing-script guard lost its diagnostic"; cat /tmp/tls-nopy2.txt; exit 1; }
 
+      - name: contour-poll.sh argument branches (no server needed)
+        run: |
+          bash plugins/voice-loop/scripts/contour-poll.sh --help | grep -q "contour-poll" \
+            || { echo "--help did not print the usage text"; exit 1; }
+          set +e
+          bash plugins/voice-loop/scripts/contour-poll.sh --no-such-flag 2>/tmp/contour-err.txt
+          rc=$?
+          set -e
+          # 64, not 1: a mis-invocation must never read as "an alert is active" — exit 1 is the
+          # page signal a scheduler or a hook branches on
+          [ "$rc" = "64" ] || { echo "an unknown argument exited $rc, not 64"; cat /tmp/contour-err.txt; exit 1; }
+          grep -q "unknown argument" /tmp/contour-err.txt \
+            || { echo "unknown-arg rejection lost its diagnostic"; cat /tmp/contour-err.txt; exit 1; }
+          # a config that names services none of which is usable is a config error (64), never
+          # "contour ok" — a monitoring hole must not report as coverage
+          export VOICE_LOOP_CONFIG="$RUNNER_TEMP/contour-bad.json"
+          printf '%s' '{"contour": {"services": ["not-a-url"]}}' > "$VOICE_LOOP_CONFIG"
+          set +e
+          bash plugins/voice-loop/scripts/contour-poll.sh --status "$RUNNER_TEMP/contour.json" 2>/tmp/contour-cfg.txt
+          rc=$?
+          set -e
+          [ "$rc" = "64" ] || { echo "a config with no usable service exited $rc, not 64"; exit 1; }
+          grep -q "has no fetchable" /tmp/contour-cfg.txt \
+            || { echo "the config error lost its diagnostic"; cat /tmp/contour-cfg.txt; exit 1; }
+
+      - name: contour-poll.sh fails closed when its preconditions are missing
+        run: |
+          # The launcher's own two guards — byte-identical in shape to tls-probe.sh's, which have
+          # had their own step since #52 while these had none: drop either one and every gate here
+          # stayed green. Both exit 64, not 1: a broken install is "called wrong", never "an alert
+          # is active", and that distinction is the whole exit-code vocabulary of #40.
+          set +e
+          # bash by absolute path: with PATH emptied, `env` could not look the interpreter up either
+          env PATH=/nonexistent "$(command -v bash)" plugins/voice-loop/scripts/contour-poll.sh 2>/tmp/contour-nopy.txt
+          rc=$?
+          set -e
+          [ "$rc" = "64" ] || { echo "a missing python3 did not fail closed (exit $rc)"; cat /tmp/contour-nopy.txt; exit 1; }
+          grep -q "python3 is required" /tmp/contour-nopy.txt \
+            || { echo "the missing-python3 guard lost its diagnostic"; cat /tmp/contour-nopy.txt; exit 1; }
+          orphan="$RUNNER_TEMP/orphan-contour"
+          mkdir -p "$orphan"
+          cp plugins/voice-loop/scripts/contour-poll.sh "$orphan/"   # deliberately WITHOUT the .py
+          set +e
+          bash "$orphan/contour-poll.sh" 2>/tmp/contour-nopy2.txt
+          rc=$?
+          set -e
+          [ "$rc" = "64" ] || { echo "a launcher with no contour_poll.py beside it did not fail closed (exit $rc)"; exit 1; }
+          grep -q "contour_poll.py is missing" /tmp/contour-nopy2.txt \
+            || { echo "the missing-script guard lost its diagnostic"; cat /tmp/contour-nopy2.txt; exit 1; }
+
   coverage:
     name: unit tests (python ${{ matrix.python }})
     runs-on: ubuntu-latest
@@ -250,6 +300,146 @@ jobs:
             --endpoint http://127.0.0.1:8355 \
             --language "$VOICE_LOOP_LANGUAGE" \
             --strict --threshold 0.7
+
+      - name: contour-poll contract (real invocation — quiet, then a REAL demotion page)
+        run: |
+          # The monitoring substrate of #40, proven end to end against the live server this job
+          # already runs: the poller writes contour.json, and the speaking hook — registration
+          # unchanged — voices an active alert ONCE. The demotion is real: the runners have no
+          # GPU, so the server's /health genuinely reports "cpu" while the config declares a
+          # client that depends on "cuda". Own state dir, like the contract steps beside it, so
+          # every file counted here is one of ours.
+          #
+          # Two things this step asserts that a log line alone cannot. FIRST, the status file is
+          # written where contour.status_path says and NOT to the default — and the hook still
+          # finds it. Passing a --status that happens to equal the default hid a seam where the
+          # poller could poll correctly, exit 1 correctly, and page nobody. SECOND, delivery is
+          # OBSERVABLE: speak.player is a recording script, so "the alert was voiced" is bytes
+          # that reached a player process, asserted through play_text's own outcome line
+          # (`played rc=…`), not through a line logged three statements before playback starts.
+          export XDG_STATE_HOME="$RUNNER_TEMP/contour-state"
+          state_dir="$XDG_STATE_HOME/voice-loop"
+          mkdir -p "$state_dir"
+          # deliberately NOT the default path, and never named on the command line
+          export CONTOUR_STATUS="$RUNNER_TEMP/contour-elsewhere/contour.json"
+          mkdir -p "$(dirname "$CONTOUR_STATUS")"
+          export PLAYED_LOG="$RUNNER_TEMP/contour-played.txt"
+          : > "$PLAYED_LOG"
+          cat > "$RUNNER_TEMP/recording-player.sh" <<'SH'
+          #!/usr/bin/env bash
+          # stands in for aplay/afplay: records that real audio reached a real player process
+          wc -c < "$1" >> "$PLAYED_LOG"
+          SH
+          export VOICE_LOOP_CONFIG="$RUNNER_TEMP/contour-config.json"
+          cat > "$VOICE_LOOP_CONFIG" <<JSON
+          {
+            "tts": { "backend": "lan", "endpoint": "http://127.0.0.1:8355" },
+            "speak": { "player": "bash $RUNNER_TEMP/recording-player.sh", "timeout": 180 },
+            "contour": {
+              "services": [ { "name": "voice-loop", "health": "http://127.0.0.1:8355/health" } ],
+              "vram": { "command": false },
+              "status_path": "$CONTOUR_STATUS"
+            }
+          }
+          JSON
+          # quiet first: the server is up, and nothing is expected of its device. No --status: the
+          # SCHEDULED shape, resolving the path out of the config exactly as the hook will.
+          bash plugins/voice-loop/scripts/contour-poll.sh \
+            || { echo "a healthy contour paged"; cat "$CONTOUR_STATUS"; exit 1; }
+          [ -f "$CONTOUR_STATUS" ] \
+            || { echo "contour.status_path was ignored — nothing at $CONTOUR_STATUS"; exit 1; }
+          [ -f "$state_dir/contour.json" ] \
+            && { echo "the poller wrote the DEFAULT path, so this step proves nothing"; exit 1; }
+          python3 - <<'PY'
+          import json, os
+          status = json.load(open(os.environ["CONTOUR_STATUS"]))
+          service = status["services"]["voice-loop"]
+          assert service["reachable"] is True and service["ok"] is True, status
+          assert status["alerts"] == [], status["alerts"]
+          # the file is the page, not a dashboard: no accumulated window, and small enough that the
+          # hook re-reading it on every tool call costs nothing
+          assert set(status) == {"at", "max_age", "alerts", "services", "vram"}, sorted(status)
+          assert os.path.getsize(os.environ["CONTOUR_STATUS"]) < 2048, "the status file is growing again"
+          PY
+
+          # THE QUIET DIRECTION, which nothing covered: a green contour, a hook that really runs
+          # its whole speaking path, and NOT ONE word about the contour. Asserted positively (the
+          # turn's own line was delivered) so that "said nothing" cannot be a crash in disguise.
+          python3 -c 'import json; print(json.dumps({"type": "assistant", "message": {"content": [{"type": "text", "text": "🔊 the gate is speaking"}]}}))' > /tmp/contour-marked.jsonl
+          printf '%s' '{"transcript_path": "/tmp/contour-marked.jsonl"}' | bash plugins/voice-loop/scripts/speak.sh
+          grep -q "played rc=" "$state_dir/speak.log" \
+            || { echo "the hook never reached playback, so its silence proves nothing"; cat "$state_dir/speak.log"; exit 1; }
+          [ -s "$PLAYED_LOG" ] \
+            || { echo "no audio reached the player — delivery is not observable here"; exit 1; }
+          grep -q "contour:" "$state_dir/speak.log" \
+            && { echo "a clean contour was not silent"; cat "$state_dir/speak.log"; exit 1; }
+
+          # now declare the dependency — a client relies on cuda and the runner has none: the page
+          python3 -c 'import json, os; p = os.environ["VOICE_LOOP_CONFIG"]; c = json.load(open(p)); c["contour"]["services"][0]["expect_device"] = "cuda"; json.dump(c, open(p, "w"))'
+          set +e
+          bash plugins/voice-loop/scripts/contour-poll.sh > /tmp/contour-out.txt
+          rc=$?
+          set -e
+          [ "$rc" = "1" ] || { echo "a real demotion did not page (exit $rc)"; cat /tmp/contour-out.txt; exit 1; }
+          grep -q "ALERT voice-loop is serving on cpu, expected cuda" /tmp/contour-out.txt \
+            || { echo "the demotion alert lost its message"; cat /tmp/contour-out.txt; exit 1; }
+
+          # …and the hook turns the active alert into a VOICE — exactly once, however often it
+          # fires. The transcript has nothing marked in it, so every delivery counted from here on
+          # is the ALERT's own.
+          python3 -c 'import json; print(json.dumps({"type": "assistant", "message": {"content": [{"type": "text", "text": "nothing marked here"}]}}))' > /tmp/contour-transcript.jsonl
+          before_played=$(grep -c "played rc=" "$state_dir/speak.log")
+          before_wavs=$(wc -l < "$PLAYED_LOG")
+          printf '%s' '{"transcript_path": "/tmp/contour-transcript.jsonl"}' | bash plugins/voice-loop/scripts/speak.sh
+          grep -q "contour: voicing 1 alert(s)" "$state_dir/speak.log" \
+            || { echo "the hook did not voice the active alert"; cat "$state_dir/speak.log"; exit 1; }
+          # play_text's OWN outcome, not the decision three statements above it: regress playback to
+          # return early and "voicing 1 alert(s)" still appears, while these two do not.
+          [ "$(grep -c "played rc=" "$state_dir/speak.log")" -gt "$before_played" ] \
+            || { echo "the page was announced but play_text never played it"; cat "$state_dir/speak.log"; exit 1; }
+          grep -q "nothing played via=" "$state_dir/speak.log" \
+            && { echo "the page reached no player"; cat "$state_dir/speak.log"; exit 1; }
+          [ "$(wc -l < "$PLAYED_LOG")" -gt "$before_wavs" ] \
+            || { echo "no audio bytes reached the player for the alert"; exit 1; }
+
+          # the second firing, and it must leave a POSITIVE mark. "no second `contour: voicing`" is
+          # equally satisfied by a run that died before it ever looked — speak.sh swallows every
+          # exception and exits 0, so dying is exactly what a regression here looks like.
+          printf '%s' '{"transcript_path": "/tmp/contour-transcript.jsonl"}' | bash plugins/voice-loop/scripts/speak.sh
+          grep -q "contour: already announced — nothing to voice (1 alert(s) still active)" "$state_dir/speak.log" \
+            || { echo "the second firing never reached the dedup"; cat "$state_dir/speak.log"; exit 1; }
+          [ "$(grep -c "contour: voicing" "$state_dir/speak.log")" = "1" ] \
+            || { echo "a persistent alert paged twice"; cat "$state_dir/speak.log"; exit 1; }
+
+      - name: contour-poll VRAM probe (a REAL subprocess spawn, with a stub card)
+        run: |
+          # contour.vram.command is the one place this poller starts a process, and the gate
+          # configured it to `false` everywhere — so the spawn, the argv split, the parse and the
+          # floor comparison shipped with nothing in CI ever running them. nvidia-smi is stubbed
+          # (no runner has a card); the SPAWN is real, and so is the page it produces.
+          export XDG_STATE_HOME="$RUNNER_TEMP/contour-vram-state"
+          mkdir -p "$XDG_STATE_HOME/voice-loop"
+          cat > "$RUNNER_TEMP/fake-nvidia-smi.sh" <<'SH'
+          #!/usr/bin/env bash
+          # two cards, and the tightest one is what the floor is compared against
+          printf '2206\n11\n'
+          SH
+          export VOICE_LOOP_CONFIG="$RUNNER_TEMP/contour-vram-config.json"
+          cat > "$VOICE_LOOP_CONFIG" <<JSON
+          {
+            "contour": {
+              "services": [ { "name": "voice-loop", "health": "http://127.0.0.1:8355/health" } ],
+              "vram": { "command": "bash $RUNNER_TEMP/fake-nvidia-smi.sh", "min_free_mib": 200 }
+            }
+          }
+          JSON
+          set +e
+          bash plugins/voice-loop/scripts/contour-poll.sh > /tmp/contour-vram.txt
+          rc=$?
+          set -e
+          [ "$rc" = "1" ] || { echo "free VRAM under the floor did not page (exit $rc)"; cat /tmp/contour-vram.txt; exit 1; }
+          grep -q "ALERT free VRAM is 11 MiB, below the 200 MiB floor" /tmp/contour-vram.txt \
+            || { echo "the vram alert lost its message (or read the wrong card)"; cat /tmp/contour-vram.txt; exit 1; }
 
       - name: TLS-probe contract (real invocation — green, then an overridden store)
         run: |

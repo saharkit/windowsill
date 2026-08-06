@@ -120,6 +120,36 @@ the real runtime. So the guarantee is layered differently:
 
    The one thing no runner can offer is a genuine python.org-installer Python with its own empty
    store; that is row 5.8, checked by a human.
+8. **`tests/test_contour_poll.py`** for the contour poller (#40), same seam shape: the health
+   fetch and the clock are injected callables, so the alert rules (unreachable, device demoted —
+   only when `expect_device` declares the dependency, VRAM under the floor, `oom_overflows` on a
+   rise *or a restart* and never on the level), the atomic status write and the `0/1/64` exit
+   contract are all pinned without a socket. Three things there are deliberately **not** faked,
+   because faking them is what let them ship unexecuted: `sample_vram`'s default runner really
+   spawns a subprocess (a stub script, never `nvidia-smi` — no GPU is needed for the *spawn* to be
+   the thing under test, including a wedged one killed by its own timeout); the atomic write is
+   pinned at `os.replace` rather than by its outcome, because an atomic write and a truncating one
+   leave the same file behind; and the poll-time bound is asserted where the waits are *spent*.
+   The hook half lives in `tests/test_speak.py`: an active alert is voiced once through the
+   real `contour_check` (and once through the real `entry()`, proving the page does not depend on
+   the turn having a marked line), a persistent condition does not re-page, a cleared-and-returned
+   one does, an alert that loses the eager lock stays unannounced for the next firing, and the
+   status file is read from `contour.status_path` — the seam that used to let a relocated poller
+   page nobody. What a fake cannot prove, **one real invocation in the loopback job does** — the
+   *contour-poll contract* step runs the poller against the live server with `contour.status_path`
+   pointed somewhere that is **not** the default and no `--status` on the command line, asserts a
+   green contour makes the hook say nothing at all (with the turn's own line delivered, so silence
+   cannot be a crash in disguise), then declares `expect_device: "cuda"` on runners that have no
+   GPU, so a REAL demotion alert fires: exit 1, the alert message, and the real `speak.sh` voicing
+   it exactly once across two invocations. Delivery is asserted on `play_text`'s own outcome
+   (`played rc=…`, plus a recording player that counts the audio it was handed), never on the
+   decision logged before playback starts; and the second firing must leave its own positive mark
+   (`contour: already announced`), because `speak.sh` swallows every exception and exits 0, so
+   "did not page twice" is otherwise satisfied by a run that crashed before it looked. The
+   launcher's two fail-closed guards have their own step beside `tls-probe.sh`'s, and the VRAM
+   probe has one that spawns a stub card for real. The `contour.alerts` opt-out,
+   `contour.vram.command: false`, and the announced-ledger pruning are unit-tested above; the one
+   thing no runner can offer is a real oversubscribed card.
 
 Real invocation is the guarantee for the runtime path. Every spoken run also logs
 `timings extract_ms=… first_audio_ms=… total_ms=…` to `~/.local/state/voice-loop/speak.log`, so a

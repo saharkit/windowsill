@@ -13,6 +13,11 @@ speech server, a **hotkey binding** in the desktop's own config, `~/.config/voic
 **convention line** in a `CLAUDE.md`. Removing the plugin removes none of it. This skill does — in
 reverse order, listing before deleting, and asking per group.
 
+**Plus one thing setup never created:** the contour poller's schedule, which the README asks the
+user to write by hand (a `systemd --user` timer or a cron line). It is the one piece that can
+outlive the scripts it runs, so it is inventoried in Step 0 and stopped in Step 1b — a timer left
+firing a deleted `contour-poll.sh` every five minutes is the failure this skill exists to prevent.
+
 **Scope argument** (optional): `service`, `hotkey`, `config`, `models` or `convention` runs only
 that step; `all`, or nothing, runs the whole flow. Step 0 always runs — you cannot offer to delete
 what you have not looked at.
@@ -53,6 +58,11 @@ du -sh "${HF_HOME:-$HOME/.cache/huggingface}"/hub/models--*faster-whisper* \
        "${HF_HOME:-$HOME/.cache/huggingface}"/hub/models--*ccentuator* 2>/dev/null; \
 echo "== service"; ls -1 "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/voice-loop.service" 2>/dev/null; \
 systemctl --user is-enabled voice-loop.service 2>/dev/null; systemctl --user is-active voice-loop.service 2>/dev/null; \
+echo "== contour schedule"; \
+ls -1 "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/voice-loop-contour.timer" \
+      "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/voice-loop-contour.service" 2>/dev/null; \
+systemctl --user is-enabled voice-loop-contour.timer 2>/dev/null; \
+crontab -l 2>/dev/null | grep -n 'contour-poll'; \
 echo "== hotkey"; gsettings get org.gnome.settings-daemon.plugins.media-keys custom-keybindings 2>/dev/null; \
 grep -n 'dictate-toggle' "$HOME/.config/skhd/skhdrc" 2>/dev/null; \
 echo "== convention"; grep -n 'spoken summary' "$HOME/.claude/CLAUDE.md" ./CLAUDE.md 2>/dev/null; \
@@ -81,6 +91,33 @@ running but Step 0 found no unit file, it was not written by setup: report it an
 
 On macOS setup writes no launch agent — the server, if any, was started by hand. Say so rather than
 inventing a unit to remove.
+
+### Step 1b — the contour poller's schedule (stop it BEFORE the scripts go)
+
+Setup never created this one: the README tells the user to write it themselves, which means it can
+outlive everything else here. **A timer left firing a deleted `contour-poll.sh` is this skill's
+worst outcome** — a unit that fails every five minutes forever, with the failure attributed to a
+plugin that is no longer installed. Remove it in the same step as the service, before anything is
+deleted, and only what Step 0 actually found.
+
+```sh
+systemctl --user disable --now voice-loop-contour.timer; \
+rm -f "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/voice-loop-contour.timer" \
+      "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/voice-loop-contour.service"; \
+systemctl --user daemon-reload
+```
+
+**The cron line is the user's file, so it is theirs to edit.** Never rewrite a crontab: it holds
+entries this skill knows nothing about, and `crontab -` replaces the whole thing. Print the line
+Step 0 found with its number and the one command that opens the file:
+
+```sh
+crontab -e   # delete the line above
+```
+
+If Step 0 found a schedule pointing at `contour-poll.sh` in **neither** of those two shapes (a
+launchd agent, a Kubernetes CronJob, someone's own supervisor), say exactly what you found and
+leave it: a scheduler you did not write is not yours to disable.
 
 ## Step 2 — the hotkey binding
 
@@ -126,7 +163,8 @@ compositor config you did not write.
 Two questions, because they carry different risk.
 
 **State** (`~/.local/state/voice-loop/` — `speak.log`, `dictate.log`, `spoken.ledger`,
-`speaking.lock`, the recorder PID, the last WAV): pure runtime residue, nothing in it is
+`speaking.lock`, the recorder PID, the last WAV, the contour poller's `contour.json` and its
+`contour-announced` ledger): pure runtime residue, nothing in it is
 configuration. Offer deletion plainly; mention the logs are the only record of past runs.
 
 **Config** (`~/.config/voice-loop/`): `config.json` and `stress.json` are re-creatable by re-running
@@ -192,6 +230,8 @@ One verify batch, re-running the Step 0 shape so the report is measured rather t
 
 ```sh
 systemctl --user is-active voice-loop.service 2>/dev/null; \
+systemctl --user is-enabled voice-loop-contour.timer 2>/dev/null; \
+crontab -l 2>/dev/null | grep -c 'contour-poll'; \
 ls -d "${XDG_CONFIG_HOME:-$HOME/.config}/voice-loop" "${XDG_STATE_HOME:-$HOME/.local/state}/voice-loop" \
       "$HOME/.local/share/voice-loop" 2>/dev/null; \
 gsettings get org.gnome.settings-daemon.plugins.media-keys custom-keybindings 2>/dev/null; \

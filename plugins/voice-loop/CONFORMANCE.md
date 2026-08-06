@@ -1,4 +1,4 @@
-# voice-loop conformance — v0.4.0
+# voice-loop conformance — v0.5.0
 
 A versioned acceptance checklist for the voice-loop plugin. This file is pinned to the
 plugin version it tests: a release that changes behaviour changes this checklist, and a
@@ -15,7 +15,7 @@ In a Claude Code session with voice-loop installed:
 
 The skill walks this checklist interactively: it asks you for the physical acts (tap the
 hotkey, confirm you heard the sound) and probes the machine for everything else. The result
-is one report file (`conformance-v0.4.0-YYYYMMDD.md`) with every row adjudicated. The
+is one report file (`conformance-v0.5.0-YYYYMMDD.md`) with every row adjudicated. The
 report is then offered through the same three transports as `/report-bug` — a GitHub issue
 (with the `conformance` label), a pre-filled new-issue URL, or a mailto:.
 
@@ -31,7 +31,7 @@ SKIP needs a reason in the evidence cell (e.g. "Wayland-only guard, tested on X1
 | tester | _(filled at runtime)_ |
 | OS / version | _(filled at runtime)_ |
 | desktop / session (GNOME-Wayland, KDE, X11, macOS) | _(filled at runtime)_ |
-| plugin version | 0.4.0 |
+| plugin version | 0.5.0 |
 | backends chosen (stt / tts) | _(filled at runtime)_ |
 | language | _(filled at runtime)_ |
 
@@ -84,6 +84,9 @@ SKIP needs a reason in the evidence cell (e.g. "Wayland-only guard, tested on X1
 | 3.11 | Queued, not dropped | A 🔊 line long enough to play for ~10 s; send the next prompt so its reply lands mid-clip | the second line is spoken (after the first clip, or in place of it — never skipped); `speak.log` shows `queued, not dropped` | | |
 | 3.12 | Unheard line accounted for | Any turn whose 🔊 line was NOT heard | `speak.log` has a line saying why (give-up, dedup, synthesis failure). A turn with NO log line at all is a FAIL | | |
 | 3.13 | Stress/pronunciation (ru/uk only) | Add a proper name to `~/.config/voice-loop/stress.json`, then say it in a 🔊 line | pronunciation is acceptable after the stress entry is added | | |
+| 3.14 | Contour alert — the page | Add a `contour.services` entry whose `expect_device` the server does NOT match (e.g. `"gpu"` on a CPU-only box), run `bash scripts/contour-poll.sh`, then end a turn | the poller exits 1 and its line names the demotion; at the turn's end the alert is SPOKEN ("Voice contour: …"); `speak.log` shows `contour: voicing 1 alert(s)` | | |
+| 3.15 | Contour alert — once, not every turn | End another turn while the condition persists | the alert is NOT spoken again; `speak.log` shows `contour: already announced` for that turn (a turn with NO contour line at all is a FAIL — the hook died before it looked); then clear the condition (remove the expectation, re-poll), let it recur later — it pages again | | |
+| 3.16 | Contour page relocated | Set `contour.status_path` to a path outside the state dir, schedule the poller with NO `--status`, make a service fail, end a turn | the poller writes there and the hook pages from there — one config key, both halves. Nothing is written to the default path | | |
 
 ## 4. Degrade paths — failures must be legible, never hangs
 
@@ -107,6 +110,7 @@ SKIP needs a reason in the evidence cell (e.g. "Wayland-only guard, tested on X1
 | 5.1 | Inventory first | Run `/voice-remove` on a machine with the full install | inventory printed FIRST — every path with its size — before anything is deleted | | |
 | 5.2 | Permission prompt count | Count the permission prompts during `/voice-remove` | ≤3 | | |
 | 5.3 | Service stopped and disabled | After accepting the service removal | `systemctl --user is-active voice-loop.service` → inactive, `is-enabled` → disabled or not found; the unit file is gone | | |
+| 5.3b | Contour schedule stopped | Follow the README's scheduling recipe (timer or cron line), then run `/voice-remove` | the schedule is inventoried in Step 0 and stopped BEFORE the scripts go: `systemctl --user is-enabled voice-loop-contour.timer` → not found, unit files gone; a cron line is PRINTED for the user to delete, never rewritten. A timer still firing a deleted `contour-poll.sh` is a FAIL | | |
 | 5.4 | Hotkey unbound | After accepting the hotkey removal | the binding is gone (GNOME: voice-loop path removed from `custom-keybindings`, user's other shortcuts intact; macOS: dictate-toggle line gone from `skhdrc`) | | |
 | 5.5 | Decline all deletions | Run `/voice-remove` and decline every deletion offer | nothing is deleted; the report says so plainly | | |
 | 5.6 | Key file kept when config deleted | A cloud `key_file` present; accept "delete the config" but decline the key question | `config.json` gone, `*.key` STILL there, the directory still exists; report names the kept key path | | |
@@ -119,5 +123,5 @@ SKIP needs a reason in the evidence cell (e.g. "Wayland-only guard, tested on X1
 
 ---
 
-**Checklist version:** 0.4.0 — pinned to `plugins/voice-loop/.claude-plugin/plugin.json`.
+**Checklist version:** 0.5.0 — pinned to `plugins/voice-loop/.claude-plugin/plugin.json`.
 A mismatch between this version and the plugin version is a stale checklist.

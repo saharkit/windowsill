@@ -23,6 +23,7 @@ import signal
 import subprocess
 import sys
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -43,6 +44,9 @@ def state(monkeypatch, tmp_path):
     monkeypatch.setattr(speak, "_LEDGER_PATH", str(tmp_path / "spoken.ledger"))
     monkeypatch.setattr(speak, "_LOCK_PATH", str(tmp_path / "speaking.lock"))
     monkeypatch.setattr(speak, "_STAMP_PATH", str(tmp_path / "hook-last-fired"))
+
+    monkeypatch.setattr(speak, "_CONTOUR_PATH", str(tmp_path / "contour.json"))
+    monkeypatch.setattr(speak, "_CONTOUR_ANNOUNCED_PATH", str(tmp_path / "contour-announced"))
     return tmp_path
 
 
@@ -1645,3 +1649,346 @@ def test_an_eager_firing_with_nothing_new_stays_out_of_the_log(state, monkeypatc
     before = _speak_log(state)
     assert _fire(state, monkeypatch, transcript, "PostToolUse")[0] == 0
     assert _speak_log(state) == before  # not one line added by a firing that lost nothing
+
+
+# --- the contour check (#40): the hook voices what the poller found ---------------------------------
+#
+# contour_poll.py writes contour.json; entry() runs contour_check after every firing, so an
+# ACTIVE alert is heard once — a page, not a dashboard. These drive the real contour_check (and
+# one real entry()) with the audio half recorded, exactly like the marked-line tests above.
+
+_DEMOTED = {
+    "key": "device-demoted:rvc",
+    "kind": "device-demoted",
+    "service": "rvc",
+    "message": "rvc is serving on cpu, expected gpu",
+}
+_VOICED = "Voice contour: rvc is serving on cpu, expected gpu"
+
+
+def _contour_status(state, alerts, *, age_seconds: float = 0.0, max_age: int | None = 900) -> None:
+    """A status file exactly as the poller writes one: alerts, and a timestamp with a bound on it.
+    ``age_seconds`` ages the file — that is the only way a poller that stopped is visible."""
+    written = datetime.now(timezone.utc) - timedelta(seconds=age_seconds)
+    status: dict = {"at": written.isoformat(), "alerts": alerts}
+    if max_age is not None:
+        status["max_age"] = max_age
+    (state / "contour.json").write_text(json.dumps(status), encoding="utf-8")
+
+
+def _alerts_of(path) -> list[dict]:
+    return speak.contour_alerts(speak.read_contour_status(str(path)), datetime.now(timezone.utc))
+
+
+def test_a_status_file_of_every_bad_shape_says_nothing(state):
+    assert _alerts_of(state / "absent.json") == []
+    bad = state / "contour.json"
+    bad.write_text("{corrupt", encoding="utf-8")
+    assert _alerts_of(bad) == []
+    bad.write_text(json.dumps(["not", "a", "status"]), encoding="utf-8")
+    assert _alerts_of(bad) == []
+    fresh = datetime.now(timezone.utc).isoformat()
+    bad.write_text(json.dumps({"at": fresh, "alerts": "not a list"}), encoding="utf-8")
+    assert _alerts_of(bad) == []
+    # entries without a string key AND message are not voiceable, so they are dropped, not voiced oddly
+    bad.write_text(
+        json.dumps({"at": fresh, "alerts": [{"key": 1, "message": "m"}, {"key": "k"}, _DEMOTED]}),
+        encoding="utf-8",
+    )
+    assert _alerts_of(bad) == [_DEMOTED]
+
+
+def test_no_status_file_is_the_silent_common_case(state, monkeypatch):
+    spoken = _record_speech(monkeypatch)
+    speak.contour_check({}, 0.0)
+    assert spoken == []  # an install that never set the poller up hears nothing and pays one read
+
+
+def test_an_active_alert_is_voiced_once_and_then_not_again(state, monkeypatch):
+    _contour_status(state, [_DEMOTED])
+    spoken = _record_speech(monkeypatch)
+    speak.contour_check({}, 0.0)
+    speak.contour_check({}, 0.0)  # the condition persists — the page does not repeat
+    assert spoken == [_VOICED]
+    assert (state / "contour-announced").read_text(encoding="utf-8").split() == ["device-demoted:rvc"]
+    # The second firing leaves a POSITIVE mark. Without one, "did not repeat" and "died before it
+    # ever looked" are the same empty log — and speak.sh swallows every exception and exits 0, so
+    # dying is exactly what a regression here looks like from outside.
+    assert "contour: already announced — nothing to voice (1 alert(s) still active)" in _speak_log(state)
+
+
+def test_a_quiet_contour_says_nothing_at_all_not_even_that_it_is_quiet(state, monkeypatch):
+    # The other direction, and the overwhelming common case: a fresh green status file. The dedup's
+    # marker must not fire here — one line per tool call, forever, for nothing.
+    _contour_status(state, [])
+    spoken = _record_speech(monkeypatch)
+    speak.contour_check({}, 0.0)
+    assert spoken == []
+    assert "contour:" not in _speak_log(state)
+
+
+def test_the_hook_reads_the_status_file_the_poller_was_told_to_write(state, monkeypatch, tmp_path):
+    """The seam, from this end. contour_poll.py can be pointed anywhere; this hook only ever read
+    the default, so a cron line written with `--status /var/tmp/contour.json` polled correctly,
+    exited 1 correctly, and paged nobody. One config key now answers for both halves."""
+    relocated = tmp_path / "elsewhere" / "contour.json"
+    relocated.parent.mkdir()
+    written = datetime.now(timezone.utc).isoformat()
+    relocated.write_text(json.dumps({"at": written, "max_age": 900, "alerts": [_DEMOTED]}), encoding="utf-8")
+    assert not (state / "contour.json").exists()  # nothing at the default path: the whole point
+
+    spoken = _record_speech(monkeypatch)
+    speak.contour_check({"contour": {"status_path": str(relocated)}}, 0.0)
+    assert spoken == [_VOICED]
+    # …and an unset key is still the default path, byte for byte
+    assert speak.contour_status_path({}) == speak._CONTOUR_PATH
+
+
+def test_a_cleared_and_returned_alert_pages_again(state, monkeypatch):
+    spoken = _record_speech(monkeypatch)
+    _contour_status(state, [_DEMOTED])
+    speak.contour_check({}, 0.0)
+    _contour_status(state, [])  # the condition cleared: the announced key is pruned
+    speak.contour_check({}, 0.0)
+    assert not (state / "contour-announced").read_text(encoding="utf-8").split()
+    _contour_status(state, [_DEMOTED])  # …and came back — a stale key must not mute its return
+    speak.contour_check({}, 0.0)
+    assert spoken == [_VOICED, _VOICED]
+
+
+def test_contour_alerts_opt_out_and_speak_disabled_both_stay_silent(state, monkeypatch):
+    _contour_status(state, [_DEMOTED])
+    spoken = _record_speech(monkeypatch)
+    speak.contour_check({"contour": {"alerts": False}}, 0.0)
+    speak.contour_check({"speak": {"enabled": False}}, 0.0)
+    assert spoken == []
+    assert not (state / "contour-announced").exists()  # nothing claimed either
+
+
+def test_an_alert_that_loses_the_eager_lock_stays_unannounced(state, monkeypatch):
+    _contour_status(state, [_DEMOTED])
+    spoken = _record_speech(monkeypatch)
+    monkeypatch.setattr(speak, "acquire_lock", lambda *grace: None)  # another firing holds it
+    speak.contour_check({"speak": {"eager": True}}, 0.0)
+    assert spoken == []
+    assert not (state / "contour-announced").exists()  # left for the next firing, one tool call away
+    assert "left unannounced" in _speak_log(state)
+
+
+def test_the_alert_text_is_capped_at_max_chars(state, monkeypatch):
+    _contour_status(state, [_DEMOTED])
+    spoken = _record_speech(monkeypatch)
+    speak.contour_check({"speak": {"max_chars": 25}}, 0.0)
+    assert len(spoken) == 1 and len(spoken[0]) <= 25
+    assert _VOICED.startswith(spoken[0])  # truncated, not paraphrased
+
+
+def test_the_hook_entry_voices_the_alert_after_a_turn_with_nothing_to_say(state, monkeypatch):
+    """The page does not depend on the turn having a marked line: a Stop whose transcript holds
+    no marker speaks nothing of its own, and the contour alert is STILL voiced after it — the
+    whole point of putting the check in the hook path."""
+    _write_config(state, monkeypatch)
+    transcript = state / "transcript.jsonl"
+    transcript.write_text(_assistant("a reply with nothing marked in it") + "\n", encoding="utf-8")
+    _contour_status(state, [_DEMOTED])
+    spoken = _record_speech(monkeypatch)
+    monkeypatch.setattr(speak.sys, "stdin", _Stdin(json.dumps({"transcript_path": str(transcript), "hook_event_name": "Stop"})))
+    monkeypatch.setattr(speak.time, "sleep", lambda seconds: None)
+    assert speak.entry() == 0
+    assert spoken == [_VOICED]
+
+
+# --- the page's own delivery, its freshness, and the two firings that race for it -------------------
+
+
+class _RefusedOpener:
+    """Every request refused — the speech server is STOPPED. Drives the real _get/_post/synthesize
+    /_play_stream bodies; the only thing faked is the socket that would not have connected."""
+
+    def __init__(self) -> None:
+        self.attempts = 0
+
+    def open(self, request, timeout=None):
+        self.attempts += 1
+        raise speak.urllib.error.URLError(ConnectionRefusedError(111, "Connection refused"))
+
+
+_UNREACHABLE = {
+    "key": "unreachable:voice-loop",
+    "kind": "unreachable",
+    "service": "voice-loop",
+    "message": "voice-loop is not answering its health endpoint (URLError)",
+}
+
+
+def test_an_alert_the_stopped_speech_server_could_not_voice_is_retried_not_swallowed(state, monkeypatch):
+    """THE failure the shipped defaults guarantee: `tts.backend: lan` speaks through
+    127.0.0.1:8355, and with `contour.services` unset that same server is the only thing polled.
+    So the commonest alert of all — "the speech server is not answering" — is the one whose own
+    delivery cannot possibly succeed. Announced-before-synthesis made it voiced NEVER and, because
+    the key was already in the ledger, repeated never: silence for as long as the fault lasted.
+    """
+    _contour_status(state, [_UNREACHABLE])
+    refused = _RefusedOpener()
+    monkeypatch.setattr(speak.urllib.request, "build_opener", lambda *handlers: refused)
+    monkeypatch.setattr(speak.subprocess, "Popen", lambda argv, **kwargs: _NullPlayer())
+
+    speak.contour_check({}, 0.0)
+
+    assert refused.attempts  # it really went for the server, and the server was not there
+    log = _speak_log(state)
+    assert "nothing played via=tts" in log
+    assert "left unannounced, to be retried" in log
+    assert not (state / "contour-announced").exists()  # NOT announced: nothing was ever delivered
+
+    # the server comes back while the condition persists: the alert is still there to be said
+    spoken = _record_speech(monkeypatch)
+    speak.contour_check({}, 0.0)
+    speak.contour_check({}, 0.0)  # …and then said exactly once, like every other page
+    assert spoken == ["Voice contour: voice-loop is not answering its health endpoint (URLError)"]
+    assert (state / "contour-announced").read_text(encoding="utf-8").splitlines() == ["unreachable:voice-loop"]
+
+
+def test_a_poller_that_stopped_is_not_a_healthy_contour(state, monkeypatch):
+    """#40's opening line, on the consumption side. Remove the cron entry (or reboot a box whose
+    timer was never enabled) and contour.json freezes at its last green poll: alerts == [], the
+    hook silent forever, and nothing at all to distinguish it from a live green contour."""
+    _contour_status(state, [], age_seconds=4000)  # last polled over an hour ago, and it was green
+    spoken = _record_speech(monkeypatch)
+    speak.contour_check({}, 0.0)
+    assert len(spoken) == 1 and "nobody has polled the voice contour" in spoken[0]
+    assert (state / "contour-announced").read_text(encoding="utf-8").splitlines() == ["poller-stale"]
+
+    # said once while it stays stale…
+    speak.contour_check({}, 0.0)
+    assert len(spoken) == 1
+    # …and the poller coming back prunes the key, so a second outage later pages again
+    _contour_status(state, [])
+    speak.contour_check({}, 0.0)
+    assert not (state / "contour-announced").read_text(encoding="utf-8").split()
+    assert len(spoken) == 1  # a fresh, green file has nothing to say
+
+
+def test_a_stale_file_reports_the_staleness_and_not_its_own_frozen_alerts(state, monkeypatch):
+    # A reading nobody refreshed says nothing about NOW. The one true thing left is that nobody
+    # is looking, so that is the only thing voiced.
+    _contour_status(state, [_DEMOTED], age_seconds=4000)
+    spoken = _record_speech(monkeypatch)
+    speak.contour_check({}, 0.0)
+    assert len(spoken) == 1 and "nobody has polled" in spoken[0]
+    assert _VOICED not in spoken
+
+
+def test_the_bound_is_the_pollers_own_and_a_file_without_one_still_gets_a_bound(state, monkeypatch):
+    # the poller writes its cadence into the file, and that wins…
+    _contour_status(state, [_DEMOTED], age_seconds=120, max_age=60)
+    spoken = _record_speech(monkeypatch)
+    speak.contour_check({}, 0.0)
+    assert len(spoken) == 1 and "nobody has polled" in spoken[0]
+
+    # …a file written by a poller that predates the bound gets the fallback rather than a pass…
+    (state / "contour-announced").unlink()
+    _contour_status(state, [_DEMOTED], age_seconds=speak.CONTOUR_MAX_AGE + 60, max_age=None)
+    speak.contour_check({}, 0.0)
+    assert len(spoken) == 2 and "nobody has polled" in spoken[1]
+
+    # …and a timestamp that cannot be read at all cannot vouch for anything either
+    (state / "contour-announced").unlink()
+    (state / "contour.json").write_text(json.dumps({"at": "yesterday", "alerts": [_DEMOTED]}), encoding="utf-8")
+    speak.contour_check({}, 0.0)
+    assert len(spoken) == 3 and "no readable timestamp" in spoken[2]
+
+    # a fresh file, though, is read exactly as before: its own alerts, nothing invented
+    (state / "contour-announced").unlink()
+    _contour_status(state, [_DEMOTED])
+    speak.contour_check({}, 0.0)
+    assert spoken[3] == _VOICED
+
+
+def test_with_eager_off_a_post_tool_use_firing_runs_no_contour_check(state, monkeypatch):
+    """hooks.json registers PostToolUse unconditionally, so with `speak.eager` off this file is
+    executed after EVERY tool call. entry() ran the check from there regardless, which meant a
+    take_over() — a SIGTERM at whatever was playing — on every tool call of every turn, for a
+    feature the install never opted into. The eager no-op covers this file, not just main()."""
+    _write_config(state, monkeypatch)
+    transcript = state / "transcript.jsonl"
+    transcript.write_text(_assistant("a reply with nothing marked in it") + "\n", encoding="utf-8")
+    _contour_status(state, [_DEMOTED])
+    spoken = _record_speech(monkeypatch)
+    takeovers: list[int] = []
+    monkeypatch.setattr(speak, "take_over", lambda: takeovers.append(1))
+    payload = {"transcript_path": str(transcript), "hook_event_name": "PostToolUse"}
+    monkeypatch.setattr(speak.sys, "stdin", _Stdin(json.dumps(payload)))
+
+    assert speak.entry() == 0
+    assert (spoken, takeovers) == ([], [])
+    assert not (state / "contour-announced").exists()
+
+    # and the SAME alert on the Stop path is still paged: the gate is the event, not the feature
+    payload["hook_event_name"] = "Stop"
+    monkeypatch.setattr(speak.sys, "stdin", _Stdin(json.dumps(payload)))
+    monkeypatch.setattr(speak.time, "sleep", lambda seconds: None)
+    assert speak.entry() == 0
+    assert spoken == [_VOICED]
+
+
+def test_two_firings_in_one_assistant_block_cannot_both_page(state, monkeypatch):
+    """Two tool calls in one assistant block are two concurrent hook processes. The eager-off page
+    path took no lock at all, and the announced-ledger is a read-modify-write, so both read an
+    empty ledger, both saw the alert as fresh, both claimed it and both spoke. The contender here
+    is a REAL second flock on the real lockfile, held while the check runs."""
+    _contour_status(state, [_DEMOTED])
+    spoken = _record_speech(monkeypatch)
+
+    holder = open(str(state / "speaking.lock"), "w", encoding="utf-8")  # noqa: SIM115 — released below
+    speak.fcntl.flock(holder.fileno(), speak.fcntl.LOCK_EX | speak.fcntl.LOCK_NB)
+    try:
+        speak.contour_check({}, 0.0)  # eager off — this is the path that used to have no lock
+    finally:
+        holder.close()
+
+    assert spoken == []
+    assert not (state / "contour-announced").exists()  # nothing claimed by the firing that lost
+    assert "left unannounced" in _speak_log(state)
+
+    # the firing in front is gone: the alert is still there, and is said exactly once
+    speak.contour_check({}, 0.0)
+    speak.contour_check({}, 0.0)
+    assert spoken == [_VOICED]
+
+
+def test_a_page_leaves_no_pidfile_behind(state, monkeypatch):
+    """contour_check writes playing.pid like every path that makes a sound, and had no counterpart
+    for it. The leftover is not inert: dictate.py's echo guard reads a non-empty playing.pid as
+    "a chain is playing", signals pids that are gone, and skips the `pkill -f voice-loop-speak`
+    fallback it keeps for exactly this case — a chain that died without cleanup."""
+    _contour_status(state, [_DEMOTED])
+    spoken = _record_speech(monkeypatch)
+    speak.contour_check({}, 0.0)
+    assert spoken == [_VOICED]
+    assert not (state / "playing.pid").exists()
+
+    # …including when the page could not be delivered at all
+    _contour_status(state, [_UNREACHABLE])
+    monkeypatch.setattr(speak, "synthesize", lambda text, s, key: None)
+    speak.contour_check({}, 0.0)
+    assert not (state / "playing.pid").exists()
+
+
+def test_an_alert_key_naming_a_service_with_a_space_survives_the_ledger(state, monkeypatch):
+    """The announced-ledger is one key per LINE. Read back with str.split(), a service the
+    operator called "tts worker" became two tokens matching nothing — so the prune found the whole
+    file stale, TRUNCATED it, and the alert was voiced again on every single firing, forever."""
+    spaced = {
+        "key": "device-demoted:tts worker",
+        "kind": "device-demoted",
+        "service": "tts worker",
+        "message": "tts worker is serving on cpu, expected gpu",
+    }
+    _contour_status(state, [spaced])
+    spoken = _record_speech(monkeypatch)
+    speak.contour_check({}, 0.0)
+    speak.contour_check({}, 0.0)
+    speak.contour_check({}, 0.0)
+    assert spoken == ["Voice contour: tts worker is serving on cpu, expected gpu"]
+    assert (state / "contour-announced").read_text(encoding="utf-8").splitlines() == ["device-demoted:tts worker"]

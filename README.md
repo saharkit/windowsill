@@ -31,7 +31,7 @@ Then install what you want — this one is typed **inside a session**, not in yo
 | plugin | version | what it does | |
 |---|---|---|---|
 | **sill-core** | 0.1.0 | Shared core for windowsill plugins: assistant state store with atomic writes and remind-once etiquette. Schema-versioned JSON persistence — one file per plugin under `XDG_STATE_HOME`, separate from config. | [README](plugins/sill-core/README.md) |
-| **voice-loop** | 0.4.0 | Talk to Claude Code and hear it answer — a `Stop` hook speaks marked lines, a push-to-talk script dictates into the prompt, and `/voice-setup` installs the whole contour (local, LAN, or cloud speech). Ships its own self-hostable speech server. | [README](plugins/voice-loop/README.md) |
+| **voice-loop** | 0.5.0 | Talk to Claude Code and hear it answer — a `Stop` hook speaks marked lines, a push-to-talk script dictates into the prompt, and `/voice-setup` installs the whole contour (local, LAN, or cloud speech). Ships its own self-hostable speech server. | [README](plugins/voice-loop/README.md) |
 
 Every plugin owns its own README, its own tests, its own docs and its own version — open its README
 for anything about it. More will land on the sill over time.

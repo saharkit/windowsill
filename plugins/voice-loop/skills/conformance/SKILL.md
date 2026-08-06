@@ -219,7 +219,7 @@ from report_bug import issue_url
 # GitHub's new-issue form does not accept ?labels= in the query string
 body = open('${REPORT_PATH}').read()
 body = '<!-- conformance -->\n' + body
-print(issue_url('conformance: voice-loop v0.4.0', body))
+print(issue_url('conformance: voice-loop v0.5.0', body))
 "
 ```
 
