@@ -311,8 +311,8 @@ def connect(
     """Open a websocket. Raises WebSocketError, and nothing else, on every failure.
 
     ``connector`` is the one seam a test needs (it hands back a connected socket), and ``wss``
-    wraps whatever it returns in TLS with a DEFAULT context — certificate verification and
-    hostname checking on, never a switch to turn them off.
+    wraps whatever it returns in TLS with ``tls_context()`` — certificate verification and
+    hostname checking on, a TLS 1.2 floor, and no switch anywhere to turn any of it off.
     """
     parts = urllib.parse.urlsplit(url)
     if parts.scheme not in DEFAULT_PORTS:
@@ -331,7 +331,7 @@ def connect(
         raise WebSocketError(f"could not reach {host}:{port}: {err}") from err
     try:
         if parts.scheme == "wss":
-            sock = (context or ssl.create_default_context()).wrap_socket(sock, server_hostname=host)
+            sock = (context or tls_context()).wrap_socket(sock, server_hostname=host)
         key = base64.b64encode(os.urandom(16)).decode("ascii")
         request = [
             f"GET {target} HTTP/1.1",
@@ -362,3 +362,20 @@ def _quietly_close(sock) -> None:
         sock.close()
     except OSError:
         pass
+
+
+def tls_context() -> ssl.SSLContext:
+    """The TLS context a ``wss`` connection gets: verification and hostname checking on (that is
+    ``create_default_context``'s doing, and there is deliberately no switch here to turn either
+    off), plus an EXPLICIT floor at TLS 1.2.
+
+    The floor is stated rather than inherited. A default context's protocol range follows the
+    linked OpenSSL build and its system policy — which is how a client that "uses the defaults"
+    can still negotiate TLS 1.0 on an older or laxer host — and dictation audio is exactly the
+    payload that must not travel over a protocol with known-broken ciphers. CodeQL's
+    py/insecure-default-protocol reads the same line the same way (windowsill#99 review), and the
+    honest answer to it is the floor, not an exemption.
+    """
+    context = ssl.create_default_context()
+    context.minimum_version = ssl.TLSVersion.TLSv1_2
+    return context

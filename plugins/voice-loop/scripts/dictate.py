@@ -945,7 +945,12 @@ def assemble_stream_text(finals: list[str]) -> str:
 
 def _write_stream_result(result: dict) -> None:
     """The worker's ONE write, temp-then-replace so the stop toggle cannot read a half-written
-    answer and conclude the stream produced nothing. 0600: it holds the dictated words."""
+    answer and conclude the stream produced nothing. 0600: it holds the dictated words.
+
+    Its own pid rides along as the fencing token the reader checks (see _read_stream_result), so a
+    document written late — by a worker whose recording is already over — cannot be mistaken for
+    the answer to somebody else's."""
+    result = {**result, "pid": os.getpid()}
     try:
         fd, tmp = tempfile.mkstemp(prefix="voice-loop-stream-", dir=os.path.dirname(_STREAM_RESULT_PATH))
         os.fchmod(fd, 0o600)
@@ -958,14 +963,24 @@ def _write_stream_result(result: dict) -> None:
         log(f"stream result not written: {err}")
 
 
-def _read_stream_result() -> dict | None:
-    """The worker's answer, or None while it has not finished (or could not be read at all)."""
+def _read_stream_result(pid: int | None = None) -> dict | None:
+    """The worker's answer, or None while it has not finished (or could not be read at all).
+
+    ``pid`` is a FENCING check, and it closes a real window: a worker that outstayed its stop
+    toggle (a short clip discards it without waiting, and a wedged socket can be SIGKILLed) writes
+    its document LATE — possibly after the next recording has already started its own worker. A
+    result is only this stop's answer if the worker that wrote it is the one whose pid we hold; an
+    older worker's transcript pasted into a later recording is precisely the #50 class of bug."""
     try:
         with open(_STREAM_RESULT_PATH, encoding="utf-8") as fh:
             loaded = json.load(fh)
     except (OSError, ValueError):
         return None
-    return loaded if isinstance(loaded, dict) else None
+    if not isinstance(loaded, dict):
+        return None
+    if pid is not None and loaded.get("pid") != pid:
+        return None
+    return loaded
 
 
 def _read_stream_pid() -> int | None:
@@ -1062,10 +1077,10 @@ def finish_stream_worker() -> str | None:
         except OSError:
             pass  # already gone: its result file (if any) is still the answer
     deadline = time.monotonic() + STREAM_FINISH_TIMEOUT
-    result = _read_stream_result()
+    result = _read_stream_result(pid)
     while result is None and time.monotonic() < deadline:
         time.sleep(STREAM_IDLE_POLL)
-        result = _read_stream_result()
+        result = _read_stream_result(pid)
     if result is None:
         log(f"stream worker did not finish within {STREAM_FINISH_TIMEOUT:.0f}s — using the recorded clip")
         if pid_looks_like_stream_worker(pid):
@@ -1469,11 +1484,6 @@ def stop_and_transcribe(s: dict, system: str, mode: str, recorder_pid: int) -> i
     time.sleep(0.2)
     sound(s["stop_sound"], s["player"])
 
-    # The worker is stopped BEFORE any early return below: a child holding a metered socket open
-    # must not survive a clip the guard threw away, and its state files must not survive into the
-    # next recording. finish_stream_worker is a no-op when streaming was never on for this one.
-    streamed = finish_stream_worker()
-
     # min-clip guard: a bounced hotkey leaves a clip too short to hold speech — skip STT entirely
     # rather than hand the server pure silence to hallucinate on
     try:
@@ -1481,6 +1491,10 @@ def stop_and_transcribe(s: dict, system: str, mode: str, recorder_pid: int) -> i
     except OSError:
         size = 0
     if clip_seconds(size) < MIN_CLIP_SECONDS:
+        # The worker is stopped here too, but NOT waited for: a bounced hotkey must stay as cheap
+        # as it has always been, and there is no transcript anybody wants. Its late document (if it
+        # writes one at all) carries a pid this stop never held, so no later recording can adopt it.
+        clear_stream_state()
         note("clip too short — ignored", system)
         log(f"clip too short ({size} bytes ≈ {clip_seconds(size):.2f}s) — stt skipped")
         try:
@@ -1489,6 +1503,9 @@ def stop_and_transcribe(s: dict, system: str, mode: str, recorder_pid: int) -> i
             pass
         return 0
 
+    # Past the guard, the worker's answer IS the transcript when there is one. A no-op when
+    # streaming was never on for this recording; bounded, and a degrade on every failure.
+    streamed = finish_stream_worker()
     if streamed is None:
         # The batch path, unchanged, and the destination of every streaming degrade.
         note("transcribing…", system)

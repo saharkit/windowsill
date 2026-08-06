@@ -2011,11 +2011,17 @@ class TestStreamSessionRoundTrip:
 # --- the worker's lifecycle: spawned by start, stopped by stop, never outliving either -----------
 
 
-def _plant_worker(state, result: dict | None, *, pid: int = 999999) -> None:
-    """A worker that has already run: its pidfile, and optionally the answer it left behind."""
+def _plant_worker(state, result: dict | None, *, pid: int = 999999, wrote: int | None = None) -> None:
+    """A worker that has already run: its pidfile, and optionally the answer it left behind.
+
+    ``wrote`` is the pid stamped INTO the result document — the fencing token the reader checks.
+    It defaults to the worker's own pid (what a real worker writes); a different value is the
+    late-document case, where a worker from an earlier recording wrote after this one started.
+    """
     (state / "dictate-stream.pid").write_text(str(pid), encoding="utf-8")
     if result is not None:
-        (state / "dictate-stream.json").write_text(json.dumps(result), encoding="utf-8")
+        document = {**result, "pid": pid if wrote is None else wrote}
+        (state / "dictate-stream.json").write_text(json.dumps(document), encoding="utf-8")
 
 
 class TestFinishStreamWorker:
@@ -2088,6 +2094,18 @@ class TestFinishStreamWorker:
 
         assert dictate.finish_stream_worker() is None  # no answer ever came: the clip is used
         assert signalled == []
+
+    def test_a_document_written_by_an_earlier_worker_is_not_this_stops_answer(self, state, monkeypatch):
+        """The fencing check. A worker that outstayed its own recording (a short clip discards it
+        without waiting) writes its document LATE — possibly after the next recording has started.
+        Its pid is not the one this stop holds, so the text is not adopted: pasting an earlier
+        dictation into a later recording is exactly the #50 class of bug."""
+        ticks = iter([n * 1.0 for n in range(200)])
+        monkeypatch.setattr(dictate.time, "monotonic", lambda: next(ticks))
+        _plant_worker(state, {"status": "ok", "text": "words from the recording before this one"}, wrote=4242)
+
+        assert dictate.finish_stream_worker() is None
+        assert "did not finish within" in _log_of(state)
 
     def test_a_half_written_result_reads_as_no_result_rather_than_as_an_empty_one(self, state, monkeypatch):
         """The worker writes temp-then-replace precisely so this cannot happen — this pins the
@@ -2230,17 +2248,23 @@ class TestTheStopToggleUsesWhatTheStreamAssembled:
         assert "dictation latency stop_to_paste_ms=" in _log_of(state)
         assert "via=batch to=paste" in _log_of(state)
 
-    def test_a_clip_below_the_guard_still_stops_the_worker(self, state, monkeypatch):
-        """A recording the guard throws away must not leave a child holding a metered socket, and
-        must not leave its transcript where the NEXT recording would find it."""
+    def test_a_clip_below_the_guard_stops_the_worker_without_waiting_for_it(self, state, monkeypatch):
+        """A bounced hotkey must stay as cheap as it has always been: there is no transcript
+        anybody wants, so the worker is stopped and NOT waited for — while still leaving nothing
+        behind for the next recording to adopt."""
+        signalled: list[tuple[int, int]] = []
         monkeypatch.setattr(dictate, "_pid_alive", lambda pid: False)
-        monkeypatch.setattr(dictate.os, "kill", lambda pid, sig: None)
+        monkeypatch.setattr(dictate.os, "kill", lambda pid, sig: signalled.append((pid, sig)))
         monkeypatch.setattr(dictate.time, "sleep", lambda seconds: None)
         monkeypatch.setattr(dictate, "note", lambda message, system: None)
-        monkeypatch.setattr(dictate, "pid_looks_like_stream_worker", lambda pid, **kw: False)
-        _plant_worker(state, {"status": "ok", "text": "from the clip that was too short", "messages": 1})
+        monkeypatch.setattr(dictate, "pid_looks_like_stream_worker", lambda pid, **kw: True)
+        _plant_worker(state, {"status": "ok", "text": "from the clip that was too short", "messages": 1}, pid=4321)
 
         assert dictate.stop_and_transcribe(dictate.resolve_settings({}, "Linux"), "Linux", "send", 1) == 0
+
+        assert (4321, dictate.signal.SIGTERM) in signalled  # stopped
+        assert "clip too short" in _log_of(state)
+        assert "streaming stt" not in _log_of(state)  # and never waited on for an answer
         assert not (state / "dictate-stream.pid").exists()
         assert not (state / "dictate-stream.json").exists()
 

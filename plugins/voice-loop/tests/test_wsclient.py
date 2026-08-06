@@ -19,6 +19,7 @@ import hashlib
 import importlib.util
 import json
 import socket
+import ssl
 import struct
 import threading
 from pathlib import Path
@@ -474,3 +475,53 @@ class TestTheMessagesAProviderSends:
         assert json.loads(frames[0][1]) == message
         ws.close()
         server.stop()
+
+
+class TestTls:
+    """What a `wss` connection is wrapped in. No socket here — the context IS the assertion."""
+
+    def test_the_default_context_floors_at_tls_1_2(self):
+        """CodeQL's py/insecure-default-protocol, answered rather than exempted (windowsill#99
+        review): a default context's protocol range follows the linked OpenSSL build and its
+        system policy, so "we use the defaults" is not the same statement as "we never negotiate
+        TLS 1.0". Dictation audio is exactly the payload that must not travel over one."""
+        context = wsclient.tls_context()
+        assert context.minimum_version >= ssl.TLSVersion.TLSv1_2
+
+    def test_verification_and_hostname_checking_are_on_and_have_no_switch(self):
+        context = wsclient.tls_context()
+        assert context.verify_mode == ssl.CERT_REQUIRED
+        assert context.check_hostname is True
+        source = _WSCLIENT_PATH.read_text(encoding="utf-8")
+        for escape in ("CERT_NONE", "check_hostname = False", "_create_unverified_context"):
+            assert escape not in source, f"{escape} is a way out of TLS that must not exist here"
+
+    def test_a_wss_url_goes_through_that_context(self, monkeypatch):
+        """The wiring, without a certificate authority: the connect path must reach tls_context()
+        for a wss URL, and a caller-supplied context (the test seam) must be honoured as given."""
+        wrapped: list[str] = []
+
+        class _Ctx:
+            def wrap_socket(self, sock, server_hostname):
+                wrapped.append(server_hostname)
+                raise ssl.SSLError("no real handshake in a unit test")
+
+        def connector(address, timeout):
+            return socket.socket()
+
+        with pytest.raises(wsclient.WebSocketError, match="TLS failed"):
+            wsclient.connect("wss://api.example/v1/listen", {}, connector=connector, context=_Ctx())
+        assert wrapped == ["api.example"]
+
+        real = wsclient.tls_context
+        made: list[ssl.SSLContext] = []
+
+        def spy() -> ssl.SSLContext:
+            made.append(real())
+            return made[-1]
+
+        monkeypatch.setattr(wsclient, "tls_context", spy)
+        with pytest.raises(wsclient.WebSocketError):
+            wsclient.connect("wss://127.0.0.1:1/v1/listen", {}, connector=connector, timeout=1.0)
+        assert made, "a wss URL did not reach tls_context()"
+        assert made[0].minimum_version >= ssl.TLSVersion.TLSv1_2  # and it is the floored one
