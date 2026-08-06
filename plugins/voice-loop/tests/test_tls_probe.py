@@ -18,6 +18,8 @@ from pathlib import Path
 
 import pytest
 
+import providers
+
 _PROBE_PATH = Path(__file__).resolve().parents[1] / "scripts" / "tls-probe.py"
 _spec = importlib.util.spec_from_file_location("tls_probe", _PROBE_PATH)
 tls_probe = importlib.util.module_from_spec(_spec)
@@ -343,8 +345,30 @@ def test_a_plain_http_endpoint_carries_no_certificate_so_the_fallback_host_is_pr
 
 
 def test_a_configured_cloud_voice_is_probed_at_its_own_api_host():
-    config = {"tts": {"backend": "cloud", "cloud": {"provider": "elevenlabs"}}}
-    assert tls_probe.resolve_url(config) == tls_probe.ELEVENLABS_HOST
+    """Every provider that HAS a remote default host, not a special case for one of them.
+
+    This used to be `provider == "elevenlabs"` in resolve_url — the fifth branch site, and the one
+    that would have kept a new provider probing pypi.org while its own host was the thing that
+    failed. The host is now the registry entry's, so the loop below covers whatever is on the shelf.
+    """
+    for name, entry in providers.TTS_PROVIDERS.items():
+        config = {"tts": {"backend": "cloud", "cloud": {"provider": name}}}
+        expected = entry.default_host or tls_probe.DEFAULT_URL
+        assert tls_probe.resolve_url(config) == expected
+    # and the two that stand for the whole shape today
+    assert tls_probe.resolve_url({"tts": {"backend": "cloud", "cloud": {"provider": "elevenlabs"}}}) == (
+        "https://api.elevenlabs.io"
+    )
+    assert tls_probe.resolve_url({"tts": {"backend": "cloud", "cloud": {"provider": "deepgram"}}}) == (
+        "https://api.deepgram.com"
+    )
+
+
+def test_a_provider_the_registry_does_not_know_is_probed_at_the_fallback_host():
+    """A typo has no default host to offer, and guessing one would probe a host this install never
+    talks to — the pip fallback is the honest answer."""
+    config = {"tts": {"backend": "cloud", "cloud": {"provider": "deepgrma"}}}
+    assert tls_probe.resolve_url(config) == tls_probe.DEFAULT_URL
 
 
 def test_an_empty_config_falls_back_to_the_host_pip_needs():
@@ -354,8 +378,8 @@ def test_an_empty_config_falls_back_to_the_host_pip_needs():
 def test_the_openai_compatible_cloud_path_has_no_remote_default_host_of_its_own():
     # Deliberate, and easy to misread as a gap: speak.py defaults the OpenAI-compatible endpoint to
     # the LOCAL server on http, so there is no https host to probe unless one is configured — in
-    # which case tts.endpoint above already wins. ElevenLabs is special-cased because it is the one
-    # provider whose default IS a remote host.
+    # which case tts.endpoint above already wins. That is the entry's `default_host: ""`, and it is
+    # the same field the providers with a remote default fill in.
     unset = {"tts": {"backend": "cloud"}}
     openai = {"tts": {"backend": "cloud", "cloud": {"provider": "openai"}}}
     configured = {"tts": {"backend": "cloud", "cloud": {"provider": "openai"}, "endpoint": "https://api.openai.com"}}

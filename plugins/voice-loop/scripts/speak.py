@@ -146,6 +146,11 @@ import urllib.request
 from collections.abc import Callable
 from datetime import datetime, timezone
 
+# The one module in scripts/ this file imports: the provider registry (see providers.py). It
+# resolves because sys.path[0] is this file's directory when speak.sh runs it; the tests, which
+# load this file by spec_from_file_location, put scripts/ on sys.path themselves.
+import providers
+
 try:
     import fcntl
 except ImportError:  # pragma: no cover - POSIX-only; Linux and macOS are the supported platforms
@@ -291,11 +296,21 @@ def cfg(config: dict, dotted: str, default):
     return node
 
 
+def resolve_tts_provider(name: str):
+    """The registry entry for a configured provider name — the default entry, loudly, for a name
+    the registry has never heard of. The counterpart of dictate.resolve_stt_provider."""
+    entry = providers.tts_provider(name)
+    if entry is None:
+        log(f'tts.cloud.provider is not a known provider — using "{providers.DEFAULT_TTS}" instead of {name!r}')
+        entry = providers.TTS_PROVIDERS[providers.DEFAULT_TTS]
+    return entry
+
+
 def resolve_settings(config: dict, system: str) -> dict:
     """Every knob speak.sh honoured, same names, same defaults, same precedence."""
     speaker = str(cfg(config, "tts.speaker", ""))
-    provider = str(cfg(config, "tts.cloud.provider", "openai"))
-    default_model = "eleven_multilingual_v2" if provider == "elevenlabs" else "tts-1"
+    # the provider is an ENTRY, never a branch — every per-provider default below comes off it
+    entry = resolve_tts_provider(str(cfg(config, "tts.cloud.provider", providers.DEFAULT_TTS)))
     voice_settings = cfg(config, "tts.cloud.voice_settings", None)
     return {
         "enabled": cfg(config, "speak.enabled", True) not in (False, "false"),
@@ -307,18 +322,21 @@ def resolve_settings(config: dict, system: str) -> dict:
         "max_chars": int(cfg(config, "speak.max_chars", 600)),
         "timeout": float(cfg(config, "speak.timeout", 60)),
         "backend": str(cfg(config, "tts.backend", "lan")),
-        # left empty here: the per-backend default differs (see synthesize) — the LAN server and the
-        # OpenAI-compatible path default to the local speech server, ElevenLabs to its own API host.
+        # left empty here: the per-backend default differs (see synthesize) — the LAN server and a
+        # provider with no remote default host both land on the local speech server, while a
+        # provider that HAS one (ElevenLabs, Deepgram) lands there. That choice is the entry's.
         "endpoint": str(cfg(config, "tts.endpoint", "")),
         "speaker": speaker,
         # top-level "language" is the one the user sets; ".tts.language" is the advanced escape for
         # people who dictate in one language and listen in another.
         "language": str(cfg(config, "tts.language", cfg(config, "language", "en"))),
         "command": str(cfg(config, "tts.command", "")),
-        "provider": provider,
+        "provider": entry.name,
         "voice_id": str(cfg(config, "tts.cloud.voice_id", speaker)),
-        "cloud_model": str(cfg(config, "tts.cloud.model", default_model)),
-        "output_format": str(cfg(config, "tts.cloud.output_format", "mp3_44100_128")),
+        "cloud_model": str(cfg(config, "tts.cloud.model", entry.default_model)),
+        # the audio CONTAINER, and its spelling is provider-private: one opaque token for
+        # ElevenLabs, a pair of query parameters for Deepgram — so the default rides the entry
+        "output_format": str(cfg(config, "tts.cloud.output_format", entry.default_output_format)),
         "key_env": str(cfg(config, "tts.cloud.api_key_env", cfg(config, "tts.api_key_env", "VOICE_LOOP_TTS_API_KEY"))),
         "key_file": str(cfg(config, "tts.cloud.key_file", "")),
         # provider-specific synthesis knobs, passed through verbatim (ElevenLabs: stability,
@@ -695,29 +713,20 @@ def _open_stream(endpoint: str, payload: dict, timeout: float):
 
 def synthesize(text: str, s: dict, key: str) -> bytes | None:
     """One chunk -> audio bytes, or None (with the reason logged). Mirrors speak.sh's checks:
-    empty body and JSON-error-document responses are dropped, not played."""
+    empty body and JSON-error-document responses are dropped, not played.
+
+    There is NO per-provider branch here and there must never be one: the cloud request is built by
+    the configured provider's registry entry (see providers.py), which owns the host, the path, the
+    auth header, the payload shape and the audio container. The one branch left is the one that is
+    NOT about providers — cloud versus this plugin's own server.
+    """
     if s["backend"] == "cloud":
-        if s["provider"] == "elevenlabs":
-            # the response container follows output_format (mp3 by default) — your speak.player
-            # must be able to play it (macOS afplay does; on Linux use mpg123 or ffplay)
-            endpoint = s["endpoint"] or "https://api.elevenlabs.io"
-            payload: dict = {"text": text, "model_id": s["cloud_model"]}
-            if s["voice_settings"] is not None:
-                payload["voice_settings"] = s["voice_settings"]
-            url = f"{endpoint}/v1/text-to-speech/{s['voice_id']}?output_format={s['output_format']}"
-            body = _post(url, {"xi-api-key": key}, payload, s["timeout"])
-        else:
-            # OpenAI-compatible speech API
-            endpoint = s["endpoint"] or "http://127.0.0.1:8355"
-            payload = {
-                "model": s["cloud_model"],
-                "voice": s["voice_id"] or "alloy",
-                "input": text,
-                "response_format": "wav",
-            }
-            body = _post(f"{endpoint}/v1/audio/speech", {"Authorization": f"Bearer {key}"}, payload, s["timeout"])
+        entry = resolve_tts_provider(s["provider"])
+        request = entry.request(s, key, text)
+        endpoint = entry.endpoint(s)  # for the error messages below, which name where it went
+        body = _post(request.url, request.headers, request.payload, s["timeout"])
     else:
-        endpoint = s["endpoint"] or "http://127.0.0.1:8355"
+        endpoint = s["endpoint"] or providers.LOCAL_SPEECH_HOST
         payload = {
             k: v for k, v in (("text", text), ("speaker", s["speaker"]), ("language", s["language"])) if v
         }

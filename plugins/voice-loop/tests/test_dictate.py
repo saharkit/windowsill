@@ -1358,6 +1358,82 @@ def test_elevenlabs_stt_with_no_key_at_all_degrades_to_whisper(state, monkeypatc
     assert "cloud stt failed — falling back to local whisper" in log_text
 
 
+def test_deepgram_stt_goes_through_transcribe_with_no_branch_in_the_way(state, monkeypatch, opener):
+    """The proof that adding a provider is one ENTRY: Deepgram was added to the registry and
+    nothing in this dispatch path learned its name — yet a configured `deepgram` reaches its own
+    host, with its own auth scheme, its own body encoding, and its own response nesting.
+
+    The response body here is the pinned fixture, so this case and test_providers.py's parser case
+    fail together if Deepgram's shape drifts (windowsill#94, criterion 4)."""
+    (state / "dictate.wav").write_bytes(b"RIFFfakewav")
+    fixture = (Path(__file__).resolve().parent / "fixtures" / "deepgram_listen_response.json").read_bytes()
+    fake = opener(fixture)
+    monkeypatch.setenv("VOICE_LOOP_STT_API_KEY", "dg-secret")
+    s = dictate.resolve_settings({"stt": {"backend": "cloud", "cloud": {"provider": "deepgram"}}}, "Linux")
+    assert s["stt_model"] == "nova-3"  # the default model came off the entry
+    assert dictate.transcribe(s) == "Hello agent, this is the dictation contract."
+
+    request, timeout = fake.requests[0]
+    assert request.full_url.startswith("https://api.deepgram.com/v1/listen?")
+    assert "language=en" in request.full_url  # a QUERY parameter here, a form field for OpenAI
+    assert request.get_header("Authorization") == "Token dg-secret"  # Token, not Bearer
+    assert request.get_header("Content-type") == "audio/wav"  # the WAV is the whole body
+    assert request.data == b"RIFFfakewav"
+    assert timeout == 60.0
+
+
+def test_a_deepgram_error_document_degrades_with_deepgrams_own_reason(state, monkeypatch, opener):
+    """A quota or auth error must name itself. Deepgram puts the reason in `err_msg`, not in
+    `detail` — reading the wrong field is how a degrade becomes a mystery."""
+    (state / "dictate.wav").write_bytes(b"RIFFfakewav")
+    fake = opener(b'{"err_code": "INVALID_AUTH", "err_msg": "Token is invalid", "request_id": "abc"}')
+    monkeypatch.setenv("VOICE_LOOP_STT_API_KEY", "dg-wrong")
+    s = dictate.resolve_settings({"stt": {"backend": "cloud", "cloud": {"provider": "deepgram"}}}, "Linux")
+    assert dictate.transcribe(s) == ""  # cloud said no, whisper is not running in this test
+    log_text = (state / "dictate.log").read_text(encoding="utf-8")
+    assert "cloud stt returned an error: Token is invalid" in log_text
+    assert "cloud stt failed — falling back to local whisper" in log_text
+    assert len(fake.requests) == 2  # the cloud attempt, then the one-shot degrade
+
+
+def test_an_unknown_stt_provider_falls_back_to_the_default_and_says_so(state):
+    """A typo used to land on the OpenAI arm of an if/else in silence. Same destination now — the
+    historical behaviour — but the log names the typo, which is the whole difference between a
+    five-minute fix and a bug report."""
+    s = dictate.resolve_settings({"stt": {"cloud": {"provider": "deepgrma"}}}, "Linux")
+    assert s["stt_provider"] == "openai"
+    assert s["stt_model"] == "whisper-1"
+    log_text = (state / "dictate.log").read_text(encoding="utf-8")
+    assert "stt.cloud.provider is not a known provider" in log_text
+    assert "'deepgrma'" in log_text
+
+
+def test_the_no_key_message_names_the_provider_and_every_env_it_tried(state, monkeypatch, opener):
+    """One message for every provider, listing that provider's own credential chain — so the
+    ElevenLabs-only wording (and its LOG_RULES row) does not have to be duplicated per provider."""
+    (state / "dictate.wav").write_bytes(b"RIFFfakewav")
+    monkeypatch.delenv("VOICE_LOOP_STT_API_KEY", raising=False)
+    monkeypatch.delenv("VOICE_LOOP_TTS_API_KEY", raising=False)
+    opener(b'{"text": "whisper fallback"}')
+    s = dictate.resolve_settings({"stt": {"backend": "cloud", "cloud": {"provider": "elevenlabs"}}}, "Linux")
+    assert dictate.transcribe(s) == "whisper fallback"
+    log_text = (state / "dictate.log").read_text(encoding="utf-8")
+    assert "cloud stt: no key for elevenlabs" in log_text
+    assert "$VOICE_LOOP_STT_API_KEY" in log_text and "$VOICE_LOOP_TTS_API_KEY" in log_text
+
+
+def test_a_provider_without_the_shared_credentials_home_names_only_its_own_env(state, monkeypatch, opener):
+    (state / "dictate.wav").write_bytes(b"RIFFfakewav")
+    monkeypatch.delenv("VOICE_LOOP_STT_API_KEY", raising=False)
+    monkeypatch.setenv("VOICE_LOOP_TTS_API_KEY", "an-elevenlabs-key-that-deepgram-must-not-be-handed")
+    opener(b'{"text": "whisper fallback"}')
+    s = dictate.resolve_settings({"stt": {"backend": "cloud", "cloud": {"provider": "deepgram"}}}, "Linux")
+    assert dictate.transcribe(s) == "whisper fallback"
+    log_text = (state / "dictate.log").read_text(encoding="utf-8")
+    assert "cloud stt: no key for deepgram" in log_text
+    assert "VOICE_LOOP_TTS_API_KEY" not in log_text  # not this provider's key to borrow
+
+
 class _FailingOpener:
     """An opener whose .open() raises — simulating an unreachable server."""
     def open(self, request, timeout=None):

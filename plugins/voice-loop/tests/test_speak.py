@@ -185,6 +185,19 @@ def test_cloud_model_default_follows_provider():
     eleven = speak.resolve_settings({"tts": {"cloud": {"provider": "elevenlabs"}}}, "Linux")
     assert eleven["cloud_model"] == "eleven_multilingual_v2"
     assert speak.resolve_settings({}, "Linux")["cloud_model"] == "tts-1"
+    deepgram = speak.resolve_settings({"tts": {"cloud": {"provider": "deepgram"}}}, "Linux")
+    assert deepgram["cloud_model"] == "aura-2-thalia-en"
+
+
+def test_the_output_format_default_follows_the_provider_too():
+    """It is not one value with one spelling: ElevenLabs takes an opaque token, Deepgram takes a
+    query fragment, and the OpenAI-compatible path does not use it at all. So the default is the
+    entry's, not a constant in this file."""
+    assert speak.resolve_settings({}, "Linux")["output_format"] == ""
+    eleven = speak.resolve_settings({"tts": {"cloud": {"provider": "elevenlabs"}}}, "Linux")
+    assert eleven["output_format"] == "mp3_44100_128"
+    deepgram = speak.resolve_settings({"tts": {"cloud": {"provider": "deepgram"}}}, "Linux")
+    assert deepgram["output_format"] == "encoding=linear16&container=wav"
 
 
 def test_key_env_precedence_cloud_over_tts_over_default():
@@ -840,6 +853,39 @@ def test_elevenlabs_omits_voice_settings_when_unset(opener):
     request, _ = fake.requests[0]
     assert request.full_url == "https://api.elevenlabs.io/v1/text-to-speech/v123?output_format=mp3_44100_128"
     assert json.loads(request.data) == {"text": "hi", "model_id": "eleven_multilingual_v2"}
+
+
+def test_deepgram_synthesis_goes_through_synthesize_with_no_branch_in_the_way(opener):
+    """The TTS half of the one-entry proof: `deepgram` reaches its own host with its own auth
+    scheme and its own container parameters, and synthesize() never learned its name.
+
+    WAV rather than mp3 on purpose — `aplay -q`, the documented Linux player, cannot play mp3, so
+    an mp3 default would be a provider that installs green and plays nothing."""
+    fake = opener(b"RIFF-wav-audio-bytes")
+    config = {"tts": {"backend": "cloud", "cloud": {"provider": "deepgram"}}}
+    s = speak.resolve_settings(config, "Linux")
+    assert speak.synthesize("hello there", s, "dg-secret") == b"RIFF-wav-audio-bytes"
+
+    request, timeout = fake.requests[0]
+    assert request.full_url == (
+        "https://api.deepgram.com/v1/speak?model=aura-2-thalia-en&encoding=linear16&container=wav"
+    )
+    assert request.get_header("Authorization") == "Token dg-secret"
+    assert request.get_header("Content-type") == "application/json"
+    assert json.loads(request.data) == {"text": "hello there"}
+    assert timeout == 60.0
+
+
+def test_an_unknown_tts_provider_falls_back_to_the_default_and_says_so(state, opener):
+    fake = opener(b"WAV-audio-bytes")
+    s = speak.resolve_settings({"tts": {"backend": "cloud", "cloud": {"provider": "11labs"}}}, "Linux")
+    assert s["provider"] == "openai"
+    assert speak.synthesize("hi", s, "sk-secret") == b"WAV-audio-bytes"
+    # the default provider has no remote host of its own — it lands on the local speech server
+    assert fake.requests[0][0].full_url == "http://127.0.0.1:8355/v1/audio/speech"
+    log_text = (state / "speak.log").read_text(encoding="utf-8")
+    assert "tts.cloud.provider is not a known provider" in log_text
+    assert "'11labs'" in log_text
 
 
 def test_openai_compatible_synthesis_posts_the_documented_shape(opener):
