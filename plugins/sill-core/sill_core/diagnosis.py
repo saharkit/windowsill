@@ -218,6 +218,16 @@ _CHECK_RUNNERS = {
     "log": _run_log_check,
 }
 
+# Which source each runner is handed, by the source names ``diagnose()`` uses.
+# Every key of ``_CHECK_RUNNERS`` must appear here: the lookup is unconditional,
+# so a runner registered without a source fails loudly (KeyError) on its first
+# check instead of silently producing no finding.
+_CHECK_SOURCES = {
+    "config": "config",
+    "ledger": "ledger",
+    "log": "logs",
+}
+
 
 # ---------------------------------------------------------------------------
 # Public entry point
@@ -242,9 +252,11 @@ def diagnose(
     unfinished install, then real anomaly.  Within each bin the manifest order
     is preserved.
     """
-    cfg = config or {}
-    lgr = ledger or {}
-    lgs = logs or {}
+    sources: dict[str, Any] = {
+        "config": config or {},
+        "ledger": ledger or {},
+        "logs": logs or {},
+    }
 
     findings: list[Finding] = []
 
@@ -261,14 +273,7 @@ def diagnose(
         if runner is None:
             continue  # unknown check type → skip
 
-        if check_type == "config":
-            evidence = runner(check_def, cfg)
-        elif check_type == "ledger":
-            evidence = runner(check_def, lgr)
-        elif check_type == "log":
-            evidence = runner(check_def, lgs)
-        else:
-            evidence = None
+        evidence = runner(check_def, sources[_CHECK_SOURCES[check_type]])
 
         if evidence is not None:
             findings.append(

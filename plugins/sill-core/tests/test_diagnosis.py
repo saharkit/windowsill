@@ -23,6 +23,8 @@ import pytest
 from sill_core.diagnosis import (
     Bin,
     Finding,
+    _CHECK_RUNNERS,
+    _CHECK_SOURCES,
     _MISSING,
     _resolve_path,
     _run_config_check,
@@ -262,6 +264,12 @@ class TestDiagnose:
             "check": {"type": "nonexistent"},
         }]
         assert diagnose(manifest) == []
+
+    def test_every_runner_declares_a_source(self) -> None:
+        """Dispatch is data-driven: ``diagnose()`` looks a runner's source up
+        unconditionally, so a runner registered without one would raise KeyError
+        on its first check.  Pin the two tables to the same key set."""
+        assert _CHECK_RUNNERS.keys() == _CHECK_SOURCES.keys()
 
 
 # ---------------------------------------------------------------------------
