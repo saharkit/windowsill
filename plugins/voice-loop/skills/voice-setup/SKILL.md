@@ -476,15 +476,30 @@ Field notes worth telling the user:
 - `tts.command` / `stt.command` — the escape hatch for engines that are not HTTP servers (`say`,
   whisper.cpp). `tts.command` receives text on stdin and makes the sound itself; `stt.command`
   receives the WAV path as its last argument and prints the transcript.
-- `stt.cloud.provider` — `"openai"` (default, OpenAI-compatible speech-to-text) or `"elevenlabs"`
-  (ElevenLabs Scribe). When the user already has an ElevenLabs key configured for TTS
-  (`VOICE_LOOP_TTS_API_KEY`), offer `elevenlabs` as the natural choice — the same key covers both
-  directions with no extra setup. The model default follows the provider (`whisper-1` for OpenAI,
-  `scribe_v1` for ElevenLabs). Say plainly that cloud STT sends the recorded audio clip to the
-  provider's servers — that is the privacy trade every cloud backend makes, and it is stated
-  explicitly in the plugin README. If the cloud call fails (network down, quota, expired key)
-  dictation **degrades to the local whisper server** with a log line rather than going dead —
-  nothing about the config changes, and the next clip tries the cloud again.
+- `stt.cloud.provider` / `tts.cloud.provider` — which hosted API each direction talks to. Today:
+  `"openai"` (the default both ways, OpenAI-compatible), `"elevenlabs"` (Scribe for STT, and the
+  provider `/voice-design` casts voices with), `"deepgram"` (Nova for STT, Aura for TTS). The two
+  directions are independent — recognition through one provider and synthesis through another is an
+  ordinary config. **Do not memorise this list**: it is a registry, and
+  `plugins/voice-loop/PROVIDERS.md` is the current table with latency, cost per minute, language
+  coverage and privacy posture — read it with the user rather than quoting figures from here.
+  - The model default follows the provider (`whisper-1`, `scribe_v1`, `nova-3`), so leave
+    `stt.model` unset unless the user wants a specific one.
+  - **Language first, price second.** Deepgram's *synthesis* is English (and Spanish) only — never
+    offer `tts.cloud.provider: "deepgram"` to a user whose `language` is `ru` or `uk`. Its
+    *recognition* covers Russian (with `stt.language: "multi"`), and Ukrainian only on
+    `stt.model: "nova-2"`.
+  - When the user already has an ElevenLabs key configured for TTS (`VOICE_LOOP_TTS_API_KEY`),
+    offer `elevenlabs` for STT as the natural choice — the same key covers both directions with no
+    extra setup. That shared-key rule is ElevenLabs' alone; every other provider needs its own key.
+  - Say plainly that cloud STT sends the recorded audio clip to the provider's servers — that is
+    the privacy trade every cloud backend makes, and it is stated explicitly in the plugin README.
+  - If the cloud call fails (network down, quota, expired key) dictation **degrades to the local
+    whisper server** with a log line rather than going dead — nothing about the config changes, and
+    the next clip tries the cloud again. One hop, not a cascade across providers.
+  - A provider name the plugin does not know falls back to `"openai"` and says so in the log — so
+    if dictation is quietly OpenAI-shaped when the user asked for something else, check the spelling
+    in `~/.local/state/voice-loop/dictate.log` first.
 
 **Checkpoint** — after the config file is written and valid (`jq .` parses it):
 

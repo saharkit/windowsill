@@ -79,15 +79,22 @@ reasonable mix.
 | `lan` | another box you own, over HTTP or an ssh tunnel | free | stays on your network | the honest sweet spot if you have a GPU machine — `server/` is that server |
 | `cloud` | a hosted speech API | per-use billing | **your audio and text leave your machine** | off by default; keys live in a file the config points at, never in the config |
 
-### Cloud STT — OpenAI and ElevenLabs
+### Cloud providers — a registry, not a switch
 
-The `cloud` backend for dictation sends your recorded audio to a hosted API. Two providers are
-supported, selected by `stt.cloud.provider` in your config:
+The `cloud` backend sends your audio (dictation) or your text (synthesis) to a hosted API. Which
+one is a **registry entry**, chosen by `stt.cloud.provider` and `tts.cloud.provider` — the two
+directions are independent, and mixing them is ordinary:
 
-| provider | what it is | config key | default model |
+| provider | speech-to-text | text-to-speech | default models |
 |---|---|---|---|
-| `openai` | OpenAI-compatible speech-to-text (the default) | `stt.cloud.provider: "openai"` | `whisper-1` |
-| `elevenlabs` | [ElevenLabs Scribe](https://elevenlabs.io/docs/api-reference/speech-to-text) — high-accuracy transcription | `stt.cloud.provider: "elevenlabs"` | `scribe_v1` |
+| `openai` | ✅ OpenAI-compatible (the default both ways) | ✅ | `whisper-1` / `tts-1` |
+| `elevenlabs` | ✅ [Scribe](https://elevenlabs.io/docs/api-reference/speech-to-text) | ✅ + `/voice-design` voice cloning | `scribe_v1` / `eleven_multilingual_v2` |
+| `deepgram` | ✅ Nova | ✅ Aura — **English (and Spanish) only** | `nova-3` / `aura-2-thalia-en` |
+
+**[`PROVIDERS.md`](PROVIDERS.md) is the table to pick from** — latency, cost per minute, language
+coverage (including Russian and Ukrainian) and privacy posture, side by side. The short version:
+Deepgram is the cheapest and quickest for recognition and the `$200` new-account credit covers an
+evaluation, but its synthesis does not speak Russian or Ukrainian; ElevenLabs and OpenAI do both.
 
 **ElevenLabs STT reuses your existing ElevenLabs API key.** If you already configured
 `/voice-design` (or set `VOICE_LOOP_TTS_API_KEY`), dictation works without a second key. When
@@ -96,10 +103,17 @@ supported, selected by `stt.cloud.provider` in your config:
 1. Your configured STT key (`stt.cloud.api_key_env` or `stt.cloud.key_file`)
 2. The TTS key (`VOICE_LOOP_TTS_API_KEY`) — one credentials home, not a second one
 
-**Privacy note: with `stt.cloud.provider` set to `elevenlabs`, your recorded audio clips leave
-your machine and are sent to ElevenLabs' servers for transcription.** The same is true of any
-cloud STT provider — that is the trade the `cloud` row above states. If you would rather keep
-your audio local, `stt.backend: "lan"` (the default) transcribes on your own hardware.
+That shared-key rule is ElevenLabs' alone, because it is the one provider covering both directions
+with one account here: a `deepgram` STT config is never handed an ElevenLabs key.
+
+**Privacy note: with any cloud `stt.cloud.provider`, your recorded audio clips leave your machine
+and are sent to that provider's servers for transcription** — that is the trade the `cloud` row
+above states. If you would rather keep your audio local, `stt.backend: "lan"` (the default)
+transcribes on your own hardware.
+
+**Adding a provider is one entry** in [`scripts/providers.py`](scripts/providers.py) plus its row
+in `PROVIDERS.md` — no dispatch path in the plugin compares a provider name against a literal, and
+a test enforces that.
 
 ### Degrade — what happens when the cloud is down
 
@@ -111,6 +125,10 @@ clip tries the cloud again — the degrade is one-shot, not a permanent switch.
 This means: kill your network mid-session, and your next dictation still transcribes through
 local whisper with a log line marking the fallback. Nothing about your config changes, and you
 never stare at a dead microphone wondering why.
+
+One hop, deliberately. A *cascade* across several cloud providers before the local fallback is its
+own feature with its own config schema, and it is not implemented — see the degrade section of
+[`PROVIDERS.md`](PROVIDERS.md).
 
 ## Languages
 

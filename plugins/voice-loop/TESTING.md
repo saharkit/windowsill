@@ -100,7 +100,9 @@ the real runtime. So the guarantee is layered differently:
    stderr line — and every one of those strings is then hunted in the rendered bundle. The
    collector's `LOG_RULES` table classifies log lines written by two *other* files in this plugin,
    so a second test reads `speak.py` and `dictate.py` and fails if either grows a log call the table
-   does not know, or keeps a row nothing writes any more. An unclassified line is redacted at
+   does not know, or keeps a row nothing writes any more. That second direction is what keeps the
+   table honest when a message MOVES: the per-provider "no key" wording collapsed into one line when
+   the provider registry landed, and the row it replaced could not be left behind quietly. An unclassified line is redacted at
    runtime regardless — the table falling behind costs diagnostics, never a leak. The transports are
    unit-tested at their seams (an injected subprocess runner for `gh`, URL round-trips through
    `urlsplit`/`parse_qs` for the other two): no issue is ever created, no mail is ever sent.
@@ -153,6 +155,22 @@ the real runtime. So the guarantee is layered differently:
    probe has one that spawns a stub card for real. The `contour.alerts` opt-out,
    `contour.vram.command: false`, and the announced-ledger pruning are unit-tested above; the one
    thing no runner can offer is a real oversubscribed card.
+9. **`tests/test_providers.py`** for the cloud provider registry, where the property under test is
+   an *absence*: no dispatch path in `scripts/` compares a configured provider against a literal.
+   That is checked by grep, in both the forms the code actually uses — a bare `provider ==` **and**
+   the `s["provider"] == …` the two dispatch sites are written in — because a check that matched
+   only the first would pass over exactly the branches this seam exists to remove. The rest of the
+   file exercises every entry at its pure boundary: the request each one builds (host, path, body
+   encoding, auth header) and the body each one parses, with no socket anywhere.
+
+   **What the Deepgram fixture does and does not prove.** `tests/fixtures/` holds a pinned
+   `POST /v1/listen` response and asserts the entry reads the transcript out of it, so a nesting
+   drift goes RED — the failure it guards against is silent, since a parse that finds nothing
+   degrades to local whisper under a log line that blames "the cloud". It is a *structural* pin, and
+   `fixtures/PROVENANCE.md` says out loud that it is transcribed from the published schema rather
+   than captured from a live call: it cannot catch a shape that was wrong on day one. The live
+   proof — a real clip through a real key, real text out — is a **human** step recorded in the PR,
+   deliberately not a CI gate, because a metered API key does not belong in this repository's CI.
 
 Real invocation is the guarantee for the runtime path. Every spoken run also logs
 `timings extract_ms=… first_audio_ms=… total_ms=…` to `~/.local/state/voice-loop/speak.log`, so a

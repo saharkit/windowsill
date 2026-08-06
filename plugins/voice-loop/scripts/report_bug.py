@@ -252,6 +252,8 @@ LOG_RULES: tuple[tuple[str, str | None], ...] = (
     ("local command rc=", None),
     ("timings extract_ms=", None),
     ("cloud tts: no key", None),
+    # a provider name the registry does not know is the user's own typo — cut like paste_target's
+    ("tts.cloud.provider is not a known provider — using ", "instead of "),
     ("stream died before its first chunk", None),
     ("played rc=", None),
     ("nothing played via=", None),
@@ -265,9 +267,11 @@ LOG_RULES: tuple[tuple[str, str | None], ...] = (
     ("dictate.debounce_ms is not a usable number (", "number ("),
     ("stt unreachable: ", None),
     ("stt command failed: ", None),
-    ("cloud stt: no key", None),
+    # the provider name and the env var names it tried; both are config-shaped metadata, and
+    # naming which provider had no key is the whole diagnostic value of the line
+    ("cloud stt: no key for ", None),
+    ("stt.cloud.provider is not a known provider — using ", "instead of "),
     ("cloud stt failed — falling back to local whisper", None),
-    ("elevenlabs stt: no key (key_file unset/unreadable, $", None),
     ("cloud stt returned an error: ", "error: "),
     ("cloud stt returned undecodable response: ", "response: "),
     ("debounce stamp unavailable (", None),

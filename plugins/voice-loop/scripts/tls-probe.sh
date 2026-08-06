@@ -19,4 +19,7 @@ set -u
 command -v python3 >/dev/null 2>&1 || { echo "FAIL: python3 is required" >&2; exit 1; }
 DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd) || exit 1
 [ -f "$DIR/tls-probe.py" ] || { echo "FAIL: tls-probe.py is missing beside $0" >&2; exit 1; }
+# tls-probe.py imports the provider registry beside it — the same fail-closed diagnostic, so a
+# half-copied scripts/ names what is missing instead of raising ModuleNotFoundError.
+[ -f "$DIR/providers.py" ] || { echo "FAIL: providers.py is missing beside $0" >&2; exit 1; }
 exec python3 "$DIR/tls-probe.py" "$@"

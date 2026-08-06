@@ -81,6 +81,12 @@ import urllib.parse
 import urllib.request
 import uuid
 
+# The one module in scripts/ this file imports: the provider registry (see providers.py). The
+# launcher checks for it beside dictate.py the same way it checks for dictate.py itself, and it
+# resolves because sys.path[0] is this file's directory — the tests, which load this file by
+# spec_from_file_location, put scripts/ on sys.path themselves.
+import providers
+
 try:
     import fcntl
 except ImportError:  # pragma: no cover - POSIX-only; Linux and macOS are the supported platforms
@@ -214,11 +220,24 @@ def resolve_paste_target(value) -> str:
     return "same-window"
 
 
+def resolve_stt_provider(name: str):
+    """The registry entry for a configured provider name — the default entry, loudly, for a name
+    the registry has never heard of.
+
+    A typo here used to land on the OpenAI arm of an if/else silently, and the symptom was a cloud
+    call that 404s and degrades to whisper under a log line blaming "the cloud". The fallback is
+    unchanged (that IS the historical behaviour); what is new is that it says so."""
+    entry = providers.stt_provider(name)
+    if entry is None:
+        log(f'stt.cloud.provider is not a known provider — using "{providers.DEFAULT_STT}" instead of {name!r}')
+        entry = providers.STT_PROVIDERS[providers.DEFAULT_STT]
+    return entry
+
+
 def resolve_settings(config: dict, system: str) -> dict:
     """Every knob dictate-toggle.sh honoured, same names, same defaults, same precedence."""
-    stt_provider = str(cfg(config, "stt.cloud.provider", "openai"))
-    # provider-specific default model: "scribe_v1" for ElevenLabs Scribe, "whisper-1" for OpenAI
-    default_stt_model = "scribe_v1" if stt_provider == "elevenlabs" else "whisper-1"
+    # the provider is an ENTRY, never a branch — every per-provider default below comes off it
+    entry = resolve_stt_provider(str(cfg(config, "stt.cloud.provider", providers.DEFAULT_STT)))
     return {
         "mode": str(cfg(config, "dictate.mode", "send")),
         "paste_key": str(cfg(config, "dictate.paste_key", "cmd+v" if system == "Darwin" else "ctrl+shift+v")),
@@ -240,9 +259,9 @@ def resolve_settings(config: dict, system: str) -> dict:
         # top-level "language" is the one the user sets; ".stt.language" is the advanced escape
         # for people who dictate in one language and listen in another.
         "language": str(cfg(config, "stt.language", cfg(config, "language", "en"))),
-        "stt_model": str(cfg(config, "stt.model", default_stt_model)),
+        "stt_model": str(cfg(config, "stt.model", entry.default_model)),
         "stt_command": str(cfg(config, "stt.command", "")),
-        "stt_provider": stt_provider,
+        "stt_provider": entry.name,
         "cloud_endpoint": str(cfg(config, "stt.cloud.endpoint", "")),
         "key_env": str(cfg(config, "stt.cloud.api_key_env", cfg(config, "stt.api_key_env", "VOICE_LOOP_STT_API_KEY"))),
         "key_file": str(cfg(config, "stt.cloud.key_file", "")),
@@ -472,31 +491,18 @@ def _log_stderr(stderr_bytes: bytes) -> None:
         pass
 
 
-def multipart_form(fields: dict[str, str], file_field: str, filename: str, payload: bytes, boundary: str) -> bytes:
-    """A multipart/form-data body the way curl -F built it: text fields, then one WAV part."""
-    lines: list[str] = []
-    for name, value in fields.items():
-        lines += [f"--{boundary}", f'Content-Disposition: form-data; name="{name}"', "", value]
-    lines += [
-        f"--{boundary}",
-        f'Content-Disposition: form-data; name="{file_field}"; filename="{filename}"',
-        "Content-Type: audio/wav",
-        "",
-    ]
-    head = "\r\n".join(lines).encode("utf-8") + b"\r\n"
-    return head + payload + f"\r\n--{boundary}--\r\n".encode("ascii")
+# The multipart builder moved into the registry with the request-build axis it belongs to; this
+# alias keeps the name where dictate.py's own callers (and its tests) have always found it.
+multipart_form = providers.multipart_form
 
 
 def transcript_from_response(raw: bytes | None) -> str:
     """The ``text`` field of a JSON response, stripped — '' for anything malformed (parity with
-    the shell's ``python3 -c 'json.load(...).get("text","")'`` tail, which printed '' on error)."""
-    if not raw:
-        return ""
-    try:
-        data = json.loads(raw)
-    except ValueError:
-        return ""
-    return str(data.get("text", "")).strip() if isinstance(data, dict) else ""
+    the shell's ``python3 -c 'json.load(...).get("text","")'`` tail, which printed '' on error).
+
+    This is the LOCAL server's shape, which is also what the OpenAI and ElevenLabs entries parse
+    with; a cloud response goes through its own entry's ``transcript`` instead."""
+    return providers.text_field(providers.decode(raw))
 
 
 def applescript_escape(text: str) -> str:
@@ -595,12 +601,20 @@ def sound(path: str, player: str) -> None:
 
 
 def _post_multipart(url: str, headers: dict, body: bytes, boundary: str, timeout: float) -> bytes | None:
-    """POST the form, return the body even on an HTTP error (the body is the diagnosis). None only
-    when the server was unreachable. Proxies bypassed (parity with ``curl --noproxy '*'``)."""
+    """POST a multipart form — the LAN path's one shape, and the shape most cloud entries build."""
+    return _post_bytes(url, headers, body, f"multipart/form-data; boundary={boundary}", timeout)
+
+
+def _post_bytes(url: str, headers: dict, body: bytes, content_type: str, timeout: float) -> bytes | None:
+    """POST a body of any encoding, return it even on an HTTP error (the body is the diagnosis).
+    None only when the server was unreachable. Proxies bypassed (parity with ``curl --noproxy '*'``).
+
+    The content type is an argument rather than a constant because it is a per-provider axis:
+    Deepgram takes the WAV as the whole request body (``audio/wav``), not as a form part."""
     request = urllib.request.Request(
         url,
         data=body,
-        headers={"Content-Type": f"multipart/form-data; boundary={boundary}", **headers},
+        headers={"Content-Type": content_type, **headers},
         method="POST",
     )
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -677,50 +691,37 @@ def _transcribe_cloud(s: dict, wav_bytes: bytes, boundary: str) -> str | None:
 
     The caller logs the degrade reason — this function only logs the specific failure
     that made the cloud path unusable (missing key, network error, API error document).
+
+    There is NO per-provider branch here and there must never be one: the configured provider is
+    an entry in the registry, and every axis it varies — host, path, body encoding, auth header,
+    which env vars hold its key, where the transcript lives, how its error documents read — is
+    read off that entry (see providers.py).
     """
-    if s["stt_provider"] == "elevenlabs":
-        key = read_key(s["key_file"], s["key_env"], os.environ)
-        if not key:
-            # One credentials home: re-use the existing ElevenLabs key from the TTS side
-            # so a user who already configured voice-design has dictation working too.
-            key = read_key(s.get("key_file", ""), "VOICE_LOOP_TTS_API_KEY", os.environ)
-        if not key:
-            log(f"elevenlabs stt: no key (key_file unset/unreadable, ${s['key_env']} empty, "
-                "and $VOICE_LOOP_TTS_API_KEY empty)")
-            return None
-        cloud_endpoint = s.get("cloud_endpoint") or "https://api.elevenlabs.io"
-        body = multipart_form(
-            {"model_id": s["stt_model"]}, "file", "dictate.wav", wav_bytes, boundary
-        )
-        raw = _post_multipart(
-            f"{cloud_endpoint}/v1/speech-to-text",
-            {"xi-api-key": key}, body, boundary, s["timeout"],
-        )
-    else:
-        # OpenAI-compatible speech-to-text (the existing cloud path).
-        key = read_key(s["key_file"], s["key_env"], os.environ)
-        if not key:
-            log(f"cloud stt: no key (key_file unset/unreadable and ${s['key_env']} empty)")
-            return None
-        cloud_endpoint = s.get("cloud_endpoint") or s["endpoint"]
-        body = multipart_form(
-            {"model": s["stt_model"], "language": s["language"]}, "file", "dictate.wav", wav_bytes, boundary
-        )
-        raw = _post_multipart(
-            f"{cloud_endpoint}/v1/audio/transcriptions",
-            {"Authorization": f"Bearer {key}"}, body, boundary, s["timeout"],
-        )
+    entry = resolve_stt_provider(s["stt_provider"])
+    key_envs = entry.key_envs(s["key_env"])
+    key = ""
+    for env in key_envs:
+        key = read_key(s["key_file"], env, os.environ)
+        if key:
+            break
+    if not key:
+        tried = ", ".join(f"${env}" for env in key_envs)
+        log(f"cloud stt: no key for {entry.name} (key_file unset/unreadable, and {tried} empty)")
+        return None
+
+    request = entry.request(s, key, wav_bytes, boundary)
+    raw = _post_bytes(request.url, request.headers, request.body, request.content_type, s["timeout"])
     if raw is None:
-        return None  # network error — already logged by _post_multipart
-    text = transcript_from_response(raw)
+        return None  # network error — already logged by _post_bytes
+    data = providers.decode(raw)
+    text = entry.transcript(data)
     if not text and raw:
         # Got a response but no recognised text — could be an API error document.
         # Log its shape so the operator can tell a quota error from a bad model name.
-        try:
-            err = json.loads(raw)
-            log(f"cloud stt returned an error: {str(err.get('detail', err))[:200]}")
-        except ValueError:
+        if data is None:
             log(f"cloud stt returned undecodable response: {raw[:200]!r}")
+        else:
+            log(f"cloud stt returned an error: {entry.error_summary(data)}")
         return None
     return text
 

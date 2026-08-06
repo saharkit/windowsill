@@ -46,16 +46,17 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+# The one module in scripts/ this file imports: the provider registry (see providers.py). Which
+# host is worth probing is a per-provider fact — "does this provider have a remote default host?"
+# — and it belongs in the entry, not in a special case here.
+import providers
+
 # The fallback probe target: a host with a perfectly ordinary public certificate that this install
 # genuinely depends on — it is where `pip install -r requirements.txt` gets the server's wheels
 # from. Probing it therefore predicts the next step of setup rather than testing an unrelated host
 # — for everything that does not go through a proxy, which this probe deliberately bypasses and
 # says so on the way past (see PROXY_VARS).
 DEFAULT_URL = "https://pypi.org/"
-
-# Where a cloud voice comes from when one is configured; probed in preference to the default so the
-# thing that failed for the user is the thing the probe checks.
-ELEVENLABS_HOST = "https://api.elevenlabs.io"
 
 # A probe must never be the slow part of setup: a handshake that has not happened in this long is
 # an unreachable host, which is a different answer from a rejected certificate.
@@ -125,13 +126,15 @@ def resolve_url(config: dict) -> str:
         value = str(cfg(config, dotted, ""))
         if value.startswith("https://"):
             return value.rstrip("/")
-    # ElevenLabs is the one provider with a remote DEFAULT host (speak.py falls back to it when no
-    # endpoint is configured); the OpenAI-compatible path falls back to the local server on http,
-    # so a configured https OpenAI endpoint is already caught by the loop above.
+    # Some providers have a remote DEFAULT host — speak.py falls back to it when no endpoint is
+    # configured — and some do not: the OpenAI-compatible path falls back to the LOCAL server on
+    # http, so a configured https OpenAI endpoint is already caught by the loop above. Which is
+    # which is the entry's ``default_host``, never a name compared here; an unknown provider name
+    # has no host to offer, and the pip fallback below is the honest answer for it.
     backend = str(cfg(config, "tts.backend", ""))
-    provider = str(cfg(config, "tts.cloud.provider", "openai"))
-    if backend == "cloud" and provider == "elevenlabs":
-        return ELEVENLABS_HOST
+    entry = providers.tts_provider(str(cfg(config, "tts.cloud.provider", providers.DEFAULT_TTS)))
+    if backend == "cloud" and entry is not None and entry.default_host:
+        return entry.default_host
     return DEFAULT_URL
 
 

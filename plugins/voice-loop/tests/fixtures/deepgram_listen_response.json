@@ -1,0 +1,39 @@
+{
+  "metadata": {
+    "transaction_key": "deprecated",
+    "request_id": "00000000-0000-0000-0000-000000000000",
+    "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "created": "2026-08-06T00:00:00.000Z",
+    "duration": 2.72,
+    "channels": 1,
+    "models": ["00000000-0000-0000-0000-000000000000"],
+    "model_info": {
+      "00000000-0000-0000-0000-000000000000": {
+        "name": "general-nova-3",
+        "version": "2024-01-01.0",
+        "arch": "nova-3"
+      }
+    }
+  },
+  "results": {
+    "channels": [
+      {
+        "alternatives": [
+          {
+            "transcript": "Hello agent, this is the dictation contract.",
+            "confidence": 0.99902,
+            "words": [
+              {"word": "hello", "start": 0.08, "end": 0.4, "confidence": 0.999, "punctuated_word": "Hello"},
+              {"word": "agent", "start": 0.4, "end": 0.8, "confidence": 0.998, "punctuated_word": "agent,"},
+              {"word": "this", "start": 0.88, "end": 1.12, "confidence": 0.999, "punctuated_word": "this"},
+              {"word": "is", "start": 1.12, "end": 1.28, "confidence": 0.999, "punctuated_word": "is"},
+              {"word": "the", "start": 1.28, "end": 1.44, "confidence": 0.999, "punctuated_word": "the"},
+              {"word": "dictation", "start": 1.44, "end": 2.0, "confidence": 0.997, "punctuated_word": "dictation"},
+              {"word": "contract", "start": 2.0, "end": 2.56, "confidence": 0.998, "punctuated_word": "contract."}
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}

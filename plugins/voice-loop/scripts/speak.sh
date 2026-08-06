@@ -10,4 +10,7 @@ set -u
 command -v python3 >/dev/null 2>&1 || exit 0
 DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd) || exit 0
 [ -f "$DIR/speak.py" ] || exit 0
+# speak.py imports the provider registry beside it; a half-copied scripts/ must be silence too,
+# not a traceback in the middle of a turn.
+[ -f "$DIR/providers.py" ] || exit 0
 exec python3 "$DIR/speak.py"
