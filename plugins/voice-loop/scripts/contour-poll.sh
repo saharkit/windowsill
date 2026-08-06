@@ -5,8 +5,11 @@
 #
 # One poll per run: every configured service's /health, free VRAM, the alert rules of #40
 # (unreachable, device demoted off its expected device, free VRAM under the floor, oom_overflows
-# rising), the p95-by-device latency SLI — all written atomically to contour.json in the state
-# dir, which the speaking hook reads to voice an alert once.
+# rising or restarting) — written atomically to contour.json (contour.status_path, default in the
+# state dir), which the speaking hook reads to voice an alert once.
+#
+# Bounded: (services + 1) x contour.timeout, polled serially — at the shipped default, 10 s for
+# one service, under a minute for ten, against a five-minute cadence.
 #
 # Usage: contour-poll.sh [--json] [--status PATH]
 # Exit:  0 polled, no alert · 1 polled, an alert is active (the status file says which)

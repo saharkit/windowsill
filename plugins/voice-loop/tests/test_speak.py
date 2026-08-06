@@ -1711,6 +1711,37 @@ def test_an_active_alert_is_voiced_once_and_then_not_again(state, monkeypatch):
     speak.contour_check({}, 0.0)  # the condition persists — the page does not repeat
     assert spoken == [_VOICED]
     assert (state / "contour-announced").read_text(encoding="utf-8").split() == ["device-demoted:rvc"]
+    # The second firing leaves a POSITIVE mark. Without one, "did not repeat" and "died before it
+    # ever looked" are the same empty log — and speak.sh swallows every exception and exits 0, so
+    # dying is exactly what a regression here looks like from outside.
+    assert "contour: already announced — nothing to voice (1 alert(s) still active)" in _speak_log(state)
+
+
+def test_a_quiet_contour_says_nothing_at_all_not_even_that_it_is_quiet(state, monkeypatch):
+    # The other direction, and the overwhelming common case: a fresh green status file. The dedup's
+    # marker must not fire here — one line per tool call, forever, for nothing.
+    _contour_status(state, [])
+    spoken = _record_speech(monkeypatch)
+    speak.contour_check({}, 0.0)
+    assert spoken == []
+    assert "contour:" not in _speak_log(state)
+
+
+def test_the_hook_reads_the_status_file_the_poller_was_told_to_write(state, monkeypatch, tmp_path):
+    """The seam, from this end. contour_poll.py can be pointed anywhere; this hook only ever read
+    the default, so a cron line written with `--status /var/tmp/contour.json` polled correctly,
+    exited 1 correctly, and paged nobody. One config key now answers for both halves."""
+    relocated = tmp_path / "elsewhere" / "contour.json"
+    relocated.parent.mkdir()
+    written = datetime.now(timezone.utc).isoformat()
+    relocated.write_text(json.dumps({"at": written, "max_age": 900, "alerts": [_DEMOTED]}), encoding="utf-8")
+    assert not (state / "contour.json").exists()  # nothing at the default path: the whole point
+
+    spoken = _record_speech(monkeypatch)
+    speak.contour_check({"contour": {"status_path": str(relocated)}}, 0.0)
+    assert spoken == [_VOICED]
+    # …and an unset key is still the default path, byte for byte
+    assert speak.contour_status_path({}) == speak._CONTOUR_PATH
 
 
 def test_a_cleared_and_returned_alert_pages_again(state, monkeypatch):

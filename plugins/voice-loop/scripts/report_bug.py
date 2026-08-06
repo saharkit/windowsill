@@ -259,6 +259,7 @@ LOG_RULES: tuple[tuple[str, str | None], ...] = (
     # services — host:port derived from THEIR config's URLs — so the message itself is cut
     ("contour: another firing is speaking", None),
     ("contour: the page reached no player", None),
+    ("contour: already announced", None),
     ("contour: voicing ", "alert(s): "),
     # dictate.py
     ("dictate.debounce_ms is not a usable number (", "number ("),

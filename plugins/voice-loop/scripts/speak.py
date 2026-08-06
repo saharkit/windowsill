@@ -213,7 +213,8 @@ _STAMP_PATH = os.path.join(_STATE_DIR, "hook-last-fired")
 
 # The contour check (#40): the poller's status file, and the announced-ledger of alert keys
 # already voiced (pruned to the alerts still active, so a cleared-and-returned condition pages
-# again). contour.json is written by scripts/contour_poll.py — this hook only ever READS it.
+# again). contour.json is written by scripts/contour_poll.py — this hook only ever READS it. The
+# path is the DEFAULT: contour.status_path relocates it for both halves at once (contour_status_path).
 _CONTOUR_PATH = os.path.join(_STATE_DIR, "contour.json")
 _CONTOUR_ANNOUNCED_PATH = os.path.join(_STATE_DIR, "contour-announced")
 
@@ -872,6 +873,17 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def contour_status_path(config: dict) -> str:
+    """Where the poller was told to write, read the SAME way the poller resolves it.
+
+    The seam this closes: contour_poll.py can be pointed anywhere with ``--status`` while this
+    hook only ever read the default, so a cron line written with ``--status /var/tmp/contour.json``
+    polled correctly, exited 1 correctly, and paged nobody. One config key answers for both halves
+    (contour_poll.resolve_status_path is the same lookup), and the default is unchanged.
+    """
+    return str(cfg(config, "contour.status_path", _CONTOUR_PATH))
+
+
 def read_contour_status(path: str) -> dict:
     """The poller's whole status object — {} on ANY read problem.
 
@@ -1016,7 +1028,7 @@ def contour_check(config: dict, t0: float, event: str = "Stop") -> None:
         return
     if cfg(config, "contour.alerts", True) in (False, "false"):
         return
-    alerts = contour_alerts(read_contour_status(_CONTOUR_PATH), _utcnow())
+    alerts = contour_alerts(read_contour_status(contour_status_path(config)), _utcnow())
 
     # ONE lock, both event paths. The announced-ledger is a read-modify-write, and the check is a
     # second event path into it: two tool calls in one assistant block gave two firings that both
@@ -1034,6 +1046,13 @@ def contour_check(config: dict, t0: float, event: str = "Stop") -> None:
         announced = sync_contour_announced([alert["key"] for alert in alerts], _CONTOUR_ANNOUNCED_PATH)
         fresh = [alert for alert in alerts if alert["key"] not in announced]
         if not fresh:
+            if alerts:
+                # The dedup's own positive mark. Without it the second firing of a persisting alert
+                # left NO trace, so "the page did not repeat" was indistinguishable from "the hook
+                # crashed before it ever looked" — and speak.sh swallows every exception and
+                # exits 0, so crashing is exactly what a regression here looks like. Only logged
+                # when there is something to be quiet ABOUT: the empty case is every quiet turn.
+                log(f"contour: already announced — nothing to voice ({len(alerts)} alert(s) still active)")
             return
         text = f"Voice contour: {'; '.join(alert['message'] for alert in fresh)}"
         log(f"contour: voicing {len(fresh)} alert(s): {text[:80]}")

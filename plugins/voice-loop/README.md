@@ -240,7 +240,7 @@ No Prometheus, no root.
     "services": [
       { "name": "speech", "health": "http://127.0.0.1:8355/health" },
       { "name": "converter", "health": "http://192.0.2.10:8358/health",
-        "expect_device": "gpu", "latency_fields": ["rtf"] }
+        "expect_device": "gpu" }
     ],
     "vram": { "min_free_mib": 200 }
   }
@@ -250,31 +250,85 @@ No Prometheus, no root.
 - **Alerts.** A service that does not answer (or reports `ok: false`); a service serving on a
   device other than its `expect_device` — set that key exactly when a client depends on the fast
   path, because that dependency is yours to declare and the alert means "the fast path is gone";
-  free VRAM under `vram.min_free_mib` (default 200); a rising `oom_overflows` counter; and, read
-  by the hook rather than the poller, **a status file nobody has refreshed** (see `max_age`).
+  free VRAM under `vram.min_free_mib` (default 200); an `oom_overflows` counter that **changed**
+  (a rise, or a drop — these are per-process counters, so a counter that went backwards is a
+  service that restarted and is already overflowing again; a steady counter does not re-page); and,
+  read by the hook rather than the poller, **a status file nobody has refreshed** (see `max_age`).
   `ok` is a service's *optional* self-assessment: `false` alerts, and **absent does not** — a
   third-party `/health` with its own vocabulary (the `converter` above) is answering, not down.
 - **Exit codes, and the vocabulary is closed.** `0` quiet, `1` an alert is active, `64` everything
   else — called wrong, a config that will not parse, a knob that is not a number, a `services`
   value that is not a list, an entry with no fetchable URL, two entries resolving to one name, or
   a poll that failed. **`1` never means anything but "page"**, so a cron line or scheduler can
-  branch on it. Every `64` still writes the status file, carrying a `poller-error` alert, so a
-  broken poller is heard rather than leaving the hook to read a stale "all quiet".
+  branch on it — and, for the same reason, a poll that found an alert and then could not *write*
+  its status file still exits `1`: the diagnosis outranks the broken monitor, and the exit code is
+  the only channel it has left. Every other `64` still tries to write the status file, carrying a
+  `poller-error` alert, so a broken poller is heard rather than leaving the hook to read a stale
+  "all quiet".
+- **How long a poll takes, as a bound.** `(services + 1) × contour.timeout`, polled one after
+  another, with no other wait in the path — at the default `timeout: 5`, ten seconds for one
+  service and under a minute for ten, against a five-minute cadence.
+- **Numbers are numbers.** Every numeric knob must be a JSON number: `"5"` is refused exactly like
+  `"5s"`. Accepting the string that happens to parse and refusing the one that does not is a rule
+  no operator can predict, and it is the accepted one that goes on being written.
 - **`max_age`** (default 900 s — three missed polls at a five-minute cadence) is written into
   `contour.json`, and the hook pages when the file is older than it. Remove the cron entry and the
   status file freezes at its last green poll; without this bound "the contour is fine" and "nobody
   looked" are the same silence. A stale file's own alerts are dropped with it — a reading nobody
   refreshed says nothing about now.
-- **The SLI.** Every sample is appended to a bounded history (default a week at a five-minute
-  cadence), and any numeric health field named in `latency_fields` gets a **p95 split by device** —
-  the CPU/GPU split is a cliff, so an average across both would be meaningless. That history is
-  what a future SLO gets written against; there is deliberately no SLO yet.
+- **What is in the file: the alerts and the last sample, nothing accumulated.** There is no latency
+  history and no p95. There was — a week-long per-service window and a p95 split by device — and
+  nothing read it: no alert rule, no SLO, no caller in this repository. Meanwhile the hook re-parsed
+  the whole file on every tool call (967 KB and 6.3 ms for three services) to reach an `alerts` key
+  that is almost always empty. The window comes back with the SLO that consumes it; today the file
+  stays a few hundred bytes and the read is free.
+- **`contour.status_path`** relocates `contour.json` (default
+  `~/.local/state/voice-loop/contour.json`) — **for both halves at once**, because the hook reads
+  the same key. `--status` overrides it for a one-off probe or a test; do **not** use it in a
+  scheduled command, because the hook cannot see a command-line flag and a poller writing where
+  nobody reads pages nobody.
 - **`vram.command: false`** disables the GPU probe (a Mac, a GPU-less box) — an empty string
   cannot, because an empty config value means "unset" everywhere in this plugin.
 - **`contour.alerts: false`** opts out of the spoken page; the poller keeps writing the file.
-- Scheduling is yours: a cron line or a `systemd --user` timer running
-  `bash .../scripts/contour-poll.sh` every few minutes. The default config (no `contour` key at
-  all) polls just the local speech server on `127.0.0.1:8355` — no host is ever baked in.
+
+### Scheduling it
+
+The poller is one shot; running it every few minutes is yours to arrange. `/voice-setup` does not
+do it for you — the contour is optional and the cadence is a judgement about your machine — but
+**`/voice-remove` knows how to undo the two shapes below**, so if you write your own, tell it.
+
+A `systemd --user` timer (Linux), the shape `/voice-remove` looks for:
+
+```sh
+plugin=~/.claude/plugins/voice-loop     # wherever your checkout lives
+mkdir -p ~/.config/systemd/user
+cat > ~/.config/systemd/user/voice-loop-contour.service <<EOF
+[Unit]
+Description=voice-loop contour poll
+[Service]
+Type=oneshot
+ExecStart=/bin/bash $plugin/scripts/contour-poll.sh
+EOF
+cat > ~/.config/systemd/user/voice-loop-contour.timer <<'EOF'
+[Unit]
+Description=poll the voice contour every five minutes
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+[Install]
+WantedBy=timers.target
+EOF
+systemctl --user daemon-reload && systemctl --user enable --now voice-loop-contour.timer
+```
+
+Or a cron line — keep the trailing comment, it is what `/voice-remove` matches on:
+
+```cron
+*/5 * * * * /bin/bash "$HOME/.claude/plugins/voice-loop/scripts/contour-poll.sh" >/dev/null 2>&1  # voice-loop contour
+```
+
+The default config (no `contour` key at all) polls just the local speech server on
+`127.0.0.1:8355` — no host is ever baked in.
 
 ## What is in here
 
@@ -293,7 +347,7 @@ plugins/voice-loop/
   scripts/report-bug.sh       bug-report launcher (stable entry point for /report-bug)
   scripts/report_bug.py       the collector: diagnostics -> redaction -> one bundle -> a transport
   scripts/tls-probe.sh/.py    "do https certificates verify from this python?" — names the fix, --fix runs it
-  scripts/contour-poll.sh/.py the contour poller: /health + VRAM -> alerts + p95-by-device -> contour.json
+  scripts/contour-poll.sh/.py the contour poller: /health + VRAM -> the alert rules -> contour.json
   skills/voice-setup/         the agent installer
   skills/voice-design/        voice casting
   skills/voice-remove/        the symmetric uninstaller (service, hotkey, config, caches, convention)
