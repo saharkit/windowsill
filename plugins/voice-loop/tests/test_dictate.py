@@ -109,6 +109,30 @@ def test_empty_string_falls_back_to_default():
     assert dictate.resolve_settings({"stt": {"endpoint": ""}}, "Linux")["endpoint"] == "http://127.0.0.1:8355"
 
 
+def test_stt_cloud_provider_defaults_to_openai():
+    s = dictate.resolve_settings({}, "Linux")
+    assert s["stt_provider"] == "openai"
+    assert s["stt_model"] == "whisper-1"  # the provider-dependent model default
+
+
+def test_stt_cloud_provider_elevenlabs_switches_model_default():
+    s = dictate.resolve_settings({"stt": {"cloud": {"provider": "elevenlabs"}}}, "Linux")
+    assert s["stt_provider"] == "elevenlabs"
+    assert s["stt_model"] == "scribe_v1"
+
+
+def test_stt_model_explicit_overrides_provider_default():
+    s = dictate.resolve_settings(
+        {"stt": {"cloud": {"provider": "elevenlabs"}, "model": "custom-model"}}, "Linux"
+    )
+    assert s["stt_provider"] == "elevenlabs"
+    assert s["stt_model"] == "custom-model"
+
+
+def test_stt_cloud_endpoint_defaults_to_empty():
+    assert dictate.resolve_settings({}, "Linux")["cloud_endpoint"] == ""
+
+
 # --- read_key: key_file wins, whitespace stripped, never from argv ------------------------------
 
 
@@ -1279,6 +1303,114 @@ def test_lan_stt_posts_the_audio_field_with_a_language_query(state, opener):
     assert request.full_url == "http://127.0.0.1:8355/stt?language=en"
     assert request.get_header("Authorization") is None  # the LAN server never sees a key
     assert b'name="audio"; filename="dictate.wav"' in request.data
+
+
+def test_elevenlabs_scribe_posts_the_documented_shape(state, monkeypatch, opener):
+    (state / "dictate.wav").write_bytes(b"RIFFfakewav")
+    fake = opener(b'{"text": "hello agent", "language_code": "en", "language_probability": 0.99}')
+    monkeypatch.setenv("VOICE_LOOP_STT_API_KEY", "xi-secret")
+    s = dictate.resolve_settings(
+        {"stt": {"backend": "cloud", "cloud": {"provider": "elevenlabs"}}}, "Linux"
+    )
+    assert dictate.transcribe(s) == "hello agent"
+
+    request, timeout = fake.requests[0]
+    assert request.full_url == "https://api.elevenlabs.io/v1/speech-to-text"
+    assert request.get_method() == "POST"
+    assert request.get_header("Xi-api-key") == "xi-secret"
+    assert timeout == 60.0
+    body = request.data
+    assert b'name="model_id"\r\n\r\nscribe_v1\r\n' in body
+    assert b'name="file"; filename="dictate.wav"' in body
+
+
+def test_elevenlabs_stt_falls_back_to_tts_key(state, monkeypatch, opener):
+    """When VOICE_LOOP_STT_API_KEY is not set, ElevenLabs STT tries the TTS key —
+    one credentials home, not a second one."""
+    (state / "dictate.wav").write_bytes(b"RIFFfakewav")
+    fake = opener(b'{"text": "hello from shared key"}')
+    monkeypatch.setenv("VOICE_LOOP_TTS_API_KEY", "shared-xi-key")
+    monkeypatch.delenv("VOICE_LOOP_STT_API_KEY", raising=False)
+    s = dictate.resolve_settings(
+        {"stt": {"backend": "cloud", "cloud": {"provider": "elevenlabs"}}}, "Linux"
+    )
+    assert dictate.transcribe(s) == "hello from shared key"
+    request, _ = fake.requests[0]
+    assert request.get_header("Xi-api-key") == "shared-xi-key"
+
+
+def test_elevenlabs_stt_with_no_key_at_all_degrades_to_whisper(state, monkeypatch, opener):
+    """No STT key and no TTS key: the cloud path returns None, transcribe degrades to whisper."""
+    (state / "dictate.wav").write_bytes(b"RIFFfakewav")
+    monkeypatch.delenv("VOICE_LOOP_STT_API_KEY", raising=False)
+    monkeypatch.delenv("VOICE_LOOP_TTS_API_KEY", raising=False)
+    # The cloud call will return None (no key), then the degrade LAN call succeeds.
+    fake = opener(b'{"text": "whisper fallback"}')
+    s = dictate.resolve_settings(
+        {"stt": {"backend": "cloud", "cloud": {"provider": "elevenlabs"}}}, "Linux"
+    )
+    assert dictate.transcribe(s) == "whisper fallback"
+    # One request: only the LAN degrade path made it past the key check
+    assert len(fake.requests) == 1
+    assert "/stt?language=en" in fake.requests[0][0].full_url
+    log_text = (state / "dictate.log").read_text(encoding="utf-8")
+    assert "no key" in log_text.lower()
+    assert "cloud stt failed — falling back to local whisper" in log_text
+
+
+class _FailingOpener:
+    """An opener whose .open() raises — simulating an unreachable server."""
+    def open(self, request, timeout=None):
+        raise OSError("Network unreachable")
+
+
+def test_cloud_network_failure_degrades_to_local_whisper(state, monkeypatch):
+    """On a network error the cloud path returns None, and the caller degrades to the
+    local whisper server with a logged reason — never a silent dead mic."""
+    (state / "dictate.wav").write_bytes(b"RIFFfakewav")
+
+    # First call (cloud) -> FailingOpener, second call (LAN degrade) -> FakeOpener
+    openers = [_FailingOpener(), FakeOpener(b'{"text": "degraded transcript"}')]
+
+    def rotating_build(*args):
+        return openers.pop(0)
+
+    monkeypatch.setattr(dictate.urllib.request, "build_opener", rotating_build)
+    monkeypatch.setenv("VOICE_LOOP_STT_API_KEY", "sk-secret")
+    s = dictate.resolve_settings({"stt": {"backend": "cloud"}}, "Linux")
+    assert dictate.transcribe(s) == "degraded transcript"
+
+    log_text = (state / "dictate.log").read_text(encoding="utf-8")
+    assert "cloud stt failed — falling back to local whisper" in log_text
+
+
+def test_cloud_error_response_degrades_to_local_whisper(state, monkeypatch, opener):
+    """An API error document (no `text` field) is a cloud failure, not a silent empty transcript."""
+    (state / "dictate.wav").write_bytes(b"RIFFfakewav")
+    # First response: cloud API error. Second response: LAN degrade success.
+    monkeypatch.setenv("VOICE_LOOP_STT_API_KEY", "sk-secret")
+
+    # Build a two-response opener sequence
+    class _TwoResponseOpener:
+        def __init__(self, responses):
+            self._responses = responses
+            self.requests: list = []
+
+        def open(self, request, timeout=None):
+            self.requests.append((request, timeout))
+            return self._responses.pop(0)
+
+    opener_seq = _TwoResponseOpener([
+        FakeResponse(b'{"error": {"message": "insufficient_quota"}}'),
+        FakeResponse(b'{"text": "whisper stepped in"}'),
+    ])
+    monkeypatch.setattr(dictate.urllib.request, "build_opener", lambda *handlers: opener_seq)
+    s = dictate.resolve_settings({"stt": {"backend": "cloud"}}, "Linux")
+    assert dictate.transcribe(s) == "whisper stepped in"
+
+    assert len(opener_seq.requests) == 2
+    log_text = (state / "dictate.log").read_text(encoding="utf-8")
+    assert "cloud stt failed — falling back to local whisper" in log_text
 
 
 # --- the cross-module framing loop: dictate's multipart through the real /stt -------------------

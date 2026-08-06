@@ -195,6 +195,14 @@ transcribes a short phrase in a couple of seconds on a modern CPU; `base`/`tiny`
 accurate. Silero TTS is CPU-friendly (near real-time). First run downloads roughly 0.5–1.5 GB of
 models. Say this **before** installing, not after.
 
+**If an ElevenLabs key is already configured** (the probe printed an existing config with
+`tts.cloud.provider: "elevenlabs"` or the env var `VOICE_LOOP_TTS_API_KEY` is set): when
+dictation goes cloud, offer ElevenLabs Scribe as the STT provider (`stt.cloud.provider:
+"elevenlabs"`). The same key covers both TTS and STT — no second key needed. Say plainly that
+cloud STT sends recorded audio clips to ElevenLabs' servers (the privacy row above covers it),
+and that if the cloud call fails the script degrades to local whisper automatically (the
+microphone never goes dead).
+
 ### Switching away from `local` on a re-run (clean up behind the old choice)
 
 Step 0 printed the existing config, so you know what the previous run chose. If a direction *was*
@@ -395,7 +403,12 @@ referenced). Full schema — omit what you do not need, the scripts have default
     "model": "whisper-1",
     "command": "",
     "timeout": 60,
-    "cloud": { "api_key_env": "VOICE_LOOP_STT_API_KEY", "key_file": "" }
+    "cloud": {
+      "provider": "openai",
+      "endpoint": "",
+      "api_key_env": "VOICE_LOOP_STT_API_KEY",
+      "key_file": ""
+    }
   },
   "tts": {
     "backend": "lan",
@@ -463,6 +476,15 @@ Field notes worth telling the user:
 - `tts.command` / `stt.command` — the escape hatch for engines that are not HTTP servers (`say`,
   whisper.cpp). `tts.command` receives text on stdin and makes the sound itself; `stt.command`
   receives the WAV path as its last argument and prints the transcript.
+- `stt.cloud.provider` — `"openai"` (default, OpenAI-compatible speech-to-text) or `"elevenlabs"`
+  (ElevenLabs Scribe). When the user already has an ElevenLabs key configured for TTS
+  (`VOICE_LOOP_TTS_API_KEY`), offer `elevenlabs` as the natural choice — the same key covers both
+  directions with no extra setup. The model default follows the provider (`whisper-1` for OpenAI,
+  `scribe_v1` for ElevenLabs). Say plainly that cloud STT sends the recorded audio clip to the
+  provider's servers — that is the privacy trade every cloud backend makes, and it is stated
+  explicitly in the plugin README. If the cloud call fails (network down, quota, expired key)
+  dictation **degrades to the local whisper server** with a log line rather than going dead —
+  nothing about the config changes, and the next clip tries the cloud again.
 
 **Checkpoint** — after the config file is written and valid (`jq .` parses it):
 
