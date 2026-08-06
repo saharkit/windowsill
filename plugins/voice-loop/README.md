@@ -126,6 +126,38 @@ transcribes on your own hardware.
 in `PROVIDERS.md` — no dispatch path in the plugin compares a provider name against a literal, and
 a test enforces that.
 
+### Streaming dictation — the transcript arrives while you speak
+
+A batch dictation makes a long one pay twice: you speak for a minute, then wait at the end while
+the whole clip uploads and transcribes. Where the provider's registry entry has a **streaming
+variant** (today: `deepgram`), one setting feeds the recording to its live socket *while the
+microphone is open*, so at stop-time the text is already assembled:
+
+```json
+{ "stt": { "backend": "cloud", "cloud": { "provider": "deepgram", "streaming": true } } }
+```
+
+It is **off by default** — a live socket is a second failure surface, and you should ask for it.
+What does not change when you do:
+
+- the **WAV is still written** and still kept as `dictate-last.wav`. The socket *tails* the
+  recording; it never stands between the recorder and the disk;
+- **any** failure falls back to the ordinary record → POST flow with a line in `dictate.log` — no
+  key, a socket that will not open, an auth refusal, a server that hangs up mid-recording, a stream
+  that carried nothing. A recording is never lost to the live path;
+- your hotkey, your debounce, the min-clip guard, the clipboard tier and the paste rules are the
+  same code they were.
+
+Every dictation logs what it cost, both ways, so you can compare them on your own machine:
+
+```
+dictation latency stop_to_paste_ms=412 via=stream to=paste
+```
+
+Turning it on for a provider that has no streaming variant changes nothing and says so in the log.
+`stt.model` and `stt.language` are the same axes as the batch call. See
+[`PROVIDERS.md`](PROVIDERS.md) for which providers stream and what the billing difference is.
+
 ### Degrade — what happens when the cloud is down
 
 When the cloud backend fails — a network error, an expired key, a quota limit — dictation does
@@ -376,6 +408,8 @@ plugins/voice-loop/
   scripts/speak.py            the speaking hook: extract marked lines -> chunk -> synthesize -> stream-play
   scripts/dictate-toggle.sh   push-to-talk launcher (stable hotkey entry point)
   scripts/dictate.py          the toggle: record -> transcribe -> clipboard/paste-into-prompt
+  scripts/providers.py        the speech provider registry: one entry per provider, per direction
+  scripts/wsclient.py         a minimal stdlib RFC 6455 client — what streaming dictation talks over
   scripts/selftest.sh         hardware-free loopback proof (TTS -> STT -> compare)
   scripts/report-bug.sh       bug-report launcher (stable entry point for /report-bug)
   scripts/report_bug.py       the collector: diagnostics -> redaction -> one bundle -> a transport

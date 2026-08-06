@@ -1,4 +1,4 @@
-# voice-loop conformance — v0.6.0
+# voice-loop conformance — v0.7.0
 
 A versioned acceptance checklist for the voice-loop plugin. This file is pinned to the
 plugin version it tests: a release that changes behaviour changes this checklist, and a
@@ -15,7 +15,7 @@ In a Claude Code session with voice-loop installed:
 
 The skill walks this checklist interactively: it asks you for the physical acts (tap the
 hotkey, confirm you heard the sound) and probes the machine for everything else. The result
-is one report file (`conformance-v0.6.0-YYYYMMDD.md`) with every row adjudicated. The
+is one report file (`conformance-v0.7.0-YYYYMMDD.md`) with every row adjudicated. The
 report is then offered through the same three transports as `/report-bug` — a GitHub issue
 (with the `conformance` label), a pre-filled new-issue URL, or a mailto:.
 
@@ -31,7 +31,7 @@ SKIP needs a reason in the evidence cell (e.g. "Wayland-only guard, tested on X1
 | tester | _(filled at runtime)_ |
 | OS / version | _(filled at runtime)_ |
 | desktop / session (GNOME-Wayland, KDE, X11, macOS) | _(filled at runtime)_ |
-| plugin version | 0.6.0 |
+| plugin version | 0.7.0 |
 | backends chosen (stt / tts) | _(filled at runtime)_ |
 | language | _(filled at runtime)_ |
 
@@ -68,6 +68,11 @@ SKIP needs a reason in the evidence cell (e.g. "Wayland-only guard, tested on X1
 | 2.10 | Same-window guard on Wayland | Enable `paste_target: same-window` on a Wayland session | it pastes anyway (degrades to `any`); `dictate.log` says `focus at start: unknown …` — a suppressed paste here would be the bug | | |
 | 2.11 | Cloud provider is a config entry | With a cloud STT key configured, set `stt.cloud.provider` to a second registry provider (`openai`, `elevenlabs` or `deepgram`) and dictate again — no other edit | the transcript arrives, from that provider's API, with no code change anywhere | | |
 | 2.12 | Unknown provider says so | Set `stt.cloud.provider` to a name the registry does not carry (e.g. `"nosuchvendor"`), then dictate | `dictate.log` says the provider is not a known one and names the default it used instead — a silent fall-through would be the bug | | |
+| 2.13 | Streaming dictation — on | With a streaming provider configured (`stt.backend: "cloud"`, `stt.cloud.provider: "deepgram"`, `stt.cloud.streaming: true`) and a valid key, dictate for ~60 s and stop | the text lands as usual. `dictate.log` shows `stream worker started pid=…`, `streaming stt done: finals=N` with N > 0, and `dictation latency stop_to_paste_ms=… via=stream` — a `via=batch` line here means the stream degraded, and the reason is the line above it | | |
+| 2.14 | Streaming latency beats batch | Repeat 2.13 with `stt.cloud.streaming: false`, same length of speech | both dictations produce comparable text; the `stop_to_paste_ms` of the `via=stream` run is markedly lower than the `via=batch` one, and the gap grows with the length of the dictation | | |
+| 2.15 | Streaming degrade — a broken socket | With streaming on, make the socket fail (a deliberately wrong key, or `stt.cloud.endpoint` pointed at a port nothing listens on), then dictate | the text still arrives — `dictate.log` names the failure (`streaming stt failed (…)`) and then transcribes the recorded clip (`via=batch`). `dictate-last.wav` holds the recording either way. A dictation lost to a failed socket is a FAIL | | |
+| 2.16 | Streaming leaves no worker behind | After 2.13 and 2.15, check the state dir and the process table | no `dictate-stream.pid` / `dictate-stream.json` left in `~/.local/state/voice-loop/`, and no `dictate.py stream-worker` process still running — a live socket outliving its recording is a FAIL | | |
+| 2.17 | Streaming on a provider that has none | Set `stt.cloud.provider: "openai"` with `stt.cloud.streaming: true` and dictate | it works exactly as the batch path does, and `dictate.log` says the provider has no streaming variant — a silently ignored setting would be the bug | | |
 
 ## 3. Speak-back — the assistant's voice
 
@@ -127,5 +132,5 @@ SKIP needs a reason in the evidence cell (e.g. "Wayland-only guard, tested on X1
 
 ---
 
-**Checklist version:** 0.6.0 — pinned to `plugins/voice-loop/.claude-plugin/plugin.json`.
+**Checklist version:** 0.7.0 — pinned to `plugins/voice-loop/.claude-plugin/plugin.json`.
 A mismatch between this version and the plugin version is a stale checklist.

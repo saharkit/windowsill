@@ -25,7 +25,8 @@ set -u
 command -v python3 >/dev/null 2>&1 || exit 0
 DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd) || exit 0
 [ -f "$DIR/dictate.py" ] || exit 0
-# dictate.py imports the provider registry beside it; a half-copied scripts/ does nothing rather
-# than half-recording, same as a missing dictate.py.
+# dictate.py imports the provider registry and the websocket client beside it; a half-copied
+# scripts/ does nothing rather than half-recording, same as a missing dictate.py.
 [ -f "$DIR/providers.py" ] || exit 0
+[ -f "$DIR/wsclient.py" ] || exit 0
 exec python3 "$DIR/dictate.py" "$@"

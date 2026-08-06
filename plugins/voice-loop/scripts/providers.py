@@ -30,9 +30,10 @@ The axes that vary per provider, all seven of them in the entry and nowhere else
 7. **the remote default host** — ``default_host``; "" means "this provider has none, use the
    configured endpoint", which is what makes the TLS probe's old ElevenLabs special case go away
 
-This is the one module in ``scripts/`` that the other scripts import, so the "a single file can be
-copied out and still run" property now means "that file plus ``providers.py``". The launchers
-(``speak.sh``, ``dictate-toggle.sh``) check for it the same way they check for their own .py.
+This is the module the other scripts import, so the "a single file can be copied out and still run"
+property now means "that file plus ``providers.py``" — and, for the dictation toggle since the
+streaming variant landed, plus ``wsclient.py``. The launchers (``speak.sh``, ``dictate-toggle.sh``)
+check for what they need the same way they check for their own .py.
 
 Stdlib only, Python 3.10+. Nothing here does I/O: an entry BUILDS a request and READS a decoded
 body; the scripts own the sockets, the logging and the degrade decision.
@@ -89,6 +90,49 @@ class TtsRequest:
 
 
 @dataclass(frozen=True)
+class StreamResult:
+    """One transcript update off a streaming socket.
+
+    ``is_final`` is the whole distinction the caller cares about: an INTERIM result is a guess that
+    the next message may rewrite, and a FINAL one is a settled span that will never be sent again.
+    Assembling finals in arrival order reconstructs the dictation; assembling interims would
+    duplicate half of it."""
+
+    text: str
+    is_final: bool
+
+
+@dataclass(frozen=True)
+class SttStreaming:
+    """The STREAMING variant of an STT provider — the same provider, a different transport.
+
+    It sits ON the batch entry rather than in a table of its own because it is not a different
+    provider: it is the same vendor, the same key, the same model family, reached over a websocket
+    while the microphone is still open instead of by POSTing a finished clip. A provider that has
+    no streaming variant carries ``streaming=None``, and that — never a name comparison — is what
+    the caller branches on.
+
+    Pure like everything else in this module: it BUILDS a URL and READS a decoded message. The
+    socket, the audio, the retry and the degrade decision all belong to the script.
+
+    The audio SHAPE travels in the settings the caller passes (``stream_rate``, and the linear16
+    mono encoding this plugin's recorder table pins): a streaming URL declares what the client is
+    about to send, and only the client knows that. There is deliberately no ``default_model`` here
+    — the MODEL is the batch entry's axis and the two transports share it, so a user who set
+    ``stt.model`` gets that model both ways and one who set nothing gets one default, not two."""
+
+    url: Callable[["SttStreaming", "SttProvider", dict], str]
+    headers: Callable[[str], dict[str, str]]
+    # a decoded message -> a transcript update, or None for every message that is not one
+    # (metadata, speech-started, keepalive acks — a live socket says a great deal besides words)
+    result: Callable[[object], StreamResult | None]
+    # what to send to ask the server to flush its finals and hang up, and what to send to keep an
+    # idle socket alive; both are provider-private JSON strings, hence text frames
+    close_message: str
+    keepalive_message: str
+
+
+@dataclass(frozen=True)
 class Comparison:
     """What a user picks a provider FROM. Kept beside the code rather than in an issue comment,
     and rendered as a table in PROVIDERS.md — which a test holds in sync with this registry.
@@ -121,6 +165,9 @@ class SttProvider:
     transcript: Callable[[object], str | None]
     error_summary: Callable[[object], str]
     comparison: Comparison
+    # the live-socket variant of this same provider, or None where the vendor has none / we have
+    # not built one. The batch path above is unaffected by its presence and is the fallback for it.
+    streaming: "SttStreaming | None" = None
 
     def endpoint(self, s: dict) -> str:
         """The host this call goes to: an explicit stt.cloud.endpoint wins, then the provider's own
@@ -297,6 +344,73 @@ def _deepgram_stt(entry: SttProvider, s: dict, key: str, wav_bytes: bytes, bound
     )
 
 
+# --- STT streaming variants ----------------------------------------------------------------------
+
+
+def websocket_scheme(host: str) -> str:
+    """An http(s) host rewritten to its websocket scheme, and left alone if it already is one.
+
+    A provider's ``default_host`` is an https URL because that is what the batch path POSTs to, and
+    a self-hosted ``stt.cloud.endpoint`` is whatever the operator wrote. Both name the same server;
+    only the scheme differs, and guessing it wrong is a connection that never opens."""
+    for prefix, replacement in (("https://", "wss://"), ("http://", "ws://")):
+        if host.startswith(prefix):
+            return replacement + host[len(prefix):]
+    return host
+
+
+def _deepgram_stream_url(stream: SttStreaming, entry: SttProvider, s: dict) -> str:
+    """Deepgram Listen, live: the same ``/v1/listen`` path as the batch call, over a websocket.
+
+    Every knob is a query parameter, and three of them describe the AUDIO WE ARE ABOUT TO SEND
+    rather than what we want back — there is no container to read the shape out of, because raw
+    PCM is exactly what a growing recording can be forwarded as. ``interim_results`` costs nothing
+    and gives the caller a live signal that speech is being heard at all; ``smart_format`` is what
+    puts punctuation and capitalisation in the finals, exactly as on the batch path."""
+    host = websocket_scheme(str(s.get("cloud_endpoint") or entry.default_host))
+    query = urllib.parse.urlencode(
+        {
+            "model": s["stt_model"],
+            "language": s["language"],
+            "smart_format": "true",
+            "interim_results": "true",
+            "encoding": "linear16",
+            "sample_rate": str(s["stream_rate"]),
+            "channels": "1",
+        }
+    )
+    return f"{host}/v1/listen?{query}"
+
+
+def _deepgram_stream_result(data: object) -> StreamResult | None:
+    """A live message -> a transcript update, or None for everything that is not one.
+
+    A live socket says far more than words: ``Metadata`` when the stream ends, ``SpeechStarted``,
+    ``UtteranceEnd``, and error documents. Only ``Results`` carries a transcript, and its nesting
+    is the streaming shape (``channel.alternatives[0]``), one level shallower than the batch
+    response's (``results.channels[0].alternatives[0]``) — which is precisely the kind of drift a
+    shared parser would hide."""
+    if not isinstance(data, dict) or data.get("type") not in (None, "Results"):
+        return None
+    try:
+        text = str(data["channel"]["alternatives"][0]["transcript"]).strip()  # type: ignore[index]
+    except (TypeError, KeyError, IndexError):
+        return None
+    return StreamResult(text, bool(data.get("is_final")))
+
+
+DEEPGRAM_STREAMING = SttStreaming(
+    url=_deepgram_stream_url,
+    headers=lambda key: {"Authorization": f"Token {key}"},
+    result=_deepgram_stream_result,
+    # documented control messages: CloseStream asks the server to transcribe what is left and
+    # close (the finals arrive AFTER it, which is why the caller drains), KeepAlive holds an idle
+    # socket open past the vendor's ten-second silence timeout.
+    close_message=json.dumps({"type": "CloseStream"}),
+    keepalive_message=json.dumps({"type": "KeepAlive"}),
+)
+
+
 # --- TTS request builders ------------------------------------------------------------------------
 
 
@@ -392,8 +506,12 @@ STT_PROVIDERS: dict[str, SttProvider] = {
         build=_deepgram_stt,
         transcript=_deepgram_transcript,
         error_summary=_deepgram_error,
+        # the one entry with a live socket today (windowsill#99) — opt in with stt.cloud.streaming
+        streaming=DEEPGRAM_STREAMING,
         comparison=Comparison(
-            latency="the fastest of the three on short clips; streaming exists but this plugin posts whole clips",
+            latency="the fastest of the three on short clips, and the only one with a STREAMING "
+            "variant here (stt.cloud.streaming: true) — the transcript is assembled while you "
+            "speak, so a long dictation stops paying for its own length at the end",
             cost="nova-3 pre-recorded list price ≈$0.0043/min; new accounts start with a $200 credit",
             languages="Russian via nova-3 multilingual (stt.language: \"multi\"); "
             "Ukrainian needs stt.model: \"nova-2\" — check the vendor's model/language matrix",
@@ -464,6 +582,25 @@ def tts_provider(name: str) -> TtsProvider | None:
     return TTS_PROVIDERS.get(name)
 
 
+def _validate_streaming(key: str, streaming: "SttStreaming | None") -> None:
+    """A streaming variant validates like a row of its own, because that is what it is.
+
+    Same reasoning as the batch checks beside it: everything here would otherwise surface at
+    runtime as a socket that will not open or a message nobody parses — in a path whose failure
+    mode is a quiet degrade back to the batch call, i.e. exactly the kind of break that ships."""
+    if streaming is None:
+        return
+    for field in ("url", "headers", "result"):
+        if not callable(getattr(streaming, field)):
+            raise ValueError(f"provider registry: {key!r}'s streaming variant has no {field}")
+    for field in ("close_message", "keepalive_message"):
+        value = getattr(streaming, field)
+        try:
+            json.loads(value)
+        except ValueError as err:
+            raise ValueError(f"provider registry: {key!r}'s streaming {field} is not JSON: {err}") from err
+
+
 def _validate_registry() -> None:
     """Run at import (ADR-shaped: a vocabulary other artifacts cite by id validates its own rows).
 
@@ -480,6 +617,7 @@ def _validate_registry() -> None:
             missing = [f for f in ("latency", "cost", "languages", "privacy") if not getattr(entry.comparison, f)]
             if missing:
                 raise ValueError(f"provider registry: {key!r} has an empty comparison field {missing[0]}")
+            _validate_streaming(key, getattr(entry, "streaming", None))
     if DEFAULT_STT not in STT_PROVIDERS:
         raise ValueError(f"provider registry: the default STT provider {DEFAULT_STT!r} has no entry")
     if DEFAULT_TTS not in TTS_PROVIDERS:

@@ -31,7 +31,7 @@ Then install what you want — this one is typed **inside a session**, not in yo
 | plugin | version | what it does | |
 |---|---|---|---|
 | **sill-core** | 0.1.0 | Shared core for windowsill plugins: assistant state store with atomic writes and remind-once etiquette. Schema-versioned JSON persistence — one file per plugin under `XDG_STATE_HOME`, separate from config. | [README](plugins/sill-core/README.md) |
-| **voice-loop** | 0.6.0 | Two-way voice for Claude Code with **pluggable speech providers** — a config registry picks OpenAI, ElevenLabs or Deepgram per direction, or keeps every clip local/self-hosted on the bundled server (faster-whisper STT; Silero, XTTS-v2 or Ukrainian TTS). Switching backends is a config entry, never a code change. A `Stop` hook speaks marked lines, a push-to-talk script dictates into the prompt, and `/voice-setup` installs the whole contour. | [README](plugins/voice-loop/README.md) |
+| **voice-loop** | 0.7.0 | Two-way voice for Claude Code with **pluggable speech providers** — a config registry picks OpenAI, ElevenLabs or Deepgram per direction, or keeps every clip local/self-hosted on the bundled server (faster-whisper STT; Silero, XTTS-v2 or Ukrainian TTS). Switching backends is a config entry, never a code change. A `Stop` hook speaks marked lines, a push-to-talk script dictates into the prompt, and `/voice-setup` installs the whole contour. | [README](plugins/voice-loop/README.md) |
 
 Every plugin owns its own README, its own tests, its own docs and its own version — open its README
 for anything about it. More will land on the sill over time.
