@@ -52,10 +52,27 @@ OP_CLOSE = 0x8
 OP_PING = 0x9
 OP_PONG = 0xA
 
+# Everything else (0x3-0x7 and 0xB-0xF) is RESERVED, and the RFC's answer to a reserved opcode is to
+# fail the connection — not to guess. Guessing is what an `else` branch does: an unknown opcode read
+# as a data frame would open a message that no `fin` of ours ever closes.
+CONTROL_OPCODES = frozenset({OP_CLOSE, OP_PING, OP_PONG})
+KNOWN_OPCODES = frozenset({OP_CONT, OP_TEXT, OP_BINARY}) | CONTROL_OPCODES
+
 # A speech API's messages are small JSON documents; a megabyte is already three orders of magnitude
 # more than any of them and small enough that a hostile (or broken) peer cannot make us allocate our
 # way out of memory. The length is refused from the HEADER, before the payload is read.
 MAX_FRAME_BYTES = 1 << 20
+
+# The SAME ceiling over a whole message, and it is a separate number because it bounds a separate
+# thing: MAX_FRAME_BYTES bounds one frame, and a message may be split across as many continuation
+# frames as a peer cares to send. Without this, a hostile provider streams megabyte fragments for
+# as long as the dictation lasts and the accumulator below is the whole memory of the desktop.
+MAX_MESSAGE_BYTES = 1 << 20
+
+# A control frame (close, ping, pong) carries at most 125 bytes and is never fragmented — RFC 6455
+# §5.5, and a rule with teeth here: a 1 MiB "ping" is echoed back as a pong on the same thread that
+# is pumping the microphone, so a peer that sends them chooses how much of our uplink to burn.
+MAX_CONTROL_BYTES = 125
 
 # The handshake response is a few hundred bytes of headers. A peer that keeps sending them without
 # ever ending them is a peer we stop reading from.
@@ -199,6 +216,13 @@ class WebSocket:
             if opcode == OP_CONT:
                 if self._fragment is None:
                     raise WebSocketError("a continuation frame with nothing to continue")
+                # The bound that MAX_FRAME_BYTES cannot give: it limits one frame, and this limits
+                # what a peer can accumulate ACROSS them. Checked before the extend, so the byte
+                # that would cross the ceiling is never appended.
+                if len(self._fragment[1]) + len(payload) > MAX_MESSAGE_BYTES:
+                    raise WebSocketError(
+                        f"a fragmented message past the {MAX_MESSAGE_BYTES}-byte ceiling"
+                    )
                 self._fragment[1].extend(payload)
             else:
                 if self._fragment is not None:
@@ -219,10 +243,20 @@ class WebSocket:
             raise WebSocketError("a frame set a reserved bit — this client negotiates no extensions")
         fin = bool(first & 0x80)
         opcode = first & 0x0F
+        if opcode not in KNOWN_OPCODES:
+            # RFC 6455 §5.2: a reserved opcode fails the connection. The `else` below would
+            # otherwise read it as a data frame and open a message nothing ever finishes.
+            raise WebSocketError(f"opcode 0x{opcode:x} is reserved — this client speaks none of them")
         if second & 0x80:
             raise WebSocketError("the server masked a frame, which the RFC forbids")
         length = second & 0x7F
         offset = 2
+        # RFC 6455 §5.5, refused from the HEADER like every other bound here — so an oversized
+        # "ping" is never read, never buffered, and never echoed back as a pong.
+        if opcode in CONTROL_OPCODES and (not fin or length > MAX_CONTROL_BYTES):
+            raise WebSocketError(
+                f"a control frame must be final and at most {MAX_CONTROL_BYTES} bytes"
+            )
         if length == 126:
             if len(buf) < 4:
                 return None

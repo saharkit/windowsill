@@ -388,6 +388,64 @@ class TestFrames:
                 ws.poll(0.1)
         server.stop()
 
+    def test_a_fragmented_message_past_the_ceiling_is_refused_mid_reassembly(self, upgrade):
+        """The bound MAX_FRAME_BYTES cannot give. It limits ONE frame; a message may be split over
+        as many continuation frames as a peer cares to send, so without a total the accumulator is
+        the whole memory of the desktop — megabyte fragments for as long as the dictation lasts."""
+
+        def handler(server, conn):
+            upgrade(conn)
+            half = wsclient.MAX_MESSAGE_BYTES // 2 + 1024
+            head = bytearray([wsclient.OP_TEXT, 127]) + struct.pack("!Q", half)  # FIN clear: a fragment
+            conn.sendall(bytes(head) + b"a" * half)
+            head = bytearray([wsclient.OP_CONT, 127]) + struct.pack("!Q", half)  # and the rest of it
+            conn.sendall(bytes(head) + b"b" * half)
+
+        server = Server(handler)
+        ws = wsclient.connect(server.url, {})
+        with pytest.raises(wsclient.WebSocketError, match="ceiling"):
+            for _ in range(200):
+                ws.poll(0.1)
+        server.stop()
+
+    def test_a_reserved_opcode_fails_the_connection_instead_of_being_guessed(self, upgrade):
+        """RFC 6455 §5.2. Read as a data frame — which is what an `else` branch does — a reserved
+        opcode opens a message that no FIN of ours ever closes."""
+
+        def handler(server, conn):
+            upgrade(conn)
+            conn.sendall(server_frame(0x3, b"reserved"))
+
+        server = Server(handler)
+        ws = wsclient.connect(server.url, {})
+        with pytest.raises(wsclient.WebSocketError, match="reserved"):
+            for _ in range(50):
+                ws.poll(0.1)
+        server.stop()
+
+    @pytest.mark.parametrize("frame", ["oversized", "fragmented"])
+    def test_a_control_frame_that_breaks_its_own_rules_is_refused(self, upgrade, frame):
+        """RFC 6455 §5.5: a control frame is at most 125 bytes and never fragmented. The teeth are
+        the ping path — a 1 MiB "ping" is echoed back as a pong on the very thread pumping the
+        microphone, so a peer that sends them chooses how much of our uplink to burn. Refused from
+        the HEADER, so the payload is never even read."""
+
+        def handler(server, conn):
+            upgrade(conn)
+            if frame == "oversized":
+                body = b"x" * 200
+                conn.sendall(bytes([0x80 | wsclient.OP_PING, 126]) + struct.pack("!H", len(body)) + body)
+            else:
+                conn.sendall(bytes([wsclient.OP_PING, 4]) + b"ping")  # FIN clear
+
+        server = Server(handler)
+        ws = wsclient.connect(server.url, {})
+        with pytest.raises(wsclient.WebSocketError, match="control frame"):
+            for _ in range(50):
+                ws.poll(0.1)
+        server.stop()
+        assert server.frames == []  # and no pong was ever sent back
+
     def test_a_masked_server_frame_is_refused(self, upgrade):
         def handler(server, conn):
             upgrade(conn)
