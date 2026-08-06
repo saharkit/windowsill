@@ -1,7 +1,7 @@
 {
   "name": "voice-loop",
-  "version": "0.5.0",
-  "description": "Talk to Claude Code and hear it answer: a Stop hook speaks marker-tagged lines, a push-to-talk script dictates into the prompt, and /voice-setup installs it all. Local, LAN, or cloud speech backends.",
+  "version": "0.6.0",
+  "description": "Two-way voice for Claude Code with pluggable speech providers: a config registry picks OpenAI, ElevenLabs or Deepgram per direction, or keeps every clip local/self-hosted (faster-whisper STT; Silero, XTTS-v2 or Ukrainian TTS on the bundled server) — switching backends is a config entry, never a code change. A Stop hook speaks the lines Claude marks, a push-to-talk hotkey dictates into your prompt, and /voice-setup installs it all.",
   "author": {
     "name": "Sahar"
   },
@@ -9,9 +9,17 @@
   "license": "MIT",
   "keywords": [
     "voice",
+    "speech",
     "tts",
     "stt",
     "dictation",
+    "provider-registry",
+    "deepgram",
+    "elevenlabs",
+    "openai",
+    "whisper",
+    "silero",
+    "self-hosted",
     "accessibility"
   ]
 }

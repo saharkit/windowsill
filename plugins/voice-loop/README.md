@@ -9,7 +9,17 @@
 > branches, on 3.10–3.13), not a drifting number; the shell scripts are held to shellcheck plus a
 > real Stop-hook invocation in CI instead. [TESTING.md](TESTING.md) spells out both.
 
-Talk to Claude Code, and hear it answer.
+Talk to Claude Code, and hear it answer — **on the speech provider you choose**.
+
+**Pluggable speech providers, through a config registry.** `openai`, `elevenlabs` and `deepgram` are
+entries you name in your config — one per direction, so recognition and synthesis can sit with
+different vendors — and the same config keeps every clip **local or self-hosted** instead: the
+bundled server does STT with faster-whisper and TTS with Silero, XTTS-v2 or dedicated Ukrainian
+voices. **Switching a backend is a config entry, never a code change**, and adding a provider is one
+row in [`scripts/providers.py`](scripts/providers.py) — no dispatch path in this plugin compares a
+provider name against a literal, and a test enforces that.
+[`PROVIDERS.md`](PROVIDERS.md) is the table you pick from: latency, cost, language coverage and
+privacy posture, side by side.
 
 A Claude Code plugin that closes the voice loop in both directions:
 
@@ -22,7 +32,8 @@ A Claude Code plugin that closes the voice loop in both directions:
   your clipboard, which is the default no-permissions path). That reach is the feature and the
   footgun in one: see [Where the text lands](#where-the-text-lands--and-the-one-way-it-bites).
 
-Speech runs where you choose: **on this machine**, on **a box on your network**, or in the **cloud**.
+Where speech runs is the other half of the choice: **on this machine**, on **a box on your network**,
+or in the **cloud** — per direction, and covered in [The three backends](#the-three-backends) below.
 Setup is not a document you follow — it is `/voice-setup`, a skill that probes your machine, installs
 what is missing, writes your config, wires a hotkey, and proves the result with a loopback test.
 
