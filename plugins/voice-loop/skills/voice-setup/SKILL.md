@@ -88,8 +88,11 @@ If they pick **cancel**: run `python3 "$LEDGER_CMD" cancel` and stop. Say that r
   skip to the verification check at Step 8. This is a no-op diff, not a re-do.
 - If something is missing: name it and ask whether to repair (re-run only the affected steps).
 
-**Exit 0, `{"state": "cancelled"}`** — the user previously chose cancel. Offer the same three
-choices as in_progress above. The ledger still holds the completed steps from that run.
+**Exit 0, `{"state": "cancelled"}`** — the user previously chose cancel. Cancelled is terminal
+and carries no `next_step`, so **Resume is not on the menu** — offer **start fresh** only: run
+`python3 "$LEDGER_CMD" start` (it auto-restarts from cancelled — a fresh ledger, no `reset`
+needed) and proceed from Step 0. The old run's completed steps are discarded, not resumed, so
+verify the environment idempotently as you go rather than trusting the old ledger.
 
 **If `install_ledger.py` is not found** (the checkout predates the ledger): say so and proceed
 without checkpoints. The install still works — it just won't survive an interruption.
