@@ -317,6 +317,34 @@ CHECK_MANIFEST: list[dict] = [
     },
     {
         "bin": "real_anomaly",
+        "key": "streaming_stt_degraded",
+        "title": "Streaming dictation fell back to the recorded clip",
+        "explanation": (
+            "You asked for streaming dictation (`stt.cloud.streaming: "
+            "true`), but the live socket failed and the clip was "
+            "transcribed the ordinary way instead.  Nothing was lost — "
+            "the recording is always written to disk first — but the "
+            "end-of-speech wait is the one streaming was meant to "
+            "remove, and it is back."
+        ),
+        "fix": (
+            "Read the reason on the `streaming stt failed (…)` line in "
+            "`~/.local/state/voice-loop/dictate.log`.  An auth refusal "
+            "means the key is wrong for this provider; 'could not "
+            "reach' means the host or `stt.cloud.endpoint` is "
+            "unreachable from here; 'has no streaming variant' means "
+            "the configured provider does not stream and the setting "
+            "is doing nothing."
+        ),
+        "offer_flip": False,
+        "check": {
+            "type": "log",
+            "source": "dictate.log",
+            "pattern": "streaming stt failed",
+        },
+    },
+    {
+        "bin": "real_anomaly",
         "key": "no_recorder_available",
         "title": "No audio recorder found",
         "explanation": (

@@ -60,6 +60,31 @@ Deliberate behaviours, found by live debugging — do not "simplify" them away:
   guard that cannot see focus must not be a dictation that never pastes.
 * keys — the cloud API key comes from ``key_file`` (wins) or the named env var, is used only as
   an in-process HTTP header, and NEVER appears in argv, in the config, or in the log.
+* streaming dictation (opt-in, ``stt.cloud.streaming``, windowsill#99) — the batch flow makes a long
+  dictation pay twice: you speak for a minute, then wait at the end while the whole clip uploads and
+  transcribes. Where the configured provider's registry entry carries a STREAMING variant and the
+  config asks for it, the START toggle spawns one child — the stream worker — which opens the
+  provider's websocket and forwards the recording's PCM to it WHILE the microphone is open,
+  collecting the finals as they come back. The stop toggle then stops the recorder, asks the worker
+  for its last word, and pastes what is already assembled instead of POSTing the clip.
+  Four properties hold it together, and none of them is optional:
+  - **the WAV is written exactly as before.** The worker TAILS the recording file; it does not
+    stand between the recorder and the disk. Salvage discipline is unchanged — the clip lands in
+    ``dictate-last.wav`` whatever the socket did — and the recorder table, the min-clip guard and
+    the debounce all work on the same bytes they always did.
+  - **degrade to batch at ANY point.** No key, a socket that will not open, an auth refusal, a
+    server that hangs up mid-recording, a worker that does not finish inside its bound, a stream
+    that produced nothing at all — every one of them logs its reason and falls back to the existing
+    record→POST path. A recording is never lost to the new path.
+  - **it does not touch the toggle's mutex (#50).** The worker is spawned only after the O_CREAT|
+    O_EXCL pidfile claim is won and the recorder is live; it records its own pid in its own file;
+    the stop path stops it, reads its result and CLEARS both files unconditionally, so no later
+    recording can adopt an older worker's transcript. The stop path's wait for it is bounded
+    (STREAM_FINISH_TIMEOUT), which is what keeps "re-toggle during the tail" from wedging.
+  - **the worker outlives nothing.** It stops on the stop toggle's SIGTERM, and failing that on its
+    own evidence: the recorder pid is gone and the file has stopped growing (STREAM_TAIL_SECONDS),
+    or the session hit STREAM_MAX_SECONDS. A hotkey that is never pressed again cannot leave a
+    metered socket open forever.
 """
 
 from __future__ import annotations
@@ -75,17 +100,20 @@ import signal
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
 
-# The one module in scripts/ this file imports: the provider registry (see providers.py). The
-# launcher checks for it beside dictate.py the same way it checks for dictate.py itself, and it
-# resolves because sys.path[0] is this file's directory — the tests, which load this file by
-# spec_from_file_location, put scripts/ on sys.path themselves.
+# The two modules in scripts/ this file imports: the provider registry (see providers.py) and the
+# stdlib-only websocket client the streaming variant needs (see wsclient.py). The launcher checks
+# for both beside dictate.py the same way it checks for dictate.py itself, and they resolve because
+# sys.path[0] is this file's directory — the tests, which load this file by spec_from_file_location,
+# put scripts/ on sys.path themselves.
 import providers
+import wsclient
 
 try:
     import fcntl
@@ -115,6 +143,41 @@ DEBOUNCE_SECONDS = 0.75
 # wedged System Events, and the guard's answer to "I cannot see focus" is already "paste anyway".
 FOCUS_PROBE_TIMEOUT = 2.0
 
+# --- streaming dictation (windowsill#99) ---------------------------------------------------------
+#
+# Every number here is a BOUND on something that would otherwise be unbounded, and each one is sized
+# against what it is protecting: the toggle's responsiveness, a metered socket, or the user's tail.
+
+# The argv the worker child is spawned with — this script calling itself, so there is one file to
+# copy and one launcher to register, exactly as before.
+STREAM_WORKER_ARG = "stream-worker"
+# 250 ms of 16 kHz mono PCM per frame. Small enough that the server is transcribing while the
+# sentence is still being spoken, large enough that a minute of speech is 240 frames, not 6000.
+STREAM_CHUNK_BYTES = BYTES_PER_SECOND // 4
+# How long a poll waits when the recorder has produced nothing new — the loop's idle cost.
+STREAM_IDLE_POLL = 0.05
+# The socket must open fast or not at all: this whole feature exists to REMOVE a wait.
+STREAM_CONNECT_TIMEOUT = 5.0
+# A vendor closes an idle live socket after ~10 s of silence; a keepalive every few seconds costs
+# one tiny text frame and keeps a thinking pause from ending the dictation.
+STREAM_KEEPALIVE_SECONDS = 5.0
+# After CloseStream the server still owes us the finals for the audio it has not answered yet.
+# THIS is the end-of-speech latency the feature is measured on, so it is bounded tightly.
+STREAM_DRAIN_SECONDS = 3.0
+# What the STOP toggle will wait for the worker's own last word before giving up on it and using
+# the recorded clip instead. Bounded because #50 is exactly the shape of an unbounded tail.
+STREAM_FINISH_TIMEOUT = 5.0
+# The worker's own evidence that the recording is over even though no stop toggle ever arrived:
+# the recorder process is gone AND the file has not grown for this long.
+STREAM_TAIL_SECONDS = 2.0
+# The last resort against a metered socket held open by a hotkey nobody pressed again.
+STREAM_MAX_SECONDS = 3600.0
+# A WAV header is 44 bytes canonically, but ffmpeg writes extra chunks; this is how far into the
+# file the `data` chunk is looked for before the header is called unreadable.
+STREAM_HEADER_PROBE_BYTES = 4096
+# How long the worker waits for the recorder to produce a readable header at all.
+STREAM_HEADER_TIMEOUT = 3.0
+
 _STATE_DIR = os.path.join(os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state")), "voice-loop")
 _LOG_PATH = os.path.join(_STATE_DIR, "dictate.log")
 _PID_PATH = os.path.join(_STATE_DIR, "dictate.pid")
@@ -128,6 +191,14 @@ _TOGGLE_PATH = os.path.join(_STATE_DIR, "dictate-last-toggle")
 # keeps, written at start and consumed at stop. Absent (guard off at start, an unwritable state
 # dir, a platform that cannot name its focus) reads as "unknown", which pastes.
 _FOCUS_PATH = os.path.join(_STATE_DIR, "dictate-focus")
+
+# The streaming worker's two files (windowsill#99), both owned by one recording and cleared by the
+# stop that ends it. The pidfile is how the stop toggle finds the child it must stop; the result
+# file is the child's ONE write — a whole JSON document, written temp-then-replace, so the reader
+# either sees a complete answer or no answer at all. Its `text` field is the dictated words
+# themselves, which is why /report-bug lists it for its SIZE and never opens it.
+_STREAM_PID_PATH = os.path.join(_STATE_DIR, "dictate-stream.pid")
+_STREAM_RESULT_PATH = os.path.join(_STATE_DIR, "dictate-stream.json")
 
 # CROSS-SCRIPT CONTRACT (keep in sync with speak.py): speak.py records its live speaking chain in
 # playing.pid — space-separated PIDs, its python process first, then the current player/command
@@ -266,6 +337,14 @@ def resolve_settings(config: dict, system: str) -> dict:
         "key_env": str(cfg(config, "stt.cloud.api_key_env", cfg(config, "stt.api_key_env", "VOICE_LOOP_STT_API_KEY"))),
         "key_file": str(cfg(config, "stt.cloud.key_file", "")),
         "timeout": float(cfg(config, "stt.timeout", 60)),
+        # Streaming is OPT-IN and defaults OFF (windowsill#99): the batch path is the proven one,
+        # and a live socket is a second failure surface a user must ask for. Same "true"/JSON-true
+        # spelling as auto_paste, and nothing else counts.
+        "streaming": cfg(config, "stt.cloud.streaming", False) is True
+        or cfg(config, "stt.cloud.streaming", False) == "true",
+        # The PCM shape the recorder table pins, handed to the streaming entry because a live URL
+        # declares what the client is about to send and only the client knows that.
+        "stream_rate": RECORD_RATE,
     }
 
 
@@ -817,6 +896,407 @@ def stop_speak_playback() -> None:
                 pass
 
 
+# --- streaming dictation: the pure parts (windowsill#99) -----------------------------------------
+
+
+def streaming_wanted(s: dict) -> bool:
+    """Does THIS recording get a live socket?
+
+    Three conditions, and all three are the user's or the registry's, never a provider name in an
+    if: the cloud backend is the one that has a socket to open, ``stt.cloud.streaming`` is the
+    opt-in, and the configured provider's entry actually carries a streaming variant. A config that
+    asks for streaming from a provider that has none is answered by the batch path — with a line in
+    the log, because a silently ignored setting is how a user concludes the feature is broken."""
+    if not s["streaming"] or s["backend"] != "cloud" or s["stt_command"]:
+        return False
+    entry = resolve_stt_provider(s["stt_provider"])
+    if entry.streaming is None:
+        log(f"stt.cloud.streaming is on but {entry.name} has no streaming variant — using the batch path")
+        return False
+    return True
+
+
+def wav_data_offset(head: bytes) -> int:
+    """Where the PCM starts inside a WAV, or -1 when this is not a readable RIFF/WAVE header.
+
+    A live socket is fed RAW samples, so the header must be skipped — and skipping a fixed 44 bytes
+    is only right for the canonical layout. ffmpeg writes a LIST/INFO chunk before `data`, and 44
+    bytes into one of those files is the middle of a metadata chunk: the first quarter-second of
+    every dictation would be transcribed as noise. So the `data` chunk is FOUND, never assumed."""
+    if not head.startswith(b"RIFF") or head[8:12] != b"WAVE":
+        return -1
+    index = head.find(b"data", 12)
+    if index < 0 or len(head) < index + 8:
+        return -1
+    return index + 8  # the chunk id and its 4-byte size, then the samples
+
+
+def assemble_stream_text(finals: list[str]) -> str:
+    """The finals, in arrival order, as one dictation.
+
+    Finals only (an interim is a guess the next message rewrites), single-spaced, empties dropped —
+    a live socket emits empty finals for the pauses between phrases, and joining them naively is how
+    a transcript arrives full of double spaces."""
+    return " ".join(part.strip() for part in finals if part.strip())
+
+
+# --- streaming dictation: the worker's own state -------------------------------------------------
+
+
+def _write_stream_result(result: dict) -> None:
+    """The worker's ONE write, temp-then-replace so the stop toggle cannot read a half-written
+    answer and conclude the stream produced nothing. 0600: it holds the dictated words.
+
+    Its own pid rides along as the fencing token the reader checks (see _read_stream_result), so a
+    document written late — by a worker whose recording is already over — cannot be mistaken for
+    the answer to somebody else's."""
+    result = {**result, "pid": os.getpid()}
+    try:
+        fd, tmp = tempfile.mkstemp(prefix="voice-loop-stream-", dir=os.path.dirname(_STREAM_RESULT_PATH))
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(result, fh)
+        os.replace(tmp, _STREAM_RESULT_PATH)
+    except OSError as err:
+        # The stop toggle will see no result and use the recorded clip — the degrade, reached by a
+        # different road. Worth one line, because a state dir that will not write is a real fault.
+        log(f"stream result not written: {err}")
+
+
+def _read_stream_result(pid: int | None = None) -> dict | None:
+    """The worker's answer, or None while it has not finished (or could not be read at all).
+
+    ``pid`` is a FENCING check, and it closes a real window: a worker that outstayed its stop
+    toggle (a short clip discards it without waiting, and a wedged socket can be SIGKILLed) writes
+    its document LATE — possibly after the next recording has already started its own worker. A
+    result is only this stop's answer if the worker that wrote it is the one whose pid we hold; an
+    older worker's transcript pasted into a later recording is precisely the #50 class of bug."""
+    try:
+        with open(_STREAM_RESULT_PATH, encoding="utf-8") as fh:
+            loaded = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(loaded, dict):
+        return None
+    if pid is not None and loaded.get("pid") != pid:
+        return None
+    return loaded
+
+
+def _read_stream_pid() -> int | None:
+    try:
+        with open(_STREAM_PID_PATH, encoding="utf-8") as fh:
+            pid = int(fh.read().strip() or "-1")
+    except (OSError, ValueError):
+        return None
+    return pid if pid > 0 and pid != os.getpid() else None
+
+
+def pid_looks_like_stream_worker(pid: int, read_cmdline=_cmdline_of, platform_id: str = sys.platform) -> bool:
+    """PID-reuse guard for the worker, the same shape as the speak-chain one above: a pidfile
+    outlives its process and the kernel recycles PIDs. The worker's argv carries this script's
+    name and the ``stream-worker`` word, which nothing else on the machine does."""
+    if not platform_id.startswith("linux"):
+        return True
+    cmdline = read_cmdline(pid)
+    if cmdline is None:
+        return False
+    return STREAM_WORKER_ARG in cmdline and "dictate.py" in cmdline
+
+
+def clear_stream_state(*, stop_survivor: bool = True) -> None:
+    """Forget everything about a previous stream — and stop it if it somehow still runs.
+
+    Called on BOTH ends of the cycle: before a new worker is spawned (so a crashed cycle's leftover
+    transcript can never be pasted into a later recording) and after the stop toggle has taken the
+    answer (so the next start begins from nothing). This is the property #50 is about, in the one
+    place the streaming path could have broken it.
+
+    ``stop_survivor`` is False for the one caller that has JUST killed the worker itself: signalling
+    a pid twice is harmless but says something untrue about what this call is doing."""
+    pid = _read_stream_pid()
+    if stop_survivor and pid is not None and pid_looks_like_stream_worker(pid):
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+    for path in (_STREAM_PID_PATH, _STREAM_RESULT_PATH):
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
+def start_stream_worker(recorder_pid: int) -> None:
+    """Spawn the child that holds the socket open. Never fatal: a worker that will not start is a
+    recording that transcribes the old way, which is exactly the fallback."""
+    clear_stream_state()
+    try:
+        with open(_LOG_PATH, "a", encoding="utf-8") as errlog:
+            proc = subprocess.Popen(
+                [sys.executable, os.path.abspath(__file__), STREAM_WORKER_ARG, str(recorder_pid)],
+                stdout=subprocess.DEVNULL,
+                stderr=errlog,
+                start_new_session=True,  # its own session: a hotkey launcher exiting must not end it
+            )
+    except OSError as err:
+        log(f"stream worker did not start: {err} — this recording uses the batch path")
+        return
+    try:
+        with open(_STREAM_PID_PATH, "w", encoding="utf-8") as fh:
+            fh.write(str(proc.pid))
+    except OSError as err:
+        # We cannot find it again to stop it, so stop it now rather than leave a metered socket
+        # open: without the pidfile the stop toggle has no handle on this child at all.
+        log(f"stream worker pid not recorded: {err} — stopping it and using the batch path")
+        try:
+            proc.terminate()
+        except OSError:
+            pass
+        return
+    log(f"stream worker started pid={proc.pid}")
+
+
+def finish_stream_worker() -> str | None:
+    """Stop the worker and take its transcript. None means "use the recorded clip".
+
+    Every None is logged with its reason, and every one of them is a degrade to the batch path
+    rather than a lost recording: no worker at all, a worker that missed its bound, a failed
+    session, or a session that connected and never heard one message. The one empty string this
+    CAN return is a stream that heard the server fine and found no speech — a silent clip, which
+    is a success (windowsill#93) and must not cost a second transcription of the same silence."""
+    pid = _read_stream_pid()
+    if pid is None:
+        return None  # streaming was off for this recording: nothing to stop, nothing to say
+    # The same PID-reuse guard the echo guard applies: a pidfile outlives its process and the
+    # kernel recycles PIDs, so a stale number here would be a same-user SIGTERM to a stranger. A
+    # pid that is not ours is simply not signalled — and the missing result then degrades below.
+    if pid_looks_like_stream_worker(pid):
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass  # already gone: its result file (if any) is still the answer
+    deadline = time.monotonic() + STREAM_FINISH_TIMEOUT
+    result = _read_stream_result(pid)
+    while result is None and time.monotonic() < deadline:
+        time.sleep(STREAM_IDLE_POLL)
+        result = _read_stream_result(pid)
+    if result is None:
+        log(f"stream worker did not finish within {STREAM_FINISH_TIMEOUT:.0f}s — using the recorded clip")
+        if pid_looks_like_stream_worker(pid):
+            try:
+                os.kill(pid, signal.SIGKILL)  # not merely abandoned: it holds a metered socket
+            except OSError:
+                pass
+        clear_stream_state(stop_survivor=False)
+        return None
+    clear_stream_state()
+    if result.get("status") != "ok":
+        log(f"streaming stt failed ({str(result.get('reason', ''))[:120]}) — using the recorded clip")
+        return None
+    text = str(result.get("text", ""))
+    if not text and not result.get("messages"):
+        # Connected, closed cleanly, and the server never said a word: that is not a silent clip,
+        # it is a stream that carried nothing. The clip is still on disk — transcribe it.
+        log("streaming stt heard nothing back from the server — using the recorded clip")
+        return None
+    log(f"streaming stt done: finals={result.get('finals', 0)} audio_bytes={result.get('audio_bytes', 0)}")
+    return text
+
+
+# --- streaming dictation: the session itself ------------------------------------------------------
+
+
+def _open_pcm(wav_path: str, sleep, clock):
+    """The recording, opened and positioned at its first PCM sample — None if it never became one.
+
+    The recorder has been running for milliseconds by the time the worker gets here, so the header
+    may not exist yet; that is a wait of milliseconds, bounded by STREAM_HEADER_TIMEOUT, not a
+    failure. Once positioned, plain repeated ``read()`` calls return whatever the recorder has
+    appended since — which is the whole trick that lets the file be tailed without standing between
+    the recorder and the disk."""
+    deadline = clock() + STREAM_HEADER_TIMEOUT
+    while clock() < deadline:
+        try:
+            handle = open(wav_path, "rb")
+        except OSError:
+            sleep(STREAM_IDLE_POLL)
+            continue
+        offset = wav_data_offset(handle.read(STREAM_HEADER_PROBE_BYTES))
+        if offset >= 0:
+            handle.seek(offset)
+            return handle
+        handle.close()
+        sleep(STREAM_IDLE_POLL)
+    return None
+
+
+def run_stream_session(
+    s: dict,
+    entry,
+    key: str,
+    *,
+    stopping,
+    recorder_alive,
+    wav_path: str = "",
+    connect=wsclient.connect,
+    sleep=time.sleep,
+    clock=time.monotonic,
+) -> dict:
+    """Forward the growing recording to the provider's socket and collect what comes back.
+
+    The whole streaming path in one function, and every seam a test needs is an argument: when to
+    stop, whether the recorder still lives, where the audio is, how to open a socket, and the two
+    clocks. Returns the document the worker writes — ``status`` ok/failed, the assembled ``text``,
+    and the counts that let the stop toggle tell "a silent clip" from "a stream that carried
+    nothing".
+
+    It never raises: every failure of the socket is caught here and becomes ``status: failed``,
+    because the caller's only response to any of them is the same batch fallback.
+    """
+    streaming = entry.streaming
+    finals: list[str] = []
+    messages = 0
+    sent = 0
+
+    def snapshot(status: str, reason: str = "") -> dict:
+        """The answer, whenever it is reached — every exit below returns one of these, so a
+        failure that happened halfway still reports the audio it sent and the finals it heard."""
+        return {
+            "status": status,
+            "reason": reason,
+            "text": assemble_stream_text(finals),
+            "finals": len(finals),
+            "messages": messages,
+            "audio_bytes": sent,
+        }
+
+    try:
+        socket_ = connect(
+            streaming.url(streaming, entry, s), streaming.headers(key), timeout=STREAM_CONNECT_TIMEOUT
+        )
+    except wsclient.WebSocketError as err:
+        return snapshot("failed", str(err))
+
+    def collect(frames) -> bool:
+        """Fold every frame into the finals; True when the peer said goodbye."""
+        nonlocal messages
+        closed = False
+        for opcode, payload in frames:
+            if opcode == wsclient.OP_CLOSE:
+                closed = True
+                continue
+            if opcode != wsclient.OP_TEXT:
+                continue
+            update = streaming.result(providers.decode(payload))
+            if update is None:
+                continue
+            messages += 1
+            if update.is_final and update.text:
+                finals.append(update.text)
+        return closed
+
+    try:
+        audio = _open_pcm(wav_path or _WAV_PATH, sleep, clock)
+        if audio is None:
+            socket_.close()
+            return snapshot("failed", "the recorder produced no readable WAV header")
+        started = clock()
+        idle_since = None
+        last_frame_at = started
+        with audio:
+            while True:
+                chunk = audio.read(STREAM_CHUNK_BYTES)
+                if chunk:
+                    socket_.send_binary(chunk)
+                    sent += len(chunk)
+                    idle_since = None
+                    last_frame_at = clock()
+                else:
+                    now = clock()
+                    idle_since = now if idle_since is None else idle_since
+                    if now - last_frame_at >= STREAM_KEEPALIVE_SECONDS:
+                        socket_.send_text(streaming.keepalive_message)
+                        last_frame_at = now
+                if collect(socket_.poll(0.0 if chunk else STREAM_IDLE_POLL)):
+                    socket_.close()
+                    return snapshot("failed", "the server closed the stream while the microphone was open")
+                if stopping():
+                    break
+                if idle_since is not None and not recorder_alive() and clock() - idle_since >= STREAM_TAIL_SECONDS:
+                    break  # the recorder is gone and the file stopped growing: the clip is complete
+                if clock() - started >= STREAM_MAX_SECONDS:
+                    break
+            # The stop toggle beat us to the recorder's last flush: send what is left before
+            # asking for the finals, or the tail of the dictation is transcribed by nobody.
+            while True:
+                chunk = audio.read(STREAM_CHUNK_BYTES)
+                if not chunk:
+                    break
+                socket_.send_binary(chunk)
+                sent += len(chunk)
+        socket_.send_text(streaming.close_message)
+        # THE end-of-speech wait, and the only one this feature adds: the server owes finals for
+        # the audio it has not answered yet. Bounded, and it ends the moment the server hangs up.
+        deadline = clock() + STREAM_DRAIN_SECONDS
+        while clock() < deadline and not socket_.closed:
+            if collect(socket_.poll(STREAM_IDLE_POLL)):
+                break
+        socket_.close()
+        result = snapshot("ok")
+    except wsclient.WebSocketError as err:
+        socket_.close()
+        result = snapshot("failed", str(err))
+    except OSError as err:
+        socket_.close()
+        result = snapshot("failed", f"the recording could not be read: {err}")
+    return result
+
+
+def stream_worker(s: dict, args: list[str]) -> int:
+    """The child process: resolve the key, run the session, write the one answer, exit.
+
+    Spawned by this same script's START toggle and by nothing else. It never touches the recorder,
+    the pidfile mutex, the clipboard or the paste path — its whole output is one JSON document the
+    stop toggle reads, and its whole input is a file somebody else is writing."""
+    stopping = {"now": False}
+
+    def _stop(signum, frame):  # noqa: ARG001 — signal-handler signature
+        stopping["now"] = True
+
+    signal.signal(signal.SIGTERM, _stop)
+    signal.signal(signal.SIGINT, _stop)
+    try:
+        recorder_pid = int(args[0])
+    except (IndexError, ValueError):
+        recorder_pid = -1
+
+    entry = resolve_stt_provider(s["stt_provider"])
+    if entry.streaming is None:
+        _write_stream_result({"status": "failed", "reason": f"{entry.name} has no streaming variant"})
+        return 1
+    key_envs = entry.key_envs(s["key_env"])
+    key = ""
+    for env in key_envs:
+        key = read_key(s["key_file"], env, os.environ)
+        if key:
+            break
+    if not key:
+        tried = ", ".join(f"${env}" for env in key_envs)
+        _write_stream_result({"status": "failed", "reason": f"no key (key_file unset/unreadable, and {tried} empty)"})
+        return 1
+
+    result = run_stream_session(
+        s,
+        entry,
+        key,
+        stopping=lambda: stopping["now"],
+        recorder_alive=lambda: _pid_alive(recorder_pid),
+    )
+    _write_stream_result(result)
+    return 0 if result["status"] == "ok" else 1
+
+
 def debounce_toggle(window: float, now: float | None = None) -> float | None:
     """Stamp this toggle, or refuse it as a key-repeat re-fire.
 
@@ -952,6 +1432,11 @@ def start_recording(s: dict, system: str, pidfile_fd: int) -> int:
         except OSError:
             pass
     log(f"recording via {recorder} pid={proc.pid}")
+    # The socket goes up FIRST of the two things that follow the recorder: opening it costs a
+    # round trip, and every millisecond of that is speech the server never hears. The focus probe
+    # below can spend up to FOCUS_PROBE_TIMEOUT and is deliberately behind it.
+    if streaming_wanted(s):
+        start_stream_worker(proc.pid)
     # After the recorder is live, never before it: the probe may spend up to FOCUS_PROBE_TIMEOUT,
     # and none of that may be time the microphone is not yet capturing.
     if same_window_guard_on(s):
@@ -970,6 +1455,10 @@ def _wait_gone(pid: int) -> bool:
 
 
 def stop_and_transcribe(s: dict, system: str, mode: str, recorder_pid: int) -> int:
+    # END OF SPEECH. Every latency number this file reports is an offset from this instant — the
+    # toggle that stopped the recording — because that is the wait the user actually feels, and the
+    # one windowsill#99 exists to remove. It covers both paths, so the two are comparable.
+    stopped_at = time.monotonic()
     # Consumed unconditionally, whatever this stop goes on to do (see take_remembered_focus): an
     # identity must never outlive its own recording. Only the same-window guard below reads it.
     started_focus = take_remembered_focus()
@@ -1002,6 +1491,10 @@ def stop_and_transcribe(s: dict, system: str, mode: str, recorder_pid: int) -> i
     except OSError:
         size = 0
     if clip_seconds(size) < MIN_CLIP_SECONDS:
+        # The worker is stopped here too, but NOT waited for: a bounced hotkey must stay as cheap
+        # as it has always been, and there is no transcript anybody wants. Its late document (if it
+        # writes one at all) carries a pid this stop never held, so no later recording can adopt it.
+        clear_stream_state()
         note("clip too short — ignored", system)
         log(f"clip too short ({size} bytes ≈ {clip_seconds(size):.2f}s) — stt skipped")
         try:
@@ -1010,8 +1503,25 @@ def stop_and_transcribe(s: dict, system: str, mode: str, recorder_pid: int) -> i
             pass
         return 0
 
-    note("transcribing…", system)
-    text = transcribe(s)
+    # Past the guard, the worker's answer IS the transcript when there is one. A no-op when
+    # streaming was never on for this recording; bounded, and a degrade on every failure.
+    streamed = finish_stream_worker()
+    if streamed is None:
+        # The batch path, unchanged, and the destination of every streaming degrade.
+        note("transcribing…", system)
+        text = transcribe(s)
+        via = "batch"
+    else:
+        # Already assembled while the user was still speaking — nothing to upload, nothing to wait
+        # for beyond the finals the drain already collected.
+        text = streamed
+        via = "stream"
+
+    def latency(landed: str) -> None:
+        """The number windowsill#99 is judged on: end of speech -> the text being where it goes."""
+        elapsed_ms = int((time.monotonic() - stopped_at) * 1000)
+        log(f"dictation latency stop_to_paste_ms={elapsed_ms} via={via} to={landed}")
+
     log(f"transcript: {text[:120]}")
     try:
         os.replace(_WAV_PATH, _LAST_WAV_PATH)
@@ -1021,6 +1531,9 @@ def stop_and_transcribe(s: dict, system: str, mode: str, recorder_pid: int) -> i
     if not text:
         note("nothing recognized", system)
         log("empty transcription")
+        # A silent clip is a RESULT, and a streaming one is the fastest result this file produces —
+        # leaving it out of the latency ledger is how a path gets a reputation it never earned.
+        latency("nothing")
         return 0
 
     tool = resolve_clipboard(
@@ -1048,6 +1561,7 @@ def stop_and_transcribe(s: dict, system: str, mode: str, recorder_pid: int) -> i
         if same_window_guard_on(s) and started_focus and focus_changed(started_focus, current_focus(system)):
             note("focus moved — text is in the clipboard", system)
             log("focus moved since this recording started — paste suppressed (dictate.paste_target=same-window)")
+            latency("clipboard")
             return 0
         sock = os.environ.get("YDOTOOL_SOCKET", "/tmp/.ydotool_socket")
         try:
@@ -1058,15 +1572,18 @@ def stop_and_transcribe(s: dict, system: str, mode: str, recorder_pid: int) -> i
         paste_was_denied = paste_tool == "osascript" and _paste_denied()
         if _run_paste(paste_tool, s["paste_key"], mode == "send", sock):
             log(f"auto-pasted (mode={mode} key={s['paste_key']})")
+            latency("paste")
             return 0
         if paste_tool == "osascript" and _paste_denied() and not paste_was_denied:
             # The user just declined the macOS Accessibility permission — tell them once that
             # the text is on the clipboard and the keystroke path won't be retried.
             note("accessibility permission denied — text is on the clipboard", system)
             log("auto-paste denied — Accessibility permission not granted")
+            latency("clipboard")
             return 0
         log("auto-paste unavailable — clipboard fallback")
     note(f"copied — press {s['paste_key']} to paste", system)
+    latency("clipboard")
     return 0
 
 
@@ -1123,6 +1640,15 @@ def main(argv: list[str]) -> int:
         os.path.join(os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")), "voice-loop/config.json"),
     )
     s = resolve_settings(load_config(cfg_path), system)
+
+    # The streaming worker (windowsill#99) is this same script, spawned by its own START toggle —
+    # never a hotkey invocation. It is dispatched here, ABOVE the debounce and the pidfile mutex,
+    # because it is neither a toggle nor a competitor for the recording slot: it only reads the
+    # file the recorder is writing. Nothing else may reach this argv, which is why it is checked
+    # before `mode` is derived from the same position.
+    if len(argv) > 1 and argv[1] == STREAM_WORKER_ARG:
+        return stream_worker(s, argv[2:])
+
     mode = argv[1] if len(argv) > 1 and argv[1] else s["mode"]
 
     # Key-repeat guard, before the pidfile is even read (see debounce_toggle): a held hotkey

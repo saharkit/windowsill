@@ -931,6 +931,211 @@ jobs:
           [ -s "$FAKE_CLIP_FILE" ] \
             || { echo "the transcript never reached the clipboard"; exit 1; }
 
+      - name: streaming dictation contract (real invocation, fake provider on loopback)
+        env:
+          LANGUAGE: ${{ matrix.language }}
+        run: |
+          # windowsill#99's real-invocation proof. The unit tests drive run_stream_session against a
+          # real socket, but they cannot show the part that only exists between PROCESSES: that the
+          # START toggle really spawns the worker, that the worker really tails the file the recorder
+          # is writing, and that the STOP toggle really collects its answer and pastes it. The
+          # provider is a fake websocket server on loopback (no key, no metered call, no network);
+          # the transcript it returns is a phrase the local whisper server would never produce, so
+          # "the text came from the STREAM" is an assertion rather than a hope.
+          fake="$RUNNER_TEMP/stream-fake"
+          mkdir -p "$fake"
+          export FAKE_RECORD_WAV="$RUNNER_TEMP/dictate-source.wav"   # the clip the step above made
+          export FAKE_CLIP_FILE="$RUNNER_TEMP/stream-clip.txt"
+          export XDG_STATE_HOME="$RUNNER_TEMP/stream-state"          # own state dir: countable logs
+          state="$XDG_STATE_HOME/voice-loop"
+          cat > "$fake/pw-record" <<'SH'
+          #!/usr/bin/env bash
+          wav=""
+          for arg in "$@"; do wav="$arg"; done
+          cp "${FAKE_RECORD_WAV:?}" "${wav:?}"
+          exec sleep 60
+          SH
+          cat > "$fake/wl-copy" <<'SH'
+          #!/usr/bin/env bash
+          cat >> "${FAKE_CLIP_FILE:?}"
+          SH
+          chmod +x "$fake/pw-record" "$fake/wl-copy"
+
+          cat > "$RUNNER_TEMP/fake_dg.py" <<'PY'
+          """A fake live-transcription provider: one connection, real RFC 6455 framing."""
+          import base64, hashlib, json, socket, struct, sys
+
+          TRANSCRIPT = "the streaming socket said this"
+
+
+          def frame(opcode: int, payload: bytes) -> bytes:      # server frames are never masked
+              head = bytearray([0x80 | opcode])
+              head.append(len(payload) if len(payload) < 126 else 126)
+              if len(payload) >= 126:
+                  head += struct.pack("!H", len(payload))
+              return bytes(head) + payload
+
+
+          def take(buf: bytearray):
+              if len(buf) < 2:
+                  return None
+              opcode, second = buf[0] & 0x0F, buf[1]
+              length, offset = second & 0x7F, 2
+              if length == 126:
+                  length, offset = struct.unpack_from("!H", buf, 2)[0], 4
+              elif length == 127:
+                  length, offset = struct.unpack_from("!Q", buf, 2)[0], 10
+              if len(buf) < offset + 4 + length:
+                  return None
+              mask = buf[offset:offset + 4]
+              body = buf[offset + 4:offset + 4 + length]
+              del buf[:offset + 4 + length]
+              return opcode, bytes(b ^ mask[i % 4] for i, b in enumerate(body))
+
+
+          def results(text: str, final: bool) -> bytes:
+              return json.dumps(
+                  {"type": "Results", "is_final": final,
+                   "channel": {"alternatives": [{"transcript": text}]}}
+              ).encode()
+
+
+          listener = socket.socket()
+          listener.bind(("127.0.0.1", 0))
+          listener.listen(1)
+          # Bounded on both ends so a client that never arrives (the whole point of the assertions
+          # below is that one does) cannot leave this process — and the step's `wait` — hanging.
+          listener.settimeout(120)
+          with open(sys.argv[1], "w") as fh:
+              fh.write(str(listener.getsockname()[1]))
+          conn, _ = listener.accept()
+          conn.settimeout(60)
+          head = b""
+          while b"\r\n\r\n" not in head:
+              head += conn.recv(4096)
+          key = ""
+          for line in head.decode("utf-8", "replace").split("\r\n"):
+              name, sep, value = line.partition(":")
+              if sep and name.strip().lower() == "sec-websocket-key":
+                  key = value.strip()
+          accept = base64.b64encode(
+              hashlib.sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest()
+          ).decode()
+          conn.sendall(
+              b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+              b"Sec-WebSocket-Accept: " + accept.encode() + b"\r\n\r\n"
+          )
+          buf, audio, spoke = bytearray(), 0, False
+          while True:
+              chunk = conn.recv(65536)
+              if not chunk:
+                  break
+              buf += chunk
+              while True:
+                  taken = take(buf)
+                  if taken is None:
+                      break
+                  opcode, payload = taken
+                  if opcode == 0x2:
+                      audio += len(payload)
+                      if not spoke:
+                          spoke = True
+                          conn.sendall(frame(0x1, results(TRANSCRIPT.split()[0], False)))
+                          conn.sendall(frame(0x1, results(TRANSCRIPT, True)))
+                  elif opcode == 0x1 and b"CloseStream" in payload:
+                      conn.sendall(frame(0x1, json.dumps({"type": "Metadata"}).encode()))
+                      conn.sendall(frame(0x8, struct.pack("!H", 1000)))
+                      print(f"fake provider received {audio} bytes of pcm", flush=True)
+                      sys.exit(0)
+          sys.exit(1)
+          PY
+          python3 "$RUNNER_TEMP/fake_dg.py" "$RUNNER_TEMP/fake_dg.port" > "$RUNNER_TEMP/fake_dg.log" 2>&1 &
+          dg=$!
+          for _ in $(seq 1 50); do [ -s "$RUNNER_TEMP/fake_dg.port" ] && break; sleep 0.2; done
+          port=$(cat "$RUNNER_TEMP/fake_dg.port")
+          [ -n "$port" ] || { echo "the fake provider never bound a port"; exit 1; }
+
+          export VOICE_LOOP_CONFIG="$RUNNER_TEMP/stream-config.json"
+          cat > "$VOICE_LOOP_CONFIG" <<JSON
+          {
+            "language": "$LANGUAGE",
+            "stt": {
+              "backend": "cloud",
+              "model": "nova-2",
+              "cloud": {
+                "provider": "deepgram",
+                "streaming": true,
+                "endpoint": "http://127.0.0.1:$port",
+                "api_key_env": "FAKE_DG_KEY"
+              }
+            },
+            "dictate": { "recorder": "pw-record", "clipboard": "wl-copy", "debounce_ms": 0 }
+          }
+          JSON
+          export FAKE_DG_KEY="not-a-real-key-and-never-leaves-this-runner"
+          export PATH="$fake:$PATH"
+
+          python3 plugins/voice-loop/scripts/dictate.py paste    # toggle 1: record + open the socket
+          sleep 2
+          python3 plugins/voice-loop/scripts/dictate.py paste    # toggle 2: stop -> collect -> paste
+          wait "$dg" || true
+
+          echo "--- dictate.log"; cat "$state/dictate.log"
+          echo "--- fake provider"; cat "$RUNNER_TEMP/fake_dg.log"
+          echo "--- clipboard capture"; cat "$FAKE_CLIP_FILE" 2>/dev/null || true; echo
+          grep -q "stream worker started pid=" "$state/dictate.log" \
+            || { echo "the start toggle never spawned the stream worker"; exit 1; }
+          grep -q "streaming stt done: finals=" "$state/dictate.log" \
+            || { echo "the stop toggle got no answer from the worker"; exit 1; }
+          grep -q "via=stream" "$state/dictate.log" \
+            || { echo "the dictation did not go via the stream -- it degraded to the batch path"; exit 1; }
+          if grep -q "streaming stt failed" "$state/dictate.log"; then
+            echo "the streaming path degraded"; exit 1
+          fi
+          # THE assertion: the pasted words are the ones the SOCKET returned, and the local whisper
+          # server on 127.0.0.1:8355 could never have produced them
+          grep -q "the streaming socket said this" "$FAKE_CLIP_FILE" \
+            || { echo "the clipboard does not hold what the stream transcribed"; exit 1; }
+          grep -q "dictation latency stop_to_paste_ms=" "$state/dictate.log" \
+            || { echo "no end-of-speech latency was reported"; exit 1; }
+          if grep -q -e "unexpected error" -e "Traceback" "$state/dictate.log"; then
+            echo "the streaming path hit an error"; exit 1
+          fi
+          # nothing outlives the recording: no worker still running, no state left for the next one
+          [ ! -e "$state/dictate-stream.pid" ] && [ ! -e "$state/dictate-stream.json" ] \
+            || { echo "the stream worker left its state behind"; ls -l "$state"; exit 1; }
+          if pgrep -f "dictate.py stream-worker" >/dev/null 2>&1; then
+            echo "a stream worker is still running after the stop toggle"; exit 1
+          fi
+
+          # THE DEGRADE, in the same real processes: the same toggle pair with the streaming
+          # endpoint pointed at a port nothing listens on. The recording must still become text —
+          # by the batch path, through the live server this job already started — because "a
+          # recording is never lost to the live path" is the promise, and a promise only unit tests
+          # have made is a promise nobody has kept.
+          export XDG_STATE_HOME="$RUNNER_TEMP/stream-degrade-state"
+          state="$XDG_STATE_HOME/voice-loop"
+          export FAKE_CLIP_FILE="$RUNNER_TEMP/stream-degrade-clip.txt"
+          python3 -c "
+          import json, os
+          path = os.environ['VOICE_LOOP_CONFIG']
+          config = json.load(open(path))
+          config['stt']['cloud']['endpoint'] = 'http://127.0.0.1:9'   # discard: never listening
+          json.dump(config, open(path, 'w'))
+          "
+          python3 plugins/voice-loop/scripts/dictate.py paste
+          sleep 2
+          python3 plugins/voice-loop/scripts/dictate.py paste
+          echo "--- dictate.log (degrade)"; cat "$state/dictate.log"
+          grep -q "streaming stt failed" "$state/dictate.log" \
+            || { echo "the dead endpoint did not produce a streaming failure"; exit 1; }
+          grep -q "via=batch" "$state/dictate.log" \
+            || { echo "the degrade did not reach the batch path"; exit 1; }
+          [ -s "$FAKE_CLIP_FILE" ] \
+            || { echo "the recording was LOST to the failed stream — nothing reached the clipboard"; exit 1; }
+          [ -s "$state/dictate-last.wav" ] \
+            || { echo "the clip was not kept for salvage"; exit 1; }
+
       - name: server log on failure
         if: failure()
         run: kill "$(cat /tmp/voice-loop.pid)" 2>/dev/null || true

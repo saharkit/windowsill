@@ -294,3 +294,156 @@ def test_the_fixture_says_out_loud_that_it_is_not_a_live_capture_yet():
     assert "deepgram_listen_response.json" in provenance
     # the fixture is valid JSON of the shape the parser reads, whatever its provenance
     assert json.loads((_FIXTURES / "deepgram_listen_response.json").read_bytes())["results"]["channels"]
+
+
+# --- the streaming variant (windowsill#99) -------------------------------------------------------
+
+
+class TestTheStreamingVariantIsAnEntryToo:
+    """A live socket is an eighth axis on the SAME entry, not a second table and not a branch."""
+
+    def test_a_provider_without_one_carries_none_rather_than_a_guess(self):
+        assert providers.STT_PROVIDERS["openai"].streaming is None
+        assert providers.STT_PROVIDERS["elevenlabs"].streaming is None
+        assert providers.STT_PROVIDERS["deepgram"].streaming is not None
+
+    def test_the_variant_carries_every_axis_a_socket_needs(self):
+        """Same bar as the batch rows: a variant that leaves one axis to its caller has put the
+        branch back somewhere else, out of sight of the grep above."""
+        for entry in providers.STT_PROVIDERS.values():
+            if entry.streaming is None:
+                continue
+            assert callable(entry.streaming.url)
+            assert callable(entry.streaming.headers)
+            assert callable(entry.streaming.result)
+            assert json.loads(entry.streaming.close_message)
+            assert json.loads(entry.streaming.keepalive_message)
+
+    def test_the_deepgram_live_url_declares_the_audio_it_is_about_to_send(self):
+        """There is no container to read the PCM's shape out of — the URL says it, or the server
+        transcribes the samples as whatever it assumed."""
+        entry = providers.STT_PROVIDERS["deepgram"]
+        s = {"cloud_endpoint": "", "endpoint": "", "stt_model": "nova-2", "language": "ru", "stream_rate": 16000}
+        url = entry.streaming.url(entry.streaming, entry, s)
+        assert url.startswith("wss://api.deepgram.com/v1/listen?")
+        for expected in ("model=nova-2", "language=ru", "encoding=linear16", "sample_rate=16000", "channels=1"):
+            assert expected in url
+        assert "interim_results=true" in url and "smart_format=true" in url
+        assert entry.streaming.headers("dg-secret") == {"Authorization": "Token dg-secret"}
+
+    def test_a_self_hosted_endpoint_becomes_a_websocket_of_the_same_scheme(self):
+        """The batch host is an https URL and a self-hosted one is whatever the operator wrote;
+        both name the same server, and guessing the scheme wrong is a socket that never opens."""
+        assert providers.websocket_scheme("https://deepgram.internal") == "wss://deepgram.internal"
+        assert providers.websocket_scheme("http://127.0.0.1:8355") == "ws://127.0.0.1:8355"
+        assert providers.websocket_scheme("wss://already.ws") == "wss://already.ws"
+        entry = providers.STT_PROVIDERS["deepgram"]
+        s = {"cloud_endpoint": "http://127.0.0.1:9999", "stt_model": "nova-2", "language": "en", "stream_rate": 16000}
+        assert entry.streaming.url(entry.streaming, entry, s).startswith("ws://127.0.0.1:9999/v1/listen?")
+
+    def test_the_live_parser_reads_the_streaming_nesting_not_the_batch_one(self):
+        """One level shallower than the pre-recorded response, which is exactly the kind of drift a
+        shared parser would hide until a user's dictation went quiet."""
+        entry = providers.STT_PROVIDERS["deepgram"]
+        message = {"type": "Results", "is_final": True, "channel": {"alternatives": [{"transcript": " Привет "}]}}
+        assert entry.streaming.result(message) == providers.StreamResult("Привет", True)
+        interim = dict(message, is_final=False)
+        assert entry.streaming.result(interim).is_final is False
+
+    @pytest.mark.parametrize(
+        "message",
+        [
+            {"type": "Metadata", "duration": 1.5},
+            {"type": "SpeechStarted"},
+            {"type": "UtteranceEnd", "last_word_end": 2.0},
+            {"type": "Results", "channel": {}},
+            {"type": "Results", "channel": {"alternatives": []}},
+            {"err_code": "INVALID_AUTH"},
+            ["not", "a", "message"],
+            None,
+        ],
+    )
+    def test_everything_that_is_not_a_transcript_reads_as_none(self, message):
+        """A live socket says a great deal besides words, and every one of those must not be
+        appended to somebody's dictation."""
+        assert providers.STT_PROVIDERS["deepgram"].streaming.result(message) is None
+
+    def test_a_silent_span_is_an_empty_final_and_not_a_failure(self):
+        entry = providers.STT_PROVIDERS["deepgram"]
+        empty = {"type": "Results", "is_final": True, "channel": {"alternatives": [{"transcript": ""}]}}
+        assert entry.streaming.result(empty) == providers.StreamResult("", True)
+
+
+class TestTheStreamingVariantValidatesItself:
+    """The same import-time bar the batch rows meet: a broken variant is a socket that will not
+    open or a message nobody parses, in a path whose failure mode is a quiet degrade."""
+
+    def _variant(self, **overrides) -> providers.SttStreaming:
+        base = providers.DEEPGRAM_STREAMING
+        fields = {
+            "url": base.url,
+            "headers": base.headers,
+            "result": base.result,
+            "close_message": base.close_message,
+            "keepalive_message": base.keepalive_message,
+        }
+        fields.update(overrides)
+        return providers.SttStreaming(**fields)
+
+    @pytest.mark.parametrize(
+        "overrides",
+        [
+            {"url": "not callable"},
+            {"headers": None},
+            {"result": 42},
+            {"close_message": "not json"},
+            {"keepalive_message": ""},
+        ],
+    )
+    def test_a_broken_variant_is_refused_at_import(self, monkeypatch, overrides):
+        table = dict(providers.STT_PROVIDERS)
+        table["deepgram"] = _replace_streaming(table["deepgram"], self._variant(**overrides))
+        monkeypatch.setattr(providers, "STT_PROVIDERS", table)
+        with pytest.raises(ValueError):
+            providers._validate_registry()
+
+    def test_a_variant_that_is_absent_is_not_an_error(self, monkeypatch):
+        """Most providers have none, and that is a row like any other — not a broken one."""
+        table = dict(providers.STT_PROVIDERS)
+        table["deepgram"] = _replace_streaming(table["deepgram"], None)
+        monkeypatch.setattr(providers, "STT_PROVIDERS", table)
+        providers._validate_registry()
+
+
+def _replace_streaming(entry: providers.SttProvider, streaming) -> providers.SttProvider:
+    return providers.SttProvider(
+        name=entry.name,
+        default_model=entry.default_model,
+        default_host=entry.default_host,
+        key_env_fallbacks=entry.key_env_fallbacks,
+        build=entry.build,
+        transcript=entry.transcript,
+        error_summary=entry.error_summary,
+        comparison=entry.comparison,
+        streaming=streaming,
+    )
+
+
+class TestTheStreamingVariantIsDocumented:
+    """PROVIDERS.md is the human half of the registry, and it drifts the moment nothing checks."""
+
+    def test_every_provider_says_whether_it_streams(self):
+        doc = (Path(__file__).resolve().parents[1] / "PROVIDERS.md").read_text(encoding="utf-8")
+        assert "`stt.cloud.streaming`" in doc
+        for name, entry in providers.STT_PROVIDERS.items():
+            if entry.streaming is not None:
+                assert f"`{name}` (STT) | **yes**" in doc, f"{name} streams but the table does not say so"
+
+    def test_and_nothing_claims_to_stream_that_does_not(self):
+        """The other direction, the LOG_RULES way. A row promising a live socket that the registry
+        cannot open is worse than a missing row: the first sends a user to change a setting that
+        does nothing, the second only fails to advertise. Both directions or neither."""
+        doc = (Path(__file__).resolve().parents[1] / "PROVIDERS.md").read_text(encoding="utf-8")
+        claimed = set(re.findall(r"`([a-z0-9-]+)` \(STT\) \| \*\*yes\*\*", doc))
+        streams = {name for name, entry in providers.STT_PROVIDERS.items() if entry.streaming is not None}
+        assert claimed == streams, f"PROVIDERS.md claims {sorted(claimed)} stream; the registry says {sorted(streams)}"

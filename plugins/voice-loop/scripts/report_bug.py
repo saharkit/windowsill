@@ -71,6 +71,9 @@ _STATE_FILES = (
     ("dictate.wav", "the clip being recorded"),
     ("dictate-last.wav", "the last recorded clip"),
     ("dictate-last-toggle", "the key-repeat debounce stamp"),
+    ("dictate-stream.pid", "the streaming worker's pidfile"),
+    # the streamed transcript itself — size only, never its text, exactly like last-spoken above
+    ("dictate-stream.json", "the streaming session's result — size only, never its text"),
     ("contour.json", "the contour poller's status — size only, it names the operator's services"),
     ("contour-announced", "the contour alerts already voiced (opaque alert keys)"),
 )
@@ -280,6 +283,19 @@ LOG_RULES: tuple[tuple[str, str | None], ...] = (
     ("cloud stt: no key for ", None),
     ("stt.cloud.provider is not a known provider — using ", "instead of "),
     ("cloud stt failed — falling back to local whisper", None),
+    # streaming dictation (#99): the worker's lifecycle and the degrade. Counts, byte totals, pids
+    # and socket reasons — the transcript itself travels only through the `transcript: ` row above,
+    # which is cut, and the `stream result` file is listed for its size and never opened.
+    ("stt.cloud.streaming is on but ", None),
+    ("stream worker started pid=", None),
+    ("stream worker did not start: ", None),
+    ("stream worker did not finish within ", None),
+    ("stream worker pid not recorded: ", None),
+    ("stream result not written: ", None),
+    ("streaming stt done: finals=", None),
+    ("streaming stt failed (", None),
+    ("streaming stt heard nothing back from the server", None),
+    ("dictation latency stop_to_paste_ms=", None),
     ("cloud stt returned an error: ", "error: "),
     ("cloud stt returned undecodable response: ", "response: "),
     ("debounce stamp unavailable (", None),
@@ -335,6 +351,8 @@ _validate_log_rules()
 # last JOB_LINES of them separately, because a maintainer's first question is always "did the last
 # few actually complete, and how long did they take".
 _JOB_PREFIXES = (
+    "dictation latency stop_to_paste_ms=",
+    "streaming stt done: finals=",
     "played rc=",
     "nothing played via=",
     "timings extract_ms=",

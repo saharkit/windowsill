@@ -190,6 +190,34 @@ the real runtime. So the guarantee is layered differently:
    than captured from a live call: it cannot catch a shape that was wrong on day one. The live
    proof — a real clip through a real key, real text out — is a **human** step recorded in the PR,
    deliberately not a CI gate, because a metered API key does not belong in this repository's CI.
+10. **`tests/test_wsclient.py`** for the stdlib websocket client streaming dictation talks over
+    (#99), against a **real socket**: every case stands up a listener on 127.0.0.1 and speaks the
+    protocol to it by hand. That is the point rather than a convenience — this module exists
+    *because* the stdlib has no websocket client, so a fake of "a websocket" would be a fake of the
+    thing under test. The server half is written out in bytes in the test file (its own frame
+    decoder, its own handshake response), so a client bug cannot cancel out against a server built
+    from the same code. Two groups carry the weight: the handshake is **verified** (an endpoint
+    answering 101 without the accept token is not a websocket server, and framing audio into
+    whatever it actually is would be a dictation nobody receives; a refusal is named by its status
+    line and never by its body, which is where a key could be echoed), and the read path is treated
+    as the **untrusted input** it is — a declared length past the ceiling is refused from the header
+    before a byte is waited for, a masked server frame, a reserved bit, an orphan continuation and
+    an interleaved data frame are all refused, and a peer that vanishes is an error rather than a
+    silence. The masking of *client* frames is asserted by the test's own decoder, because a
+    missing mask is invisible to every server that unmasks anyway.
+11. **The streaming dictation path in `tests/test_dictate.py`**, against the same kind of loopback
+    socket with a fake provider on the end of it: the recording is forwarded as raw PCM (the WAV
+    header never reaches the wire — the `data` chunk is *found*, because 44 bytes is only right for
+    the canonical layout and ffmpeg's is not), interims are not assembled into the transcript,
+    the tail written after the stop toggle still goes out before `CloseStream`, and the finals the
+    server owes arrive during the drain. The URL is built by the **real registry entry**, so the
+    query parameters that declare the audio's own shape are exercised rather than described. Every
+    degrade has its own case — a socket that will not open, a server that hangs up mid-recording, a
+    recorder that produced no header, a worker that misses its bound (killed, not merely
+    abandoned), a stream that carried nothing at all versus a genuinely silent clip — because the
+    property is that **a recording is never lost to the live path**. The #50 property has its own
+    cases too: the worker is dispatched above the debounce and the pidfile mutex, its state is
+    cleared on both ends of a cycle, and a clip below the min-clip guard still stops it.
 
 Real invocation is the guarantee for the runtime path. Every spoken run also logs
 `timings extract_ms=… first_audio_ms=… total_ms=…` to `~/.local/state/voice-loop/speak.log`, so a
@@ -261,6 +289,8 @@ prompt the setup causes.
 | 3.4c | **The same-window guard** (`dictate.paste_target: "same-window"`, auto-paste on), same switch as 3.4b — **macOS/X11 only** | NOTHING is pasted anywhere; the notification says "focus moved — text is in the clipboard"; your paste key still pastes it. `dictate.log` has `focus at start: …` and a `paste suppressed` line | | |
 | 3.4d | The guard with **no** window switch | pastes exactly as before — the guard is invisible when you stay put | | |
 | 3.4e | The guard on **Wayland** (GNOME/KDE/sway) | it pastes anyway (degrades to `any` — no portable focus query exists) and `dictate.log` says `focus at start: unknown …`. A suppressed paste here would be the bug | | |
+| 3.4f | **Streaming dictation** (`stt.cloud.streaming: true` with a streaming provider and a real key): dictate for ~60 s | the text lands as usual; `dictate.log` shows `streaming stt done: finals=N` and `dictation latency stop_to_paste_ms=… via=stream`, and that number is markedly lower than the same dictation's `via=batch` one | | |
+| 3.4g | Streaming with the socket broken on purpose (a wrong key, or an endpoint nothing listens on) | the text still arrives via the recorded clip; `dictate.log` names the failure and then `via=batch`. Nothing is left behind: no `dictate-stream.*` in the state dir, no `stream-worker` process | | |
 | 3.5 | **Speak-back**: assistant replies with a 🔊 line | it is audibly spoken, once, and matches the text | | |
 | 3.6 | Unmarked lines | are NOT spoken | | |
 | 3.7 | Two turns in a row | the second turn speaks the new line, not a repeat of the first (dedup) | | |

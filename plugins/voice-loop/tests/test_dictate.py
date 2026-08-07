@@ -16,6 +16,8 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import socket
+import struct
 import subprocess
 import sys
 import threading
@@ -23,6 +25,8 @@ import time
 from pathlib import Path
 
 import pytest
+
+from test_wsclient import Server, accept_for, parse_client_frame, read_http_head, server_frame
 
 _DICTATE_PATH = Path(__file__).resolve().parents[1] / "scripts" / "dictate.py"
 _spec = importlib.util.spec_from_file_location("dictate", _DICTATE_PATH)
@@ -50,6 +54,8 @@ def state(monkeypatch, tmp_path):
     monkeypatch.setattr(dictate, "_TOGGLE_PATH", str(tmp_path / "dictate-last-toggle"))
     monkeypatch.setattr(dictate, "_FOCUS_PATH", str(tmp_path / "dictate-focus"))
     monkeypatch.setattr(dictate, "_PASTE_DENIED_PATH", str(tmp_path / "dictate-paste-denied"))
+    monkeypatch.setattr(dictate, "_STREAM_PID_PATH", str(tmp_path / "dictate-stream.pid"))
+    monkeypatch.setattr(dictate, "_STREAM_RESULT_PATH", str(tmp_path / "dictate-stream.json"))
     return tmp_path
 
 
@@ -1640,3 +1646,819 @@ def test_multipart_round_trip_through_the_server_stt(client, fake_whisper):
     assert response.status_code == 200
     assert response.json()["text"] == "hello world"
     assert fake_whisper.calls[0]["language"] == "en"
+
+
+# --- streaming dictation (windowsill#99): the live socket beside the batch POST ------------------
+#
+# The batch flow makes a long dictation pay twice — speak for a minute, then wait while the whole
+# clip uploads and transcribes. The streaming variant forwards the recording to the provider's
+# websocket WHILE the microphone is open, so by stop-time the transcript is already assembled.
+#
+# What is real in these tests and what is not: the socket is REAL (a listening socket on loopback,
+# speaking the protocol by hand — see tests/test_wsclient.py, whose server helpers are reused here),
+# the URL is built by the REAL registry entry, and the WAV is a real RIFF file. Only the clocks and
+# the process table are faked. Nothing reaches the network, a microphone, or the live state dir.
+
+
+class TestStreamingIsOptIn:
+    """Three conditions, none of them a provider name in an `if`."""
+
+    def test_streaming_is_off_by_default(self):
+        assert dictate.resolve_settings({}, "Linux")["streaming"] is False
+
+    @pytest.mark.parametrize("value", [True, "true"])
+    def test_it_accepts_json_true_and_the_shell_string(self, value):
+        s = dictate.resolve_settings({"stt": {"cloud": {"streaming": value}}}, "Linux")
+        assert s["streaming"] is True
+
+    @pytest.mark.parametrize("value", [False, "false", "yes", 1, None])
+    def test_nothing_else_turns_it_on(self, value):
+        s = dictate.resolve_settings({"stt": {"cloud": {"streaming": value}}}, "Linux")
+        assert s["streaming"] is False
+
+    def test_the_pcm_shape_travels_with_the_settings(self):
+        """A live URL declares what the client is ABOUT to send, and only the client knows that."""
+        assert dictate.resolve_settings({}, "Linux")["stream_rate"] == dictate.RECORD_RATE
+
+    def test_a_streaming_provider_with_the_opt_in_and_the_cloud_backend_streams(self, state):
+        s = dictate.resolve_settings(
+            {"stt": {"backend": "cloud", "cloud": {"provider": "deepgram", "streaming": True}}}, "Linux"
+        )
+        assert dictate.streaming_wanted(s) is True
+        assert _log_of(state) == ""  # the happy path says nothing
+
+    def test_the_opt_in_alone_is_not_enough_without_the_cloud_backend(self):
+        s = dictate.resolve_settings(
+            {"stt": {"backend": "lan", "cloud": {"provider": "deepgram", "streaming": True}}}, "Linux"
+        )
+        assert dictate.streaming_wanted(s) is False
+
+    def test_a_local_stt_command_has_no_socket_to_open(self):
+        s = dictate.resolve_settings(
+            {
+                "stt": {
+                    "backend": "cloud",
+                    "command": "whisper-cli -f",
+                    "cloud": {"provider": "deepgram", "streaming": True},
+                }
+            },
+            "Linux",
+        )
+        assert dictate.streaming_wanted(s) is False
+
+    def test_a_provider_without_a_streaming_variant_says_so_instead_of_ignoring_the_setting(self, state):
+        """A silently ignored setting is how a user concludes the feature is broken. The batch path
+        still runs — the recording is never at risk — but the log names why."""
+        s = dictate.resolve_settings(
+            {"stt": {"backend": "cloud", "cloud": {"provider": "openai", "streaming": True}}}, "Linux"
+        )
+        assert dictate.streaming_wanted(s) is False
+        assert "stt.cloud.streaming is on but openai has no streaming variant" in _log_of(state)
+
+
+class TestWavDataOffset:
+    """Where the PCM starts. A live socket is fed RAW samples, so the header must be SKIPPED — and
+    skipping a fixed 44 bytes is only right for the canonical layout."""
+
+    def _wav(self, extra_chunks: bytes = b"", data: bytes = b"\x01\x02") -> bytes:
+        body = b"WAVEfmt " + struct.pack("<I", 16) + b"\x00" * 16 + extra_chunks
+        body += b"data" + struct.pack("<I", len(data)) + data
+        return b"RIFF" + struct.pack("<I", len(body) + 4) + body
+
+    def test_a_canonical_header_is_forty_four_bytes(self):
+        assert dictate.wav_data_offset(self._wav()) == 44
+
+    def test_a_writer_that_puts_a_chunk_before_data_is_still_found(self):
+        """ffmpeg writes a LIST/INFO chunk first, and 44 bytes into one of those files is the
+        middle of a metadata chunk — the first quarter-second of every dictation transcribed as
+        noise. The `data` chunk is FOUND, never assumed."""
+        listing = b"LIST" + struct.pack("<I", 10) + b"INFOhello\x00"
+        assert dictate.wav_data_offset(self._wav(listing)) == 44 + len(listing)
+
+    @pytest.mark.parametrize(
+        "head",
+        [b"", b"not a wav at all", b"RIFF" + b"\x00" * 4 + b"AVI ", b"RIFF" + b"\x00" * 4 + b"WAVEfmt "],
+    )
+    def test_anything_that_is_not_a_readable_wav_header_is_minus_one(self, head):
+        assert dictate.wav_data_offset(head) == -1
+
+    def test_a_data_chunk_whose_size_field_has_not_landed_yet_is_not_a_header(self):
+        """The recorder writes the header in pieces; a `data` tag with no length behind it is a
+        file caught mid-write, which is a wait, not a failure."""
+        assert dictate.wav_data_offset(b"RIFF" + b"\x00" * 4 + b"WAVE" + b"data\x00") == -1
+
+
+class TestAssembleStreamText:
+    def test_finals_join_in_arrival_order(self):
+        assert dictate.assemble_stream_text(["Привет,", "это диктовка."]) == "Привет, это диктовка."
+
+    def test_the_empty_finals_a_pause_produces_are_dropped(self):
+        """A live socket emits empty finals for the pauses between phrases; joining them naively is
+        how a transcript arrives full of double spaces."""
+        assert dictate.assemble_stream_text(["one", "", "  ", " two "]) == "one two"
+
+    def test_a_session_that_heard_nothing_assembles_to_nothing(self):
+        assert dictate.assemble_stream_text([]) == ""
+
+
+# --- the session itself, against a fake provider on a real loopback socket -----------------------
+
+# The modules dictate.py itself imported — same objects, so a constant or an error type compared
+# here is the one the code under test raised, not a second copy of it.
+_OP = dictate.wsclient
+providers = dictate.providers
+
+
+def _results(text: str, *, final: bool) -> bytes:
+    """A Deepgram live message, in the shape the registry entry parses."""
+    return json.dumps(
+        {"type": "Results", "is_final": final, "channel": {"alternatives": [{"transcript": text}]}}
+    ).encode("utf-8")
+
+
+def _wav_bytes(pcm: bytes) -> bytes:
+    """A real, canonical 44-byte-header WAV around some PCM."""
+    body = b"WAVEfmt " + struct.pack("<I", 16) + b"\x00" * 16 + b"data" + struct.pack("<I", len(pcm)) + pcm
+    return b"RIFF" + struct.pack("<I", len(body) + 4) + body
+
+
+class FakeDeepgram:
+    """A listening socket that answers like a live-transcription API.
+
+    It speaks once the audio starts flowing (an interim, then a final — proving interims are not
+    assembled twice), and answers CloseStream with the last final the server still owed, a
+    Metadata message and a close frame. That order IS the contract the drain exists for: the tail
+    of a dictation arrives AFTER the client has stopped sending.
+    """
+
+    def __init__(self, *, close_early: bool = False, reset_early: bool = False) -> None:
+        self.audio = bytearray()
+        self.close_early = close_early
+        # reset_early is the DEATH the close frame is not: SO_LINGER 0 makes close() send a TCP
+        # RST, so the client meets a dead socket rather than a polite goodbye — which is what a
+        # provider dropping out mid-dictation actually looks like.
+        self.reset_early = reset_early
+        self.server = Server(self._handle)
+
+    @property
+    def endpoint(self) -> str:
+        return f"http://127.0.0.1:{self.server.port}"
+
+    def _handle(self, server, conn) -> None:
+        head = read_http_head(conn)
+        conn.sendall(
+            b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n"
+            b"Sec-WebSocket-Accept: " + accept_for(head).encode() + b"\r\n\r\n"
+        )
+        spoke = False
+        buf = bytearray()
+        while True:
+            chunk = conn.recv(65536)
+            if not chunk:
+                return
+            buf += chunk
+            while True:
+                frame = parse_client_frame(buf)
+                if frame is None:
+                    break
+                opcode, payload = frame
+                server.frames.append(frame)
+                if opcode == _OP.OP_BINARY:
+                    self.audio += payload
+                    if self.reset_early:
+                        conn.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+                        conn.close()
+                        return
+                    if self.close_early:
+                        conn.sendall(server_frame(_OP.OP_CLOSE, struct.pack("!H", 1011)))
+                        return
+                    if not spoke:
+                        spoke = True
+                        conn.sendall(server_frame(_OP.OP_TEXT, _results("привет это", final=False)))
+                        conn.sendall(server_frame(_OP.OP_TEXT, _results("Привет, это", final=True)))
+                elif opcode == _OP.OP_TEXT and b"CloseStream" in payload:
+                    conn.sendall(server_frame(_OP.OP_TEXT, _results("диктовка.", final=True)))
+                    conn.sendall(server_frame(_OP.OP_TEXT, b'{"type":"Metadata","duration":1.5}'))
+                    conn.sendall(server_frame(_OP.OP_CLOSE, struct.pack("!H", 1000)))
+                    return
+
+
+def _streaming_settings(endpoint: str) -> dict:
+    """Real settings for the real Deepgram entry, pointed at a loopback server."""
+    return dictate.resolve_settings(
+        {
+            "stt": {
+                "backend": "cloud",
+                "model": "nova-2",
+                "language": "ru",
+                "cloud": {"provider": "deepgram", "streaming": True, "endpoint": endpoint},
+            }
+        },
+        "Linux",
+    )
+
+
+def _stop_after(calls: int):
+    """A stop toggle that arrives after N passes of the loop."""
+    seen = [0]
+
+    def stopping() -> bool:
+        seen[0] += 1
+        return seen[0] > calls
+
+    return stopping
+
+
+class TestOpenPcm:
+    """The wait for a header the recorder has not finished writing — a wait of milliseconds, and
+    the difference between streaming a dictation and declaring the recorder broken."""
+
+    def test_a_header_that_lands_one_poll_late_is_waited_for(self, state):
+        wav = state / "dictate.wav"
+        wav.write_bytes(b"RIFF" + struct.pack("<I", 0))  # the recorder, caught mid-write
+        pcm = b"\x07\x08" * 64
+        slept: list[float] = []
+
+        def sleep(seconds: float) -> None:
+            slept.append(seconds)
+            wav.write_bytes(_wav_bytes(pcm))  # …and now the header (and its samples) are there
+
+        ticks = iter([n * 0.1 for n in range(200)])
+        handle = dictate._open_pcm(str(wav), sleep, lambda: next(ticks))
+        assert handle is not None
+        try:
+            assert slept == [dictate.STREAM_IDLE_POLL]  # exactly one poll of patience, not zero
+            assert handle.read() == pcm  # and positioned at the first SAMPLE, not the header
+        finally:
+            handle.close()
+
+    def test_a_recorder_that_never_writes_a_header_gives_up_at_its_bound(self, state):
+        ticks = iter([n * 1.0 for n in range(200)])
+        assert dictate._open_pcm(str(state / "never.wav"), lambda seconds: None, lambda: next(ticks)) is None
+
+
+class TestStreamSessionRoundTrip:
+    """The whole streaming path, end to end, over a socket that really exists."""
+
+    def test_the_recording_is_forwarded_as_pcm_and_the_finals_come_back_assembled(self, state):
+        pcm = bytes(range(256)) * 80  # 20480 bytes: three chunks and a bit
+        (state / "dictate.wav").write_bytes(_wav_bytes(pcm))
+        fake = FakeDeepgram()
+        s = _streaming_settings(fake.endpoint)
+        entry = providers.STT_PROVIDERS["deepgram"]
+
+        result = dictate.run_stream_session(
+            s,
+            entry,
+            "dg-secret",
+            stopping=_stop_after(4),
+            recorder_alive=lambda: True,
+            wav_path=str(state / "dictate.wav"),
+        )
+        fake.server.stop()
+
+        assert result["status"] == "ok"
+        # the interim was NOT assembled — only the two finals, in arrival order
+        assert result["text"] == "Привет, это диктовка."
+        assert result["finals"] == 2
+        assert result["messages"] == 3  # the interim counts as "the server said something"
+        assert result["audio_bytes"] == len(pcm)
+        # the WAV HEADER never reached the wire: raw samples only, exactly as the URL declared
+        assert bytes(fake.audio) == pcm
+
+    def test_the_tail_written_after_the_stop_toggle_is_still_sent(self, state):
+        """The stop toggle beats the recorder's last flush by design (there is a 0.2 s settle in
+        stop_and_transcribe for exactly that). Whatever landed in the file after the loop broke
+        must go out BEFORE CloseStream, or the last words are transcribed by nobody."""
+        wav = state / "dictate.wav"
+        pcm = b"\x11\x22" * 100
+        wav.write_bytes(_wav_bytes(pcm))
+        tail = b"\x33\x44" * 4000
+
+        def stopping() -> bool:
+            with wav.open("ab") as fh:  # the recorder's flush, landing between two polls
+                fh.write(tail)
+            return True
+
+        fake = FakeDeepgram()
+        result = dictate.run_stream_session(
+            _streaming_settings(fake.endpoint),
+            providers.STT_PROVIDERS["deepgram"],
+            "dg-secret",
+            stopping=stopping,
+            recorder_alive=lambda: True,
+            wav_path=str(wav),
+        )
+        fake.server.stop()
+        assert result["status"] == "ok"
+        assert bytes(fake.audio) == pcm + tail
+
+    def test_a_recorder_that_is_gone_and_a_file_that_stopped_growing_ends_the_session(self, state):
+        """The worker's own evidence, for the stop toggle that never comes: no SIGTERM, no
+        stopping() — just a dead recorder and a file at rest, on a clock the test owns."""
+        (state / "dictate.wav").write_bytes(_wav_bytes(b"\x01\x02" * 500))
+        ticks = iter([n * 0.5 for n in range(400)])
+        fake = FakeDeepgram()
+
+        result = dictate.run_stream_session(
+            _streaming_settings(fake.endpoint),
+            providers.STT_PROVIDERS["deepgram"],
+            "dg-secret",
+            stopping=lambda: False,
+            recorder_alive=lambda: False,
+            wav_path=str(state / "dictate.wav"),
+            sleep=lambda seconds: None,
+            clock=lambda: next(ticks),
+        )
+        fake.server.stop()
+        assert result["status"] == "ok"
+        assert result["text"] == "Привет, это диктовка."
+
+    def test_a_server_that_hangs_up_mid_recording_is_a_degrade_with_a_reason(self, state):
+        (state / "dictate.wav").write_bytes(_wav_bytes(b"\x01\x02" * 500))
+        fake = FakeDeepgram(close_early=True)
+        result = dictate.run_stream_session(
+            _streaming_settings(fake.endpoint),
+            providers.STT_PROVIDERS["deepgram"],
+            "dg-secret",
+            stopping=_stop_after(20),
+            recorder_alive=lambda: True,
+            wav_path=str(state / "dictate.wav"),
+        )
+        fake.server.stop()
+        assert result["status"] == "failed"
+        assert "closed the stream" in result["reason"]
+
+    def test_a_provider_that_dies_mid_stream_is_a_degrade_with_the_socket_s_own_reason(self, state):
+        """THE arms that no other test reaches: the `except wsclient.WebSocketError` around the
+        session body, and the send-failed/read-failed raises inside the client that feed it.
+
+        A close frame is a POLITE end and is already covered; this is the other one — SO_LINGER 0
+        and close(), i.e. a TCP RST, which is what a provider dropping out actually looks like. The
+        next send (or the next poll) meets a dead socket, and the whole point is that the caller
+        sees a *result document* rather than a traceback: the recording is on disk and the batch
+        path is still there.
+        """
+        (state / "dictate.wav").write_bytes(_wav_bytes(b"\x01\x02" * 5000))
+        fake = FakeDeepgram(reset_early=True)
+
+        result = dictate.run_stream_session(
+            _streaming_settings(fake.endpoint),
+            providers.STT_PROVIDERS["deepgram"],
+            "dg-secret",
+            stopping=_stop_after(40),
+            recorder_alive=lambda: True,
+            wav_path=str(state / "dictate.wav"),
+        )
+        fake.server.stop()
+
+        assert result["status"] == "failed"
+        # named by the socket that died, not by a generic shrug — "send failed"/"read failed" are
+        # the two ways the client can meet an RST depending on which syscall gets there first
+        assert "failed" in result["reason"]
+        assert any(word in result["reason"] for word in ("send", "read", "closed")), result["reason"]
+        assert result["audio_bytes"] > 0  # it really was mid-stream, not a failure to start
+
+        # …and the stop toggle turns that document into the batch path, with the clip intact.
+        _plant_worker(state, result)
+        assert dictate.finish_stream_worker() is None
+        assert "streaming stt failed" in _log_of(state)
+
+    def test_a_session_nobody_ever_stops_ends_at_its_own_ceiling(self, state):
+        """STREAM_MAX_SECONDS, the last resort against a metered socket held open by a hotkey
+        nobody pressed again: no stop toggle, a recorder that never dies, and a file at rest. The
+        session must end ANYWAY — and end cleanly, because the audio it did send was transcribed."""
+        (state / "dictate.wav").write_bytes(_wav_bytes(b"\x01\x02" * 500))
+        # A clock that stands still while the header is opened (STREAM_HEADER_TIMEOUT is three
+        # seconds and would otherwise expire before the first read) and then moves in two-minute
+        # steps, so the hour-long ceiling is reached in a handful of polls. The BOUND under test is
+        # the comparison, not the wall time.
+        ticks = iter([0.0, 0.0, 0.0] + [n * 120.0 for n in range(1, 200)])
+        fake = FakeDeepgram()
+
+        result = dictate.run_stream_session(
+            _streaming_settings(fake.endpoint),
+            providers.STT_PROVIDERS["deepgram"],
+            "dg-secret",
+            stopping=lambda: False,          # the stop toggle never comes
+            recorder_alive=lambda: True,     # and the recorder never dies
+            wav_path=str(state / "dictate.wav"),
+            sleep=lambda seconds: None,
+            clock=lambda: next(ticks),
+        )
+        fake.server.stop()
+
+        # The ceiling is an END, not an abort: what the server had already said is kept and the
+        # session closes cleanly. (Only the finals it owed AFTER CloseStream are missing here, and
+        # that is this fake clock's doing — the drain is a wall-clock window and a two-minute tick
+        # steps straight over it. The drain has its own test in the round trip above.)
+        assert result["status"] == "ok"
+        assert result["text"] == "Привет, это"
+        assert result["audio_bytes"] > 0
+
+    def test_a_socket_that_will_not_open_is_a_degrade_and_never_an_exception(self, state):
+        """Nothing about a failed socket may reach the caller as a traceback: the caller's answer
+        to every one of these is the same batch fallback, and a recording is never lost to it."""
+        (state / "dictate.wav").write_bytes(_wav_bytes(b"\x01\x02" * 500))
+        result = dictate.run_stream_session(
+            _streaming_settings("http://127.0.0.1:1"),  # nothing is listening there, ever
+            providers.STT_PROVIDERS["deepgram"],
+            "dg-secret",
+            stopping=lambda: True,
+            recorder_alive=lambda: False,
+            wav_path=str(state / "dictate.wav"),
+        )
+        assert result["status"] == "failed"
+        assert "could not reach" in result["reason"]
+        assert result["text"] == ""
+
+    def test_a_recording_that_never_produced_a_header_is_a_degrade(self, state):
+        """The recorder died before writing a WAV at all. The socket opened, so it is closed
+        again — and the clip (such as it is) is still on disk for the batch path."""
+        fake = FakeDeepgram()
+        ticks = iter([n * 0.5 for n in range(400)])
+        result = dictate.run_stream_session(
+            _streaming_settings(fake.endpoint),
+            providers.STT_PROVIDERS["deepgram"],
+            "dg-secret",
+            stopping=lambda: True,
+            recorder_alive=lambda: False,
+            wav_path=str(state / "never-written.wav"),
+            sleep=lambda seconds: None,
+            clock=lambda: next(ticks),
+        )
+        fake.server.stop()
+        assert result["status"] == "failed"
+        assert "no readable WAV header" in result["reason"]
+
+    def test_a_long_quiet_stretch_sends_a_keepalive_rather_than_losing_the_socket(self, state):
+        """A vendor closes an idle live socket after ~10 s of silence. A thinking pause in the
+        middle of a dictation is exactly that, and it must not end the dictation."""
+        (state / "dictate.wav").write_bytes(_wav_bytes(b"\x01\x02" * 50))
+        ticks = iter([n * 1.0 for n in range(400)])
+        fake = FakeDeepgram()
+        dictate.run_stream_session(
+            _streaming_settings(fake.endpoint),
+            providers.STT_PROVIDERS["deepgram"],
+            "dg-secret",
+            stopping=_stop_after(12),
+            recorder_alive=lambda: True,
+            wav_path=str(state / "dictate.wav"),
+            sleep=lambda seconds: None,
+            clock=lambda: next(ticks),
+        )
+        fake.server.stop()
+        keepalives = [payload for opcode, payload in fake.server.frames if b"KeepAlive" in payload]
+        assert keepalives, "an idle stretch sent no keepalive — the vendor would have hung up"
+
+
+# --- the worker's lifecycle: spawned by start, stopped by stop, never outliving either -----------
+
+
+def _plant_worker(state, result: dict | None, *, pid: int = 999999, wrote: int | None = None) -> None:
+    """A worker that has already run: its pidfile, and optionally the answer it left behind.
+
+    ``wrote`` is the pid stamped INTO the result document — the fencing token the reader checks.
+    It defaults to the worker's own pid (what a real worker writes); a different value is the
+    late-document case, where a worker from an earlier recording wrote after this one started.
+    """
+    (state / "dictate-stream.pid").write_text(str(pid), encoding="utf-8")
+    if result is not None:
+        document = {**result, "pid": pid if wrote is None else wrote}
+        (state / "dictate-stream.json").write_text(json.dumps(document), encoding="utf-8")
+
+
+class TestFinishStreamWorker:
+    """Every way the stop toggle can end up on the batch path, and the one way it does not."""
+
+    @pytest.fixture(autouse=True)
+    def _no_signals(self, state, monkeypatch):
+        monkeypatch.setattr(dictate.os, "kill", lambda pid, sig: None)
+        monkeypatch.setattr(dictate, "pid_looks_like_stream_worker", lambda pid, **kw: False)
+        monkeypatch.setattr(dictate.time, "sleep", lambda seconds: None)
+
+    def test_no_worker_at_all_is_silence_and_the_batch_path(self, state):
+        """Streaming was off for this recording: nothing to stop, nothing to say, no degrade to
+        announce. A log line here would fire on every dictation of every default install."""
+        assert dictate.finish_stream_worker() is None
+        assert _log_of(state) == ""
+
+    def test_a_streamed_transcript_is_handed_back_and_the_state_is_cleared(self, state):
+        _plant_worker(state, {"status": "ok", "text": "Привет, это диктовка.", "finals": 2, "messages": 3})
+        assert dictate.finish_stream_worker() == "Привет, это диктовка."
+        assert "streaming stt done: finals=2" in _log_of(state)
+        # cleared on the way out: no later recording can adopt this one's transcript (#50)
+        assert not (state / "dictate-stream.json").exists()
+        assert not (state / "dictate-stream.pid").exists()
+
+    def test_a_failed_session_degrades_with_its_reason(self, state):
+        _plant_worker(state, {"status": "failed", "reason": "could not reach api.example:443", "text": ""})
+        assert dictate.finish_stream_worker() is None
+        assert "streaming stt failed (could not reach" in _log_of(state)
+
+    def test_a_silent_clip_is_a_success_and_not_a_second_transcription(self, state):
+        """windowsill#93's distinction, at the streaming seam: the server answered, and what it
+        heard was nothing. Posting the same silence to a second engine would be the old bug."""
+        _plant_worker(state, {"status": "ok", "text": "", "finals": 0, "messages": 4})
+        assert dictate.finish_stream_worker() == ""
+        assert "heard nothing back" not in _log_of(state)
+
+    def test_a_stream_that_carried_nothing_at_all_falls_back(self, state):
+        """Connected, closed cleanly, and the server never said one word. That is not a silent
+        clip — it is a stream that carried nothing, and the clip is still on disk."""
+        _plant_worker(state, {"status": "ok", "text": "", "finals": 0, "messages": 0})
+        assert dictate.finish_stream_worker() is None
+        assert "heard nothing back from the server" in _log_of(state)
+
+    def test_a_worker_that_misses_its_bound_is_killed_and_the_clip_is_used(self, state, monkeypatch):
+        """The #50 property: the stop toggle's wait for the child is BOUNDED. A worker wedged on a
+        socket must not hold the tail of a dictation open — and must not be left running either."""
+        killed: list[int] = []
+        monkeypatch.setattr(dictate, "pid_looks_like_stream_worker", lambda pid, **kw: True)
+        monkeypatch.setattr(dictate.os, "kill", lambda pid, sig: killed.append(sig))
+        ticks = iter([n * 1.0 for n in range(200)])
+        monkeypatch.setattr(dictate.time, "monotonic", lambda: next(ticks))
+        _plant_worker(state, None, pid=1234)
+
+        assert dictate.finish_stream_worker() is None
+        assert "did not finish within 5s" in _log_of(state)
+        assert killed == [dictate.signal.SIGTERM, dictate.signal.SIGKILL]  # asked, then made to
+        assert not (state / "dictate-stream.pid").exists()
+
+    def test_a_recycled_pid_is_never_signalled_by_the_stop_toggle(self, state, monkeypatch):
+        """The pidfile outlives its process and the kernel hands the number to somebody else. The
+        guard costs one /proc read and is the difference between stopping our own child and
+        SIGTERMing a stranger of the same user."""
+        signalled: list[int] = []
+        monkeypatch.setattr(dictate, "pid_looks_like_stream_worker", lambda pid, **kw: False)
+        monkeypatch.setattr(dictate.os, "kill", lambda pid, sig: signalled.append(sig))
+        ticks = iter([n * 1.0 for n in range(200)])
+        monkeypatch.setattr(dictate.time, "monotonic", lambda: next(ticks))
+        _plant_worker(state, None, pid=1234)
+
+        assert dictate.finish_stream_worker() is None  # no answer ever came: the clip is used
+        assert signalled == []
+
+    def test_a_document_written_by_an_earlier_worker_is_not_this_stops_answer(self, state, monkeypatch):
+        """The fencing check. A worker that outstayed its own recording (a short clip discards it
+        without waiting) writes its document LATE — possibly after the next recording has started.
+        Its pid is not the one this stop holds, so the text is not adopted: pasting an earlier
+        dictation into a later recording is exactly the #50 class of bug."""
+        ticks = iter([n * 1.0 for n in range(200)])
+        monkeypatch.setattr(dictate.time, "monotonic", lambda: next(ticks))
+        _plant_worker(state, {"status": "ok", "text": "words from the recording before this one"}, wrote=4242)
+
+        assert dictate.finish_stream_worker() is None
+        assert "did not finish within" in _log_of(state)
+
+    def test_a_half_written_result_reads_as_no_result_rather_than_as_an_empty_one(self, state, monkeypatch):
+        """The worker writes temp-then-replace precisely so this cannot happen — this pins the
+        reader's side of that contract: unparseable is 'not finished yet', never 'heard nothing'."""
+        _plant_worker(state, None)
+        (state / "dictate-stream.json").write_text('{"status": "ok", "text": "half', encoding="utf-8")
+        ticks = iter([n * 1.0 for n in range(200)])
+        monkeypatch.setattr(dictate.time, "monotonic", lambda: next(ticks))
+        assert dictate.finish_stream_worker() is None
+        assert "did not finish within" in _log_of(state)
+
+
+class TestStreamWorkerState:
+    def test_clear_stream_state_removes_both_files_and_stops_a_survivor(self, state, monkeypatch):
+        signalled: list[tuple[int, int]] = []
+        monkeypatch.setattr(dictate, "pid_looks_like_stream_worker", lambda pid, **kw: True)
+        monkeypatch.setattr(dictate.os, "kill", lambda pid, sig: signalled.append((pid, sig)))
+        _plant_worker(state, {"status": "ok", "text": "from a previous recording"}, pid=4321)
+
+        dictate.clear_stream_state()
+
+        assert signalled == [(4321, dictate.signal.SIGTERM)]
+        assert not (state / "dictate-stream.pid").exists()
+        assert not (state / "dictate-stream.json").exists()
+
+    def test_a_recycled_pid_is_not_signalled(self, state, monkeypatch):
+        """Same PID-reuse guard the echo guard uses: a pidfile outlives its process, and the
+        kernel hands the number to somebody else."""
+        signalled: list[int] = []
+        monkeypatch.setattr(dictate, "pid_looks_like_stream_worker", lambda pid, **kw: False)
+        monkeypatch.setattr(dictate.os, "kill", lambda pid, sig: signalled.append(pid))
+        _plant_worker(state, None, pid=4321)
+        dictate.clear_stream_state()
+        assert signalled == []
+
+    def test_the_identity_guard_reads_the_workers_own_argv(self):
+        argv = "/usr/bin/python3 /opt/voice-loop/scripts/dictate.py stream-worker 4242 "
+        assert dictate.pid_looks_like_stream_worker(1, lambda pid: argv, "linux") is True
+        assert dictate.pid_looks_like_stream_worker(1, lambda pid: "/usr/bin/python3 speak.py", "linux") is False
+        assert dictate.pid_looks_like_stream_worker(1, lambda pid: None, "linux") is False
+        # off Linux there is no /proc to ask, and the historical behaviour is kept
+        assert dictate.pid_looks_like_stream_worker(1, lambda pid: None, "darwin") is True
+
+    def test_start_spawns_the_worker_with_its_own_argv_and_records_its_pid(self, state, monkeypatch):
+        spawned: list[list[str]] = []
+
+        class _Proc:
+            pid = 5150
+
+        monkeypatch.setattr(
+            dictate.subprocess, "Popen", lambda argv, **kw: spawned.append((argv, kw)) or _Proc()
+        )
+        dictate.start_stream_worker(4242)
+
+        argv, kwargs = spawned[0]
+        assert argv[1].endswith("dictate.py")
+        assert argv[2:] == [dictate.STREAM_WORKER_ARG, "4242"]
+        assert kwargs["start_new_session"] is True  # a launcher exiting must not end the socket
+        assert (state / "dictate-stream.pid").read_text(encoding="utf-8") == "5150"
+        assert "stream worker started pid=5150" in _log_of(state)
+
+    def test_a_worker_that_will_not_spawn_is_a_logged_degrade_not_a_failed_recording(self, state, monkeypatch):
+        def refuse(argv, **kwargs):
+            raise OSError("no fork for you")
+
+        monkeypatch.setattr(dictate.subprocess, "Popen", refuse)
+        dictate.start_stream_worker(4242)
+        assert "stream worker did not start" in _log_of(state)
+        assert not (state / "dictate-stream.pid").exists()  # so the stop toggle uses the clip
+
+    def test_a_worker_whose_pid_cannot_be_recorded_is_stopped_immediately(self, state, monkeypatch):
+        """Without the pidfile the stop toggle has no handle on the child at all — and a child
+        with a metered socket must never be the thing we lose track of."""
+        terminated: list[bool] = []
+
+        class _Proc:
+            pid = 5150
+
+            def terminate(self):
+                terminated.append(True)
+
+        monkeypatch.setattr(dictate.subprocess, "Popen", lambda argv, **kw: _Proc())
+        monkeypatch.setattr(dictate, "_STREAM_PID_PATH", str(state / "nope" / "dictate-stream.pid"))
+        dictate.start_stream_worker(4242)
+        assert terminated == [True]
+        assert "stream worker pid not recorded" in _log_of(state)
+
+    def test_the_result_is_written_atomically_and_readable_back(self, state):
+        dictate._write_stream_result({"status": "ok", "text": "round trip", "finals": 1, "messages": 1})
+        assert dictate._read_stream_result()["text"] == "round trip"
+        assert not list(state.glob("voice-loop-stream-*"))  # renamed over, never left half-written
+        assert oct(os.stat(state / "dictate-stream.json").st_mode)[-3:] == "600"
+
+    def test_an_unwritable_state_dir_is_logged_and_never_raises(self, state, monkeypatch):
+        monkeypatch.setattr(dictate, "_STREAM_RESULT_PATH", str(state / "nope" / "dictate-stream.json"))
+        dictate._write_stream_result({"status": "ok"})
+        assert "stream result not written" in _log_of(state)
+
+
+class TestTheStopToggleUsesWhatTheStreamAssembled:
+    """The integration the whole ticket is about, driven through the real stop_and_transcribe."""
+
+    def test_a_streamed_transcript_is_pasted_and_the_clip_is_never_posted(self, state, monkeypatch, paste_run):
+        def never(s):
+            raise AssertionError("a streamed transcript must not be transcribed a second time")
+
+        monkeypatch.setattr(dictate, "transcribe", never)
+        monkeypatch.setattr(dictate, "pid_looks_like_stream_worker", lambda pid, **kw: False)
+        _plant_worker(state, {"status": "ok", "text": "стриминговая диктовка", "finals": 1, "messages": 2})
+
+        s = dictate.resolve_settings(
+            {"dictate": {"clipboard": "xclip"}, "stt": {"backend": "cloud", "cloud": {"streaming": True}}}, "Linux"
+        )
+        assert dictate.stop_and_transcribe(s, "Linux", "send", 12345) == 0
+
+        # both selections, and the words are the SOCKET's, not the batch server's
+        assert paste_run.clipboard == ["стриминговая диктовка".encode()] * 2
+        log_text = _log_of(state)
+        assert "dictation latency stop_to_paste_ms=" in log_text
+        assert "via=stream" in log_text
+        # the salvage discipline is untouched: the clip is still moved aside, streamed or not
+        assert (state / "dictate-last.wav").exists()
+
+    def test_a_failed_stream_falls_back_to_the_recorded_clip(self, state, monkeypatch, paste_run):
+        monkeypatch.setattr(dictate, "pid_looks_like_stream_worker", lambda pid, **kw: False)
+        _plant_worker(state, {"status": "failed", "reason": "TLS failed for api.example", "text": ""})
+
+        s = dictate.resolve_settings(
+            {"dictate": {"clipboard": "xclip"}, "stt": {"backend": "cloud", "cloud": {"streaming": True}}}, "Linux"
+        )
+        assert dictate.stop_and_transcribe(s, "Linux", "send", 12345) == 0
+
+        assert paste_run.clipboard == [b"hello agent", b"hello agent"]  # the batch transcript
+        log_text = _log_of(state)
+        assert "streaming stt failed" in log_text
+        assert "via=batch" in log_text
+
+    def test_a_streamed_silent_clip_reports_its_latency_too(self, state, monkeypatch, paste_run):
+        """A silent clip is a RESULT, and a streamed one is the fastest result this file produces.
+        Leaving it out of the latency ledger is how a path gets a reputation it never earned — and
+        it is the one outcome nobody would notice was missing, because the clipboard stays empty."""
+
+        def never(s):
+            raise AssertionError("a stream that heard the server fine must not be re-transcribed")
+
+        monkeypatch.setattr(dictate, "transcribe", never)
+        monkeypatch.setattr(dictate, "pid_looks_like_stream_worker", lambda pid, **kw: False)
+        # status ok, no words, and the server DID speak — windowsill#93's silent clip, streamed
+        _plant_worker(state, {"status": "ok", "text": "", "finals": 0, "messages": 4})
+
+        s = dictate.resolve_settings(
+            {"dictate": {"clipboard": "xclip"}, "stt": {"backend": "cloud", "cloud": {"streaming": True}}}, "Linux"
+        )
+        assert dictate.stop_and_transcribe(s, "Linux", "send", 12345) == 0
+
+        assert paste_run.clipboard == []  # nothing to paste, and nothing pretended otherwise
+        log_text = _log_of(state)
+        assert "empty transcription" in log_text
+        assert "dictation latency stop_to_paste_ms=" in log_text
+        assert "via=stream to=nothing" in log_text
+
+    def test_the_batch_path_reports_its_latency_too_so_the_two_are_comparable(self, state, paste_run):
+        assert dictate.stop_and_transcribe(_guarded(paste_target="any"), "Linux", "send", 12345) == 0
+        assert "dictation latency stop_to_paste_ms=" in _log_of(state)
+        assert "via=batch to=paste" in _log_of(state)
+
+    def test_a_clip_below_the_guard_stops_the_worker_without_waiting_for_it(self, state, monkeypatch):
+        """A bounced hotkey must stay as cheap as it has always been: there is no transcript
+        anybody wants, so the worker is stopped and NOT waited for — while still leaving nothing
+        behind for the next recording to adopt."""
+        signalled: list[tuple[int, int]] = []
+        monkeypatch.setattr(dictate, "_pid_alive", lambda pid: False)
+        monkeypatch.setattr(dictate.os, "kill", lambda pid, sig: signalled.append((pid, sig)))
+        monkeypatch.setattr(dictate.time, "sleep", lambda seconds: None)
+        monkeypatch.setattr(dictate, "note", lambda message, system: None)
+        monkeypatch.setattr(dictate, "pid_looks_like_stream_worker", lambda pid, **kw: True)
+        _plant_worker(state, {"status": "ok", "text": "from the clip that was too short", "messages": 1}, pid=4321)
+
+        assert dictate.stop_and_transcribe(dictate.resolve_settings({}, "Linux"), "Linux", "send", 1) == 0
+
+        assert (4321, dictate.signal.SIGTERM) in signalled  # stopped
+        assert "clip too short" in _log_of(state)
+        assert "streaming stt" not in _log_of(state)  # and never waited on for an answer
+        assert not (state / "dictate-stream.pid").exists()
+        assert not (state / "dictate-stream.json").exists()
+
+
+class TestTheWorkerEntryPoint:
+    """`dictate.py stream-worker <pid>` — this script calling itself, and nothing else may."""
+
+    def test_the_subcommand_dispatches_before_the_toggle_machinery(self, state, monkeypatch, tmp_path):
+        """Above the debounce and above the pidfile mutex on purpose: the worker is not a toggle
+        and never competes for the recording slot (#50)."""
+        seen: list[list[str]] = []
+        monkeypatch.setattr(dictate, "stream_worker", lambda s, args: seen.append(args) or 0)
+        monkeypatch.setattr(dictate, "debounce_toggle", lambda window, now=None: pytest.fail("debounced"))
+        _write_config(monkeypatch, tmp_path, {})
+
+        assert dictate.main(["dictate.py", dictate.STREAM_WORKER_ARG, "4242"]) == 0
+        assert seen == [["4242"]]
+        assert not (state / "dictate.pid").exists()  # it claimed no recording slot
+
+    def test_a_worker_with_no_key_writes_the_reason_and_stops(self, state, monkeypatch):
+        monkeypatch.delenv("VOICE_LOOP_STT_API_KEY", raising=False)
+        s = dictate.resolve_settings(
+            {"stt": {"backend": "cloud", "cloud": {"provider": "deepgram", "streaming": True}}}, "Linux"
+        )
+        assert dictate.stream_worker(s, ["4242"]) == 1
+        result = dictate._read_stream_result()
+        assert result["status"] == "failed"
+        assert "$VOICE_LOOP_STT_API_KEY" in result["reason"]  # which env var it looked in
+        assert "no key" in result["reason"]
+
+    def test_a_worker_for_a_provider_with_no_streaming_variant_stops_before_the_key(self, state, monkeypatch):
+        monkeypatch.setenv("VOICE_LOOP_STT_API_KEY", "unused")
+        s = dictate.resolve_settings(
+            {"stt": {"backend": "cloud", "cloud": {"provider": "openai", "streaming": True}}}, "Linux"
+        )
+        assert dictate.stream_worker(s, ["4242"]) == 1
+        assert dictate._read_stream_result()["reason"] == "openai has no streaming variant"
+
+    def test_the_worker_runs_the_session_and_writes_its_answer(self, state, monkeypatch):
+        monkeypatch.setenv("VOICE_LOOP_STT_API_KEY", "dg-secret")
+        (state / "dictate.wav").write_bytes(_wav_bytes(b"\x05\x06" * 500))
+        fake = FakeDeepgram()
+        s = _streaming_settings(fake.endpoint)
+        # Stand in for the SIGTERM the stop toggle sends: the worker's own handler flips the same
+        # flag, and what is under test here is everything AROUND the session — the key resolution,
+        # the entry lookup, and the one document it writes.
+        original = dictate.run_stream_session
+
+        def session(*args, **kwargs):
+            kwargs["stopping"] = _stop_after(3)
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(dictate, "run_stream_session", session)
+        assert dictate.stream_worker(s, ["4242"]) == 0
+        fake.server.stop()
+
+        result = dictate._read_stream_result()
+        assert result["status"] == "ok"
+        assert result["text"] == "Привет, это диктовка."
+
+    def test_a_worker_told_no_recorder_pid_still_runs_rather_than_crashing(self, state, monkeypatch):
+        """argv is a contract with ourselves, and a broken one must degrade like everything else."""
+        monkeypatch.setenv("VOICE_LOOP_STT_API_KEY", "dg-secret")
+        monkeypatch.setattr(dictate, "run_stream_session", lambda *a, **kw: {"status": "failed", "reason": "stub"})
+        s = dictate.resolve_settings(
+            {"stt": {"backend": "cloud", "cloud": {"provider": "deepgram", "streaming": True}}}, "Linux"
+        )
+        assert dictate.stream_worker(s, []) == 1
+        assert dictate._read_stream_result()["reason"] == "stub"

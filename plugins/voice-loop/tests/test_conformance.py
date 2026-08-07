@@ -105,6 +105,69 @@ def test_checklist_version_matches_plugin_version():
     )
 
 
+class TestEveryVersionBearingDocAgreesWithTheManifest:
+    """`plugin.json` is the source; every other statement of the version is a MIRROR.
+
+    CLAUDE.md names three sites and says out loud that "nothing in CI checks that they do [agree] —
+    a bump that misses one is caught by a reviewer or not at all". A fourth site had already grown
+    (PUBLISHING.md's submission table) and was found stale at 0.6.0 by the QA lens, which is the
+    prediction coming true. This test is the mechanical backstop the note asked for: it reads the
+    manifest and then finds the version in each mirror by its OWN shape, so a site that drifts
+    fails a test forever rather than depending on somebody noticing.
+    """
+
+    _ROOT = _PLUGIN.parents[1]
+
+    def _version(self) -> str:
+        return _plugin_version()
+
+    def test_the_marketplace_mirror_agrees(self):
+        marketplace = json.loads((self._ROOT / ".claude-plugin" / "marketplace.json").read_text(encoding="utf-8"))
+        rows = [p for p in marketplace["plugins"] if p["name"] == "voice-loop"]
+        assert rows, "voice-loop has no marketplace entry"
+        assert rows[0]["version"] == self._version()
+
+    def test_the_root_catalog_row_agrees(self):
+        catalog = (self._ROOT / "README.md").read_text(encoding="utf-8")
+        row = re.search(r"^\|\s*\*\*voice-loop\*\*\s*\|\s*(\d+\.\d+\.\d+)\s*\|", catalog, re.MULTILINE)
+        assert row, "the root README catalog has no voice-loop row"
+        assert row.group(1) == self._version()
+
+    def test_the_publishing_submission_table_agrees(self):
+        """The site that was stale. It is a submission form for a marketplace listing, so a wrong
+        number here is a wrong number in front of the people the plugin is being submitted to."""
+        publishing = (self._ROOT / "PUBLISHING.md").read_text(encoding="utf-8")
+        section = publishing.split("#### voice-loop", 1)
+        assert len(section) == 2, "PUBLISHING.md has no voice-loop submission table"
+        row = re.search(r"^\|\s*version\s*\|\s*(\d+\.\d+\.\d+)\s*\|", section[1], re.MULTILINE)
+        assert row, "the voice-loop submission table pins no version"
+        assert row.group(1) == self._version()
+
+    def test_the_privacy_page_agrees(self):
+        """PRIVACY.md references voice-loop but does not state a version (the only three-part
+        number is an IP address `127.0.0.1`, not a version). This test validates that."""
+        privacy = (self._ROOT / "PRIVACY.md").read_text(encoding="utf-8")
+        # Check that PRIVACY.md does not have a voice-loop version statement
+        # (it contains 127.0.0.1 which would match \d+\.\d+\.\d+ but is an IP, not a version)
+        version_match = re.search(r"voice-loop[^0-9]*v(\d+\.\d+\.\d+)", privacy, re.IGNORECASE)
+        assert not version_match, (
+            f"PRIVACY.md should not state a voice-loop version, found: {version_match.group(0)}"
+        )
+
+    def test_no_version_bearing_site_is_missing_from_this_test(self):
+        """The other direction, the LOG_RULES way: a file that states a voice-loop version and is
+        not checked above is a site this test would not notice going stale. Adding one means
+        adding its assertion here — which is the whole point."""
+        checked = {"README.md", "PUBLISHING.md", ".claude-plugin/marketplace.json", "PRIVACY.md"}
+        stale: list[str] = []
+        for path in sorted(self._ROOT.glob("*.md")):
+            text = path.read_text(encoding="utf-8")
+            if re.search(r"voice-loop", text) and re.search(r"\b\d+\.\d+\.\d+\b", text):
+                if path.name not in checked:
+                    stale.append(path.name)
+        assert not stale, "these state a version and nothing checks them: " + ", ".join(stale)
+
+
 # --- checklist rows have verdict and evidence cells ----------------------------------
 
 

@@ -29,6 +29,39 @@ the cloud rows below are the path that works today.
 | `elevenlabs` (STT) | `scribe_v1` | a second or two; accuracy-first rather than latency-first | ≈**$0.0067/min** (≈$0.40/hour) on the paid tiers | 99 languages, **Russian ✅ Ukrainian ✅**; `stt.language` rides as Scribe's `language_code`, and an empty one lets it auto-detect | audio leaves the machine; zero-retention is an account/enterprise setting |
 | `deepgram` (STT) | `nova-3` | the quickest of the three on short clips | ≈**$0.0043/min** pre-recorded; new accounts start with a **$200 credit** | **Russian ✅** via nova-3 multilingual (set `stt.language: "multi"`); **Ukrainian ⚠️** — nova-3 multilingual does not cover it, use `stt.model: "nova-2"` and check the vendor's model/language matrix | audio leaves the machine; a self-hosted deployment is offered, and `stt.cloud.endpoint` points at one |
 
+### Streaming speech-to-text — `stt.cloud.streaming`
+
+A batch dictation makes a long one pay twice: you speak for a minute, then wait at the end while
+the whole clip uploads and transcribes. A provider whose entry carries a **streaming variant** can
+be fed the recording *while the microphone is open*, so by the time you stop, the transcript is
+already assembled and the only wait left is the server flushing its last words.
+
+| provider | streaming variant | what turning it on does |
+|---|---|---|
+| `openai` (STT) | — | nothing: the setting is ignored, with a line in `dictate.log` saying so |
+| `elevenlabs` (STT) | — | the same |
+| `deepgram` (STT) | **yes** — the live `/v1/listen` websocket, interim + final results | the recording is forwarded as raw 16 kHz mono PCM while you speak; the finals are assembled in order and pasted at stop-time |
+
+```json
+{ "stt": { "backend": "cloud", "cloud": { "provider": "deepgram", "streaming": true } } }
+```
+
+Everything else is unchanged, and deliberately so:
+
+- the **WAV is still written** and still lands in `dictate-last.wav` — the socket tails the file, it
+  does not stand between the recorder and the disk;
+- **any** failure — no key, a socket that will not open, an auth refusal, a server that hangs up
+  mid-recording, a worker that misses its bound, a stream that carried nothing — logs its reason and
+  falls back to the ordinary record → POST flow. A recording is never lost to the live path;
+- the **model and language are the same axes** as the batch call (`stt.model`, `stt.language`), so a
+  Russian contour that set `stt.model: "nova-2"` streams with nova-2;
+- billing is Deepgram's streaming rate rather than its pre-recorded one — check the vendor's page;
+  the socket is closed as soon as the recording ends (and by the worker's own evidence if the stop
+  toggle never comes), so an idle hotkey cannot hold a metered connection open.
+
+Every dictation logs `dictation latency stop_to_paste_ms=… via=stream|batch`, which is how the two
+paths are compared on your own machine rather than on a claim in this table.
+
 ## Text-to-speech — `tts.cloud.provider`
 
 | provider | default model | latency | cost | language coverage | privacy posture |
@@ -72,3 +105,9 @@ axes that vary: default model, request build (host, path, body encoding, where `
 auth header, response parse, credential resolution, error-document reading, and the remote default
 host. `tests/test_providers.py` greps `scripts/` for a provider compared against a literal and
 fails if one comes back.
+
+A **streaming variant** is an eighth axis and lives on the same entry (`streaming=…`): the live
+URL, the auth header, the message parser and the two control messages. A provider without one
+carries `streaming=None`, and that — never a name comparison — is what the dictation path branches
+on. The socket itself is `scripts/wsclient.py`, a stdlib-only RFC 6455 client written here rather
+than taken as a dependency, because everything under `scripts/` installs by being copied.
