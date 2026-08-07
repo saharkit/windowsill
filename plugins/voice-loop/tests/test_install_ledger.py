@@ -123,8 +123,13 @@ class TestStepTracking:
         clock.advance(5)
         second = install_ledger.step_done("step-0-probe", ledger_path, clock=clock)
         assert second["completed_steps"] == ["step-0-probe"]
-        # Timestamp from the first call survives
+        # Calling step_done twice is harmless and completed_at from first call survives
         assert second["completed_steps"] == first["completed_steps"]
+        # Verify the ledger has the first timestamp (idempotent step_done)
+        raw = install_ledger.read_ledger(ledger_path)
+        assert raw is not None
+        # step_done preserves the first call's completed_at (12:00:00 from step_begin's clock)
+        assert raw["steps"]["step-0-probe"]["completed_at"] == "2026-08-05T12:00:00+00:00"
 
     def test_step_begin_on_already_complete_is_noop(self, ledger_path, clock):
         install_ledger.start_install(ledger_path, clock=clock)
@@ -446,12 +451,20 @@ class TestCLI:
         rc = install_ledger.main(["install_ledger.py", "check"])
         assert rc == 0
 
-    def test_check_cancelled_exit_1(self, ledger_path, clock, monkeypatch):
+    def test_check_cancelled_is_terminal_exit_0(self, ledger_path, clock, monkeypatch):
+        """Cancelled exits 0 because it is a terminal state, not an actionable one.
+
+        The user deliberately chose "leave everything as-is and exit" — the install
+        is stopped by choice, not interrupted.  There is no ``next_step`` to resume
+        toward (cancelled is not ``in_progress``), and ``start_install`` auto-restarts
+        from cancelled anyway.  Only ``in_progress`` (mid-flight, still actionable)
+        exits 1; every other state — none, complete, cancelled — exits 0.
+        """
         monkeypatch.setenv("VOICE_LOOP_INSTALL_LEDGER", ledger_path)
         install_ledger.start_install(ledger_path, clock=clock)
         install_ledger.cancel_install(ledger_path, clock=clock)
         rc = install_ledger.main(["install_ledger.py", "check"])
-        assert rc == 1
+        assert rc == 0
 
     def test_start_and_step_flow(self, ledger_path, clock, monkeypatch, capsys):
         monkeypatch.setenv("VOICE_LOOP_INSTALL_LEDGER", ledger_path)
@@ -516,7 +529,7 @@ class TestCLI:
 
 
 class TestAcceptanceInterruptedThenResume:
-    """kill the installer at each step boundary and mid-step → re-run offers the 3 choices"""
+    """Verify check_state returns correct state for interrupted installs (re-entry behavior)"""
 
     def test_interrupted_at_every_boundary_then_resume(self, ledger_path, clock):
         # Simulate: run → interrupt at step boundary → re-run → resume → interrupt → ...
