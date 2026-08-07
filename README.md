@@ -26,6 +26,29 @@ Then install what you want — this one is typed **inside a session**, not in yo
 /plugin install <plugin>@windowsill
 ```
 
+## Running on Windows
+
+The recommended route is **WSL2 with WSLg** on Windows 11 — and honesty first: nobody has run
+this end to end on a real Windows machine yet.
+[#41](https://github.com/saharkit/windowsill/issues/41) tracks that verification pass; until
+it lands, this is the route we recommend, not a tested guarantee.
+
+From an elevated PowerShell:
+
+```powershell
+wsl --install
+```
+
+Restart when it asks; on first launch the distro prompts for a UNIX username and password. If
+the install fails with a virtualization error, enable virtualization in your UEFI/BIOS first.
+(Windows 10 21H2+ can also run WSLg via the Store WSL package, but Windows 11 is the route we
+intend to verify.)
+
+Inside the distro, **Add the marketplace** above works exactly as written — the marketplace
+add and the `/plugin install` both. A plugin's own setup may have platform-specific steps;
+its README is the place to check — for voice-loop's audio and server notes on WSL, see
+[its README](plugins/voice-loop/README.md).
+
 ## What is on the sill
 
 | plugin | version | what it does | |

@@ -335,6 +335,20 @@ discipline as section 2: default mode, count the prompts.
 | 7.11 | `/voice-remove` on a machine with **nothing** installed | says there is nothing to remove and stops — no invented work, no errors | | |
 | 7.12 | After 7.1–7.9, start a fresh session and end a reply with a 🔊 line | nothing is spoken, no hook errors, no stray processes; `/plugin uninstall voice-loop@windowsill` then completes cleanly | | |
 
+## 8. WSL2 branch (run on Windows 11 + WSLg — the #41 verification pass)
+
+Same contract as the macOS branch: run on a real machine, fill the rows, claim nothing a row
+did not show. Until every row here carries an observed value, the shelf README's Windows
+section stays "recommended route, not a tested guarantee".
+
+| # | check | expected | observed | pass |
+|---|---|---|---|---|
+| 8.1 | `claude plugin marketplace add saharkit/windowsill` inside the distro | marketplace added, no error | | |
+| 8.2 | `/plugin install voice-loop@windowsill` | the plugin appears under `/plugin` | | |
+| 8.3 | End a reply with a `🔊` line | the Stop hook fires and the line is audible on the WINDOWS host's speakers — the row that decides the WSLg audio claim | | |
+| 8.4 | `scripts/selftest.sh` against a `lan` server | green loopback | | |
+| 8.5 | `scripts/dictate-toggle.sh` with a real mic | the log states WHICH recorder `resolve_recorder` selected, and the recorded WAV is non-empty — the row that catches a present-but-daemonless `pw-record` winning the resolution order and then failing | | |
+
 ---
 
 **Sign-off**
