@@ -119,7 +119,8 @@ _HOME = os.path.expanduser("~")
 _OTHER_HOME_RE = re.compile(r"(/(?:home|Users)/)[^/\s:\"']+")
 # URL rule: matches http/https/ws/wss with their hosts, plus bare host:port combinations
 # (e.g. "Connection refused to deepgram.corp.internal:443" or "TLS failed for api.example.com:443")
-_URL_RE = re.compile(r"\b((?:https?|wss?)://)([^\s/\"'<>)\]]+)")
+# Handles bracketed IPv6 ([fd00::1234]:8355) with optional zone IDs (%eth0).
+_URL_RE = re.compile(r"\b((?:https?|wss?)://)(\[([^\]]+)\](?::(\d+))?|([^\s/:\"'<>)\]]+)(?::(\d+))?)")
 # A bare *host:port* without scheme: "Connection refused to deepgram.corp.internal:443"
 # This catches what _URL_RE does not: URLs without a scheme, or just host:port in prose.
 # We need to match:
@@ -136,13 +137,18 @@ _URL_RE = re.compile(r"\b((?:https?|wss?)://)([^\s/\"'<>)\]]+)")
 # The pattern for (2) requires at least one dot, preventing "05:17" from matching
 # (no dot in "05" or "09").
 _BARE_HOST_PORT_RE = re.compile(
-    # Bracketed IPv6:port (e.g. [fd00::1234]:443) - must be first, before unbracketed
+    # Bracketed IPv6:port (e.g. [fd00::1234]:443, [fe80::1%eth0]:8080) - must be first
     # Note: no \b before [ because \b matches between word/non-word, and [ is non-word
-    r"(\[[0-9a-fA-F:]+\]):(\d{1,5})\b"
+    # Zone ID (%eth0) is allowed after the IPv6 address, before ]
+    # The IPv6 part is [0-9a-fA-F:], zone ID is [a-zA-Z0-9-]+
+    r"(\[[0-9a-fA-F:]+(?:%[a-zA-Z0-9-]+)?\]):(\d{1,5})\b"
     # Hostname:port (must contain a dot like deepgram.corp.internal:443)
     r"|\b([^\s/:\"'<>)\]]+\.[^\s/:\"'<>)\]]+):(\d{1,5})\b"
     # Known loopback without brackets (e.g. localhost:8080, 127.0.0.1:8355)
-    r"|\b((?:localhost|127\.0\.0\.1|0\.0\.0\.0|::1)):(\d{1,5})\b"
+    r"|\b((?:localhost|127\.0\.0\.1|0\.0\.0\.0)):(\d{1,5})\b"
+    # Single-label hostname with port: must have at least one letter (to avoid matching
+    # times like "05:17" which have no letters). Port must be 2-5 digits.
+    r"|\b([^\s/:\"'<>)\]]*[a-zA-Z][^\s/:\"'<>)\]]*):(\d{2,5})\b"
 )
 # An address also reaches the logs bare, with no scheme in front of it: "Connection refused to
 # 192.168.7.31" is a urllib reason string, and it names the user's network just as precisely as a
@@ -184,26 +190,55 @@ def usernames() -> tuple[str, ...]:
 
 
 def _redact_host(match: "re.Match[str]") -> str:
-    """Redact the host in a URL match, preserving loopback addresses."""
+    """Redact the host in a URL match, preserving loopback addresses.
+
+    The URL regex has two alternatives:
+    1. Bracketed IPv6: `[...]`:port - groups (1)=scheme, (2)=bracketed+port, (3)=IPv6, (4)=port
+    2. Hostname:port - groups (1)=scheme, (2)=hostname:port, (5)=hostname, (6)=port
+    """
     netloc = match.group(2)
-    host, sep, port = netloc.rpartition(":")
-    if not sep or not port.isdigit():  # no port: the whole netloc is the host
-        host, sep, port = netloc, "", ""
-    if host.lower() in _LOOPBACK_HOSTS:
-        return match.group(0)  # loopback is the fact worth keeping, and it names nobody
-    return f"{match.group(1)}<host>{sep}{port}"
+    scheme = match.group(1)
+    # Determine which alternative matched
+    ipv6 = match.group(3)  # Bracketed IPv6 case
+    hostname = match.group(5)  # Hostname case
+
+    if ipv6 is not None:
+        # Bracketed IPv6 case: netloc is [ipv6]:port or [ipv6]
+        # Group 4 has the port if present
+        port = match.group(4)
+        if port:
+            host = f"[{ipv6}]:{port}"
+            if ipv6.lower() in ("::1", "0:0:0:0:0:0:0:1"):
+                return match.group(0)  # loopback is the fact worth keeping
+            return f"{scheme}<host>:{port}"
+        else:
+            host = f"[{ipv6}]"
+            if ipv6.lower() in ("::1", "0:0:0:0:0:0:0:1"):
+                return match.group(0)  # loopback is the fact worth keeping
+            return f"{scheme}<host>"
+    else:
+        # Hostname case
+        host, sep, port = netloc.rpartition(":")
+        if not sep or not port.isdigit():  # no port: the whole netloc is the host
+            host, sep, port = netloc, "", ""
+        if host.lower() in _LOOPBACK_HOSTS:
+            return match.group(0)  # loopback is the fact worth keeping, and it names nobody
+
+    # Redact the host, keep the scheme and port
+    return f"{scheme}<host>{sep}{port}"
 
 
 def _redact_bare_host_port(match: "re.Match[str]") -> str:
     """Redact the host in a bare host:port match, preserving loopback addresses.
 
     Matches things like "Connection refused to deepgram.corp.internal:443"
-    or "TLS failed for api.example.com:8080" or "[fd00::1234]:443".
+    or "TLS failed for api.example.com:8080" or "[fd00::1234]:443" or "voicebox:8355".
 
-    The regex has three alternatives with different capture groups:
+    The regex has four alternatives with different capture groups:
     1. Bracketed IPv6: groups (1)=host, (2)=port
     2. Hostname with dot: groups (3)=host, (4)=port
     3. Known loopback without brackets: groups (5)=host, (6)=port
+    4. Single-label hostname: groups (7)=host, (8)=port
     """
     # Determine which alternative matched by checking which host group is not None
     if match.group(1) is not None:
@@ -212,9 +247,12 @@ def _redact_bare_host_port(match: "re.Match[str]") -> str:
     elif match.group(3) is not None:
         # Hostname case (must have a dot by pattern)
         host, port = match.group(3), match.group(4)
-    else:
+    elif match.group(5) is not None:
         # Known loopback case
         host, port = match.group(5), match.group(6)
+    else:
+        # Single-label hostname case (group 7 is host, group 8 is port)
+        host, port = match.group(7), match.group(8)
 
     # Preserve loopback hosts (like 127.0.0.1, localhost, [::1])
     if host.lower() in _LOOPBACK_HOSTS:
