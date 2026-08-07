@@ -134,6 +134,42 @@ class TestConfigCheck:
         check = {"type": "config", "path": "nonexistent.key", "equals": False}
         assert _run_config_check(check, {}) is None
 
+    def test_both_keys_trigger_when_both_conditions_hold(self) -> None:
+        # equals matches AND not_equals does not match → triggers
+        check = {
+            "type": "config",
+            "path": "stt.command",
+            "equals": "/usr/local/bin/mystt",
+            "not_equals": "",
+        }
+        cfg = {"stt": {"command": "/usr/local/bin/mystt"}}
+        result = _run_config_check(check, cfg)
+        assert result is not None
+        assert result["value"] == "/usr/local/bin/mystt"
+
+    def test_both_keys_pass_when_not_equals_also_matches(self) -> None:
+        # equals matches but not_equals ALSO matches → both do not hold → passes
+        check = {"type": "config", "path": "stt.command", "equals": "", "not_equals": ""}
+        cfg = {"stt": {"command": ""}}
+        assert _run_config_check(check, cfg) is None
+
+    def test_both_keys_pass_when_equals_does_not_match(self) -> None:
+        # equals does not match (even though not_equals differs) → passes
+        check = {
+            "type": "config",
+            "path": "stt.command",
+            "equals": "/usr/local/bin/mystt",
+            "not_equals": "",
+        }
+        cfg = {"stt": {"command": "/other/stt"}}
+        assert _run_config_check(check, cfg) is None
+
+    def test_both_keys_do_not_raise(self) -> None:
+        # Compatibility: manifests carrying both keys used to work — no ValueError.
+        check = {"type": "config", "path": "flag", "equals": True, "not_equals": False}
+        assert _run_config_check(check, {"flag": True}) is not None
+        assert _run_config_check(check, {"flag": False}) is None
+
 
 # ---------------------------------------------------------------------------
 # _run_ledger_check

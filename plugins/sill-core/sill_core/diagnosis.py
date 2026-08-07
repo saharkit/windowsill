@@ -113,9 +113,11 @@ class Finding:
 #     {"type": "config", "path": "dictate.auto_paste", "equals": False}
 #     Triggers when the value at *path* (dot-separated into the config dict)
 #     equals *equals*.  ``"not_equals": ""`` triggers when the value is a
-#     non-empty string (e.g. a custom command is set).  When neither
-#     *equals* nor *not_equals* is present, the check triggers on any
-#     falsy value.
+#     non-empty string (e.g. a custom command is set).  When BOTH *equals*
+#     and *not_equals* are present, both conditions must hold: the check
+#     triggers only when the value equals *equals* AND differs from
+#     *not_equals*.  When neither *equals* nor *not_equals* is present, the
+#     check triggers on any falsy value.
 #
 #   ledger check:
 #     {"type": "ledger", "steps": ["step-3-install-deps", "step-4-write-config"]}
@@ -153,22 +155,26 @@ def _resolve_path(data: dict[str, Any], path: str) -> object:
 
 
 def _run_config_check(check: dict[str, Any], config: dict[str, Any]) -> dict[str, Any] | None:
-    """Evaluate one config-type check.  Returns evidence dict on trigger, None on pass."""
+    """Evaluate one config-type check.  Returns evidence dict on trigger, None on pass.
+
+    Condition semantics:
+    - ``equals`` only: trigger when the value equals *equals*.
+    - ``not_equals`` only: trigger when the value differs from *not_equals*.
+    - BOTH ``equals`` and ``not_equals``: both must hold — trigger only when
+      the value equals *equals* AND differs from *not_equals*.  (Existing
+      manifests carrying both keys predate this definition; accepting both
+      with conjunctive semantics keeps them working instead of erroring.)
+    - neither: trigger on any falsy value.
+    """
     path: str = check.get("path", "")
     value = _resolve_path(config, path)
     if value is _MISSING:
         return None  # path not present → check passes
 
-    # Reject manifests that specify both equals and not_equals — the precedence
-    # is non-obvious and either would suppress the other silently.
-    if "equals" in check and "not_equals" in check:
-        raise ValueError(
-            f"check for path '{path}' specifies both 'equals' and 'not_equals'; "
-            "specify only one condition"
-        )
-
     if "equals" in check:
         triggered = value == check["equals"]
+        if "not_equals" in check:
+            triggered = triggered and value != check["not_equals"]
     elif "not_equals" in check:
         triggered = value != check["not_equals"]
     else:
