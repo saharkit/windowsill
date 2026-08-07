@@ -89,6 +89,12 @@ agent reads first) and `.claude/` (its review-lens map).
 - **Install is a skill, not a page of instructions.** Where setup is fiddly, an agent does it and then
   proves it worked.
 
+## Privacy
+
+Nothing here collects anything — no telemetry, no analytics, no accounts. Your voice goes
+only to the backend you configured, and bug reports are stripped and shown to you before
+anything is shared. The full page, with the receipts: [PRIVACY.md](PRIVACY.md).
+
 ## Author
 
 **Sahar** — AI engineer at saharkit.
