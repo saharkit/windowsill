@@ -284,6 +284,9 @@ No Prometheus, no root.
 - **Alerts.** A service that does not answer (or reports `ok: false`); a service serving on a
   device other than its `expect_device` — set that key exactly when a client depends on the fast
   path, because that dependency is yours to declare and the alert means "the fast path is gone";
+  **device strings are aliased** so `cuda`, `cuda:0`, `mps`, `rocm`, and `hip` all normalize to
+  `gpu`, and `cpu`, `cpu:0`, etc. normalize to `cpu`; unknown device strings compare verbatim.
+  (See the module docstring in `scripts/contour_poll.py` for the exact alias table.)
   free VRAM under `vram.min_free_mib` (default 200); an `oom_overflows` counter that **changed**
   (a rise, or a drop — these are per-process counters, so a counter that went backwards is a
   service that restarted and is already overflowing again; a steady counter does not re-page); and,

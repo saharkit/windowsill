@@ -421,6 +421,50 @@ def test_the_demotion_alert_fires_only_when_a_client_depends_on_the_fast_path():
     assert contour_poll.evaluate_service(_service(expect_device="gpu"), _sample(device=None), {}) == []
 
 
+@pytest.mark.parametrize(
+    ("device_reported", "expect_device", "should_alert"),
+    [
+        # GPU aliases — all should be quiet when expecting "gpu" or another GPU alias
+        ("cuda", "gpu", False),
+        ("cuda:0", "gpu", False),
+        ("cuda:1", "gpu", False),
+        ("mps", "gpu", False),
+        ("rocm", "gpu", False),
+        ("hip", "gpu", False),
+        # GPU expectation with real GPU device
+        ("cuda", "cuda", False),
+        ("mps", "mps", False),
+        # CPU aliases — should page when expecting "gpu"
+        ("cpu", "gpu", True),
+        ("cpu:0", "gpu", True),
+        # CPU expectation with CPU device
+        ("cpu", "cpu", False),
+        ("cpu:0", "cpu", False),
+    ],
+)
+def test_device_aliases_are_resolved_before_comparison(device_reported, expect_device, should_alert):
+    """Device strings are aliased so services reporting cuda/mps/rocm/hip match expect_device: "gpu"."""
+    alerts = contour_poll.evaluate_service(
+        _service(expect_device=expect_device), _sample(device=device_reported), {}
+    )
+    if should_alert:
+        assert [a["kind"] for a in alerts] == ["device-demoted"]
+    else:
+        assert alerts == []
+
+
+def test_an_unknown_device_string_compares_verbatim():
+    """A service reporting an unknown device type (a typo or new type the table doesn't know)
+    compares verbatim against the expectation — so a typo pages, and a genuinely new device
+    type pages until the table is updated."""
+    # A typo: "cud" instead of "cuda" should page
+    alerts = contour_poll.evaluate_service(
+        _service(expect_device="cuda"), _sample(device="cud"), {}
+    )
+    assert [a["kind"] for a in alerts] == ["device-demoted"]
+    assert "cud" in alerts[0]["message"] and "cuda" in alerts[0]["message"]
+
+
 def test_oom_overflows_page_on_the_rise_not_on_the_level():
     service = _service()
     # first sight of a non-zero counter: say it once
