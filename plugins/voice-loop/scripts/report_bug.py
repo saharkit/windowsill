@@ -204,16 +204,18 @@ def _redact_host(match: "re.Match[str]") -> str:
 
     if ipv6 is not None:
         # Bracketed IPv6 case: netloc is [ipv6]:port or [ipv6]
-        # Group 4 has the port if present
+        # Group 4 has the port if present. A zone id (%eth0) names the interface, not the
+        # network — strip it before the loopback comparison so [::1%lo] stays visible.
         port = match.group(4)
+        ipv6_base = ipv6.lower().split("%", 1)[0]
         if port:
             host = f"[{ipv6}]:{port}"
-            if ipv6.lower() in ("::1", "0:0:0:0:0:0:0:1"):
+            if ipv6_base in ("::1", "0:0:0:0:0:0:0:1"):
                 return match.group(0)  # loopback is the fact worth keeping
             return f"{scheme}<host>:{port}"
         else:
             host = f"[{ipv6}]"
-            if ipv6.lower() in ("::1", "0:0:0:0:0:0:0:1"):
+            if ipv6_base in ("::1", "0:0:0:0:0:0:0:1"):
                 return match.group(0)  # loopback is the fact worth keeping
             return f"{scheme}<host>"
     else:
@@ -254,8 +256,11 @@ def _redact_bare_host_port(match: "re.Match[str]") -> str:
         # Single-label hostname case (group 7 is host, group 8 is port)
         host, port = match.group(7), match.group(8)
 
-    # Preserve loopback hosts (like 127.0.0.1, localhost, [::1])
-    if host.lower() in _LOOPBACK_HOSTS:
+    # Preserve loopback hosts (like 127.0.0.1, localhost, [::1]). Normalize first: the bracketed
+    # form arrives as "[::1]" and a zone id (%eth0) names the interface, not the network — neither
+    # should decide whether the address is loopback.
+    normalized = host.lower().strip("[]").split("%", 1)[0]
+    if normalized in _LOOPBACK_HOSTS:
         return match.group(0)  # preserve loopback
     # For IPv4 addresses (without brackets), keep as <host>:port (IP is fine to show)
     if re.match(r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$", host):

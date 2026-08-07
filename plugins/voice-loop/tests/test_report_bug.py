@@ -350,6 +350,43 @@ def test_bare_host_port_ipv6_is_redacted():
     )
 
 
+def test_ipv6_loopback_with_a_zone_id_is_still_loopback():
+    """A zone id (%eth0) names the interface, not the network — loopback stays visible.
+
+    This catches the blocking issue where [::1%eth0] failed the loopback check in both
+    _redact_host and _redact_bare_host_port and was redacted like a private address,
+    hiding the most useful diagnostic fact (it was loopback) from the report.
+    """
+    # URL form: the zone id rides inside the brackets
+    assert report_bug.redact("http://[::1%eth0]:8355/tts") == "http://[::1%eth0]:8355/tts"
+    # Bare bracketed host:port form
+    assert report_bug.redact("Connection refused to [::1%lo]:443") == (
+        "Connection refused to [::1%lo]:443"
+    )
+    # A zone-id loopback with no port matches no host rule and travels as it is
+    assert report_bug.redact("bound to ::1%eth0") == "bound to ::1%eth0"
+    # But a zone id does not launder a NON-loopback address past the redactor
+    assert report_bug.redact("Connection refused to [fe80::1%eth0]:8080") == (
+        "Connection refused to <host>:8080"
+    )
+    assert report_bug.redact("http://[fe80::1%eth0]:8080/tts") == "http://<host>:8080/tts"
+
+
+def test_bracketed_loopback_host_port_matches_via_normalization():
+    """The bracketed "[::1]" form must pass the loopback check after the brackets are
+    stripped, not by leaning on a bracketed entry in the loopback set."""
+    assert report_bug.redact("Connection refused to [::1]:8080") == (
+        "Connection refused to [::1]:8080"
+    )
+    # The other loopback spellings are unaffected by the bracket/zone normalization
+    assert report_bug.redact("Connection refused to 127.0.0.1:8080") == (
+        "Connection refused to 127.0.0.1:8080"
+    )
+    assert report_bug.redact("Connection refused to localhost:8080") == (
+        "Connection refused to localhost:8080"
+    )
+
+
 def test_bare_host_port_times_are_not_corrupted():
     """Plain times like '05:17' should NOT be corrupted to '<host>:17'.
 
