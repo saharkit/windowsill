@@ -143,11 +143,22 @@ class TestEveryVersionBearingDocAgreesWithTheManifest:
         assert row, "the voice-loop submission table pins no version"
         assert row.group(1) == self._version()
 
+    def test_the_privacy_page_agrees(self):
+        """PRIVACY.md references voice-loop but does not state a version (the only three-part
+        number is an IP address `127.0.0.1`, not a version). This test validates that."""
+        privacy = (self._ROOT / "PRIVACY.md").read_text(encoding="utf-8")
+        # Check that PRIVACY.md does not have a voice-loop version statement
+        # (it contains 127.0.0.1 which would match \d+\.\d+\.\d+ but is an IP, not a version)
+        version_match = re.search(r"voice-loop[^0-9]*v(\d+\.\d+\.\d+)", privacy, re.IGNORECASE)
+        assert not version_match, (
+            f"PRIVACY.md should not state a voice-loop version, found: {version_match.group(0)}"
+        )
+
     def test_no_version_bearing_site_is_missing_from_this_test(self):
         """The other direction, the LOG_RULES way: a file that states a voice-loop version and is
         not checked above is a site this test would not notice going stale. Adding one means
         adding its assertion here — which is the whole point."""
-        checked = {"README.md", "PUBLISHING.md", ".claude-plugin/marketplace.json"}
+        checked = {"README.md", "PUBLISHING.md", ".claude-plugin/marketplace.json", "PRIVACY.md"}
         stale: list[str] = []
         for path in sorted(self._ROOT.glob("*.md")):
             text = path.read_text(encoding="utf-8")
