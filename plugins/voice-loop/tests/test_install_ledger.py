@@ -451,7 +451,15 @@ class TestCLI:
         rc = install_ledger.main(["install_ledger.py", "check"])
         assert rc == 0
 
-    def test_check_cancelled_exit_0(self, ledger_path, clock, monkeypatch):
+    def test_check_cancelled_is_terminal_exit_0(self, ledger_path, clock, monkeypatch):
+        """Cancelled exits 0 because it is a terminal state, not an actionable one.
+
+        The user deliberately chose "leave everything as-is and exit" — the install
+        is stopped by choice, not interrupted.  There is no ``next_step`` to resume
+        toward (cancelled is not ``in_progress``), and ``start_install`` auto-restarts
+        from cancelled anyway.  Only ``in_progress`` (mid-flight, still actionable)
+        exits 1; every other state — none, complete, cancelled — exits 0.
+        """
         monkeypatch.setenv("VOICE_LOOP_INSTALL_LEDGER", ledger_path)
         install_ledger.start_install(ledger_path, clock=clock)
         install_ledger.cancel_install(ledger_path, clock=clock)

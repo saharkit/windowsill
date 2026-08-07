@@ -61,10 +61,11 @@ Proceed to Step 0.
 > Steps completed: <names>. Step in flight: <name>.
 >
 > 1. **Resume** — continue from the next pending step (`next_step`). Steps already done are skipped.
-> 2. **Restart** — clean slate. First run `reset` to delete the ledger, then undo what the completed
->    steps did (reverse order: remove hotkey bindings, remove the CLAUDE.md line, remove config,
->    disable service, delete copied server files — the list of completed steps tells you exactly
->    what to undo), then run `start` to create a fresh ledger and proceed from Step 0.
+> 2. **Restart** — clean slate. First undo what the completed steps did (reverse order: remove
+>    hotkey bindings, remove the CLAUDE.md line, remove config, disable service, delete copied
+>    server files — the list of completed steps in the ledger is your cleanup guide; undo while
+>    the ledger still exists so you know exactly what to revert), then run `reset` to delete the
+>    ledger, then run `start` to create a fresh ledger and proceed from Step 0.
 > 3. **Cancel** — leave everything as-is and exit. Run `python3 "$LEDGER_CMD" cancel` and stop.
 
 If they pick **resume**: look at `completed_steps` and `next_step`. Skip every step whose id is in
@@ -72,8 +73,9 @@ If they pick **resume**: look at `completed_steps` and `next_step`. Skip every s
 `current_step` is set (a step was begun but not finished), re-run that step from the beginning
 because it might be in a partial state (half-installed packages, half-written config).
 
-If they pick **restart**: run `python3 "$LEDGER_CMD" reset` to delete the ledger, then undo the
-completed work using the list you just read, then run `python3 "$LEDGER_CMD" start` and proceed from Step 0.
+If they pick **restart**: undo the completed work using the list you just read (the ledger is
+your cleanup guide — undo while it still exists), then run `python3 "$LEDGER_CMD" reset` to
+delete the ledger, then run `python3 "$LEDGER_CMD" start` and proceed from Step 0.
 
 If they pick **cancel**: run `python3 "$LEDGER_CMD" cancel` and stop. Say that re-running
 `/voice-setup` will offer the same three choices.
@@ -508,6 +510,12 @@ python3 "${CLAUDE_PLUGIN_ROOT}/scripts/install_ledger.py" step-done step-4-write
 ```
 
 ## Step 5 — paste behaviour (the permission ladder — DEFAULT IS THE NO-ROOT TIER)
+
+**Begin step** — configuring paste behaviour has side effects (config file is modified). Mark it in flight:
+
+```sh
+python3 "${CLAUDE_PLUGIN_ROOT}/scripts/install_ledger.py" step-begin step-5-paste-behaviour
+```
 
 **Tier 1 (default, zero root, works everywhere):** `auto_paste: false`. The transcript lands on the
 clipboard and a notification says "copied — press <paste_key>". The user presses their own paste key.

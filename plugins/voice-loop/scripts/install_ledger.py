@@ -185,8 +185,10 @@ def check_state(
     if in_flight:
         result["current_step"] = in_flight[0]  # at most one at a time
 
-    # Next pending step (useful for "resume")
-    if state in ("in_progress", "cancelled"):
+    # Next pending step — only meaningful for in_progress (where resume is
+    # the option).  cancelled is a terminal state: the user chose "leave
+    # everything as-is and exit", so there is nothing to resume toward.
+    if state == "in_progress":
         next_step = _next_pending(steps)
         if next_step is not None:
             result["next_step"] = next_step
@@ -219,10 +221,16 @@ def start_install(
 
     existing = read_ledger(ledger_path)
     if existing is not None:
-        # If an install exists (in_progress, complete, or cancelled), return it.
-        # A cancelled ledger should not be silently overwritten; the skill
-        # should first reset it before starting a fresh install.
-        return check_state(ledger_path)
+        state = existing.get("state", "none")
+        if state == "cancelled":
+            # Auto-restart from cancelled — the user is re-running setup after
+            # previously choosing "leave everything as-is."  Starting fresh is
+            # the natural intent; the skill does not need to call reset first.
+            pass  # fall through to create a fresh ledger below
+        else:
+            # in_progress or complete — return existing; the skill must
+            # decide whether to resume, restart, or do nothing.
+            return check_state(ledger_path)
 
     now_ts = _ts(clock)
     ledger: dict[str, Any] = {
