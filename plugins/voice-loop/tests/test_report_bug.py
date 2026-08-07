@@ -269,22 +269,6 @@ def test_a_short_login_is_left_alone(monkeypatch):
     assert "extract_ms" in report_bug.redact("timings extract_ms=12 total_ms=90")
 
 
-def test_loopback_survives_and_every_other_host_does_not():
-    assert report_bug.redact("http://127.0.0.1:8355/tts") == "http://127.0.0.1:8355/tts"
-    assert report_bug.redact("http://localhost:8355/tts") == "http://localhost:8355/tts"
-    assert report_bug.redact("http://voicebox.lan:8355/tts") == "http://<host>:8355/tts"
-    assert report_bug.redact("https://api.elevenlabs.io/v1") == "https://<host>/v1"
-
-
-def test_a_bare_address_in_a_log_line_is_a_host_too():
-    """urllib reasons name the address with no scheme in front of it — the URL rule never sees it."""
-    assert report_bug.redact("[Errno 111] Connection refused to 192.168.7.31") == (
-        "[Errno 111] Connection refused to <host>"
-    )
-    assert report_bug.redact("bound to 127.0.0.1 as always") == "bound to 127.0.0.1 as always"
-    assert report_bug.redact("plugin 0.3.2 python 3.10.12") == "plugin 0.3.2 python 3.10.12"
-
-
 def test_usernames_returns_only_the_fixture_set(monkeypatch):
     """The fixture must pin every name source so `usernames()` is deterministic on any host."""
     monkeypatch.setattr(report_bug, "_HOME", "/home/vasilisa")
@@ -296,110 +280,207 @@ def test_usernames_returns_only_the_fixture_set(monkeypatch):
     assert report_bug.usernames() == ("vasilisa",)
 
 
-def test_bare_host_port_without_scheme_is_redacted():
-    """bare host:port in failure reasons (like urllib's Connection refused) must be redacted.
+# --- the host grammar -------------------------------------------------------------------------------
 
-    This catches the security issue where private hostnames like deepgram.corp.internal:443
-    would escape the redactor and appear in a public GitHub issue.
-    """
-    # Bare hostname:port should be redacted
-    assert report_bug.redact("Connection refused to deepgram.corp.internal:443") == (
-        "Connection refused to <host>:443"
-    )
-    # Bare IP:port should be redacted
-    assert report_bug.redact("Connection refused to 192.168.7.31:8355") == (
-        "Connection refused to <host>:8355"
-    )
-    # Loopback host:port should be preserved (useful info for diagnosis)
-    assert report_bug.redact("Connection refused to 127.0.0.1:8355") == (
-        "Connection refused to 127.0.0.1:8355"
-    )
-    assert report_bug.redact("Connection refused to localhost:8355") == (
-        "Connection refused to localhost:8355"
-    )
-    # TLS failure messages with bare host:port
-    assert report_bug.redact("TLS failed for deepgram.corp.internal:443") == (
-        "TLS failed for <host>:443"
-    )
-    # WebSocket URLs should also work
-    assert report_bug.redact("ws://voicebox.lan:8355/socket") == "ws://<host>:8355/socket"
-    assert report_bug.redact("wss://secure.example.com:443/socket") == "wss://<host>:443/socket"
+# One class, because these are one decision made in one place: what a host is, and which of them is
+# the loopback a report may keep. Four review rounds patched two divergent grammars against each
+# other; each test below pins one thing that divergence cost.
 
 
-def test_bare_host_port_ipv6_is_redacted():
-    """IPv6 host:port must be redacted, with bracketed form handled.
+class TestHostRedaction:
+    """`redact` over hosts: with a scheme, bare in prose, loopback, and the tokens that are neither."""
 
-    This catches the blocking issue where private IPv6 addresses like [fd00::1234]:443
-    would escape the redactor and appear in a public GitHub issue.
-    """
-    # Bracketed IPv6 non-loopback should be redacted
-    assert report_bug.redact("Connection refused to [fd00::1234]:443") == (
-        "Connection refused to <host>:443"
-    )
-    # Bracketed IPv6 loopback should be preserved
-    assert report_bug.redact("Connection refused to [::1]:8080") == (
-        "Connection refused to [::1]:8080"
-    )
-    # Regular bracketed IPv6 should be redacted
-    assert report_bug.redact("TLS failed for [2001:db8::1]:443") == (
-        "TLS failed for <host>:443"
-    )
-    # Link-local IPv6
-    assert report_bug.redact("Connection refused to [fe80::1]:8080") == (
-        "Connection refused to <host>:8080"
-    )
+    def test_a_hosts_name_leaves_a_url_while_its_scheme_port_and_path_stay(self):
+        assert report_bug.redact("http://voicebox.lan:8355/tts") == "http://<host>:8355/tts"
+        assert report_bug.redact("https://api.elevenlabs.io/v1") == "https://<host>/v1"
+        assert report_bug.redact("ws://voicebox.lan:8355/socket") == "ws://<host>:8355/socket"
+        assert report_bug.redact("wss://secure.example.com:443/socket") == "wss://<host>:443/socket"
 
+    def test_loopback_survives_a_url_because_it_names_nobody(self):
+        assert report_bug.redact("http://127.0.0.1:8355/tts") == "http://127.0.0.1:8355/tts"
+        assert report_bug.redact("http://localhost:8355/tts") == "http://localhost:8355/tts"
 
-def test_ipv6_loopback_with_a_zone_id_is_still_loopback():
-    """A zone id (%eth0) names the interface, not the network — loopback stays visible.
+    def test_a_bare_address_in_a_log_line_is_a_host_too(self):
+        """urllib reasons name the address with no scheme in front of it — the URL rule never sees it."""
+        assert report_bug.redact("[Errno 111] Connection refused to 192.168.7.31") == (
+            "[Errno 111] Connection refused to <host>"
+        )
+        assert report_bug.redact("bound to 127.0.0.1 as always") == "bound to 127.0.0.1 as always"
+        assert report_bug.redact("plugin 0.3.2 python 3.10.12") == "plugin 0.3.2 python 3.10.12"
 
-    This catches the blocking issue where [::1%eth0] failed the loopback check in both
-    _redact_host and _redact_bare_host_port and was redacted like a private address,
-    hiding the most useful diagnostic fact (it was loopback) from the report.
-    """
-    # URL form: the zone id rides inside the brackets
-    assert report_bug.redact("http://[::1%eth0]:8355/tts") == "http://[::1%eth0]:8355/tts"
-    # Bare bracketed host:port form
-    assert report_bug.redact("Connection refused to [::1%lo]:443") == (
-        "Connection refused to [::1%lo]:443"
-    )
-    # A zone-id loopback with no port matches no host rule and travels as it is
-    assert report_bug.redact("bound to ::1%eth0") == "bound to ::1%eth0"
-    # But a zone id does not launder a NON-loopback address past the redactor
-    assert report_bug.redact("Connection refused to [fe80::1%eth0]:8080") == (
-        "Connection refused to <host>:8080"
-    )
-    assert report_bug.redact("http://[fe80::1%eth0]:8080/tts") == "http://<host>:8080/tts"
+    def test_a_bare_dotted_hostname_with_a_port_is_redacted(self):
+        """A private name in a failure reason is exactly what must not reach a public issue."""
+        assert report_bug.redact("Connection refused to deepgram.corp.internal:443") == (
+            "Connection refused to <host>:443"
+        )
+        assert report_bug.redact("TLS failed for deepgram.corp.internal:443") == (
+            "TLS failed for <host>:443"
+        )
+        assert report_bug.redact("Connection refused to voicebox.lan:8355") == (
+            "Connection refused to <host>:8355"
+        )
 
+    def test_a_private_ipv4_address_is_never_shown_with_or_without_a_port(self):
+        """The dotted quad is redacted in both spellings — no branch anywhere shows the IP."""
+        assert report_bug.redact("Connection refused to 192.168.7.31:8355") == (
+            "Connection refused to <host>:8355"
+        )
+        assert report_bug.redact("Connection at 10.0.0.1:443") == "Connection at <host>:443"
+        assert report_bug.redact("Connection refused to 192.168.7.31") == (
+            "Connection refused to <host>"
+        )
 
-def test_bracketed_loopback_host_port_matches_via_normalization():
-    """The bracketed "[::1]" form must pass the loopback check after the brackets are
-    stripped, not by leaning on a bracketed entry in the loopback set."""
-    assert report_bug.redact("Connection refused to [::1]:8080") == (
-        "Connection refused to [::1]:8080"
-    )
-    # The other loopback spellings are unaffected by the bracket/zone normalization
-    assert report_bug.redact("Connection refused to 127.0.0.1:8080") == (
-        "Connection refused to 127.0.0.1:8080"
-    )
-    assert report_bug.redact("Connection refused to localhost:8080") == (
-        "Connection refused to localhost:8080"
-    )
+    def test_loopback_survives_the_bare_rule_in_every_spelling(self):
+        assert report_bug.redact("Connection refused to 127.0.0.1:8355") == (
+            "Connection refused to 127.0.0.1:8355"
+        )
+        assert report_bug.redact("Connection refused to localhost:8355") == (
+            "Connection refused to localhost:8355"
+        )
+        assert report_bug.redact("Connection refused to [::1]:8080") == (
+            "Connection refused to [::1]:8080"
+        )
+        assert report_bug.redact("bound to ::1 as always") == "bound to ::1 as always"
 
+    def test_a_bracketed_ipv6_endpoint_is_redacted(self):
+        assert report_bug.redact("Connection refused to [fd00::1234]:443") == (
+            "Connection refused to <host>:443"
+        )
+        assert report_bug.redact("TLS failed for [2001:db8::1]:443") == "TLS failed for <host>:443"
+        assert report_bug.redact("Connection refused to [fe80::1]:8080") == (
+            "Connection refused to <host>:8080"
+        )
 
-def test_bare_host_port_times_are_not_corrupted():
-    """Plain times like '05:17' should NOT be corrupted to '<host>:17'.
+    def test_a_bracketed_ipv6_with_no_port_is_still_a_host(self):
+        """The port is optional for an IP literal: `[fd00::1234]` names the network on its own."""
+        assert report_bug.redact("Connection refused to [fd00::1234]") == (
+            "Connection refused to <host>"
+        )
+        assert report_bug.redact("http://[fd00::1234]/tts") == "http://<host>/tts"
 
-    This catches the low-priority issue where the regex was too permissive and
-    matched plain time strings.
-    """
-    # Time patterns should be preserved
-    assert report_bug.redact("Log started at 05:17") == "Log started at 05:17"
-    assert report_bug.redact("Meeting at 09:30") == "Meeting at 09:30"
-    assert report_bug.redact("Start time: 12:00") == "Start time: 12:00"
-    assert report_bug.redact("14:30:45") == "14:30:45"
-    # But host:port with dots should still work
-    assert report_bug.redact("Connection at 10.0.0.1:443") == "Connection at <host>:443"
+    def test_an_unbracketed_ipv6_in_prose_is_a_host(self):
+        """A reason string has no brackets to offer: "Connection refused to fd00::1234"."""
+        assert report_bug.redact("Connection refused to fd00::1234") == (
+            "Connection refused to <host>"
+        )
+        assert report_bug.redact("bound to fd00::1%eth0") == "bound to <host>"
+        assert report_bug.redact("stt unreachable: 2001:db8::8a2e:370:7334") == (
+            "stt unreachable: <host>"
+        )
+
+    def test_a_zone_id_may_carry_dots_and_underscores(self):
+        """A zone id is an interface NAME — `eth0.100` and `br_lan` are ordinary ones."""
+        assert report_bug.redact("Connection refused to [fd00::1%eth0_0]:8443") == (
+            "Connection refused to <host>:8443"
+        )
+        assert report_bug.redact("Connection refused to [fd00::1%eth0.100]:8443") == (
+            "Connection refused to <host>:8443"
+        )
+        assert report_bug.redact("bound to fe80::1%br_lan") == "bound to <host>"
+
+    def test_a_zone_id_does_not_hide_that_an_address_is_loopback(self):
+        """A zone id names the interface, not the network — loopback stays visible with one on."""
+        assert report_bug.redact("http://[::1%eth0]:8355/tts") == "http://[::1%eth0]:8355/tts"
+        assert report_bug.redact("Connection refused to [::1%lo]:443") == (
+            "Connection refused to [::1%lo]:443"
+        )
+        assert report_bug.redact("bound to ::1%eth0") == "bound to ::1%eth0"
+
+    def test_a_zone_id_does_not_launder_a_private_address_past_the_redactor(self):
+        assert report_bug.redact("Connection refused to [fe80::1%eth0]:8080") == (
+            "Connection refused to <host>:8080"
+        )
+        assert report_bug.redact("http://[fe80::1%eth0]:8080/tts") == "http://<host>:8080/tts"
+
+    def test_the_expanded_ipv6_loopback_is_preserved_by_both_passes(self):
+        """`0:0:0:0:0:0:0:1` is `::1` written out. The URL pass kept it and the bare pass then
+        redacted it, because each carried its own idea of loopback."""
+        assert report_bug.redact("http://[0:0:0:0:0:0:0:1]:8355/tts") == (
+            "http://[0:0:0:0:0:0:0:1]:8355/tts"
+        )
+        assert report_bug.redact("Connection refused to [0:0:0:0:0:0:0:1]:443") == (
+            "Connection refused to [0:0:0:0:0:0:0:1]:443"
+        )
+        assert report_bug.redact("bound to 0:0:0:0:0:0:0:1") == "bound to 0:0:0:0:0:0:0:1"
+        assert report_bug.redact("bound to 0:0:0:0:0:0:0:1%lo") == "bound to 0:0:0:0:0:0:0:1%lo"
+        assert report_bug.redact("Connection refused to [0:0:0:0:0:0:0:1%eth0]:443") == (
+            "Connection refused to [0:0:0:0:0:0:0:1%eth0]:443"
+        )
+
+    def test_one_loopback_set_answers_for_every_pass(self, monkeypatch):
+        """The set is the single source: a spelling added to it is loopback EVERYWHERE at once.
+
+        A rule that kept its own private tuple would ignore this and redact the planted spelling.
+        """
+        monkeypatch.setattr(
+            report_bug, "_LOOPBACK_HOSTS", frozenset(report_bug._LOOPBACK_HOSTS | {"fc00::dead"})
+        )
+        assert report_bug.redact("http://[fc00::dead]:8355/tts") == "http://[fc00::dead]:8355/tts"
+        assert report_bug.redact("Connection refused to [fc00::dead]:443") == (
+            "Connection refused to [fc00::dead]:443"
+        )
+        assert report_bug.redact("bound to fc00::dead%eth0") == "bound to fc00::dead%eth0"
+
+    def test_the_loopback_set_carries_no_bracketed_spelling(self):
+        """Brackets are punctuation the predicate strips, so `[::1]` must not be an entry — and the
+        preservation of `[::1]:8080` above must therefore rest on the normalisation, not on a
+        duplicate entry that happens to match."""
+        assert "[::1]" not in report_bug._LOOPBACK_HOSTS
+        assert report_bug._is_loopback("[::1]")
+        assert report_bug._is_loopback("[::1%lo]")
+        assert report_bug._is_loopback("0:0:0:0:0:0:0:1")
+        assert not report_bug._is_loopback("[fd00::1]")
+
+    def test_source_locations_and_key_value_tokens_are_not_hosts(self):
+        """The bare rule runs over log prose. These are the report's diagnostic value; it may not
+        eat them to look thorough."""
+        assert report_bug.redact("voice_loop/session.py:117: warning") == (
+            "voice_loop/session.py:117: warning"
+        )
+        assert report_bug.redact("File app.py:42") == "File app.py:42"
+        assert report_bug.redact("websocket closed code:1006") == "websocket closed code:1006"
+        assert report_bug.redact("worker pid:4321 task:42") == "worker pid:4321 task:42"
+        assert report_bug.redact("config ignored (~/.config/voice-loop/config.json): nope") == (
+            "config ignored (~/.config/voice-loop/config.json): nope"
+        )
+        assert report_bug.redact("dictate.debounce_ms is not a usable number") == (
+            "dictate.debounce_ms is not a usable number"
+        )
+
+    def test_timestamps_and_clock_times_are_not_hosts(self):
+        assert report_bug.redact("2026-08-07T05:17:33 stt unreachable") == (
+            "2026-08-07T05:17:33 stt unreachable"
+        )
+        assert report_bug.redact("Log started at 05:17") == "Log started at 05:17"
+        assert report_bug.redact("Meeting at 09:30") == "Meeting at 09:30"
+        assert report_bug.redact("Start time: 12:00") == "Start time: 12:00"
+        assert report_bug.redact("14:30:45") == "14:30:45"
+
+    def test_a_single_label_host_is_deliberately_left_alone(self):
+        """The grammar that catches `voicebox:8355` also catches `code:1006` and `pid:4321`. The
+        alternative was dropped: a dotless service name is the cheaper loss, and this pins that the
+        loss is a decision rather than a gap that gets 'fixed' back into the over-match."""
+        assert report_bug.redact("Connection refused to voicebox:8355") == (
+            "Connection refused to voicebox:8355"
+        )
+
+    def test_the_port_grammar_is_the_same_for_every_host_shape(self):
+        """One port fragment, so a one-digit port is not a host on one shape and prose on another."""
+        assert report_bug.redact("Connection refused to deepgram.corp.internal:8") == (
+            "Connection refused to <host>:8"
+        )
+        assert report_bug.redact("Connection refused to [fd00::1234]:8") == (
+            "Connection refused to <host>:8"
+        )
+
+    def test_inline_credentials_leave_with_the_host_they_name(self):
+        """`user:pass@host` is a password in a URL; the host rule owns it, in both spellings."""
+        assert report_bug.redact("http://user:pw@voicebox.lan:8355/tts") == (
+            "http://<user>@<host>:8355/tts"
+        )
+        assert report_bug.redact("Connection refused to user:pw@deepgram.corp.internal:443") == (
+            "Connection refused to <user>@<host>:443"
+        )
 
 
 # --- the log vocabulary ------------------------------------------------------------------------------

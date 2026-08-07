@@ -117,45 +117,94 @@ def _default_runner(argv: Sequence[str], timeout: float) -> "subprocess.Complete
 
 _HOME = os.path.expanduser("~")
 _OTHER_HOME_RE = re.compile(r"(/(?:home|Users)/)[^/\s:\"']+")
-# URL rule: matches http/https/ws/wss with their hosts, plus bare host:port combinations
-# (e.g. "Connection refused to deepgram.corp.internal:443" or "TLS failed for api.example.com:443")
-# Handles bracketed IPv6 ([fd00::1234]:8355) with optional zone IDs (%eth0).
-_URL_RE = re.compile(r"\b((?:https?|wss?)://)(\[([^\]]+)\](?::(\d+))?|([^\s/:\"'<>)\]]+)(?::(\d+))?)")
-# A bare *host:port* without scheme: "Connection refused to deepgram.corp.internal:443"
-# This catches what _URL_RE does not: URLs without a scheme, or just host:port in prose.
-# We need to match:
-#   - hostname:port (e.g. deepgram.corp.internal:443, api.example.com:8080)
-#   - IPv4:port (e.g. 192.168.7.31:8355) - but loopback IPs are preserved
-#   - IPv6:port (e.g. [::1]:8080)
-# We need to constrain the host pattern to avoid false positives like times "05:17":
-#   - Must contain a dot (hostname) or be bracketed IPv6, or match known loopback
-#   - This prevents matching plain times like "05:17" or "09:30"
-# The host side must be one of:
-#   1. Bracketed IPv6: [fd00::1234] or [::1]
-#   2. A hostname with a dot: deepgram.corp.internal
-#   3. A known loopback without brackets: localhost, 127.0.0.1, 0.0.0.0
-# The pattern for (2) requires at least one dot, preventing "05:17" from matching
-# (no dot in "05" or "09").
+
+# --- one host grammar --------------------------------------------------------------------------
+#
+# A host is spelled the same way whether a scheme precedes it or not, so what a host LOOKS LIKE is
+# described once, here, and both passes below are assembled from these fragments. Two hand-rolled
+# grammars is how a spelling ends up understood by one pass and not the other (a portless
+# `[fd00::1234]`), and how one pass keeps a loopback the other redacts. There is one grammar now,
+# and one loopback predicate (`_is_loopback`) that every site calls.
+
+# An IPv6 literal, anchored on the two spellings that cannot be anything else: a `::` elision, or
+# the full eight groups. Nothing looser is safe, because this grammar also runs over log PROSE,
+# where `05:17:33` is a clock and `[INFO]` is a level. The last character must be hex or a colon so
+# a sentence's full stop is not swallowed; `.` is in the class for the IPv4-mapped form
+# (`::ffff:10.0.0.1`). Every quantifier is BOUNDED at the literal's 45-character maximum, so a log
+# line that is one long hex blob costs a fixed amount of work per position rather than a quadratic
+# scan of the rest of the line.
+_IPV6 = (
+    r"(?=[0-9A-Fa-f:.]{0,45}::|(?:[0-9A-Fa-f]{1,4}:){7}[0-9A-Fa-f]{1,4}(?![0-9A-Fa-f]))"
+    r"[0-9A-Fa-f:.]{1,44}[0-9A-Fa-f:]"
+)
+# A zone id names an INTERFACE, not a network, and Linux lets an interface be called nearly
+# anything — `eth0`, `eth0.100`, `br_lan`, `wlp3s0-ap`. Inside brackets it is therefore any run up
+# to the closing bracket; bare in prose it is bounded to the interface-name charset so it cannot
+# swallow the words after the address.
+_ZONE_IN_BRACKETS = r"(?:%[^\]\s]+)?"
+_ZONE_BARE = r"(?:%[A-Za-z0-9._-]+)?"
+
+_HOST_BRACKETED_IPV6 = rf"\[{_IPV6}{_ZONE_IN_BRACKETS}\]"
+_HOST_BARE_IPV6 = rf"(?<![0-9A-Za-z:._%-]){_IPV6}{_ZONE_BARE}"
+# A NAME is recognisable as a host only by its shape: dotted labels ending in a TLD-ish label of
+# two or more letters. A SINGLE-label host (`voicebox:8355`) is deliberately not matched at all —
+# every grammar that catches it also eats `code:1006`, `pid:4321` and `task:42`, and a close code
+# missing from a bug report costs more than a dotless service name kept.
+_HOST_DOTTED_NAME = r"(?:[A-Za-z0-9_-]+\.)+[A-Za-z]{2,24}"
+# Credentials ride in front of a host as `user:pass@`; they leave with the host they name. Bounded
+# like everything else here: this fragment sits in front of every alternative, so an unbounded run
+# would rescan the rest of the line from every position of a long token.
+_USERINFO = r"(?:[^\s/@\"'<>]{1,128}@)?"
+# One port grammar for every alternative in both passes.
+_PORT = r"\d{1,5}(?!\d)"
+
+# The scheme'd form. The port is optional (`https://api.example.com/v1` has none) and so is the
+# userinfo. After a scheme, ANY run up to the path is a host — a name needs no dot to be one there,
+# and bracket content the IPv6 grammar does not recognise is redacted by the catch-all rather than
+# left standing.
+_URL_RE = re.compile(
+    rf"\b(?P<scheme>(?:https?|wss?)://)(?P<userinfo>{_USERINFO})"
+    rf"(?P<host>{_HOST_BRACKETED_IPV6}|[^\s/:\"'<>)\]]+)"
+    rf"(?::(?P<port>{_PORT}))?"
+)
+# The same host, bare in prose: "Connection refused to deepgram.corp.internal:443", "TLS failed for
+# [fd00::1234]:8443", "bound to fe80::1%eth0". Two families, because they are not equally
+# recognisable:
+#   * an IP LITERAL is a host on sight, so the port is optional — a portless `[fd00::1234]` names
+#     the user's network exactly as precisely as one with a port;
+#   * a NAME is a host only because a port follows it, so the port is required. Without that,
+#     `dictate.debounce_ms`, `config.json` and every other dotted token in the logs would be read
+#     as a host and destroyed.
+# A dotted quad is handled by `_IPV4_RE` below rather than by a fourth alternative here: it needs
+# rewriting with or without a port, which is exactly what that rule already does.
 _BARE_HOST_PORT_RE = re.compile(
-    # Bracketed IPv6:port (e.g. [fd00::1234]:443, [fe80::1%eth0]:8080) - must be first
-    # Note: no \b before [ because \b matches between word/non-word, and [ is non-word
-    # Zone ID (%eth0) is allowed after the IPv6 address, before ]
-    # The IPv6 part is [0-9a-fA-F:], zone ID is [a-zA-Z0-9-]+
-    r"(\[[0-9a-fA-F:]+(?:%[a-zA-Z0-9-]+)?\]):(\d{1,5})\b"
-    # Hostname:port (must contain a dot like deepgram.corp.internal:443)
-    r"|\b([^\s/:\"'<>)\]]+\.[^\s/:\"'<>)\]]+):(\d{1,5})\b"
-    # Known loopback without brackets (e.g. localhost:8080, 127.0.0.1:8355)
-    r"|\b((?:localhost|127\.0\.0\.1|0\.0\.0\.0)):(\d{1,5})\b"
-    # Single-label hostname with port: must have at least one letter (to avoid matching
-    # times like "05:17" which have no letters). Port must be 2-5 digits.
-    r"|\b([^\s/:\"'<>)\]]*[a-zA-Z][^\s/:\"'<>)\]]*):(\d{2,5})\b"
+    rf"(?P<ipuser>{_USERINFO})(?P<ip>{_HOST_BRACKETED_IPV6}|{_HOST_BARE_IPV6})"
+    rf"(?::(?P<ipport>{_PORT}))?"
+    rf"|(?P<nameuser>{_USERINFO})\b(?P<name>{_HOST_DOTTED_NAME}|localhost):(?P<nameport>{_PORT})"
 )
 # An address also reaches the logs bare, with no scheme in front of it: "Connection refused to
 # 192.168.7.31" is a urllib reason string, and it names the user's network just as precisely as a
-# URL does. A dotted quad is unambiguous enough to rewrite on sight (a version number has three
-# components, not four); a bare *hostname* in prose is not, and is left to the URL rule.
+# URL does. A dotted quad is unambiguous enough to rewrite on sight, port or no port (a version
+# number has three components, not four); a bare *hostname* in prose is not, and is left to the two
+# rules above.
 _IPV4_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
-_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", "[::1]", "0.0.0.0"})
+
+# The ONE loopback set. Every spelling lives here and nowhere else — `_is_loopback` normalises
+# before asking, so brackets, a zone id and letter case are not separate entries.
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", "0:0:0:0:0:0:0:1", "0.0.0.0"})
+
+# `session.py:117` and `File app.py:42` are source locations and `spoken.ledger:3` is a state file
+# — a bug report exists to carry them, and the host grammar above cannot tell them from
+# `voicebox.lan:8355` on shape alone. The trade is deliberate and it runs one way: a host whose
+# last label is a source-file suffix is kept. Some of these are also real TLDs (`.py` is Paraguay),
+# so an endpoint spelled like a filename survives redaction — the diagnostics are worth it.
+_FILE_SUFFIXES = frozenset({
+    "bak", "bash", "bz2", "c", "cc", "cfg", "conf", "cpp", "crt", "css", "csv", "db", "err", "flac",
+    "gif", "gz", "h", "hpp", "html", "ini", "jpeg", "jpg", "js", "json", "key", "kt", "ledger",
+    "lock", "log", "lua", "m4a", "md", "mjs", "mp3", "ogg", "out", "pdf", "pem", "php", "pid",
+    "png", "py", "pyc", "pyi", "rb", "rs", "rst", "sh", "sock", "sql", "sqlite", "svg", "swift",
+    "tar", "tmp", "toml", "ts", "tsv", "txt", "wav", "xml", "xz", "yaml", "yml", "zip",
+})
 
 # Ordered: the shaped credentials first (so a token is named as one), the catch-all long run last.
 # The catch-all is deliberately blunt — anything 32 characters of key-alphabet long is either a
@@ -189,84 +238,49 @@ def usernames() -> tuple[str, ...]:
     return tuple(sorted((name for name in names if len(name) >= 3), key=len, reverse=True))
 
 
-def _redact_host(match: "re.Match[str]") -> str:
-    """Redact the host in a URL match, preserving loopback addresses.
+def _is_loopback(host: str) -> bool:
+    """The one loopback question, asked the one way, by every rule in this section.
 
-    The URL regex has two alternatives:
-    1. Bracketed IPv6: `[...]`:port - groups (1)=scheme, (2)=bracketed+port, (3)=IPv6, (4)=port
-    2. Hostname:port - groups (1)=scheme, (2)=hostname:port, (5)=hostname, (6)=port
+    Normalised before it is asked: brackets are punctuation around an IPv6 literal, a zone id names
+    the interface rather than the network, and case is not a fact — so `[::1]`, `::1%lo` and `::1`
+    are one answer. Loopback is the fact a bug report most wants to keep: it names nobody, and "the
+    server was not listening on this machine" is the diagnosis half these reports need.
     """
-    netloc = match.group(2)
-    scheme = match.group(1)
-    # Determine which alternative matched
-    ipv6 = match.group(3)  # Bracketed IPv6 case
-    hostname = match.group(5)  # Hostname case
+    return host.strip("[]").split("%", 1)[0].lower() in _LOOPBACK_HOSTS
 
-    if ipv6 is not None:
-        # Bracketed IPv6 case: netloc is [ipv6]:port or [ipv6]
-        # Group 4 has the port if present. A zone id (%eth0) names the interface, not the
-        # network — strip it before the loopback comparison so [::1%lo] stays visible.
-        port = match.group(4)
-        ipv6_base = ipv6.lower().split("%", 1)[0]
-        if port:
-            host = f"[{ipv6}]:{port}"
-            if ipv6_base in ("::1", "0:0:0:0:0:0:0:1"):
-                return match.group(0)  # loopback is the fact worth keeping
-            return f"{scheme}<host>:{port}"
-        else:
-            host = f"[{ipv6}]"
-            if ipv6_base in ("::1", "0:0:0:0:0:0:0:1"):
-                return match.group(0)  # loopback is the fact worth keeping
-            return f"{scheme}<host>"
-    else:
-        # Hostname case
-        host, sep, port = netloc.rpartition(":")
-        if not sep or not port.isdigit():  # no port: the whole netloc is the host
-            host, sep, port = netloc, "", ""
-        if host.lower() in _LOOPBACK_HOSTS:
-            return match.group(0)  # loopback is the fact worth keeping, and it names nobody
 
-    # Redact the host, keep the scheme and port
-    return f"{scheme}<host>{sep}{port}"
+def _looks_like_a_file(host: str) -> bool:
+    """True for `session.py`, `config.json`, `spoken.ledger` — a path, not an endpoint."""
+    return host.rsplit(".", 1)[-1].lower() in _FILE_SUFFIXES
+
+
+def _redact_host(match: "re.Match[str]") -> str:
+    """A scheme'd URL with its host gone: `http://voicebox.lan:8355/tts` -> `http://<host>:8355/tts`.
+
+    The scheme, the port and the path stay — they are the diagnosis. Inline credentials
+    (`user:pass@`) leave with the host.
+    """
+    host, port = match.group("host"), match.group("port")
+    lead = "<user>@" if match.group("userinfo") else ""
+    shown = host if _is_loopback(host) else "<host>"
+    return f"{match.group('scheme')}{lead}{shown}" + (f":{port}" if port else "")
 
 
 def _redact_bare_host_port(match: "re.Match[str]") -> str:
-    """Redact the host in a bare host:port match, preserving loopback addresses.
+    """The same host with no scheme in front of it, as urllib's reason strings spell it.
 
-    Matches things like "Connection refused to deepgram.corp.internal:443"
-    or "TLS failed for api.example.com:8080" or "[fd00::1234]:443" or "voicebox:8355".
-
-    The regex has four alternatives with different capture groups:
-    1. Bracketed IPv6: groups (1)=host, (2)=port
-    2. Hostname with dot: groups (3)=host, (4)=port
-    3. Known loopback without brackets: groups (5)=host, (6)=port
-    4. Single-label hostname: groups (7)=host, (8)=port
+    Either the IP-literal alternative matched (port optional) or the dotted-name one did (port
+    required); the two groups are read the same way and answered by the same predicate.
     """
-    # Determine which alternative matched by checking which host group is not None
-    if match.group(1) is not None:
-        # Bracketed IPv6 case
-        host, port = match.group(1), match.group(2)
-    elif match.group(3) is not None:
-        # Hostname case (must have a dot by pattern)
-        host, port = match.group(3), match.group(4)
-    elif match.group(5) is not None:
-        # Known loopback case
-        host, port = match.group(5), match.group(6)
+    if match.group("ip") is not None:
+        host, port, userinfo = match.group("ip"), match.group("ipport"), match.group("ipuser")
     else:
-        # Single-label hostname case (group 7 is host, group 8 is port)
-        host, port = match.group(7), match.group(8)
-
-    # Preserve loopback hosts (like 127.0.0.1, localhost, [::1]). Normalize first: the bracketed
-    # form arrives as "[::1]" and a zone id (%eth0) names the interface, not the network — neither
-    # should decide whether the address is loopback.
-    normalized = host.lower().strip("[]").split("%", 1)[0]
-    if normalized in _LOOPBACK_HOSTS:
-        return match.group(0)  # preserve loopback
-    # For IPv4 addresses (without brackets), keep as <host>:port (IP is fine to show)
-    if re.match(r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$", host):
-        return f"<host>:{port}"
-    # For bracketed IPv6 or hostnames, redact the host part
-    return f"<host>:{port}"
+        host, port, userinfo = match.group("name"), match.group("nameport"), match.group("nameuser")
+    if _looks_like_a_file(host):
+        return match.group(0)  # a traceback location is the report's whole diagnostic value
+    lead = "<user>@" if userinfo else ""
+    shown = host if _is_loopback(host) else "<host>"
+    return f"{lead}{shown}:{port}" if port else f"{lead}{shown}"
 
 
 def redact(text: str) -> str:
@@ -285,10 +299,10 @@ def redact(text: str) -> str:
     for name in usernames():
         text = re.sub(rf"\b{re.escape(name)}\b", "<user>", text)
     text = _URL_RE.sub(_redact_host, text)
-    # Redact bare host:port combinations (e.g. "Connection refused to deepgram.corp.internal:443")
-    # Run this before _IPV4_RE so the loopback check works correctly
+    # Then the same hosts bare in prose ("Connection refused to deepgram.corp.internal:443"), and
+    # last the dotted quad, which needs no port to be an address.
     text = _BARE_HOST_PORT_RE.sub(_redact_bare_host_port, text)
-    text = _IPV4_RE.sub(lambda m: m.group(0) if m.group(0) in _LOOPBACK_HOSTS else "<host>", text)
+    text = _IPV4_RE.sub(lambda m: m.group(0) if _is_loopback(m.group(0)) else "<host>", text)
     for pattern, replacement in _SECRET_PATTERNS:
         text = pattern.sub(replacement, text)
     return text
