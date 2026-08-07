@@ -17,6 +17,7 @@ import base64
 import hashlib
 import importlib.util
 import io
+import itertools
 import json
 import os
 import signal
@@ -1695,6 +1696,411 @@ def test_an_eager_firing_with_nothing_new_stays_out_of_the_log(state, monkeypatc
     before = _speak_log(state)
     assert _fire(state, monkeypatch, transcript, "PostToolUse")[0] == 0
     assert _speak_log(state) == before  # not one line added by a firing that lost nothing
+
+
+# --- #106: the flush that outlasts the ladder, and the reason line every Stop exit owes -----------
+#
+# The live silence these pin: a long turn (several tool calls, then a long final text) whose final
+# assistant message had not reached the transcript when the fixed 2.65 s ladder ran out, with
+# NOTHING playing to extend the wait. The hook exited 0, spoke nothing, and wrote no log line at
+# all — so the only evidence of the drop was the absence of evidence, and conformance row 3.12
+# ("a turn with NO log line at all is a FAIL") was violated by the give-up path itself.
+
+
+# Four seconds in — past the whole 2.65 s ladder, which is what made the live turn unrecoverable.
+FLUSH_SECONDS_LATE = 4.0
+
+# The budget the composed ceiling has to fit inside, mirrored from THIS plugin's own manifest:
+# hooks/hooks.json declares "timeout": 90 on both registrations. Mirrored rather than imported
+# because the test is about the RELATION, and asserted against the manifest below so the mirror
+# cannot quietly drift from the file it claims to quote.
+HOOK_TIMEOUT_S = 90
+
+
+def test_the_mirrored_hook_timeout_is_the_one_the_manifest_declares():
+    manifest = json.loads((Path(__file__).resolve().parents[1] / "hooks" / "hooks.json").read_text(encoding="utf-8"))
+    declared = {
+        entry["timeout"]
+        for registrations in manifest["hooks"].values()
+        for registration in registrations
+        for entry in registration["hooks"]
+    }
+    assert declared == {HOOK_TIMEOUT_S}
+
+
+class _FakeStat:
+    """What os.stat gives wait_out_flush, and the only two fields it reads."""
+
+    def __init__(self, size: int, mtime_ns: int) -> None:
+        self.st_size = size
+        self.st_mtime_ns = mtime_ns
+
+
+def _never(*args, **kwargs):
+    raise AssertionError("an idle transcript must not be waited on, re-read, or slept over")
+
+
+class TestTranscriptActivity:
+    """One syscall, two fields — the whole evidence the extension hangs on."""
+
+    def test_it_moves_when_the_file_is_appended_to(self, tmp_path):
+        transcript = tmp_path / "transcript.jsonl"
+        transcript.write_text("one", encoding="utf-8")
+        before = speak.transcript_activity(str(transcript))
+        assert before == (3, transcript.stat().st_mtime_ns)
+        with transcript.open("a", encoding="utf-8") as fh:
+            fh.write("two")
+        assert speak.transcript_activity(str(transcript)) != before
+
+    def test_a_file_that_cannot_be_stat_ed_is_one_unchanging_value(self, tmp_path):
+        """None compares equal to the next None, so an unreadable transcript ends the wait at once
+        — the same verdict the pre-#106 code reached without looking at all."""
+        assert speak.transcript_activity(str(tmp_path / "gone.jsonl")) is None
+
+
+class TestWaitOutFlush:
+    """The wait itself, on a fake clock and a fake stat: no transcript, no reader, no sleep."""
+
+    @pytest.fixture
+    def sleeps(self, monkeypatch) -> list[float]:
+        recorded: list[float] = []
+        monkeypatch.setattr(speak.time, "sleep", lambda seconds: recorded.append(seconds))
+        return recorded
+
+    def test_an_idle_transcript_costs_one_stat_and_nothing_else(self, state, sleeps):
+        """The cheap path, and the one every quiet turn takes: the file did not move while the
+        ladder ran, so there is nobody to wait for and the caller's give-up stands unchanged."""
+        text = speak.wait_out_flush(
+            "transcript.jsonl", _never, _never, None, (10, 5), stat=lambda path: _FakeStat(10, 5)
+        )
+        assert text is None
+        assert sleeps == []
+        assert _speak_log(state) == ""  # the give-up line belongs to the caller, not here
+
+    def test_a_growing_transcript_buys_the_late_line_its_polls(self, state, sleeps):
+        sizes = iter([20, 30, 40, 50])
+        answers = iter([None, None, "the line the flush was still writing"])
+        text = speak.wait_out_flush(
+            "transcript.jsonl",
+            lambda: next(answers),
+            lambda value: bool(value),
+            None,
+            (10, 5),
+            stat=lambda path: _FakeStat(next(sizes), 5),
+        )
+        assert text == "the line the flush was still writing"
+        assert sleeps == [speak.FLUSH_POLL] * 3
+        assert "landed 0.75s past the ladder" in _speak_log(state)
+
+    def test_a_message_that_marked_nothing_is_not_called_a_line(self, state, sleeps):
+        """settled() is true for '' as well — a message that parsed and marked NOTHING is a final
+        answer and lands here exactly like a line does. Saying "the line landed" over it would put
+        a line in the log that was never in the transcript."""
+        sizes = iter([20, 30])
+        answers = iter([""])
+        text = speak.wait_out_flush(
+            "transcript.jsonl",
+            lambda: next(answers),
+            lambda value: value == "" or bool(value),
+            None,
+            (10, 5),
+            stat=lambda path: _FakeStat(next(sizes), 5),
+        )
+        assert text == ""
+        assert "a message with nothing marked landed 0.25s past the ladder" in _speak_log(state)
+        assert "the line landed" not in _speak_log(state)
+
+    def test_the_wait_ends_the_moment_the_file_stops_growing(self, state, sleeps):
+        """A writer that fell quiet has answered the question: whatever was coming is not coming."""
+        sizes = iter([20, 30, 30])
+        text = speak.wait_out_flush(
+            "transcript.jsonl",
+            lambda: None,
+            lambda value: bool(value),
+            None,
+            (10, 5),
+            stat=lambda path: _FakeStat(next(sizes), 5),
+        )
+        assert text is None
+        assert sleeps == [speak.FLUSH_POLL] * 2
+        assert "stopped growing after 0.50s" in _speak_log(state)
+
+    def test_the_wait_is_bounded_however_long_the_file_keeps_growing(self, state, sleeps):
+        """A writer that never stops must not hold the turn open: the bound is a COUNT of polls,
+        for the same reason PLAYBACK_POLLS is — that is the bound a fake sleep can drive."""
+        size = itertools.count(20, 10)
+        text = speak.wait_out_flush(
+            "transcript.jsonl",
+            lambda: None,
+            lambda value: bool(value),
+            "the stale read",
+            (10, 5),
+            stat=lambda path: _FakeStat(next(size), 5),
+        )
+        assert text is None  # the freshest read, unsettled — the caller logs the give-up over it
+        assert len(sleeps) == speak.FLUSH_POLLS
+        assert "still growing after 12.5s — waiting no longer" in _speak_log(state)
+
+
+class TestALineThatLandsPastTheLadder:
+    """THE #106 ACCEPTANCE CASE, end to end through the real main(), with nothing playing."""
+
+    def test_a_message_flushed_after_the_ladder_is_spoken_rather_than_dropped(self, state, monkeypatch):
+        """The reproduction, in the shape the forensics reconstructed: a turn still being written
+        when the 2.65 s ladder ends. The transcript GROWS throughout (the turn's own records land
+        while the final assistant message is still on its way), and that growth is what buys the
+        line its polls — four seconds in, past the whole fixed ladder, it arrives and is spoken.
+
+        Nothing is playing here, which is exactly why the pre-#106 hook dropped it: wait_out_playback
+        looks at an empty stage and hands the give-up straight back."""
+        transcript = state / "transcript.jsonl"
+        transcript.write_text("", encoding="utf-8")
+        spoken = _record_speech(monkeypatch)
+        _write_config(state, monkeypatch)  # eager off: the default, and the configuration that was hit
+
+        elapsed = [0.0]
+
+        def fake_sleep(seconds: float) -> None:
+            elapsed[0] += seconds
+            if elapsed[0] < FLUSH_SECONDS_LATE:
+                # mid-flush: the turn's own records are landing while the message is not there yet
+                with transcript.open("a", encoding="utf-8") as fh:
+                    fh.write(json.dumps({"type": "user", "message": {"content": []}}) + "\n")
+            elif "🔊" not in transcript.read_text(encoding="utf-8"):
+                _append_message(transcript, "🔊 the line the flush was still writing")
+
+        payload = json.dumps({"transcript_path": str(transcript), "hook_event_name": "Stop"})
+        monkeypatch.setattr(speak.sys, "stdin", _Stdin(payload))
+        monkeypatch.setattr(speak.time, "sleep", fake_sleep)
+        assert speak.main() == 0
+
+        assert spoken == ["the line the flush was still writing"]  # voiced, not dropped
+        assert elapsed[0] > sum(speak.BACKOFF)  # and it really did outlive the fixed ladder
+        assert "past the ladder" in _speak_log(state)
+        assert "DROPPED" not in _speak_log(state)
+
+    def test_a_transcript_nobody_is_writing_still_gives_up_after_the_same_2_65_seconds(
+        self, state, monkeypatch
+    ):
+        """The other direction, and the promise the extension had to keep: an idle transcript is
+        answered by one stat, so a turn with genuinely nothing behind it costs the ladder and not
+        one poll more."""
+        rc, sleeps = _run_main_against("{not json yet", state, monkeypatch)
+        assert (rc, sleeps) == (0, list(speak.BACKOFF))
+        assert "gave up with nothing new in the transcript" in _speak_log(state)
+
+
+class TestTheComposedCeiling:
+    """What ONE firing can cost when everything goes wrong at once.
+
+    The three waits run in SEQUENCE inside one main(), and a bound nobody measured is a bound
+    nobody has: the ladder, then the wedged-player wait, then the growing-transcript wait. This
+    pins their SUM, so a future poll-count change cannot quietly walk the Stop hook past the 60 s
+    the harness allows it.
+    """
+
+    def test_a_wedged_player_and_a_growing_transcript_cost_exactly_the_three_bounds(
+        self, state, monkeypatch
+    ):
+        transcript = state / "transcript.jsonl"
+        transcript.write_text("", encoding="utf-8")
+        _write_config(state, monkeypatch)
+        # A player that never exits: playback_is_live stays true for every poll of the first wait.
+        monkeypatch.setattr(speak, "playback_is_live", lambda: True)
+
+        sleeps: list[float] = []
+
+        def fake_sleep(seconds: float) -> None:
+            # …and a transcript somebody keeps appending to, so the second wait runs to ITS bound
+            # too. Nothing marked ever lands, so no read can settle and cut either wait short.
+            sleeps.append(seconds)
+            with transcript.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps({"type": "user", "message": {"content": []}}) + "\n")
+
+        payload = json.dumps({"transcript_path": str(transcript), "hook_event_name": "Stop"})
+        monkeypatch.setattr(speak.sys, "stdin", _Stdin(payload))
+        monkeypatch.setattr(speak.time, "sleep", fake_sleep)
+        assert speak.main() == 0
+
+        expected = (
+            sum(speak.BACKOFF)
+            + speak.PLAYBACK_POLLS * speak.PLAYBACK_POLL
+            + speak.FLUSH_POLLS * speak.FLUSH_POLL
+        )
+        assert sum(sleeps) == pytest.approx(expected)
+        # THE RELATION, not the arithmetic: what matters is that the composed ceiling fits inside
+        # the budget this plugin declares for its own hooks. A future poll-count change is free to
+        # move the sum; it is not free to walk the Stop hook past its own timeout.
+        assert expected < HOOK_TIMEOUT_S
+        log_text = _speak_log(state)
+        # and it says what it waited for, twice, before saying what it decided — the docs claim a
+        # reason line always, never that there is exactly one
+        assert "still playing after" in log_text
+        assert "still growing after" in log_text
+        assert "gave up with nothing new in the transcript" in log_text
+
+
+class TestTheFlushWaitIsEagerOffOnly:
+    """The gate: a Stop firing with `speak.eager` ON never waits on a growing transcript.
+
+    Not a performance nicety — the whole read-claim-speak sequence runs under speaking.lock, so a
+    Stop that waits 12.5 s is 12.5 s in which no eager firing can speak at all. And it buys
+    nothing: the next PostToolUse firing reads EVERY message, so the late line is said for free one
+    tool call later. #106 was reported on the default (eager-off) install, which is exactly the
+    configuration with no successor to fall back on.
+    """
+
+    def _growing(self, monkeypatch, state) -> None:
+        """A transcript that advances on every single look — the condition the wait polls on."""
+        counter = itertools.count()
+        monkeypatch.setattr(speak, "transcript_activity", lambda path, stat=os.stat: (next(counter), 0))
+
+    def test_an_eager_stop_with_nothing_marked_at_all_never_polls_the_transcript(
+        self, state, monkeypatch
+    ):
+        """Nothing vetoed, nothing spoken, a file that keeps growing: pre-gate this cost the full
+        12.5 s under the lock, and the ledger check could not have prevented it."""
+        _write_config(state, monkeypatch, eager=True)
+        transcript = state / "transcript.jsonl"
+        transcript.write_text("{not json yet\n", encoding="utf-8")  # no assistant message: read is None
+        _record_speech(monkeypatch)
+        self._growing(monkeypatch, state)
+
+        rc, sleeps = _fire(state, monkeypatch, transcript, "Stop")
+
+        assert rc == 0
+        assert sleeps == list(speak.BACKOFF)  # the ladder, and not one flush poll more
+        assert "still growing" not in _speak_log(state)
+        assert "gave up with nothing new in the transcript" in _speak_log(state)
+
+    def test_an_eager_off_stop_in_the_same_position_still_waits(self, state, monkeypatch):
+        """The other side of the gate, so it is a GATE and not a removal: the default install —
+        the one #106 was reported on — keeps the wait it was given."""
+        _write_config(state, monkeypatch)  # eager off
+        transcript = state / "transcript.jsonl"
+        transcript.write_text("{not json yet\n", encoding="utf-8")
+        _record_speech(monkeypatch)
+        self._growing(monkeypatch, state)
+
+        rc, sleeps = _fire(state, monkeypatch, transcript, "Stop")
+
+        assert rc == 0
+        assert len(sleeps) == len(speak.BACKOFF) + speak.FLUSH_POLLS
+        assert "still growing after 12.5s" in _speak_log(state)
+
+
+class TestARepeatedLineIsStillTheRaceSignature:
+    """THE DECISION behind Q-2, pinned so a future change has to argue with a red test.
+
+    `settled()` is False for a read identical to the last spoken line, and that single signature
+    covers two different worlds: a genuine repeat («Done.» twice), and #106's OWN reported failure
+    — the ladder reading the PREVIOUS message because this turn's has not been flushed yet. The
+    forensics say it plainly: "the ladder read only the PREVIOUS message ('Ура …', already spoken
+    → the race signature held)".
+
+    Nothing in an eager-off read can tell those apart (the pre-0.3.2 memory is one last-spoken
+    STRING, with no message index behind it), so treating the signature as a decided answer would
+    make the whole (b) half of this ticket inert for exactly the turn that opened it. The wait
+    therefore STAYS for it. What it costs is bounded and rare — a repeat AND a file somebody is
+    still appending to — and the dedup verdict is logged the moment the wait ends.
+    """
+
+    def test_a_repeat_arriving_while_the_transcript_grows_is_waited_out_not_decided(
+        self, state, monkeypatch
+    ):
+        transcript = state / "transcript.jsonl"
+        transcript.write_text("", encoding="utf-8")
+        spoken = _record_speech(monkeypatch)
+        _write_config(state, monkeypatch)
+        _append_message(transcript, "🔊 Done.")
+        assert _fire(state, monkeypatch, transcript, "Stop")[0] == 0
+        assert spoken == ["Done."]
+
+        # The SAME message still being the last one, and a transcript that keeps growing: this is
+        # the reported shape, and the hook must keep looking rather than call it a repeat at once.
+        (state / "speak.log").write_text("", encoding="utf-8")
+
+        def fake_sleep(seconds: float) -> None:
+            with transcript.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps({"type": "user", "message": {"content": []}}) + "\n")
+
+        payload = json.dumps({"transcript_path": str(transcript), "hook_event_name": "Stop"})
+        monkeypatch.setattr(speak.sys, "stdin", _Stdin(payload))
+        monkeypatch.setattr(speak.time, "sleep", fake_sleep)
+        assert speak.main() == 0
+
+        assert spoken == ["Done."]  # nothing said twice
+        log_text = _speak_log(state)
+        assert "the transcript stopped growing" not in log_text  # it really did keep growing
+        assert "still growing after" in log_text  # the wait ran to its bound
+        assert "dropped a read identical to the last spoken line (dedup): Done." in log_text
+
+    def test_a_repeat_on_a_quiet_transcript_still_costs_only_the_ladder(self, state, monkeypatch):
+        """The cost the decision above is bounded BY: with nobody appending, the give-up is the
+        ladder and one stat, exactly as before #106."""
+        _write_config(state, monkeypatch)
+        assert _speak_turns(state, monkeypatch, ["Done.", "Done."]) == ["Done."]
+        assert "dropped a read identical to the last spoken line (dedup): Done." in _speak_log(state)
+
+
+class TestEveryStopExitSaysWhy:
+    """Conformance 3.12, made literally true: a Stop firing writes exactly one reason line
+    whatever it decides. A turn with NO log line at all is what made the live drop invisible."""
+
+    def test_a_turn_with_no_marked_line_says_so(self, state, monkeypatch):
+        """The forensic reproduction: replaying the silent turn by hand exited 0 and logged
+        NOTHING, so the log could not tell "the hook gave up" from "the hook was never called"."""
+        rc, sleeps = _run_main_against(_assistant("plain prose, nothing marked"), state, monkeypatch)
+        assert (rc, sleeps) == (0, [])  # still the fast path: a parsed message is a final answer
+        assert "stop: nothing marked in the last assistant message" in _speak_log(state)
+
+    def test_a_bare_marker_turn_says_both_what_it_saw_and_what_it_did(self, state, monkeypatch):
+        rc, _ = _run_main_against(_assistant("🔊"), state, monkeypatch)
+        assert rc == 0
+        log_text = _speak_log(state)
+        assert "marker with no text" in log_text  # what the transcript held
+        assert "stop: nothing marked in the last assistant message" in log_text  # what the hook did
+
+    def test_speech_switched_off_is_a_diagnosis_not_a_silence(self, state, monkeypatch):
+        """`speak.enabled: false` is the first thing a "why did I hear nothing" investigation has
+        to rule out, and it used to be the one state that left no trace at all."""
+        _write_config(state, monkeypatch, enabled=False)
+        transcript = state / "transcript.jsonl"
+        transcript.write_text(_assistant("🔊 a line nobody will hear") + "\n", encoding="utf-8")
+        assert _fire(state, monkeypatch, transcript, "Stop")[0] == 0
+        assert "stop: speech is switched off" in _speak_log(state)
+        assert (state / "hook-last-fired").exists()  # and the heartbeat is stamped regardless
+
+    def test_a_disabled_install_does_not_log_once_per_tool_call(self, state, monkeypatch):
+        """The line is the Stop path's. An eager firing fires after EVERY tool call, and a
+        disabled install that wrote a line on each of them would drown the log it exists to keep
+        readable — the same reason the eager no-op has always been silent."""
+        _write_config(state, monkeypatch, enabled=False)
+        transcript = state / "transcript.jsonl"
+        transcript.write_text(_assistant("🔊 a line nobody will hear") + "\n", encoding="utf-8")
+        assert _fire(state, monkeypatch, transcript, "PostToolUse")[0] == 0
+        assert _speak_log(state) == ""
+
+    def test_the_ledgers_veto_is_still_named_as_the_veto_and_not_as_a_drop(self, state, monkeypatch):
+        """The one quiet Stop that lost nothing keeps its own wording — and does NOT spend the
+        flush wait on a growing transcript, because "eager already said it" is a decided answer
+        rather than a race."""
+        _write_config(state, monkeypatch, eager=True)
+        transcript = state / "transcript.jsonl"
+        transcript.write_text("", encoding="utf-8")
+        spoken = _record_speech(monkeypatch)
+        assert _fire(state, monkeypatch, transcript, "PostToolUse")[0] == 0  # seeds the transcript
+        _append_message(transcript, "🔊 said by the eager firing")
+        assert _fire(state, monkeypatch, transcript, "PostToolUse")[0] == 0  # speaks it mid-turn
+
+        def growing(path, stat=os.stat):
+            return (len(_speak_log(state)), 0)  # a file that advances on every single look
+
+        monkeypatch.setattr(speak, "transcript_activity", growing)
+        rc, sleeps = _fire(state, monkeypatch, transcript, "Stop")
+        assert (rc, sleeps) == (0, list(speak.BACKOFF))  # the ladder, and not one poll more
+        assert spoken == ["said by the eager firing"]
+        assert "the ledger already accounts for 1 marked line(s)" in _speak_log(state)
 
 
 # --- the contour check (#40): the hook voices what the poller found ---------------------------------

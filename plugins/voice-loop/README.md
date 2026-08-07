@@ -62,7 +62,15 @@ through) it is the **ear-check** — the agent speaks a line and you confirm you
 custom synthetic voice afterwards: `/voice-design`. To take the whole contour back off:
 [`/voice-remove`](#uninstall).
 
-Supported platforms: Linux and macOS. Windows/WSL is untested — we would rather say so than guess.
+Supported platforms: Linux and macOS. On Windows, WSL2 + WSLg is the recommended route (see
+the [shelf README](../../README.md#running-on-windows)) — still unverified on real hardware,
+tracked in [#41](https://github.com/saharkit/windowsill/issues/41). Two things that pass has
+to establish before we claim them: **audio** — WSLg routes sound through a PulseAudio server
+on the Windows side, and whether the default recorder/player chain (`pw-record` / `arecord` /
+`aplay`) picks that up unchanged is exactly the open question; and **`lan` topology** — a
+separate Linux box on the network is reached unchanged, but a server on the Windows host
+itself is not `localhost` from inside WSL (use the host's IP), and exposing a server running
+*inside* WSL to the LAN needs a port proxy or mirrored networking.
 
 **On macOS, one trap is worth knowing about even though setup now handles it.** python.org-installer
 Python ships an **empty certificate store**, so until `/Applications/Python 3.x/Install
@@ -120,7 +128,8 @@ with one account here: a `deepgram` STT config is never handed an ElevenLabs key
 **Privacy note: with any cloud `stt.cloud.provider`, your recorded audio clips leave your machine
 and are sent to that provider's servers for transcription** — that is the trade the `cloud` row
 above states. If you would rather keep your audio local, `stt.backend: "lan"` (the default)
-transcribes on your own hardware.
+transcribes on your own hardware. The shelf-wide privacy page — what is collected (nothing),
+where your voice goes, what `/report-bug` strips — is [PRIVACY.md](../../PRIVACY.md).
 
 **Adding a provider is one entry** in [`scripts/providers.py`](scripts/providers.py) plus its row
 in `PROVIDERS.md` — no dispatch path in the plugin compares a provider name against a literal, and
@@ -315,6 +324,9 @@ No Prometheus, no root.
 - **Alerts.** A service that does not answer (or reports `ok: false`); a service serving on a
   device other than its `expect_device` — set that key exactly when a client depends on the fast
   path, because that dependency is yours to declare and the alert means "the fast path is gone";
+  **device strings are aliased** so `cuda`, `cuda:0`, `mps`, `rocm`, and `hip` all normalize to
+  `gpu`, and `cpu`, `cpu:0`, etc. normalize to `cpu`; unknown device strings compare verbatim.
+  (See the module docstring in `scripts/contour_poll.py` for the exact alias table.)
   free VRAM under `vram.min_free_mib` (default 200); an `oom_overflows` counter that **changed**
   (a rise, or a drop — these are per-process counters, so a counter that went backwards is a
   service that restarted and is already overflowing again; a steady counter does not re-page); and,

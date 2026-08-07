@@ -71,7 +71,26 @@ the real runtime. So the guarantee is layered differently:
    faked) is spoken rather than dropped; the wait is bounded by its poll count however long a
    player wedges for; a line that was already there never waits for anybody; and every exit that
    abandons a line logs its reason, while the one exit that abandons nothing — an eager firing
-   with nothing new, which fires on every tool call — deliberately stays out of the log;
+   with nothing new, which fires on every tool call — deliberately stays out of the log.
+   Since #106 the **second** give-up is pinned beside it — the one with an empty stage, where the
+   fixed 2.65 s ladder simply ended before a long turn's own message was flushed. The transcript's
+   activity `(size, mtime_ns)` is what extends the wait: a file still being appended to buys the
+   late line its polls (asserted end to end through the real `main()`, with nothing playing at
+   all), a file that stops growing ends the wait, an idle one costs a single `stat` and keeps the
+   2.65 s exactly, and the whole extension is bounded by a poll count like the queue's is. The
+   three waits **compose in sequence** inside one firing — 2.65 s of ladder + up to 20 s of waiting
+   out a wedged player + up to 12.5 s of a still-growing transcript = **35.15 s** — and that
+   ceiling is a test (`sum(sleeps)` under both pathologies at once, asserted to fit inside the
+   `timeout` this plugin declares for its own hooks in `hooks/hooks.json`) rather than arithmetic
+   in a comment, because a composed bound nobody measured is a bound nobody has. The wait is
+   **eager-off only**: with `speak.eager` on, the Stop firing has a successor one tool call away
+   and holds `speaking.lock` while it waits, so waiting there would mute the very path that would
+   have said the line. The
+   other half of that ticket is asserted as an absence of silence: **every** `Stop` exit writes one
+   reason line — nothing marked, a bare marker, the ledger's veto, `speak.enabled: false` — which
+   is conformance row 3.12 ("a turn with NO log line at all is a FAIL") stated as tests, and the
+   eager path's silence is pinned from the other side so the fix cannot leak into a line per tool
+   call;
 3. a **real invocation of the Stop hook in CI**: a synthetic transcript, the actual `speak.sh`, the
    actual speech server, a no-op player — asserting that the marked line was extracted, that an
    unmarked line was *not* spoken, and that synthesis and playback returned success;
@@ -284,7 +303,8 @@ prompt the setup causes.
 | 3.14 | With eager **off** (the default), three turns whose 🔊 line is `Done.`, then `Working.`, then `Done.` again | all three are spoken — the repeat is not swallowed. `spoken.ledger` is never created: eager-off behaviour is unchanged from before eager mode existed | | |
 | 3.15 | With eager **on**, the same three turns | all three are spoken here too — the ledger keys on the message, not just the text | | |
 | 3.16 | A 🔊 line long enough to play for ~10 s, then send the next prompt straight away so its reply lands mid-clip | the second line is **spoken** (after the first clip, or in place of it — never skipped), and `speak.log` shows `queued, not dropped` | | |
-| 3.17 | Any turn whose 🔊 line you did **not** hear | `speak.log` has a line saying why — a give-up, a dedup, a synthesis failure. A turn that produced *no* log line at all is a bug | | |
+| 3.17 | Any turn whose 🔊 line you did **not** hear — and any ordinary turn that had no 🔊 line at all | `speak.log` has a line saying why — a give-up, a dedup, the ledger, nothing marked, speech switched off, a synthesis failure. A turn that produced *no* log line at all is a bug (#106) | | |
+| 3.17a | A LONG tool-heavy turn ending in a long 🔊 line — the shape that went silent in #106 | it is spoken. Where the flush outran the 2.65 s ladder, `speak.log` says `the transcript was still being written — the line landed …s past the ladder`; a give-up line here (or no line at all) is the bug | | |
 
 ## 4. Negative cases — failures must be legible, never hangs
 
@@ -344,6 +364,20 @@ discipline as section 2: default mode, count the prompts.
 | 7.10 | No `sudo` is ever executed | any root step is PRINTED for the user to run | | |
 | 7.11 | `/voice-remove` on a machine with **nothing** installed | says there is nothing to remove and stops — no invented work, no errors | | |
 | 7.12 | After 7.1–7.9, start a fresh session and end a reply with a 🔊 line | nothing is spoken, no hook errors, no stray processes; `/plugin uninstall voice-loop@windowsill` then completes cleanly | | |
+
+## 8. WSL2 branch (run on Windows 11 + WSLg — the #41 verification pass)
+
+Same contract as the macOS branch: run on a real machine, fill the rows, claim nothing a row
+did not show. Until every row here carries an observed value, the shelf README's Windows
+section stays "recommended route, not a tested guarantee".
+
+| # | check | expected | observed | pass |
+|---|---|---|---|---|
+| 8.1 | `claude plugin marketplace add saharkit/windowsill` inside the distro | marketplace added, no error | | |
+| 8.2 | `/plugin install voice-loop@windowsill` | the plugin appears under `/plugin` | | |
+| 8.3 | End a reply with a `🔊` line | the Stop hook fires and the line is audible on the WINDOWS host's speakers — the row that decides the WSLg audio claim | | |
+| 8.4 | `scripts/selftest.sh` against a `lan` server | green loopback | | |
+| 8.5 | `scripts/dictate-toggle.sh` with a real mic | the log states WHICH recorder `resolve_recorder` selected, and the recorded WAV is non-empty — the row that catches a present-but-daemonless `pw-record` winning the resolution order and then failing | | |
 
 ---
 

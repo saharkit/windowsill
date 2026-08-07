@@ -241,6 +241,11 @@ LOG_RULES: tuple[tuple[str, str | None], ...] = (
     ("stop: still playing after ", None),
     ("stop: the line waited ", None),
     ("stop: the line in front finished after ", None),
+    # the flush-race extension (#106): three verdicts about the transcript FILE — sizes and
+    # elapsed seconds, never a word of what was in it
+    ("stop: the transcript stopped growing after ", None),
+    ("stop: the transcript is still growing after ", None),
+    ("stop: the transcript was still being written", None),
     ("player failed: ", None),
     ("hook payload was not JSON", None),
     ("no transcript to read: transcript_path=", None),
@@ -249,6 +254,9 @@ LOG_RULES: tuple[tuple[str, str | None], ...] = (
     ("seeded ", None),
     ("stop: nothing new", None),
     ("stop: gave up with nothing new", None),
+    # the two quiet exits #106 made audible: neither carries a word of the turn's text
+    ("stop: nothing marked in the last assistant message", None),
+    ("stop: speech is switched off", None),
     ("stop: dropped a read identical to the last spoken line (dedup): ", "(dedup): "),
     ("text: ", "text: "),
     ("local command failed: ", None),
