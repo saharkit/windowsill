@@ -144,12 +144,18 @@ class FakeXtts:
 
 @pytest.fixture(autouse=True)
 def clean_state(monkeypatch, tmp_path):
-    """Every test starts with empty caches, its own (absent) stress file, and accentuation OFF.
+    """Every test owns its XDG paths, starts with empty caches, its own (absent) stress file, and accentuation OFF.
+
+    XDG-derived state and config paths must stay inside the test's temporary directory rather than
+    reaching an operator's live voice-loop installation.
 
     Accentuation is off by default on purpose: if a real language package happened to be installed
     in the environment, loading it would reach for models over the network. Tests that want an
     accentuator ask for the `accent_enabled` fixture and supply a fake one.
     """
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+
     voice_server.reset_caches()
     monkeypatch.setattr(voice_server, "STRESS_FILE", tmp_path / "stress.json")
     monkeypatch.setattr(voice_server, "HALLUCINATIONS_FILE", tmp_path / "stt_hallucinations.txt")
