@@ -126,8 +126,24 @@ _URL_RE = re.compile(r"\b((?:https?|wss?)://)([^\s/\"'<>)\]]+)")
 #   - hostname:port (e.g. deepgram.corp.internal:443, api.example.com:8080)
 #   - IPv4:port (e.g. 192.168.7.31:8355) - but loopback IPs are preserved
 #   - IPv6:port (e.g. [::1]:8080)
-# We use a more permissive host pattern that catches word-char sequences.
-_BARE_HOST_PORT_RE = re.compile(r"\b([^\s/:\"'<>)\]]+):(\d{1,5})\b")
+# We need to constrain the host pattern to avoid false positives like times "05:17":
+#   - Must contain a dot (hostname) or be bracketed IPv6, or match known loopback
+#   - This prevents matching plain times like "05:17" or "09:30"
+# The host side must be one of:
+#   1. Bracketed IPv6: [fd00::1234] or [::1]
+#   2. A hostname with a dot: deepgram.corp.internal
+#   3. A known loopback without brackets: localhost, 127.0.0.1, 0.0.0.0
+# The pattern for (2) requires at least one dot, preventing "05:17" from matching
+# (no dot in "05" or "09").
+_BARE_HOST_PORT_RE = re.compile(
+    # Bracketed IPv6:port (e.g. [fd00::1234]:443) - must be first, before unbracketed
+    # Note: no \b before [ because \b matches between word/non-word, and [ is non-word
+    r"(\[[0-9a-fA-F:]+\]):(\d{1,5})\b"
+    # Hostname:port (must contain a dot like deepgram.corp.internal:443)
+    r"|\b([^\s/:\"'<>)\]]+\.[^\s/:\"'<>)\]]+):(\d{1,5})\b"
+    # Known loopback without brackets (e.g. localhost:8080, 127.0.0.1:8355)
+    r"|\b((?:localhost|127\.0\.0\.1|0\.0\.0\.0|::1)):(\d{1,5})\b"
+)
 # An address also reaches the logs bare, with no scheme in front of it: "Connection refused to
 # 192.168.7.31" is a urllib reason string, and it names the user's network just as precisely as a
 # URL does. A dotted quad is unambiguous enough to rewrite on sight (a version number has three
@@ -182,19 +198,31 @@ def _redact_bare_host_port(match: "re.Match[str]") -> str:
     """Redact the host in a bare host:port match, preserving loopback addresses.
 
     Matches things like "Connection refused to deepgram.corp.internal:443"
-    or "TLS failed for api.example.com:8080".
+    or "TLS failed for api.example.com:8080" or "[fd00::1234]:443".
+
+    The regex has three alternatives with different capture groups:
+    1. Bracketed IPv6: groups (1)=host, (2)=port
+    2. Hostname with dot: groups (3)=host, (4)=port
+    3. Known loopback without brackets: groups (5)=host, (6)=port
     """
-    host, port = match.group(1), match.group(2)
-    # Preserve loopback hosts (like 127.0.0.1 or localhost)
-    # Note: we can't easily identify IPv4 vs hostname here, so we use a simpler check
-    # - IP addresses: 127.x.x.x, localhost, ::1 are loopback
-    # - We don't want to redact localhost:443 as <host>:443, that's useful info
+    # Determine which alternative matched by checking which host group is not None
+    if match.group(1) is not None:
+        # Bracketed IPv6 case
+        host, port = match.group(1), match.group(2)
+    elif match.group(3) is not None:
+        # Hostname case (must have a dot by pattern)
+        host, port = match.group(3), match.group(4)
+    else:
+        # Known loopback case
+        host, port = match.group(5), match.group(6)
+
+    # Preserve loopback hosts (like 127.0.0.1, localhost, [::1])
     if host.lower() in _LOOPBACK_HOSTS:
         return match.group(0)  # preserve loopback
-    # For IPv4 addresses, keep as <host>:port (IP address is fine to redact as host)
+    # For IPv4 addresses (without brackets), keep as <host>:port (IP is fine to show)
     if re.match(r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$", host):
         return f"<host>:{port}"
-    # For hostnames, keep just the port - the hostname is what we're trying to hide
+    # For bracketed IPv6 or hostnames, redact the host part
     return f"<host>:{port}"
 
 

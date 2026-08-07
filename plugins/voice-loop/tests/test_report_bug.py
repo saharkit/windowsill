@@ -326,6 +326,45 @@ def test_bare_host_port_without_scheme_is_redacted():
     assert report_bug.redact("wss://secure.example.com:443/socket") == "wss://<host>:443/socket"
 
 
+def test_bare_host_port_ipv6_is_redacted():
+    """IPv6 host:port must be redacted, with bracketed form handled.
+
+    This catches the blocking issue where private IPv6 addresses like [fd00::1234]:443
+    would escape the redactor and appear in a public GitHub issue.
+    """
+    # Bracketed IPv6 non-loopback should be redacted
+    assert report_bug.redact("Connection refused to [fd00::1234]:443") == (
+        "Connection refused to <host>:443"
+    )
+    # Bracketed IPv6 loopback should be preserved
+    assert report_bug.redact("Connection refused to [::1]:8080") == (
+        "Connection refused to [::1]:8080"
+    )
+    # Regular bracketed IPv6 should be redacted
+    assert report_bug.redact("TLS failed for [2001:db8::1]:443") == (
+        "TLS failed for <host>:443"
+    )
+    # Link-local IPv6
+    assert report_bug.redact("Connection refused to [fe80::1]:8080") == (
+        "Connection refused to <host>:8080"
+    )
+
+
+def test_bare_host_port_times_are_not_corrupted():
+    """Plain times like '05:17' should NOT be corrupted to '<host>:17'.
+
+    This catches the low-priority issue where the regex was too permissive and
+    matched plain time strings.
+    """
+    # Time patterns should be preserved
+    assert report_bug.redact("Log started at 05:17") == "Log started at 05:17"
+    assert report_bug.redact("Meeting at 09:30") == "Meeting at 09:30"
+    assert report_bug.redact("Start time: 12:00") == "Start time: 12:00"
+    assert report_bug.redact("14:30:45") == "14:30:45"
+    # But host:port with dots should still work
+    assert report_bug.redact("Connection at 10.0.0.1:443") == "Connection at <host>:443"
+
+
 # --- the log vocabulary ------------------------------------------------------------------------------
 
 
