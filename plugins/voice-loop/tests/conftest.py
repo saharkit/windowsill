@@ -8,9 +8,11 @@ end to end against objects that answer instantly.
 
 from __future__ import annotations
 
+import io
 import sys
 import threading
 import types
+import wave
 
 import pytest
 
@@ -146,6 +148,82 @@ class FakeXtts:
         return [0.0] * 1200  # the real model returns a plain list of floats at 24 kHz
 
 
+def pcm_wav(seconds: float = 0.05, rate: int = 16000, sample: bytes = b"\x01\x00") -> bytes:
+    """A real, minimal PCM WAV — what the recolor stage's `RIFF` check and `sf.read` both accept."""
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as handle:
+        handle.setnchannels(1)
+        handle.setsampwidth(2)
+        handle.setframerate(rate)
+        handle.writeframes(sample * int(rate * seconds))
+    return buf.getvalue()
+
+
+# The converter's answer, distinguishable from anything this server synthesizes: a different rate
+# and a non-zero sample, so "did the recolored audio come back" is a byte comparison.
+RECOLORED_WAV = pcm_wav()
+
+
+class FakeResponse:
+    """The context-managed, bounded-read object urllib hands back from `opener.open`."""
+
+    def __init__(self, body: bytes) -> None:
+        self.body = body
+
+    def __enter__(self) -> "FakeResponse":
+        return self
+
+    def __exit__(self, *exc: object) -> bool:
+        return False
+
+    def read(self, amount: int | None = None) -> bytes:
+        return self.body if amount is None else self.body[:amount]
+
+
+class FakeConverter:
+    """Stands in for the RVC recolor service, at the opener seam.
+
+    Everything above it is the real thing — the Request is really built, really posted through this
+    opener, and its answer really read back through the server's own size bound.
+    """
+
+    def __init__(self, answer: bytes = RECOLORED_WAV, error: BaseException | None = None) -> None:
+        self.answer = answer
+        self.error = error
+        self.posts: list[dict[str, object]] = []
+
+    def open(self, request: object, timeout: float | None = None) -> FakeResponse:
+        self.posts.append(
+            {
+                "url": request.full_url,
+                "method": request.get_method(),
+                "content_type": request.get_header("Content-type"),
+                "body": request.data,
+                "timeout": timeout,
+            }
+        )
+        if self.error is not None:
+            raise self.error
+        return FakeResponse(self.answer)
+
+
+@pytest.fixture
+def rvc_service(monkeypatch):
+    """The recolor stage ON, pointed at a fake converter that answers with RECOLORED_WAV."""
+    converter = FakeConverter()
+    monkeypatch.setattr(voice_server, "RVC_URL", "http://127.0.0.1:7865/convert")
+    monkeypatch.setattr(voice_server, "_default_opener", lambda: converter)
+    return converter
+
+
+@pytest.fixture
+def corpus_dir(monkeypatch, tmp_path):
+    """A training corpus configured at a directory of this test's own."""
+    root = tmp_path / "corpus"
+    monkeypatch.setattr(voice_server, "CORPUS_DIR", str(root))
+    return root
+
+
 @pytest.fixture(autouse=True)
 def clean_state(monkeypatch, tmp_path):
     """Every test owns its XDG paths, starts with empty caches, its own (absent) stress file, and accentuation OFF.
@@ -173,6 +251,11 @@ def clean_state(monkeypatch, tmp_path):
         monkeypatch.setattr(voice_server, "TTS_FALLBACK_ENGINE", "none")  # opt-in per test, never ambient
         monkeypatch.setattr(voice_server, "XTTS_REFERENCE", "")
         monkeypatch.setattr(voice_server, "XTTS_MODEL_DIR", "")
+        # The recolor stage and the corpus are OFF unless a test asks for them: the first would post to
+        # whatever URL the machine running the suite happens to have in its environment, and the second
+        # would write clips into it. Opt-in per test, never ambient — same rule as the fallback above.
+        monkeypatch.setattr(voice_server, "RVC_URL", "")
+        monkeypatch.setattr(voice_server, "CORPUS_DIR", "")
         monkeypatch.setattr(voice_server, "LANGUAGE", "ru")
     yield
     if voice_server is not None:

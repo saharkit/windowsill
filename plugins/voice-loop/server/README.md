@@ -108,6 +108,13 @@ Three caps keep any single request from monopolizing an executor:
   handed straight back to whoever is queued. What can overshoot is one segment's decoding, not one
   file's. Set it to `0` to switch the bound off and let long uploads run as long as they need.
 
+The [recolor stage](#rvc-recolor-stage-voice-conversion) is deliberately **outside** all of this: it
+is not a model call on this box, so it takes no slot and its wait cannot block a synthesis queued
+behind it. Its own bounds are `VOICE_LOOP_RVC_TIMEOUT` per piece and `VOICE_LOOP_MAX_UPLOAD_BYTES`
+on what comes back. How many conversions the converter is willing to run at once is **its** admission
+control to do, not this server's — what is bounded here is how long any one of them may keep a
+request waiting.
+
 ## Configuration (all environment variables)
 
 | variable | default | meaning |
@@ -127,6 +134,10 @@ Three caps keep any single request from monopolizing an executor:
 | `VOICE_LOOP_XTTS_REFERENCE` | — | wav of the voice to clone — the `xtts` engine refuses requests without it |
 | `VOICE_LOOP_XTTS_MODEL_DIR` | coqui's cache | load XTTS-v2 from a local directory instead of downloading |
 | `VOICE_LOOP_XTTS_MIN_FREE_VRAM_BYTES` | `3221225472` (3 GiB) | minimum free VRAM before XTTS moves to CPU, preserving whisper/RVC GPU tenants |
+| `VOICE_LOOP_RVC_URL` | — | recolor every synthesized piece through an RVC voice-conversion service at this `http(s)` URL — see [RVC recolor stage](#rvc-recolor-stage-voice-conversion) |
+| `VOICE_LOOP_RVC_TIMEOUT` | `10` | per-piece budget for that call, in seconds; a converter that outruns it leaves the base voice through |
+| `VOICE_LOOP_CORPUS_DIR` | — | accumulate the `xtts` engine's own output here as an RVC **training** corpus — see [The training corpus](#the-training-corpus) |
+| `VOICE_LOOP_CORPUS_MAX_SECONDS` | `1800` (30 min) | stop recording clips past this much audio |
 | `VOICE_LOOP_STRESS_FILE` | `~/.config/voice-loop/stress.json` | your stress overrides |
 | `VOICE_LOOP_HOOK_STAMP_FILE` | `~/.local/state/voice-loop/hook-last-fired` | the hook's heartbeat stamp — `/health` reports its age as `hook_last_fired_age_s`; see [the troubleshooting entry](../docs/troubleshooting.md#the-voice-stops-entirely-mid-session-but-everything-works-by-hand) |
 | `VOICE_LOOP_ACCENT` | `1` | set `0` to skip automatic accentuation |
@@ -349,6 +360,7 @@ is retried on `VOICE_LOOP_TTS_FALLBACK_ENGINE`, and the response says who spoke:
 | `/tts` normal | `X-Voice-Loop-Engine: xtts` | the configured engine synthesized it |
 | `/tts` fallback | `X-Voice-Loop-Engine: silero (fallback)` | the primary failed; you are hearing the other voice |
 | `/tts/stream` | terminal `end` event: `{"chunks": N, "engine": "silero (fallback)"}` | same, in the stream's own contract |
+| either, recolored | `silero + rvc`, `silero (fallback) + rvc` | the [recolor stage](#rvc-recolor-stage-voice-conversion) repainted it — it composes with whichever engine spoke |
 
 The default is `silero` behind any non-Silero primary — the global engine or a per-language
 override — and `none` behind a silero-everywhere setup: a Silero-primary server has nothing lighter
@@ -406,7 +418,7 @@ Three event types, in this order:
 | event | data | meaning |
 |---|---|---|
 | `chunk` | `{"index": 0, "audio": "<base64>"}` | one **complete, standalone WAV file** (own header, engine sample rate: 48 kHz Silero / 24 kHz XTTS / 22.05 kHz ukrainian). Decode base64, play, done. `index` counts from 0 in order. |
-| `end` | `{"chunks": N, "engine": "silero"}` | terminal success — N `chunk` events were sent. `engine` names who synthesized them, `"<engine> (fallback)"` when the primary was broken (see [Engine fallback](#engine-fallback)); it is reported here rather than in a header because the headers leave before the first chunk |
+| `end` | `{"chunks": N, "engine": "silero"}` | terminal success — N `chunk` events were sent. `engine` names who synthesized them, `"<engine> (fallback)"` when the primary was broken (see [Engine fallback](#engine-fallback)); it is reported here rather than in a header because the headers leave before the first chunk. With the [recolor stage](#rvc-recolor-stage-voice-conversion) configured it carries one extra field, `"recolored": N`; without it, the event is byte-identical to what it always was |
 | `error` | `{"error": "synthesis failed (<ExceptionClass>)", "chunks": N}` | terminal failure **mid-stream** (the `200` already left with the first bytes, so a late failure becomes the last event, never a 500). N chunks were already sent and are valid. The message is deliberately generic — the exception class name at most; the full detail stays in the server log. |
 
 A stream always ends with exactly one `end` **or** one `error` event. Requests refused *before*
@@ -443,6 +455,126 @@ with urllib.request.urlopen(req) as response:
             elif event == "error":
                 raise RuntimeError(data["error"])
 ```
+
+## RVC recolor stage (voice conversion)
+
+A second way to get a chosen voice, **composed instead of cloned**: synthesize with the fast base
+engine and hand each finished piece of audio to an [RVC](https://github.com/RVC-Project/Retrieval-based-Voice-Conversion-WebUI)
+(retrieval-based voice conversion) service, which repaints its *timbre* into a target voice. Set
+`VOICE_LOOP_RVC_URL` and it is on; leave it unset and nothing about this server changes.
+
+The trade against the `xtts` engine is a **training cost paid once**, in exchange for a timbre that
+is typically steadier — a trained converter holds one voice, where zero-shot cloning drifts a little
+between renders — and a pipeline whose slow half (the conversion) is fixed per piece rather than
+proportional to how hard the sentence was to clone. Whether it is faster on *your* hardware is a
+measurement, not a promise, and this repo has not made it: what it does promise is that both halves
+are bounded and that a failure in either one still speaks. What the trade costs is data: **RVC wants
+10-30 minutes of the target voice**, where XTTS-v2 clones from a 6-30 second reference. That is what
+[the training corpus](#the-training-corpus) below exists to produce.
+
+**The converter is not in this process, and this repo does not ship it.** It wants a GPU of its own,
+and keeping it out is exactly what lets the base voice stay cheap and the two scale separately. RVC
+itself is MIT; the model you train is yours. What lives here is the client and the contract:
+
+| direction | what it is |
+|---|---|
+| request | `POST` to `VOICE_LOOP_RVC_URL`, `Content-Type: audio/wav`, body = one complete WAV |
+| success | `200` with the recolored audio as a WAV body (its own sample rate — the server passes it through) |
+| anything else | the base audio is sent instead, unrecolored |
+
+Any RVC deployment fits behind that with a few lines of adapter. Only `http`/`https` URLs are opened
+(a `file://` URL would read this disk and hand the bytes back as "audio"), the call is made with the
+system proxy bypassed, and the answer is bounded by `VOICE_LOOP_RVC_TIMEOUT` and by
+`VOICE_LOOP_MAX_UPLOAD_BYTES` — the same ceiling `/stt` puts on audio arriving from the network.
+
+**A broken converter degrades the voice, it never silences it** — the rule the engine fallback
+already follows. A service that is down, slow, or answers with something that is not a WAV hands the
+base audio through, logged (the exception class, never its message) and counted on `GET /health`:
+
+- `rvc` — whether the stage is on. The URL itself is **never** reported: `/health` has no
+  authentication and an endpoint is nobody else's business;
+- `rvc_recolored` / `rvc_failures` — pieces that made it through the converter, and pieces that
+  did not. The second one climbing request-for-request is the signal to fix the converter.
+
+**Where it sits.** On encoded audio, after the model slot is released and after the engine question
+is settled — so it recolors whichever voice ended up speaking, fallback included, and it does not
+hold the synthesis gate while it waits on the network. `/tts` recolors the finished blob (one call);
+`/tts/stream` recolors **each chunk as it leaves**, so the stream stays a stream and the latency
+added is one conversion, not one utterance.
+
+There is one honest asymmetry with the engine fallback, and it is audible. A fallback refuses to
+change voices mid-stream; the recolor stage cannot make that promise, because when the converter
+dies halfway the only alternative to the base voice is silence from that chunk on. So the rest of
+the stream comes through in the base voice and the `end` event says how many chunks were repainted
+(`{"chunks": 12, "engine": "silero", "recolored": 4}`).
+
+**No retry.** The degrade path costs nothing and is already in hand, while a retry would spend its
+backoff inside a request someone is waiting to *hear* — between two chunks of one sentence, on the
+streaming path. `rvc_failures` is the signal; a circuit breaker is not needed for a stage whose
+failure is this cheap.
+
+### The training corpus
+
+The stage above cannot be trained out of thin air, and 10-30 minutes is a long time to sit in front
+of a microphone. `VOICE_LOOP_CORPUS_DIR` is the bootstrap: with the `xtts` engine speaking, **the
+cloned voice records its own training data as it speaks**, one clip per sentence chunk. A machine
+that has been speaking to you through XTTS-v2 for a while has already produced the corpus that
+trains its replacement — the tool below is how you find out whether yours has.
+
+```sh
+VOICE_LOOP_TTS_ENGINE=xtts \
+VOICE_LOOP_XTTS_REFERENCE=~/voice/reference.wav \
+VOICE_LOOP_CORPUS_DIR=~/voice/corpus \
+COQUI_TOS_AGREED=1 python voice_server.py
+```
+
+What lands there:
+
+```
+~/voice/corpus/ru/9f1c4b2ea77d0c31.wav    one sentence chunk, raw — no inter-chunk pause, no recolor
+~/voice/corpus/ru/9f1c4b2ea77d0c31.txt    the text that produced it
+```
+
+- **Only the `xtts` engine records.** The corpus trains a converter on the *cloned* voice; Silero's
+  stock speakers are not it.
+- **One directory per language**, which is the shape RVC's own training tools read.
+- **Named by the audio's own digest.** Two syntheses running side by side cannot collide on a name,
+  and the same sentence spoken twice is stored once — a corpus is worse, not better, for holding the
+  same seconds twice.
+- **Written atomically** (temp sibling, `fsync`, `os.replace`), so a trainer scanning the directory
+  while the server writes it sees a whole clip or none, never a truncated one it would accept as
+  valid audio.
+- **Bounded** by `VOICE_LOOP_CORPUS_MAX_SECONDS` (30 minutes by default — the top of RVC's useful
+  range). The cap counts what is already on disk, so a restart does not start it growing again.
+- **Never costs you your voice.** A clip that cannot be written is logged and skipped; the request
+  it came from is unaffected.
+- `GET /health` reports `corpus_clips` and `corpus_seconds` — `null` for both when no corpus is
+  configured, which is a different answer from `0` and `0.0`.
+
+Then ask whether there is enough yet, from the plugin's `scripts/`:
+
+```sh
+python3 ../scripts/rvc_corpus.py --corpus ~/voice/corpus
+```
+
+```
+corpus: /home/you/voice/corpus
+
+  language    clips    duration   per clip
+  ru            412     18m 07s   0.9s - 12.4s
+
+  total         412     18m 07s
+  usable        408     17m 51s   (4 outside 1s - 20s)
+
+READY — 17m 51s of usable audio, past the 10m 00s mark.
+```
+
+It exits `0` once the corpus has reached `--min-minutes` (default 10) of **usable** audio and `1`
+while it has not, so "train when ready" is one `if` around it. Clips under a second carry no usable
+pitch contour and clips over twenty are usually a chunker artefact rather than speech; both are
+counted in the total and left out of the training set. `--manifest FILE` writes that set as JSONL
+(`{"audio": …, "language": …, "seconds": …, "text": …}`, one object per line, `-` for stdout) —
+which is where this repo stops and RVC's own training takes over.
 
 ## Tests
 

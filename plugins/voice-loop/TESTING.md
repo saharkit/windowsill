@@ -43,6 +43,14 @@ What makes 100% honest rather than decorative:
   API surface the server fakes (`Stress.Dictionary.value`, the voice names, the `tts(text, voice,
   stress, file)` signature) — no voice download. Coverage cannot substitute for those probes, and
   nothing else in CI would notice the break.
+- **The RVC recolor stage is faked at the opener, and the 100% says nothing about a real converter.**
+  The stage POSTs a WAV to a service that runs on somebody else's GPU, so the tests replace the
+  urllib opener and everything above it runs for real — the URL check, the request that is built, the
+  bounded read of the answer, and the degrade-to-the-base-voice rule on every way that can fail. What
+  that structurally cannot check is whether an actual RVC deployment honours the contract in
+  `server/README.md`, and there is no probe standing in for it: unlike the XTTS install, there is no
+  canonical thing to install here — the converter is the operator's own, and the contract is the
+  agreement between them. A green suite means the client half is right, and only that.
 
 ### The hook scripts — shellcheck, a pytest for the pure parts, and a real invocation
 
@@ -219,6 +227,13 @@ the real runtime. So the guarantee is layered differently:
     property is that **a recording is never lost to the live path**. The #50 property has its own
     cases too: the worker is dispatched above the debounce and the pidfile mutex, its state is
     cleared on both ends of a cycle, and a clip below the min-clip guard still stops it.
+8. **`tests/test_rvc_corpus.py`** for `rvc_corpus.py`, the reader of the RVC training corpus. It
+   needs no seam at all — the corpus is a directory of WAV headers, so the tests write real (silent)
+   PCM files into `tmp_path` and the script reads them exactly as it would read a real one. What is
+   pinned is the arithmetic somebody would otherwise take on trust: that readiness is measured in
+   **usable** audio rather than in whatever is on disk (a 0.4 s fragment and a 25 s chunker artefact
+   are counted in the total and left out of the training set), and that the exit code says the same
+   thing the report does.
 
 Real invocation is the guarantee for the runtime path. Every spoken run also logs
 `timings extract_ms=… first_audio_ms=… total_ms=…` to `~/.local/state/voice-loop/speak.log`, so a
