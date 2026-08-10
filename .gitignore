@@ -11,6 +11,9 @@ coverage.xml
 htmlcov/
 .pytest_cache/
 
+# Claude plugin eval reports are generated locally and can contain model traces.
+plugins/*/evals/results/
+
 # Local environments — never shared; each machine builds its own.
 .venv/
 venv/

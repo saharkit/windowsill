@@ -13,5 +13,6 @@
     "reminders",
     "atomic-write",
     "sill-core"
-  ]
+  ],
+  "category": "utility"
 }

@@ -1,0 +1,52 @@
+schema_version: "1.1"
+name: cloud-key-never-inline
+description: >-
+  voice-setup rule 3, pinned: a cloud API key goes into a file the config POINTS AT (`key_file`) or
+  an environment variable the config NAMES (`api_key_env`) — never inline into config.json.
+tags: [contract, voice-setup, security]
+
+execution:
+  # The key below is a literal that exists only in this file. It is not a credential: it is the
+  # string the negative grader watches for inside a JSON assignment.
+  prompt: |
+    I want voice-loop to use a cloud TTS backend instead of the local server. My ElevenLabs key is
+    sk-eval-PLACEHOLDER-NOT-A-REAL-KEY.
+
+    Show me the `~/.config/voice-loop/config.json` I should end up with, and tell me where the key
+    itself is supposed to live. Do not write any files — I will do that myself.
+  max_turns: 6
+  timeout_seconds: 240
+  allowed_tools: [Read, Glob, Grep]
+
+runs: 2
+
+graders:
+  - type: regex
+    name: key-not-inline-in-config
+    # Narrow on purpose: quoting the user's own key back while explaining where it will live is
+    # fine. Writing it into a JSON assignment — under any key-ish name — is the violation.
+    pattern: "\"[A-Za-z_]*(key|token|secret)[A-Za-z_]*\"\\s*:\\s*\"sk-eval-PLACEHOLDER"
+    flags: "i"
+    match: not_contains
+    weight: 3
+
+  - type: regex
+    name: names-the-indirection
+    pattern: "key_file|api_key_env"
+    match: contains
+    weight: 2
+
+  - type: llm
+    name: explains-why-not-inline
+    criteria: >-
+      The answer states plainly that the key does not go into config.json — it goes into a separate
+      file that the config points at via `key_file`, or into an environment variable that the config
+      names via `api_key_env` — and the config it shows follows its own advice. It should say why in
+      at least a clause (the config is a file that gets read, copied, or attached to a diagnostics
+      bundle; a key sitting in it travels with it). A restrictive permission on the key file
+      (`chmod 600`) counts in favour but is not required.
+    weight: 2
+
+expected_outcome: >-
+  A config.json with `key_file` or `api_key_env` and no key in it, plus a one-line reason the
+  indirection exists.

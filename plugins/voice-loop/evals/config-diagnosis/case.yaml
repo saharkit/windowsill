@@ -1,0 +1,65 @@
+schema_version: "1.1"
+name: config-diagnosis
+description: >-
+  A config value explains the behaviour the user is complaining about. /doctor's first bin says that
+  is a CHOICE working as chosen — not a bug, not a broken install, not a reinstall.
+tags: [contract, doctor]
+
+execution:
+  # Everything the case needs is in the prompt: no scaffold, no fixtures on disk, no gated tools.
+  prompt: |
+    Dictation in Claude Code is half-working for me and I want to know whether it is broken.
+
+    I press the hotkey, speak, press again. `~/.local/state/voice-loop/dictate.log` ends with:
+
+        transcript: <redacted 42 chars>
+
+    …so it clearly heard me. But nothing appears in my prompt — I have to paste it myself every
+    time.
+
+    This is my `~/.config/voice-loop/config.json`:
+
+        {
+          "language": "en",
+          "stt": { "backend": "lan", "endpoint": "http://127.0.0.1:8355" },
+          "tts": { "backend": "lan", "endpoint": "http://127.0.0.1:8355" },
+          "dictate": { "auto_paste": false, "mode": "insert" }
+        }
+
+    Is voice-loop broken, and what do I do about it?
+  max_turns: 6
+  timeout_seconds: 240
+  allowed_tools: [Read, Glob, Grep]
+
+runs: 2
+
+graders:
+  - type: regex
+    name: names-the-setting
+    pattern: "auto_paste"
+    match: contains
+    weight: 2
+
+  - type: regex
+    name: no-reinstall-advice
+    # The whole point of the first bin: a chosen setting is never answered with "reinstall it".
+    pattern: "re-?install"
+    flags: "i"
+    match: not_contains
+    weight: 1
+
+  - type: llm
+    name: diagnosed-as-a-choice
+    criteria: >-
+      The answer says voice-loop is NOT broken: `dictate.auto_paste` is false, which is the default
+      clipboard tier, and that setting is why the transcript lands on the clipboard instead of
+      inserting itself. It must present this as a configuration choice working as chosen rather than
+      as a fault, an unfinished install, or something to report as a bug. It must then name the fix —
+      setting `dictate.auto_paste` to true — and it must not present that flip as free: it says the
+      auto-paste tier needs something extra from the platform (an Accessibility consent on macOS, a
+      helper such as ydotool/wtype on Linux), so the user is choosing knowingly.
+    weight: 2
+
+expected_outcome: >-
+  Bin 1 of /doctor: the assistant identifies dictate.auto_paste as the chosen setting that explains
+  the behaviour, offers the flip, and states its platform cost — without proposing a reinstall.

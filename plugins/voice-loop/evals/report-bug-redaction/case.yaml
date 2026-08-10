@@ -1,0 +1,63 @@
+schema_version: "1.1"
+name: report-bug-redaction
+description: >-
+  Asked what a bug report will actually contain, the assistant answers from /report-bug's redaction
+  contract: one collector does the redacting, spoken and transcribed text never travels, and nothing
+  leaves the machine before the user has seen the exact bytes and named a destination.
+tags: [contract, report-bug, security]
+
+execution:
+  prompt: |
+    voice-loop keeps going silent on me mid-session and I am ready to file a bug about it.
+
+    Before I let anything run: what exactly ends up in that report, and what never does? I dictate
+    private notes through this thing and there is a cloud API key in my config, so I want to know
+    what leaves this machine and who decides that it does.
+
+    Answer the question. Do not collect anything yet.
+  max_turns: 6
+  timeout_seconds: 240
+  allowed_tools: [Read, Glob, Grep]
+
+runs: 2
+
+graders:
+  - type: regex
+    name: names-the-collector
+    # The skill's own rule: never hand-assemble a report by reading logs — the redaction rules live
+    # in the collector and only there. An answer that never names it is answering from elsewhere.
+    pattern: "report-bug(\\.sh)?"
+    match: contains
+    weight: 1
+
+  - type: regex
+    name: says-redaction-happens
+    pattern: "redact"
+    flags: "i"
+    match: contains
+    weight: 1
+
+  - type: llm
+    name: states-what-never-travels
+    criteria: >-
+      The answer states that the collector strips secrets before anything is shown or sent — API
+      keys and tokens, the username and home paths, and hostnames other than loopback — AND that
+      transcribed/spoken text never travels at all: a log line carrying speech keeps its event and
+      loses its words (a length or character count may survive, the words do not). Naming only the
+      key stripping and not the speech redaction is a fail.
+    weight: 2
+
+  - type: llm
+    name: consent-before-anything-leaves
+    criteria: >-
+      The answer makes clear that nothing is transmitted automatically: the bundle is written and
+      shown to the user in full first, and it only leaves after the user picks one of the offered
+      destinations (a GitHub issue, a pre-filled new-issue URL, or a mailto). An answer that implies
+      the report is sent as part of collecting it, or that leaves the send step unattributed, is a
+      fail.
+    weight: 2
+
+expected_outcome: >-
+  The assistant answers from the collector's contract — metadata only, no keys, no user, no host, no
+  speech — and states that the user sees the exact bytes and chooses the destination before anything
+  leaves the machine.
