@@ -79,10 +79,10 @@ the real runtime. So the guarantee is layered differently:
    all), a file that stops growing ends the wait, an idle one costs a single `stat` and keeps the
    2.65 s exactly, and the whole extension is bounded by a poll count like the queue's is. The
    three waits **compose in sequence** inside one firing — 2.65 s of ladder + up to 20 s of waiting
-   out a wedged player + up to 12.5 s of a still-growing transcript = **35.15 s** — and that
-   ceiling is a test (`sum(sleeps)` under both pathologies at once, asserted to fit inside the
-   `timeout` this plugin declares for its own hooks in `hooks/hooks.json`) rather than arithmetic
-   in a comment, because a composed bound nobody measured is a bound nobody has. The wait is
+   out a wedged player + up to 12.5 s of a still-growing transcript = **35.15 s of sleep budget**.
+   That is not a wall-clock bound: every poll re-parses the transcript from byte zero, so parse time
+   can dominate on a growing multi-MB file. The hook also carries a structural `t0 + HOOK_BUDGET_S`
+   deadline checked per poll. The test pins the sleep budget and the deadline relation separately. The wait is
    **eager-off only**: with `speak.eager` on, the Stop firing has a successor one tool call away
    and holds `speaking.lock` while it waits, so waiting there would mute the very path that would
    have said the line. The

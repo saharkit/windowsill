@@ -41,10 +41,10 @@ alone.
    only the lines whose first non-space character is the marker (default `🔊`). Everything else
    stays text — the model decides what is worth hearing.
 3. Two behaviours exist because of a real race, not out of caution:
-   - **retry**: Stop can fire *before* the final assistant message is flushed to the transcript. A
-     retry happens only on the two real race signatures — an **empty** extract, or one **identical
-     to the last spoken line** — with adaptive backoff (0.15 → 1.0 s), so an already-flushed
-     transcript costs zero sleep;
+   - **retry**: Stop can fire *before* the final assistant message is flushed to the transcript. An
+     **EMPTY** extract or one **IDENTICAL** to the last spoken line is the race signature; both enter
+     the same wait and are logged with that vocabulary. Adaptive backoff (0.15 → 1.0 s) means an
+     already-flushed transcript costs zero sleep;
    - **queue**: that ladder is 2.65 s and a clip runs ten times longer. When it runs out with
      nothing new *and a previous line is still playing* (`playing.pid`, the same record the
      takeover reads), Stop keeps re-reading until that clip ends — bounded at 20 s — instead of

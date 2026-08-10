@@ -267,8 +267,9 @@ fresher turn still wins: a new hook invocation stops the playing chain (precisel
 recorded, nothing pattern-matched) and speaks the new line instead.
 
 The hook also reads the transcript **immediately** and retries only on the actual flush-race
-signatures (an empty extract, or one identical to the last spoken line), with adaptive backoff —
-an already-flushed transcript costs zero sleep. If that backoff runs out while a previous line is
+signatures (an **EMPTY** extract, or one **IDENTICAL** to the last spoken line), with adaptive
+backoff. Both outcomes enter the same wait and are named in `speak.log`, so an empty read is not
+confused with a consecutive repeat; an already-flushed transcript costs zero sleep. If that backoff runs out while a previous line is
 **still playing**, the hook keeps looking until the clip ends (bounded at 20 s) rather than giving
 up: a line written during a long clip is **queued, not dropped**. And a hook that does end up
 speaking nothing always writes the reason to `speak.log` — a line you never hear is never a line
