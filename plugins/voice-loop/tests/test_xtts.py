@@ -277,7 +277,6 @@ def test_xtts_gpu_oom_falls_back_to_cpu(monkeypatch, import_fake, caplog):
     api = import_fake("TTS.api", TTS=OomTTS)
     import_fake("TTS", api=api)
     monkeypatch.setattr(voice_server, "DEVICE", "cuda")
-    monkeypatch.setattr(voice_server.torch.cuda, "mem_get_info", lambda device: (6 * 1024**3, 6 * 1024**3))
 
     with caplog.at_level("WARNING"):
         model = voice_server.xtts()

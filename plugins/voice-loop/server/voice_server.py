@@ -664,13 +664,20 @@ def xtts_device(device: str) -> str:
     `mem_get_info` is advisory: if a driver cannot report free VRAM, the loader keeps its existing
     OOM fallback. A known-small card takes the CPU path proactively, so XTTS does not evict or
     starve whisper/RVC while it grows its activation buffers.
+
+    The probe must never be the thing that fails the request, and torch has three ways of refusing
+    to answer: no such function at all (older torch), a driver that errors (RuntimeError), and — the
+    one a VOICE_LOOP_DEVICE=cuda override on a CPU-only wheel hits — torch's own lazy-init
+    `AssertionError: Torch not compiled with CUDA enabled`. All three mean "unknown", which is not
+    the same as "too small": an unreadable card keeps the device it was given, and a real shortage
+    is still caught by the loader's OOM fallback.
     """
     if device == "cpu":
         return device
     try:
         free, _total = torch.cuda.mem_get_info(device)
-    except (AttributeError, RuntimeError):
-        return device
+    except (AttributeError, AssertionError, RuntimeError):
+        free = XTTS_MIN_FREE_VRAM_BYTES  # unknown reads as exactly enough, never as a reason to move
     if free < XTTS_MIN_FREE_VRAM_BYTES:
         log.warning(
             "XTTS-v2 has only %d bytes of free VRAM (need %d) — using CPU to preserve GPU tenants",
