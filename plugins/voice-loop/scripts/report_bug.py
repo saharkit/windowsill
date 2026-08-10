@@ -358,6 +358,8 @@ LOG_RULES: tuple[tuple[str, str | None], ...] = (
     ("empty synthesis from ", None),
     ("synthesis returned an error document: ", "document: "),
     ("stop: still playing after ", None),
+    ("stop: hook deadline reached while waiting for playback", None),
+    ("stop: hook deadline reached while waiting for transcript", None),
     ("stop: the line waited ", None),
     ("stop: the line in front finished after ", None),
     # the flush-race extension (#106): three verdicts about the transcript FILE — sizes and
@@ -373,6 +375,8 @@ LOG_RULES: tuple[tuple[str, str | None], ...] = (
     ("seeded ", None),
     ("stop: nothing new", None),
     ("stop: gave up with nothing new", None),
+    ("stop: waiting because extract was ", None),
+    ("stop: exited with no reason recorded", None),
     # the two quiet exits #106 made audible: neither carries a word of the turn's text
     ("stop: nothing marked in the last assistant message", None),
     ("stop: speech is switched off", None),

@@ -1717,6 +1717,12 @@ FLUSH_SECONDS_LATE = 4.0
 HOOK_TIMEOUT_S = 90
 
 
+def test_hook_budget_is_a_structural_deadline_not_a_sleep_claim():
+    """Mutation gap: reverting the documented sleep budget into an asserted wall-clock ceiling
+    would make parse time invisible and remove the per-poll deadline contract."""
+    assert speak.HOOK_BUDGET_S == HOOK_TIMEOUT_S
+
+
 def test_the_mirrored_hook_timeout_is_the_one_the_manifest_declares():
     manifest = json.loads((Path(__file__).resolve().parents[1] / "hooks" / "hooks.json").read_text(encoding="utf-8"))
     declared = {
@@ -1938,6 +1944,7 @@ class TestTheComposedCeiling:
         assert "still playing after" in log_text
         assert "still growing after" in log_text
         assert "gave up with nothing new in the transcript" in log_text
+        assert log_text.count("waiting because extract was EMPTY") == 2
 
 
 class TestTheFlushWaitIsEagerOffOnly:
@@ -2034,6 +2041,7 @@ class TestARepeatedLineIsStillTheRaceSignature:
         assert "the transcript stopped growing" not in log_text  # it really did keep growing
         assert "still growing after" in log_text  # the wait ran to its bound
         assert "dropped a read identical to the last spoken line (dedup): Done." in log_text
+        assert "waiting because extract was IDENTICAL" in log_text
 
     def test_a_repeat_on_a_quiet_transcript_still_costs_only_the_ladder(self, state, monkeypatch):
         """The cost the decision above is bounded BY: with nobody appending, the give-up is the

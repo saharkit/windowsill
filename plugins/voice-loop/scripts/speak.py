@@ -193,9 +193,9 @@ BACKOFF = (0.15, 0.3, 0.5, 0.7, 1.0)
 
 # What happens where that ladder runs out, on the Stop path only: while an OLDER speaking chain is
 # still playing, a line with nothing new behind it is not lost, it is standing in a queue — so keep
-# looking. The bound is a COUNT of polls rather than a wall clock, because that is the same bound a
-# test can drive with a fake sleep; PLAYBACK_POLLS * PLAYBACK_POLL is the ceiling in seconds (20 s
-# — two cloud clips' worth), and it exists so a wedged player can never hold a turn open.
+# looking. The bound is a COUNT of polls rather than a wall-clock claim: it is the sleep budget a
+# test can drive with a fake sleep. PLAYBACK_POLLS * PLAYBACK_POLL is 20 s (two cloud clips' worth),
+# and it exists so a wedged player can never hold a turn open.
 PLAYBACK_POLL = 0.25
 PLAYBACK_POLLS = 80
 
@@ -204,15 +204,11 @@ PLAYBACK_POLLS = 80
 # rather than dropped. The bound is a COUNT of polls for the same reason PLAYBACK_POLLS is — that
 # is the bound a test can drive with a fake sleep — and FLUSH_POLLS * FLUSH_POLL is 12.5 s.
 #
-# THE THREE WAITS COMPOSE, in sequence, inside one main(): sum(BACKOFF) 2.65 s + PLAYBACK_POLLS *
-# PLAYBACK_POLL 20 s + FLUSH_POLLS * FLUSH_POLL 12.5 s = 35.15 s. That is the honest ceiling of a
-# Stop firing, and the budget it has to fit inside is THIS PLUGIN'S OWN: hooks/hooks.json declares
-# `"timeout": 90` on both registrations — the one number to check this against, stated here once so
-# nothing else in the tree has to repeat it. The test asserts the RELATION (ceiling < timeout)
-# rather than the arithmetic, because what matters is the fit, not the sum.
-# It needs a wedged player AND a file appended to throughout; neither is the common case, and an
-# idle transcript costs ZERO polls here — the first stat already answers "nobody is writing", which
-# is why a quiet turn is as cheap as it ever was.
+# THE THREE SLEEP BUDGETS COMPOSE, in sequence, inside one main(): sum(BACKOFF) 2.65 s +
+# PLAYBACK_POLLS * PLAYBACK_POLL 20 s + FLUSH_POLLS * FLUSH_POLL 12.5 s = 35.15 s. This is not a
+# wall-clock ceiling: parsing the growing transcript and other work can add time. The structural
+# deadline below is checked once per poll against the hook's own timeout budget.
+HOOK_BUDGET_S = 90
 FLUSH_POLL = 0.25
 FLUSH_POLLS = 50
 
@@ -280,6 +276,7 @@ CONTOUR_MAX_AGE = 900
 # contour check can tell which path it is on. A module cell rather than a return value: main()'s
 # return IS the process exit code, and hooks.json reads that.
 _fired: dict = {"event": "Stop"}
+_stop_reason_logged = False
 
 # state the SIGTERM handler (takeover by a fresher invocation) must be able to reach:
 # the current player child, the temp WAVs on disk, and the open SSE response (its socket
@@ -288,6 +285,9 @@ _live: dict = {"proc": None, "files": set(), "stream": None}
 
 
 def log(message: str) -> None:
+    global _stop_reason_logged
+    if _fired["event"] == "Stop" and message.startswith("stop:"):
+        _stop_reason_logged = True
     try:
         if os.path.exists(_LOG_PATH) and os.path.getsize(_LOG_PATH) > 1_000_000:
             open(_LOG_PATH, "w").close()
@@ -887,7 +887,7 @@ def playback_is_live() -> bool:
     return False
 
 
-def wait_out_playback(read, settled, text=None):
+def wait_out_playback(read, settled, text=None, *, deadline=None):
     """Keep re-reading the transcript for as long as an older chain is still audibly playing.
 
     Entered at exactly one place: where the Stop path had exhausted BACKOFF with nothing new and
@@ -904,6 +904,9 @@ def wait_out_playback(read, settled, text=None):
     PLAYBACK_POLLS polls however long a player wedges for."""
     polls = 0
     while playback_is_live():
+        if deadline is not None and time.monotonic() >= deadline:
+            log("stop: hook deadline reached while waiting for playback")
+            return text
         if polls >= PLAYBACK_POLLS:
             log(f"stop: still playing after {polls * PLAYBACK_POLL:.0f}s of waiting — waiting no longer")
             return text
@@ -938,7 +941,7 @@ def transcript_activity(path: str, stat=os.stat):
     return (st.st_size, st.st_mtime_ns)
 
 
-def wait_out_flush(path, read, settled, text, mark, *, stat=os.stat):
+def wait_out_flush(path, read, settled, text, mark, *, stat=os.stat, deadline=None):
     """Keep re-reading the transcript for as long as the transcript is still GROWING.
 
     The second half of #106, and the sibling of wait_out_playback above: same entry point (the
@@ -957,6 +960,9 @@ def wait_out_flush(path, read, settled, text, mark, *, stat=os.stat):
     Returns the first settled read, or the freshest unsettled one — the caller's give-up to log."""
     polls = 0
     while True:
+        if deadline is not None and time.monotonic() >= deadline:
+            log("stop: hook deadline reached while waiting for transcript")
+            return text
         current = transcript_activity(path, stat)
         if current == mark:
             if polls:
@@ -1401,7 +1407,10 @@ def play_text(text: str, s: dict, t0: float, *, extract_ms: int) -> bool:
 def main() -> int:
     # THE clock: every logged timing (extract_ms, first_audio_ms, total_ms) is an offset from this
     # one instant, so the three are directly comparable and none can hide a wait the other counted.
+    global _stop_reason_logged
+    _stop_reason_logged = False
     t0 = time.monotonic()
+    deadline = t0 + HOOK_BUDGET_S
     try:
         os.makedirs(_STATE_DIR, exist_ok=True)
     except OSError:
@@ -1539,7 +1548,8 @@ def main() -> int:
                 # be dropped, in silence. The retry condition has not changed — we are here only
                 # because there is still nothing new — so waiting out the line in front costs a
                 # ready line nothing and buys a late one its turn.
-                text = wait_out_playback(read_fresh, settled, text)
+                log(f"stop: waiting because extract was {'EMPTY' if text is None else 'IDENTICAL'}")
+                text = wait_out_playback(read_fresh, settled, text, deadline=deadline)
             if not ledger_on and not settled(text):
                 # …and the other reason a line can be missing: nobody is playing, the ladder simply
                 # ended before this turn's own message finished being written (#106). Waited out on
@@ -1553,7 +1563,8 @@ def main() -> int:
                 # ledger's veto, which only exists with the ledger on: "eager already said it" is a
                 # decided answer, never a race.) #106 was reported on the default, eager-off
                 # install, which is exactly the configuration that has no successor to fall back on.
-                text = wait_out_flush(transcript, read_fresh, settled, text, activity)
+                log(f"stop: waiting because extract was {'EMPTY' if text is None else 'IDENTICAL'}")
+                text = wait_out_flush(transcript, read_fresh, settled, text, activity, deadline=deadline)
         if not text:
             if not eager:
                 # A Stop that leaves without speaking has abandoned the turn for good: unlike an
@@ -1620,6 +1631,8 @@ def entry() -> int:
     covers this file, not just main().
     """
     rc = main()
+    if _fired["event"] == "Stop" and not _stop_reason_logged:
+        log("stop: exited with no reason recorded")
     cfg_path = os.environ.get(
         "VOICE_LOOP_CONFIG",
         os.path.join(os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")), "voice-loop/config.json"),
