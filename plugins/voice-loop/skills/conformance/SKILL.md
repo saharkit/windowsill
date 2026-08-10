@@ -40,12 +40,22 @@ Read the version from the plugin manifest and from CONFORMANCE.md. If they disag
 Then probe the environment and fill the environment table:
 
 ```sh
-echo "OS: $(uname -s) $(uname -m)"; echo "session: ${XDG_SESSION_TYPE:-unknown} ${XDG_CURRENT_DESKTOP:-unknown}"; echo "python: $(python3 --version 2>&1)"; cat "${XDG_CONFIG_HOME:-$HOME/.config}/voice-loop/config.json" 2>/dev/null || echo "no config found"
+echo "OS: $(uname -s) $(uname -m)"; echo "session: ${XDG_SESSION_TYPE:-unknown} ${XDG_CURRENT_DESKTOP:-unknown}"; echo "python: $(python3 --version 2>&1)"; python3 -c "
+import sys, json; sys.path.insert(0, '${CLAUDE_PLUGIN_ROOT}/scripts')
+from report_bug import redact_value
+cfg_path = '${XDG_CONFIG_HOME:-$HOME/.config}/voice-loop/config.json'
+try:
+    with open(cfg_path) as fh: cfg = json.load(fh)
+    print(json.dumps(redact_value(cfg), indent=2, ensure_ascii=False))
+except Exception as e:
+    print(f'config unreadable: {type(e).__name__}')
+" 2>/dev/null || echo "no config found"
 ```
 
-From the config, extract the backends and language. Read the plugin version from
-`${CLAUDE_PLUGIN_ROOT}/.claude-plugin/plugin.json`. Ask the human for their name
-(for the tester field).
+The config output above is already redacted — keys, tokens, usernames and hostnames are
+replaced with placeholders. From the redacted config, extract the backends and language.
+Read the plugin version from `${CLAUDE_PLUGIN_ROOT}/.claude-plugin/plugin.json`.
+Ask the human for their name (for the tester field).
 
 ## Step 1 — the install section (rows 1.1–1.12)
 
@@ -81,10 +91,19 @@ def has_inline_key(node, path=''):
     if isinstance(node, dict):
         for k, v in node.items():
             if k in ('api_key', 'token', 'secret', 'password') and isinstance(v, str) and len(v) > 4:
-                print(f'INLINE KEY at {path}.{k}'); return
-            has_inline_key(v, f'{path}.{k}')
-has_inline_key(cfg)
-print('no inline secrets')
+                print(f'INLINE KEY at {path}.{k}'); return True
+            if has_inline_key(v, f'{path}.{k}'):
+                return True
+    elif isinstance(node, list):
+        for i, v in enumerate(node):
+            if has_inline_key(v, f'{path}[{i}]'):
+                return True
+    return False
+found = has_inline_key(cfg)
+if found:
+    print('FAIL: inline secrets found in config — fix before filing')
+else:
+    print('PASS: no inline secrets')
 "
 
 # 1.12 — selftest
@@ -104,7 +123,18 @@ For each cluster, tell the human what to do, ask for the outcome, and fill the r
 After the human reports, check `dictate.log` for corroborating evidence:
 
 ```sh
-tail -30 "${XDG_STATE_HOME:-$HOME/.local/state}/voice-loop/dictate.log" 2>/dev/null
+python3 -c "
+import sys; sys.path.insert(0, '${CLAUDE_PLUGIN_ROOT}/scripts')
+from report_bug import read_log_tail
+state = '${XDG_STATE_HOME:-$HOME/.local/state}/voice-loop'
+tail = read_log_tail(f'{state}/dictate.log', 30)
+for line in tail['lines']:
+    print(line)
+if not tail['present']:
+    print('dictate.log absent')
+elif tail.get('unclassified', 0):
+    print(f'({tail[\"unclassified\"]} unclassified lines — redacted)')
+"
 ```
 
 ## Step 3 — the speak-back section (rows 3.1–3.13)
@@ -118,8 +148,15 @@ tail -30 "${XDG_STATE_HOME:-$HOME/.local/state}/voice-loop/dictate.log" 2>/dev/n
 3.5–3.6: ask for a multi-sentence 🔊 line, then probe the log:
 
 ```sh
-grep "played rc=0" "${XDG_STATE_HOME:-$HOME/.local/state}/voice-loop/speak.log" | tail -3
-grep "timings " "${XDG_STATE_HOME:-$HOME/.local/state}/voice-loop/speak.log" | tail -3
+python3 -c "
+import sys; sys.path.insert(0, '${CLAUDE_PLUGIN_ROOT}/scripts')
+from report_bug import read_log_tail
+state = '${XDG_STATE_HOME:-$HOME/.local/state}/voice-loop'
+tail = read_log_tail(f'{state}/speak.log', 60)
+for line in tail['lines']:
+    if 'played rc=0' in line or 'timings ' in line:
+        print(line)
+"
 ```
 
 3.7–3.10 (eager mode): these need config changes. Warn the human before touching
@@ -132,7 +169,15 @@ then restore the original value.
 accountability:
 
 ```sh
-grep -E "queued|gave up|nothing played" "${XDG_STATE_HOME:-$HOME/.local/state}/voice-loop/speak.log" | tail -10
+python3 -c "
+import sys; sys.path.insert(0, '${CLAUDE_PLUGIN_ROOT}/scripts')
+from report_bug import read_log_tail
+state = '${XDG_STATE_HOME:-$HOME/.local/state}/voice-loop'
+tail = read_log_tail(f'{state}/speak.log', 60)
+for line in tail['lines']:
+    if 'queued' in line or 'gave up' in line or 'nothing played' in line:
+        print(line)
+"
 ```
 
 ## Step 4 — the degrade-paths section (rows 4.1–4.8)
@@ -180,17 +225,33 @@ Once every row has a verdict, assemble the report:
    the log showed, what the human reported.
 5. Write the completed report to `conformance-v<version>-<YYYYMMDD>.md` in the
    current working directory.
+6. **Redact the report before it leaves the machine.** The evidence cells were
+   filled from probe output that was already redacted, but the report body as a
+   whole runs through the same redaction as `/report-bug` as a safety net:
+
+```sh
+python3 -c "
+import sys; sys.path.insert(0, '${CLAUDE_PLUGIN_ROOT}/scripts')
+from report_bug import redact
+path = 'conformance-v<version>-<YYYYMMDD>.md'
+body = open(path).read()
+redacted = redact(body)
+open(path, 'w').write(redacted)
+"
+```
 
 ## Filing — the three transports (same as /report-bug)
 
-The completed report is now a file on disk. Offer the same three transports
-`/report-bug` offers. Run `${CLAUDE_PLUGIN_ROOT}/scripts/report-bug.sh transports`
-to see which are available, then ask **one** AskUserQuestion:
+The completed report is now a redacted file on disk. Show it to the tester
+so they can review exactly what will be published — every byte of it. Offer the
+same three transports `/report-bug` offers. Run
+`${CLAUDE_PLUGIN_ROOT}/scripts/report-bug.sh transports` to see which are
+available, then ask **one** AskUserQuestion:
 
-> File this conformance report? Options: **GitHub issue** (public, with the
-> `conformance` label — the primary path), **pre-filled URL** (you press Submit
-> yourself — nothing is sent until you do), or **don't file** (the report stays
-> on disk).
+> The redacted report is shown above. File it? Options: **GitHub issue** (public,
+> with the `conformance` label — the primary path), **pre-filled URL** (you press
+> Submit yourself — nothing is sent until you do), or **don't file** (the report
+> stays on disk).
 
 ### gh transport (primary)
 
@@ -239,8 +300,10 @@ it never expires.
 
 ## Rules
 
-1. **Nothing is sent before an explicit yes**, and the yes must have heard the
-   destination — same consent rule as `/report-bug`.
+1. **Nothing is sent before an explicit yes**, and the yes must have seen the
+   redacted report body and heard the destination — same consent rule as `/report-bug`.
+   The tester must be able to review every byte that will be published before they
+   consent.
 2. **One report, one artifact.** The file on disk is exactly what is sent.
 3. **A row without a verdict is a FAIL.** Check before writing the report.
 4. **The checklist version must match the plugin version.** Check before anything

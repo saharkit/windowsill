@@ -8,7 +8,9 @@ These tests validate the STRUCTURE of CONFORMANCE.md — they do not execute the
 from __future__ import annotations
 
 import json
+import os
 import re
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -309,4 +311,180 @@ def test_skill_references_report_bug_transports():
     )
     assert "<!-- conformance -->" in skill_text, (
         "SKILL.md must include the 'conformance' body marker for issue triage"
+    )
+
+
+# --- the inline-secret probe must actually detect secrets --------------------------------
+
+
+def _extract_inline_key_probe_code() -> str:
+    """Extract the python code from the 1.11 inline-secret probe in SKILL.md.
+
+    The code lives inside a ``python3 -c "..."`` shell command.  This helper
+    finds the 1.11 anchor, locates the opening quote, and returns everything up
+    to the closing quote (a ``"`` on a line by itself).
+    """
+    skill_text = _SKILL.read_text(encoding="utf-8")
+    anchor = "# 1.11 — no inline secrets"
+    pos = skill_text.index(anchor)
+    start_marker = 'python3 -c "'
+    code_start = skill_text.index(start_marker, pos) + len(start_marker)
+    rest = skill_text[code_start:]
+    end_match = re.search(r'\n"', rest)
+    assert end_match, "could not find closing quote of 1.11 probe code block"
+    return rest[: end_match.start()]
+
+
+_BASH_CONFIG_PATH = "${XDG_CONFIG_HOME:-$HOME/.config}/voice-loop/config.json"
+
+
+def test_inline_secret_probe_detects_keys(tmp_path):
+    """The 1.11 probe must report FAIL when config has an inline secret, PASS when clean.
+
+    Gaps this test closes (L2 — detection, not coverage):
+    - The probe always printed "no inline secrets" regardless of findings.
+      Feeding it a key and asserting FAIL catches that unconditionally.
+    - ``return`` only exited the innermost dict frame; a key nested inside a
+      second dict was printed but the verdict was still PASS.
+    - Lists were never recursed into; a key inside a list was invisible.
+    - Two-way falsification (L3): both the PASS path and the FAIL path are
+      asserted, so a function that never runs is distinguishable from one that
+      runs and finds nothing.
+    """
+    code = _extract_inline_key_probe_code()
+    assert _BASH_CONFIG_PATH in code, (
+        "SKILL.md 1.11 probe no longer contains the expected config path — "
+        "the path-replacement fixture needs updating"
+    )
+    cfg_file = tmp_path / "config.json"
+
+    def _run() -> "subprocess.CompletedProcess[str]":
+        """Run the extracted probe code with the current config file."""
+        return subprocess.run(
+            ["python3", "-c", code.replace(_BASH_CONFIG_PATH, str(cfg_file))],
+            capture_output=True, text=True, timeout=10, check=False,
+        )
+
+    # -- config with an inline api_key at the top level --------------------------------
+    cfg_file.write_text(
+        json.dumps({"tts": {"backend": "cloud", "cloud": {"api_key": "sk-live-abc123def456"}}}),
+        encoding="utf-8",
+    )
+    result = _run()
+    assert result.returncode == 0, f"probe crashed: {result.stderr}"
+    assert "INLINE KEY at .tts.cloud.api_key" in result.stdout, (
+        f"key not detected — stdout was: {result.stdout!r}"
+    )
+    assert "FAIL" in result.stdout, (
+        f"verdict should be FAIL but was: {result.stdout!r}"
+    )
+
+    # -- clean config — must report PASS ------------------------------------------------
+    cfg_file.write_text(
+        json.dumps({"language": "ru", "tts": {"backend": "lan", "endpoint": "http://127.0.0.1:8355"}}),
+        encoding="utf-8",
+    )
+    result = _run()
+    assert result.returncode == 0, f"probe crashed: {result.stderr}"
+    assert "INLINE KEY" not in result.stdout, (
+        f"false positive on clean config: {result.stdout!r}"
+    )
+    assert "PASS" in result.stdout, (
+        f"verdict should be PASS but was: {result.stdout!r}"
+    )
+
+    # -- key nested inside a list — must be detected (the missing recurse-into-list fix)
+    cfg_file.write_text(
+        json.dumps({"providers": [{"name": "openai", "api_key": "sk-deep-in-list-12345"}]}),
+        encoding="utf-8",
+    )
+    result = _run()
+    assert result.returncode == 0, f"probe crashed: {result.stderr}"
+    assert "INLINE KEY at .providers[0].api_key" in result.stdout, (
+        f"key in list not detected — stdout was: {result.stdout!r}"
+    )
+    assert "FAIL" in result.stdout, (
+        f"verdict should be FAIL for key in list but was: {result.stdout!r}"
+    )
+
+    # -- key nested two levels deep inside a dict — must propagate the hit
+    cfg_file.write_text(
+        json.dumps({"stt": {"cloud": {"credentials": {"token": "abc123def456"}}}}),
+        encoding="utf-8",
+    )
+    result = _run()
+    assert result.returncode == 0, f"probe crashed: {result.stderr}"
+    assert "INLINE KEY at .stt.cloud.credentials.token" in result.stdout, (
+        f"deeply nested key not detected — stdout was: {result.stdout!r}"
+    )
+    assert "FAIL" in result.stdout, (
+        f"verdict should be FAIL for deep key but was: {result.stdout!r}"
+    )
+
+
+# --- the skill uses redaction for evidence gathering ----------------------------------
+
+
+def test_skill_uses_redaction_for_config_evidence():
+    """The skill must redact config values before including them in the report.
+
+    Gap: the old skill used ``cat config.json`` which published raw config —
+    keys, tokens, and hostnames — verbatim into a public issue. This test
+    asserts the skill now uses ``report_bug.redact_value`` instead.
+    """
+    skill_text = _SKILL.read_text(encoding="utf-8")
+    assert "redact_value" in skill_text, (
+        "SKILL.md must use report_bug.redact_value for config evidence "
+        "— raw cat config.json would publish keys and hostnames to a public issue"
+    )
+
+
+def test_skill_uses_scrubbed_logs_for_log_evidence():
+    """The skill must use report_bug's log scrubbing, not raw tail/grep.
+
+    Gap: the old skill used ``tail -30 dictate.log`` and ``grep … speak.log``
+    which published raw log lines — including transcript text and server error
+    bodies — verbatim into a public issue. This test asserts the skill now uses
+    ``report_bug.read_log_tail`` instead.
+    """
+    skill_text = _SKILL.read_text(encoding="utf-8")
+    assert "read_log_tail" in skill_text, (
+        "SKILL.md must use report_bug.read_log_tail for log evidence "
+        "— raw tail/grep would publish transcript text to a public issue"
+    )
+
+
+def test_report_assembly_includes_redaction_safety_net():
+    """The report assembly must include a redaction pass before filing.
+
+    Gap: even when probe output is redacted, an LLM agent filling evidence cells
+    could still include raw config values or log lines it read from earlier
+    probe output. The safety-net redaction pass catches anything the evidence
+    cells picked up. Removing this step would leave no backstop.
+    """
+    skill_text = _SKILL.read_text(encoding="utf-8")
+    assert "Redact the report before it leaves the machine" in skill_text, (
+        "SKILL.md report assembly must include a redaction safety-net step "
+        "before filing"
+    )
+    assert "from report_bug import redact" in skill_text, (
+        "SKILL.md must import redact from report_bug for the safety-net pass"
+    )
+
+
+def test_consent_prompt_references_redacted_body():
+    """The consent prompt must tell the tester they are reviewing a redacted body.
+
+    Gap: the old prompt asked about "filing" without showing what would be
+    published — a tester with a key_file path or window titles in dictate.log
+    had no way to know those were about to appear in a public issue.
+    """
+    skill_text = _SKILL.read_text(encoding="utf-8")
+    assert "redacted report" in skill_text.lower(), (
+        "SKILL.md consent prompt must reference the redacted report body "
+        "so the tester knows what they are consenting to publish"
+    )
+    assert "review exactly what will be published" in skill_text, (
+        "SKILL.md must instruct the agent to show the report body before asking "
+        "for consent — the tester must see every byte that could leave"
     )
