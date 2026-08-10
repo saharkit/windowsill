@@ -148,11 +148,18 @@ def test_defaults_with_empty_config_linux():
     assert s["enabled"] is True
     assert s["marker"] == "🔊"
     assert s["player"] == "aplay -q"
+    assert s["sink"] == ""  # no echo-cancel sink by default
     assert s["max_chars"] == 600
     assert s["timeout"] == 60.0
     assert s["backend"] == "lan"
     assert s["language"] == "en"  # explicit-language setups always write the key; the default is English
     assert s["key_env"] == "VOICE_LOOP_TTS_API_KEY"
+
+
+def test_speak_sink_is_read_from_config():
+    """L2: speak.sink routes TTS audio into the named PipeWire sink for echo cancellation."""
+    s = speak.resolve_settings({"speak": {"sink": "Echo-Cancel Sink"}}, "Linux")
+    assert s["sink"] == "Echo-Cancel Sink"
 
 
 def test_default_player_on_macos():
