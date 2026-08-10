@@ -137,7 +137,14 @@ _OTHER_HOME_RE = re.compile(r"(/(?:home|Users)/)[^/\s:\"']+")
 # line that is one long hex blob costs a fixed amount of work per position rather than a quadratic
 # scan of the rest of the line.
 _IPV6 = (
-    r"(?=[0-9A-Fa-f:.]{0,45}::|(?:[0-9A-Fa-f]{1,4}:){7}[0-9A-Fa-f]{1,4}(?![0-9A-Fa-f]))"
+    r"(?=[0-9A-Fa-f:.]{0,45}::"
+    r"|(?:[0-9A-Fa-f]{1,4}:){7}[0-9A-Fa-f]{1,4}(?![0-9A-Fa-f])"
+    # the full eight-group form carrying an IPv4 tail (`0:0:0:0:0:ffff:10.0.0.1`): six hex groups
+    # then a dotted quad. The compressed `::ffff:10.0.0.1` form is already covered by the `::`
+    # branch above; this is the NON-compressed full form, whose hex prefix used to leak past the
+    # IPv4 rule below (the quad was redacted, the six groups in front of it were not).
+    r"|(?:[0-9A-Fa-f]{1,4}:){6}(?:\d{1,3}\.){3}\d{1,3}(?![0-9.])"
+    r")"
     r"[0-9A-Fa-f:.]{1,44}[0-9A-Fa-f:]"
 )
 # A zone id names an INTERFACE, not a network, and Linux lets an interface be called nearly
@@ -148,12 +155,22 @@ _ZONE_IN_BRACKETS = r"(?:%[^\]\s]+)?"
 _ZONE_BARE = r"(?:%[A-Za-z0-9._-]+)?"
 
 _HOST_BRACKETED_IPV6 = rf"\[{_IPV6}{_ZONE_IN_BRACKETS}\]"
-_HOST_BARE_IPV6 = rf"(?<![0-9A-Za-z:._%-]){_IPV6}{_ZONE_BARE}"
+# The lookbehind keeps a bare IPv6 from starting mid-token, but it must leave room for the
+# `label:address` spelling a reason string carries (`default route via gateway:fd00::1234`). A colon
+# immediately before the literal is therefore allowed UNLESS it is itself preceded by a hex digit:
+# `letter:` is a label delimiter and passes, `digit:` is the tail of a longer address and does not.
+# (`.`/`-`/`%` stay excluded — an IPv6 abutting one of those is not a spelling real prose carries,
+# and allowing it would reach for false matches that cost more than the rare true one.)
+_HOST_BARE_IPV6 = rf"(?<![0-9A-Za-z._%\-])(?<![0-9A-Fa-f]:){_IPV6}{_ZONE_BARE}"
 # A NAME is recognisable as a host only by its shape: dotted labels ending in a TLD-ish label of
 # two or more letters. A SINGLE-label host (`voicebox:8355`) is deliberately not matched at all —
 # every grammar that catches it also eats `code:1006`, `pid:4321` and `task:42`, and a close code
-# missing from a bug report costs more than a dotless service name kept.
-_HOST_DOTTED_NAME = r"(?:[A-Za-z0-9_-]+\.)+[A-Za-z]{2,24}"
+# missing from a bug report costs more than a dotless service name kept. Labels are unicode (`\w`
+# is unicode for a str pattern): a host typed in its native script (`café.example.com`, `тест.рф`)
+# is a host on the same terms as its ASCII punycode form, so neither spelling leaks. The last label
+# is letters-only — `[^\W\d_-]` is a word char that is not a digit, underscore or hyphen — matching
+# a TLD of two or more letters in any script (and still excluding `dictate.debounce_ms`).
+_HOST_DOTTED_NAME = r"(?:[\w-]+\.)+[^\W\d_-]{2,24}"
 # Credentials ride in front of a host as `user:pass@`; they leave with the host they name. Bounded
 # like everything else here: this fragment sits in front of every alternative, so an unbounded run
 # would rescan the rest of the line from every position of a long token.
@@ -164,9 +181,12 @@ _PORT = r"\d{1,5}(?!\d)"
 # The scheme'd form. The port is optional (`https://api.example.com/v1` has none) and so is the
 # userinfo. After a scheme, ANY run up to the path is a host — a name needs no dot to be one there,
 # and bracket content the IPv6 grammar does not recognise is redacted by the catch-all rather than
-# left standing.
+# left standing. The scheme itself is not sensitive, so it is ANY scheme in ANY case (RFC 3986's
+# `ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )`): a report that catches `https://` but lets `ftp://`,
+# `ssh://`, `postgres://` or an uppercase `HTTP://` through has kept the host AND its inline
+# credentials and lost nothing of diagnostic value.
 _URL_RE = re.compile(
-    rf"\b(?P<scheme>(?:https?|wss?)://)(?P<userinfo>{_USERINFO})"
+    rf"\b(?P<scheme>[A-Za-z][A-Za-z0-9+.-]*://)(?P<userinfo>{_USERINFO})"
     rf"(?P<host>{_HOST_BRACKETED_IPV6}|[^\s/:\"'<>)\]]+)"
     rf"(?::(?P<port>{_PORT}))?"
 )
@@ -183,8 +203,12 @@ _URL_RE = re.compile(
 _BARE_HOST_PORT_RE = re.compile(
     rf"(?P<ipuser>{_USERINFO})(?P<ip>{_HOST_BRACKETED_IPV6}|{_HOST_BARE_IPV6})"
     rf"(?::(?P<ipport>{_PORT}))?"
-    rf"|(?P<nameuser>{_USERINFO})\b(?P<name>{_HOST_DOTTED_NAME}|localhost):(?P<nameport>{_PORT})"
+    rf"|(?P<nameuser>{_USERINFO})\b(?P<name>{_HOST_DOTTED_NAME}|localhost)\.?\s*:\s*(?P<nameport>{_PORT})"
 )
+# `\.?\s*:\s*` (not a bare `:`) so a name still reads as a host when its port is spelled other than
+# `:port`: with a DNS root dot (`deepgram.corp.internal.:443` — `host.` is a fully-qualified name)
+# or with stray whitespace around the colon (`deepgram.corp.internal :443`). The `name` group holds
+# neither the dot nor the whitespace, so a redacted endpoint comes out clean as `<host>:port`.
 # An address also reaches the logs bare, with no scheme in front of it: "Connection refused to
 # 192.168.7.31" is a urllib reason string, and it names the user's network just as precisely as a
 # URL does. A dotted quad is unambiguous enough to rewrite on sight, port or no port (a version
@@ -253,8 +277,17 @@ def _is_loopback(host: str) -> bool:
 
 
 def _looks_like_a_file(host: str) -> bool:
-    """True for `session.py`, `config.json`, `spoken.ledger` — a path, not an endpoint."""
-    return host.rsplit(".", 1)[-1].lower() in _FILE_SUFFIXES
+    """True for `session.py`, `config.json`, `spoken.ledger` — a path, not an endpoint.
+
+    A source location is ONE label before a file suffix (`app.py:42`, `session.py:117`). A token
+    with two or more labels before a suffix that is ALSO a TLD (`api.evil.py:443`,
+    `relay.corp.sh:443`) is a subdomained host, not a file, and is redacted. The single-label form
+    (`evil.py:443`) stays ambiguous — it is shape-identical to `app.py:42`, and no shape rule can
+    tell them apart — and is kept, because losing a stray single-label host costs less than eating a
+    real source location (`.py`/`.sh`/`.md` hostnames are exotic; `app.py:42` is every traceback).
+    """
+    labels = host.split(".")
+    return len(labels) == 2 and labels[-1].lower() in _FILE_SUFFIXES
 
 
 def _redact_host(match: "re.Match[str]") -> str:
@@ -279,8 +312,8 @@ def _redact_bare_host_port(match: "re.Match[str]") -> str:
         host, port, userinfo = match.group("ip"), match.group("ipport"), match.group("ipuser")
     else:
         host, port, userinfo = match.group("name"), match.group("nameport"), match.group("nameuser")
-    if _looks_like_a_file(host):
-        return match.group(0)  # a traceback location is the report's whole diagnostic value
+        if _looks_like_a_file(host):
+            return match.group(0)  # a traceback location is the report's whole diagnostic value
     lead = "<user>@" if userinfo else ""
     shown = host if _is_loopback(host) else "<host>"
     return f"{lead}{shown}:{port}" if port else f"{lead}{shown}"
