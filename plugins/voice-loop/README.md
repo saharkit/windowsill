@@ -306,8 +306,10 @@ different feel, and nobody should get it without asking:
 in `~/.config/voice-loop/config.json`. With it off, **nothing on this page happens to you**: the
 `PostToolUse` registration exits before it reads anything (no transcript, no state, nothing per tool
 call), and the `Stop` hook keeps exactly the behaviour it has always had — it dedups against the
-line it spoke immediately before, and nothing else. Everything below is machinery that switches on
-with `speak.eager`, ledger included.
+line it spoke immediately before. Its sidecar `last-spoken-key` records only the opaque
+`sha1(transcript_path + message index + line)` identity, so a repeat in a NEW assistant message is
+a decided dedup (zero wait), while the SAME message remains the flush-race signature. Everything
+else below is machinery that switches on with `speak.eager`, ledger included.
 
 What makes it safe to have two hooks reading the same transcript is a small **spoken-ledger** at
 `~/.local/state/voice-loop/spoken.ledger`: `sha1(transcript_path + message index + line)` of every

@@ -41,6 +41,7 @@ def state(monkeypatch, tmp_path):
     monkeypatch.setattr(speak, "_STATE_DIR", str(tmp_path))
     monkeypatch.setattr(speak, "_LOG_PATH", str(tmp_path / "speak.log"))
     monkeypatch.setattr(speak, "_LAST_PATH", str(tmp_path / "last-spoken"))
+    monkeypatch.setattr(speak, "_LAST_KEY_PATH", str(tmp_path / "last-spoken-key"))
     monkeypatch.setattr(speak, "_PID_PATH", str(tmp_path / "playing.pid"))
     monkeypatch.setattr(speak, "_LEDGER_PATH", str(tmp_path / "spoken.ledger"))
     monkeypatch.setattr(speak, "_LOCK_PATH", str(tmp_path / "speaking.lock"))
@@ -1137,6 +1138,7 @@ def test_eager_stays_a_no_op_until_it_is_opted_into(state, monkeypatch):
     assert (rc, sleeps) == (0, [])
     assert not (state / "spoken.ledger").exists()
     assert not (state / "last-spoken").exists()
+    assert not (state / "last-spoken-key").exists()
 
 
 def _speak_turns(state, monkeypatch, lines: list[str]) -> list[str]:
@@ -1149,6 +1151,23 @@ def _speak_turns(state, monkeypatch, lines: list[str]) -> list[str]:
         _append_message(transcript, f"🔊 {line}")
         assert _fire(state, monkeypatch, transcript, "Stop")[0] == 0
     return spoken
+
+
+def test_eager_off_repeated_line_in_a_new_message_is_decided_without_flush_wait(state, monkeypatch):
+    """L2 mutation gap: an eager-off implementation that keys only by text still burns the
+    flush wait for a genuine repeat in a new assistant message; the message-index key must make it
+    a settled dedup with no extra sleep."""
+    transcript = state / "transcript.jsonl"
+    _write_config(state, monkeypatch)
+    spoken = _record_speech(monkeypatch)
+    transcript.write_text("", encoding="utf-8")
+    _append_message(transcript, "🔊 Done.")
+    assert _fire(state, monkeypatch, transcript, "Stop") == (0, [])
+    _append_message(transcript, "🔊 Done.")
+    rc, sleeps = _fire(state, monkeypatch, transcript, "Stop")
+    assert (rc, sleeps) == (0, [])
+    assert spoken == ["Done."]
+    assert "dropped a read identical to the last spoken line (dedup): Done." in _speak_log(state)
 
 
 def test_eager_off_keeps_exactly_the_pre_ledger_stop_dedup(state, monkeypatch):
