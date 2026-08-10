@@ -21,12 +21,14 @@ Pattern bricks consulted:
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import tempfile
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 CURRENT_SCHEMA = 1
 """The schema version stamped into every written state file.
@@ -93,6 +95,18 @@ class AssistantState:
         return self._path
 
     # -- internal read / write -----------------------------------------------
+
+    @contextmanager
+    def _locked(self) -> Iterator[None]:
+        """Hold the per-plugin lock across a read-modify-write transaction."""
+        self._state_dir.mkdir(parents=True, exist_ok=True)
+        lock_path = self._state_dir / "assistant-state.lock"
+        with lock_path.open("a+") as lock_file:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
     def _read(self) -> dict[str, Any]:
         """Read the current state dict from disk.
@@ -162,15 +176,16 @@ class AssistantState:
         triggered the reminder).
         """
         now = self._clock().isoformat()
-        state = self._read()
-        reminders: dict[str, Any] = state.setdefault("reminders", {})
-        reminders[key] = {
-            "shown_at": now,
-            "muted": True,
-            "mute_reason": reason or "shown once",
-        }
-        state["reminders"] = reminders
-        self._write_atomic(state)
+        with self._locked():
+            state = self._read()
+            reminders: dict[str, Any] = state.setdefault("reminders", {})
+            reminders[key] = {
+                "shown_at": now,
+                "muted": True,
+                "mute_reason": reason or "shown once",
+            }
+            state["reminders"] = reminders
+            self._write_atomic(state)
 
     def reminder_unmute(self, key: str) -> None:
         """Explicitly unmute a reminder so it may be shown again.
@@ -178,14 +193,15 @@ class AssistantState:
         Only call this on an **explicit user request** — never automatically.
         The mute reason is updated to record the unmute.
         """
-        state = self._read()
-        reminders: dict[str, Any] = state.setdefault("reminders", {})
-        entry = reminders.get(key)
-        if entry is not None:
-            entry["muted"] = False
-            entry["mute_reason"] = "explicitly unmuted"
-            state["reminders"] = reminders
-            self._write_atomic(state)
+        with self._locked():
+            state = self._read()
+            reminders: dict[str, Any] = state.setdefault("reminders", {})
+            entry = reminders.get(key)
+            if entry is not None:
+                entry["muted"] = False
+                entry["mute_reason"] = "explicitly unmuted"
+                state["reminders"] = reminders
+                self._write_atomic(state)
 
     def reminder_get(self, key: str) -> dict[str, Any] | None:
         """Return the reminder record for *key*, or *None* if it has never been set."""
@@ -204,10 +220,12 @@ class AssistantState:
         return dict(self._read())
 
     def merge(self, patch: dict[str, Any]) -> None:
-        """Shallow-merge *patch* into the current state and write atomically.
+        """Merge *patch* into the current state and write atomically.
 
         Unknown keys already in the current state (e.g. from a future schema
         version) are **preserved** — only keys present in *patch* are updated.
+        Mapping values are merged within their top-level namespace, so separate
+        consumers can update fields owned by the same namespace without loss.
         This is the recommended write path for consumers like ``#48``'s
         step-ledger or ``/doctor``'s throttle counters that own a top-level
         namespace.
@@ -216,7 +234,12 @@ class AssistantState:
 
             store.merge({"step_ledger": {"install": "checkpoint-done"}})
         """
-        state = self._read()
-        for key, value in patch.items():
-            state[key] = value
-        self._write_atomic(state)
+        with self._locked():
+            state = self._read()
+            for key, value in patch.items():
+                current = state.get(key)
+                if isinstance(current, dict) and isinstance(value, dict):
+                    current.update(value)
+                else:
+                    state[key] = value
+            self._write_atomic(state)

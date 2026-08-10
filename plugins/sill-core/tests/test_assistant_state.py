@@ -15,7 +15,6 @@ import os
 import signal
 import subprocess
 import sys
-import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -192,61 +191,35 @@ class TestRemindOnce:
 class TestAtomicWrite:
     """A crash mid-write leaves old state or new state, never a truncated file."""
 
-    def test_os_replace_is_atomic(self, tmp_path: Path) -> None:
-        """Write initial state, crash before os.replace, old state survives."""
+    def test_os_replace_is_atomic(self, tmp_path: Path, monkeypatch) -> None:
+        """The real writer leaves old state intact when replacement fails.
+
+        Closes the mutation gap where replacing ``_write_atomic`` with an
+        in-place truncating write would pass a test of a copied implementation.
+        """
         store = AssistantState("test", state_home=tmp_path, clock=frozen_clock)
-
-        # Write initial state
         store.reminder_mark_shown("first", reason="initial")
-        initial_data = json_on_disk(store.path)
-        assert initial_data["reminders"]["first"]["muted"] is True
 
-        # Simulate a crash during write: patch _write_atomic to raise after
-        # writing the temp file but before os.replace.
-        original_write = store._write_atomic
+        replace_calls: list[tuple[str, str]] = []
+        real_replace = os.replace
 
-        crash_sites: list[int] = []
+        def crashing_replace(src: str | os.PathLike, dst: str | os.PathLike) -> None:
+            replace_calls.append((str(src), str(dst)))
+            raise RuntimeError("simulated kill -9 before replace")
 
-        def crashing_write(state: dict[str, Any]) -> None:
-            # Write to temp and fsync, then raise BEFORE os.replace
-            state["schema"] = CURRENT_SCHEMA
-            store._state_dir.mkdir(parents=True, exist_ok=True)
-            tmp_fd, tmp_path_str = tempfile.mkstemp(
-                dir=str(store._state_dir),
-                prefix=".assistant-state-",
-                suffix=".tmp",
-            )
-            tmp_path_obj = Path(tmp_path_str)
-            try:
-                with os.fdopen(tmp_fd, "w", encoding="utf-8") as fh:
-                    json.dump(state, fh, indent=2, ensure_ascii=False, sort_keys=True)
-                    fh.flush()
-                    os.fsync(fh.fileno())
-                # temp file is complete on disk — now "crash"
-                crash_sites.append(str(tmp_path_obj))
-                raise RuntimeError("simulated kill -9 mid-write")
-            except BaseException:
-                try:
-                    os.unlink(tmp_path_str)
-                except OSError:
-                    pass
-                raise
-
-        store._write_atomic = crashing_write  # type: ignore[method-assign]
-
+        monkeypatch.setattr(assistant_state.os, "replace", crashing_replace)
         with pytest.raises(RuntimeError, match="simulated kill -9"):
             store.reminder_mark_shown("second", reason="should never land")
 
-        # After the crash, the file must still contain the OLD state intact.
         surviving = json_on_disk(store.path)
-        assert "reminders" in surviving
         assert surviving["reminders"]["first"]["muted"] is True
         assert "second" not in surviving["reminders"]
-
-        # The temp file was cleaned up.
-        assert crash_sites
-        for tmp in crash_sites:
-            assert not os.path.exists(tmp)
+        assert len(replace_calls) == 1
+        temp_path, target_path = replace_calls[0]
+        assert Path(temp_path).parent == store._state_dir
+        assert Path(target_path) == store.path
+        assert not Path(temp_path).exists()
+        assert real_replace is not assistant_state.os.replace
 
     def test_successful_write_replaces_old_state(self, tmp_path: Path) -> None:
         """Normal write path: the file is replaced atomically with new content."""
@@ -361,13 +334,16 @@ class TestConcurrentWrite:
         # Each worker's file must be valid JSON.
         for worker_id in (1, 2):
             wstore = AssistantState(f"concurrent-{worker_id}", state_home=tmp_path)
-            if wstore.path.exists():
-                data = json_on_disk(wstore.path)
-                assert isinstance(data, dict)
-                assert data.get("schema") == CURRENT_SCHEMA
+            assert wstore.path.exists()
+            data = json_on_disk(wstore.path)
+            assert isinstance(data, dict)
+            assert data.get("schema") == CURRENT_SCHEMA
 
     def test_two_writers_same_plugin_file(self, tmp_path: Path) -> None:
         """Two processes writing to the SAME plugin name — the real race.
+
+        Closes the mutation gap where read-modify-write has no lock and
+        silently loses one worker's keys.
 
         Each process writes its own reminder keys; after both finish the file
         must be valid JSON containing keys from both workers.
@@ -386,13 +362,17 @@ class TestConcurrentWrite:
         assert p2.exitcode == 0, f"worker 2 exited {p2.exitcode}"
 
         store = AssistantState("shared-plugin", state_home=tmp_path)
-        if store.path.exists():
-            data = json_on_disk(store.path)
-            assert isinstance(data, dict)
-            assert "reminders" in data
-            # We cannot assert an exact count (the last writer wins on its keys),
-            # but the file MUST be valid JSON and have the schema stamp.
-            assert data["schema"] == CURRENT_SCHEMA
+        assert store.path.exists()
+        data = json_on_disk(store.path)
+        assert isinstance(data, dict)
+        assert "reminders" in data
+        assert data["schema"] == CURRENT_SCHEMA
+        assert len(data["reminders"]) == 100
+        assert all(
+            f"worker{worker_id}-key{i}" in data["reminders"]
+            for worker_id in (1, 2)
+            for i in range(50)
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -500,6 +480,21 @@ class TestUnknownKeyPreservation:
         store.merge({"reminders": {"key": {"shown_at": "x", "muted": True, "mute_reason": "t"}}})
         data = json_on_disk(store.path)
         assert data["future_ns"] == {"flag": True}
+
+    def test_merge_preserves_sibling_keys_in_owned_namespace(self, tmp_path: Path) -> None:
+        """A second patch in one namespace must not erase its first field.
+
+        Closes the mutation gap where ``merge`` assigns mapping namespaces
+        wholesale instead of preserving sibling fields.
+        """
+        store = AssistantState("same-namespace", state_home=tmp_path, clock=frozen_clock)
+        store.merge({"doctor": {"throttle_count": 3}})
+        store.merge({"doctor": {"last_run": "2026-08-05T00:00:00+00:00"}})
+        data = json_on_disk(store.path)
+        assert data["doctor"] == {
+            "throttle_count": 3,
+            "last_run": "2026-08-05T00:00:00+00:00",
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -622,39 +617,23 @@ class TestKill9Live:
 
         child_script = (
             f"""
-import json, os, sys, tempfile, time
+import json, sys, time
+from pathlib import Path
+sys.path.insert(0, str(Path.cwd()))
+from sill_core import assistant_state
+from sill_core.assistant_state import AssistantState
+
 state_dir = {str(state_dir)!r}
-state_file = {str(state_file)!r}
+store = AssistantState("", state_home=Path(state_dir))
+real_dump = assistant_state.json.dump
 
-# Read old state
-with open(state_file, "r") as fh:
-    state = json.load(fh)
+def paused_dump(*args, **kwargs):
+    real_dump(*args, **kwargs)
+    print("READY", flush=True)
+    time.sleep(60)
 
-# Add many new keys to make the write slow enough to race the kill signal
-state["reminders"]["new-key"] = {{
-    "shown_at": "2026-08-05T00:00:00+00:00",
-    "muted": True,
-    "mute_reason": "new state being written",
-}}
-# Bulk out the payload
-state["padding"] = "x" * 500000
-
-# Write to temp, fsync, then replace
-state_dir_path = state_dir
-tmp_fd, tmp_path = tempfile.mkstemp(
-    dir=str(state_dir_path),
-    prefix=".assistant-state-",
-    suffix=".tmp",
-)
-with os.fdopen(tmp_fd, "w", encoding="utf-8") as fh:
-    json.dump(state, fh)
-    fh.flush()
-    os.fsync(fh.fileno())
-
-# Signal the parent that we are about to do the os.replace
-print("READY", flush=True)
-# Wait for the kill signal
-time.sleep(60)
+assistant_state.json.dump = paused_dump
+store.merge({{"reminders": {{"new-key": {{"muted": True}}}}, "padding": "x" * 500000}})
 """
         )
 
@@ -693,39 +672,21 @@ time.sleep(60)
 
         child_script = (
             f"""
-import json, os, sys, tempfile, time
-state_dir = {str(state_dir)!r}
-state_file = {str(state_file)!r}
+import time
+from pathlib import Path
+from sill_core import assistant_state
+from sill_core.assistant_state import AssistantState
 
-new_state = {{
-    "schema": 1,
-    "reminders": {{
-        "new-key": {{
-            "shown_at": "2026-08-05T00:00:00+00:00",
-            "muted": True,
-            "mute_reason": "new state",
-        }},
-    }},
-}}
+store = AssistantState("", state_home=Path({str(state_dir)!r}))
+real_replace = assistant_state.os.replace
 
-# Write to temp
-tmp_fd, tmp_path = tempfile.mkstemp(
-    dir=str(state_dir),
-    prefix=".assistant-state-",
-    suffix=".tmp",
-)
-with os.fdopen(tmp_fd, "w", encoding="utf-8") as fh:
-    json.dump(new_state, fh)
-    fh.flush()
-    os.fsync(fh.fileno())
+def replaced_then_pause(src, dst):
+    real_replace(src, dst)
+    print("REPLACED", flush=True)
+    time.sleep(60)
 
-# Do the atomic replace
-os.replace(tmp_path, state_file)
-
-# Signal the parent that we have done the replace
-print("REPLACED", flush=True)
-# Now wait to be killed
-time.sleep(60)
+assistant_state.os.replace = replaced_then_pause
+store.merge({{"reminders": {{"new-key": {{"muted": True, "mute_reason": "new state"}}}}}})
 """
         )
 
