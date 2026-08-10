@@ -22,6 +22,7 @@ LAN or an ssh tunnel. Everything is configured through the environment — see R
     VOICE_LOOP_TTS_SPEAKER   override the default speaker
     VOICE_LOOP_XTTS_REFERENCE  wav of the voice to clone (the xtts engine refuses requests without it)
     VOICE_LOOP_XTTS_MODEL_DIR  local XTTS-v2 model dir   (optional; default: coqui's own download cache)
+    VOICE_LOOP_XTTS_MIN_FREE_VRAM_BYTES  minimum free VRAM before XTTS uses CPU (default: 3 GiB)
     VOICE_LOOP_STRESS_FILE   stress overrides            (default ~/.config/voice-loop/stress.json)
     VOICE_LOOP_HOOK_STAMP_FILE  the hook's heartbeat stamp (default
                              $XDG_STATE_HOME/voice-loop/hook-last-fired) — /health reports its age
@@ -141,11 +142,16 @@ TTS_ENGINE = os.environ.get("VOICE_LOOP_TTS_ENGINE", "silero").lower()
 # dedicated engine while every other language stays on the global primary — a voice upgrade for one
 # language, not a server-wide switch. The variable name is the language code uppercased with '-'
 # turned into '_' (zh-cn is VOICE_LOOP_TTS_ENGINE_ZH_CN).
-TTS_ENGINE_BY_LANGUAGE: dict[str, str] = {
-    name.removeprefix("VOICE_LOOP_TTS_ENGINE_").replace("_", "-").lower(): engine.lower()
-    for name, engine in os.environ.items()
-    if name.startswith("VOICE_LOOP_TTS_ENGINE_") and engine
-}
+# XTTS is the native local Turkish path: keep the routing in the registry rather than teaching each
+# endpoint a Turkish branch. An environment override can replace this or add another language.
+TTS_ENGINE_BY_LANGUAGE: dict[str, str] = {"tr": "xtts"}
+TTS_ENGINE_BY_LANGUAGE.update(
+    {
+        name.removeprefix("VOICE_LOOP_TTS_ENGINE_").replace("_", "-").lower(): engine.lower()
+        for name, engine in os.environ.items()
+        if name.startswith("VOICE_LOOP_TTS_ENGINE_") and engine
+    }
+)
 # A down engine should degrade the voice, not silence it. The default pairs ANY non-Silero primary —
 # the global engine or a per-language override — with the one engine that is always here; a
 # silero-everywhere setup has nothing lighter to fall to.
@@ -157,6 +163,11 @@ TTS_MODEL_OVERRIDE = os.environ.get("VOICE_LOOP_TTS_MODEL", "")
 TTS_SPEAKER_OVERRIDE = os.environ.get("VOICE_LOOP_TTS_SPEAKER", "")
 XTTS_REFERENCE = os.environ.get("VOICE_LOOP_XTTS_REFERENCE", "")
 XTTS_MODEL_DIR = os.environ.get("VOICE_LOOP_XTTS_MODEL_DIR", "")
+# XTTS shares the card with whisper and any contour service such as RVC. Leave enough headroom for
+# its peak allocation; when the card is already occupied, CPU is slower but keeps speech alive.
+XTTS_MIN_FREE_VRAM_BYTES = int(
+    os.environ.get("VOICE_LOOP_XTTS_MIN_FREE_VRAM_BYTES", str(3 * 1024**3))
+)
 USE_ACCENT = os.environ.get("VOICE_LOOP_ACCENT", "1") not in ("0", "false", "no")
 STRESS_FILE = Path(
     os.environ.get("VOICE_LOOP_STRESS_FILE", "")
@@ -647,16 +658,40 @@ def _load_xtts(device: str):
     return TTS(XTTS_MODEL_ID).to(device)
 
 
+def xtts_device(device: str) -> str:
+    """Choose a safe XTTS tenant before loading, preserving the GPU for resident contour models.
+
+    `mem_get_info` is advisory: if a driver cannot report free VRAM, the loader keeps its existing
+    OOM fallback. A known-small card takes the CPU path proactively, so XTTS does not evict or
+    starve whisper/RVC while it grows its activation buffers.
+    """
+    if device == "cpu":
+        return device
+    try:
+        free, _total = torch.cuda.mem_get_info(device)
+    except (AttributeError, RuntimeError):
+        return device
+    if free < XTTS_MIN_FREE_VRAM_BYTES:
+        log.warning(
+            "XTTS-v2 has only %d bytes of free VRAM (need %d) — using CPU to preserve GPU tenants",
+            free,
+            XTTS_MIN_FREE_VRAM_BYTES,
+        )
+        return "cpu"
+    return device
+
+
 def xtts():
     """Lazily loaded XTTS-v2 voice cloner, cached; reset_caches() drops it like every other model.
 
     The weights are downloaded by coqui-tts on the USER's first request (they are CPML-licensed —
     set COQUI_TOS_AGREED=1 to accept), never bundled with this repo. A GPU too small for the model
-    (~2-2.5 GB of VRAM) degrades to CPU instead of failing the request.
+    (~2-2.5 GB of VRAM) degrades to CPU instead of failing the request. The free-VRAM guard keeps
+    the GPU tenant-safe when whisper or an adjacent contour service is already resident.
     """
     global _xtts, _xtts_device
     if _xtts is None:
-        device = resolve_device()
+        device = xtts_device(resolve_device())
         try:
             _xtts = _load_xtts(device)
         except torch.cuda.OutOfMemoryError:

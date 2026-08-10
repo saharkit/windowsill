@@ -205,6 +205,19 @@ def test_the_deepgram_stt_request_is_a_raw_wav_body_with_query_parameters():
     assert request.content_type == "audio/wav"
 
 
+def test_the_deepgram_entry_carries_turkish_to_the_cloud_provider():
+    """L2 GAP: deleting this language-axis assertion would let Turkish fall back to auto-detect or
+    another language while the provider request still looked structurally valid."""
+    entry = providers.STT_PROVIDERS["deepgram"]
+    request = entry.request(
+        {"cloud_endpoint": "", "endpoint": "", "stt_model": "nova-3", "language": "tr"},
+        "dg-secret",
+        b"RIFFfakewav",
+        "BOUND",
+    )
+    assert "language=tr" in request.url
+
+
 def test_the_scribe_request_carries_the_configured_language_as_language_code():
     """windowsill#93: the language axis is a per-provider SPELLING, not a per-provider silence.
     OpenAI takes `language`, Scribe takes `language_code`, Deepgram takes a query parameter — and
@@ -284,7 +297,7 @@ def test_every_registry_entry_has_a_row_in_the_comparison_table():
     # the four axes the operator asked for by name, and the two languages #47 is about
     for axis in ("latency", "cost per minute", "language coverage", "privacy posture"):
         assert axis in doc.lower()
-    assert "Russian" in doc and "Ukrainian" in doc
+    assert "Russian" in doc and "Ukrainian" in doc and "Turkish" in doc
 
 
 def test_the_fixture_says_out_loud_that_it_is_not_a_live_capture_yet():

@@ -215,9 +215,10 @@ own feature with its own config schema, and it is not implemented — see the de
 
 ## Languages
 
-Recognition (whisper) is multilingual. Local synthesis ships the Silero voices below; **English is a
+Recognition (whisper) is multilingual. The contour ships the local voices below; **English is a
 first-class language, not a fallback** — it has its own selftest phrase and its own CI loopback lane
-(the macOS one).
+(the macOS one). Turkish uses XTTS-v2 locally for native cloned-voice synthesis, or the cloud pair
+Deepgram STT + ElevenLabs multilingual TTS on GPU-less machines.
 
 | language | synthesis model | default speaker | automatic stress marking |
 |---|---|---|---|
@@ -227,9 +228,11 @@ first-class language, not a fallback** — it has its own selftest phrase and it
 | `de` German | `v3_de` | `eva_k` | — |
 | `es` Spanish | `v3_es` | `es_0` | — |
 | `fr` French | `v3_fr` | `fr_0` | — |
+| `tr` Turkish | XTTS-v2 (`VOICE_LOOP_TTS_ENGINE=xtts`) | cloned reference voice | XTTS prosody |
 
 Any other language: recognition still works; for synthesis use a cloud backend or the macOS built-in
-`say` voice. Details in [`server/README.md`](server/README.md). Ukrainian also has an optional
+`say` voice. Turkish's GPU-less cloud contour is Deepgram STT plus ElevenLabs multilingual TTS. Details
+in [`server/README.md`](server/README.md). Ukrainian also has an optional
 **dedicated engine** ([robinhad/ukrainian-tts](https://github.com/robinhad/ukrainian-tts), MIT
 voices trained for Ukrainian) for listeners who find the Silero uk voice too robotic —
 `VOICE_LOOP_TTS_ENGINE_UK=ukrainian` on the server, see

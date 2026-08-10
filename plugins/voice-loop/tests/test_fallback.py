@@ -116,7 +116,8 @@ def test_the_fallback_default_follows_the_primary_engine(monkeypatch):
     assert importlib.reload(voice_server).TTS_FALLBACK_ENGINE == "silero"
 
     monkeypatch.setenv("VOICE_LOOP_TTS_ENGINE", "silero")
-    assert importlib.reload(voice_server).TTS_FALLBACK_ENGINE == "none"
+    # Turkish is routed to XTTS by default, so Silero still needs a degrade path for that contour.
+    assert importlib.reload(voice_server).TTS_FALLBACK_ENGINE == "silero"
 
     monkeypatch.setenv("VOICE_LOOP_TTS_FALLBACK_ENGINE", "XTTS")  # explicit, and case-insensitive
     assert importlib.reload(voice_server).TTS_FALLBACK_ENGINE == "xtts"

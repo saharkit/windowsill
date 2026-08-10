@@ -605,7 +605,7 @@ STT_PROVIDERS: dict[str, SttProvider] = {
         comparison=Comparison(
             latency="a second or two for a short clip; the whole clip is uploaded before work starts",
             cost="whisper-1 list price $0.006/min",
-            languages="~99 languages including Russian and Ukrainian",
+            languages="~99 languages including Russian, Ukrainian and Turkish",
             privacy="audio leaves the machine; retention follows the account's API data policy",
         ),
     ),
@@ -622,7 +622,7 @@ STT_PROVIDERS: dict[str, SttProvider] = {
         comparison=Comparison(
             latency="a second or two for a short clip; accuracy-first rather than latency-first",
             cost="Scribe list price ≈$0.40/hour (≈$0.0067/min) on the paid tiers",
-            languages="99 languages including Russian and Ukrainian; stt.language rides as "
+            languages="99 languages including Russian, Ukrainian and Turkish; stt.language rides as "
             "language_code, and an empty one lets Scribe auto-detect",
             privacy="audio leaves the machine; zero-retention is an account/enterprise setting",
         ),
@@ -642,8 +642,8 @@ STT_PROVIDERS: dict[str, SttProvider] = {
             "variant here (stt.cloud.streaming: true) — the transcript is assembled while you "
             "speak, so a long dictation stops paying for its own length at the end",
             cost="nova-3 pre-recorded list price ≈$0.0043/min; new accounts start with a $200 credit",
-            languages="Russian via nova-3 multilingual (stt.language: \"multi\"); "
-            "Ukrainian needs stt.model: \"nova-2\" — check the vendor's model/language matrix",
+            languages="Russian and Turkish via nova-3 multilingual; Ukrainian needs stt.model: \"nova-2\" — "
+            "check the vendor's model/language matrix",
             privacy="audio leaves the machine; self-hosted deployment is offered, and this plugin's "
             "stt.cloud.endpoint points at one",
         ),
@@ -660,7 +660,7 @@ TTS_PROVIDERS: dict[str, TtsProvider] = {
         comparison=Comparison(
             latency="under a second to first byte for a short line",
             cost="tts-1 list price $15 per 1M characters",
-            languages="multilingual including Russian and Ukrainian, in an English-accented voice",
+            languages="multilingual including Russian, Ukrainian and Turkish, in an English-accented voice",
             privacy="text leaves the machine; retention follows the account's API data policy",
         ),
     ),
@@ -679,7 +679,7 @@ TTS_PROVIDERS: dict[str, TtsProvider] = {
         comparison=Comparison(
             latency="around a second to first byte; flash models are quicker at some quality cost",
             cost="credit-based; the character rate depends on the plan tier",
-            languages="29+ languages including Russian and Ukrainian; voice cloning via /voice-design",
+            languages="29+ languages including Russian, Ukrainian and Turkish; voice cloning via /voice-design",
             privacy="text leaves the machine; designed voices live in the user's ElevenLabs account",
         ),
     ),
@@ -694,8 +694,8 @@ TTS_PROVIDERS: dict[str, TtsProvider] = {
         comparison=Comparison(
             latency="the lowest first-byte latency of the three",
             cost="Aura list price ≈$0.030 per 1k characters; the $200 new-account credit covers it too",
-            languages="ENGLISH ONLY on Aura-2 (plus Spanish) — no Russian, no Ukrainian. "
-            "Not a choice for a Russian- or Ukrainian-speaking contour",
+            languages="English and Spanish only on Aura-2 — no Russian, Ukrainian or Turkish. "
+            "Not a choice for a Russian-, Ukrainian- or Turkish-speaking contour",
             privacy="text leaves the machine; self-hosted deployment is offered",
         ),
     ),

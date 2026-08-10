@@ -25,9 +25,9 @@ the cloud rows below are the path that works today.
 
 | provider | default model | latency | cost per minute | language coverage | privacy posture |
 |---|---|---|---|---|---|
-| `openai` (STT) | `whisper-1` | a second or two for a short clip; the whole clip uploads before work starts | list price **$0.006/min** | ~99 languages, **Russian ✅ Ukrainian ✅** | audio leaves the machine; retention follows the account's API data policy |
-| `elevenlabs` (STT) | `scribe_v1` | a second or two; accuracy-first rather than latency-first | ≈**$0.0067/min** (≈$0.40/hour) on the paid tiers | 99 languages, **Russian ✅ Ukrainian ✅**; `stt.language` rides as Scribe's `language_code` (the plugin defaults it to `en`), and an explicitly empty value asks it to auto-detect | audio leaves the machine; zero-retention is an account/enterprise setting |
-| `deepgram` (STT) | `nova-3` | the quickest of the three on short clips | ≈**$0.0043/min** pre-recorded; new accounts start with a **$200 credit** | **Russian ✅** via nova-3 multilingual (set `stt.language: "multi"`); **Ukrainian ⚠️** — nova-3 multilingual does not cover it, use `stt.model: "nova-2"` and check the vendor's model/language matrix | audio leaves the machine; a self-hosted deployment is offered, and `stt.cloud.endpoint` points at one |
+| `openai` (STT) | `whisper-1` | a second or two for a short clip; the whole clip uploads before work starts | list price **$0.006/min** | ~99 languages, **Russian ✅ Ukrainian ✅ Turkish ✅** | audio leaves the machine; retention follows the account's API data policy |
+| `elevenlabs` (STT) | `scribe_v1` | a second or two; accuracy-first rather than latency-first | ≈**$0.0067/min** (≈$0.40/hour) on the paid tiers | 99 languages, **Russian ✅ Ukrainian ✅ Turkish ✅**; `stt.language` rides as Scribe's `language_code` (the plugin defaults it to `en`), and an explicitly empty value asks it to auto-detect | audio leaves the machine; zero-retention is an account/enterprise setting |
+| `deepgram` (STT) | `nova-3` | the quickest of the three on short clips | ≈**$0.0043/min** pre-recorded; new accounts start with a **$200 credit** | **Russian ✅ Turkish ✅** via nova-3 multilingual (set `stt.language: "multi"`); **Ukrainian ⚠️** — nova-3 multilingual does not cover it, use `stt.model: "nova-2"` and check the vendor's model/language matrix | audio leaves the machine; a self-hosted deployment is offered, and `stt.cloud.endpoint` points at one |
 
 ### Streaming speech-to-text — `stt.cloud.streaming`
 
@@ -66,9 +66,9 @@ paths are compared on your own machine rather than on a claim in this table.
 
 | provider | default model | latency | cost | language coverage | privacy posture |
 |---|---|---|---|---|---|
-| `openai` (TTS) | `tts-1` | under a second to first byte for a short line | list price **$15 per 1M characters** | multilingual, **Russian ✅ Ukrainian ✅** — in an English-accented voice | text leaves the machine; retention follows the account's API data policy |
-| `elevenlabs` (TTS) | `eleven_multilingual_v2` | around a second to first byte; the flash models trade quality for speed | credit-based; the character rate depends on the plan tier | 29+ languages, **Russian ✅ Ukrainian ✅**; voice cloning through `/voice-design` | text leaves the machine; voices you design live in your ElevenLabs account |
-| `deepgram` (TTS) | `aura-2-thalia-en` | the lowest first-byte latency of the three | ≈**$0.030 per 1k characters**; the $200 new-account credit covers it too | **English only** on Aura-2 (plus Spanish) — **Russian ❌ Ukrainian ❌** | text leaves the machine; a self-hosted deployment is offered |
+| `openai` (TTS) | `tts-1` | under a second to first byte for a short line | list price **$15 per 1M characters** | multilingual, **Russian ✅ Ukrainian ✅ Turkish ✅** — in an English-accented voice | text leaves the machine; retention follows the account's API data policy |
+| `elevenlabs` (TTS) | `eleven_multilingual_v2` | around a second to first byte; the flash models trade quality for speed | credit-based; the character rate depends on the plan tier | 29+ languages, **Russian ✅ Ukrainian ✅ Turkish ✅**; voice cloning through `/voice-design` | text leaves the machine; voices you design live in your ElevenLabs account |
+| `deepgram` (TTS) | `aura-2-thalia-en` | the lowest first-byte latency of the three | ≈**$0.030 per 1k characters**; the $200 new-account credit covers it too | **English and Spanish only** on Aura-2 — **Russian ❌ Ukrainian ❌ Turkish ❌** | text leaves the machine; a self-hosted deployment is offered |
 
 **If your contour speaks Russian or Ukrainian, Deepgram is an STT choice and not a TTS one.** That
 asymmetry is the reason the two directions are configured independently — `stt.cloud.provider:

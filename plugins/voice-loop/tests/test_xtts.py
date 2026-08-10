@@ -45,6 +45,19 @@ def test_tts_xtts_speaks_languages_silero_lacks(client, fake_xtts):
     assert fake_xtts.calls[0]["language"] == "tr"
 
 
+def test_turkish_xtts_request_preserves_the_cloned_voice_and_language(client, fake_xtts, xtts_engine, monkeypatch):
+    """L2 GAP: deleting this composition test could route tr through a local-only path or lose the
+    request language, even though XTTS's standalone language set still contains Turkish."""
+    monkeypatch.setattr(voice_server, "TTS_ENGINE", "silero")
+    monkeypatch.setattr(voice_server, "TTS_ENGINE_BY_LANGUAGE", {"tr": "xtts"})
+    response = client.post("/tts", json={"text": "Merhaba dünya.", "language": "tr"})
+
+    assert response.status_code == 200
+    assert response.headers["x-voice-loop-engine"] == "xtts"
+    assert fake_xtts.calls[0]["language"] == "tr"
+    assert fake_xtts.calls[0]["speaker_wav"] == str(xtts_engine)
+
+
 def test_tts_xtts_rejects_a_language_xtts_lacks(client, fake_xtts):
     response = client.post("/tts", json={"text": "Привіт.", "language": "uk"})
 
@@ -231,6 +244,23 @@ def test_xtts_model_dir_override_loads_from_disk(monkeypatch, coqui_installed):
     assert model.kwargs == {"model_path": "/models/xtts-v2", "config_path": "/models/xtts-v2/config.json"}
 
 
+def test_xtts_uses_cpu_when_free_vram_is_below_the_tenant_floor(monkeypatch, coqui_installed, caplog):
+    """L2 GAP: deleting this test lets XTTS claim a crowded 6 GB card and evict whisper/RVC.
+
+    The guard is the language-independent tenancy decision; the Turkish route is covered above.
+    """
+    monkeypatch.setattr(voice_server, "DEVICE", "cuda")
+    monkeypatch.setattr(voice_server, "XTTS_MIN_FREE_VRAM_BYTES", 3 * 1024**3)
+    monkeypatch.setattr(voice_server.torch.cuda, "mem_get_info", lambda device: (2 * 1024**3, 6 * 1024**3))
+
+    with caplog.at_level("WARNING"):
+        model = voice_server.xtts()
+
+    assert model.device == "cpu"
+    assert voice_server._xtts_device == "cpu"
+    assert "preserve GPU tenants" in caplog.text
+
+
 def test_xtts_gpu_oom_falls_back_to_cpu(monkeypatch, import_fake, caplog):
     attempts: list[object] = []
 
@@ -247,6 +277,7 @@ def test_xtts_gpu_oom_falls_back_to_cpu(monkeypatch, import_fake, caplog):
     api = import_fake("TTS.api", TTS=OomTTS)
     import_fake("TTS", api=api)
     monkeypatch.setattr(voice_server, "DEVICE", "cuda")
+    monkeypatch.setattr(voice_server.torch.cuda, "mem_get_info", lambda device: (6 * 1024**3, 6 * 1024**3))
 
     with caplog.at_level("WARNING"):
         model = voice_server.xtts()
