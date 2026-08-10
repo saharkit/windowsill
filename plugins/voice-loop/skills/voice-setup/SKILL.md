@@ -569,7 +569,9 @@ Field notes worth telling the user:
     `stt.model: "nova-2"`.
   - When the user already has an ElevenLabs key configured for TTS (`VOICE_LOOP_TTS_API_KEY`),
     offer `elevenlabs` for STT as the natural choice — the same key covers both directions with no
-    extra setup. That shared-key rule is ElevenLabs' alone; every other provider needs its own key.
+    extra setup. That shared-key rule is ElevenLabs' STT rule alone; every other provider needs its
+    own key, and switching `tts.cloud.provider` means pointing `tts.cloud.api_key_env` at that
+    provider's own key.
   - Say plainly that cloud STT sends the recorded audio clip to the provider's servers — that is
     the privacy trade every cloud backend makes, and it is stated explicitly in the plugin README.
   - If the cloud call fails (network down, quota, expired key) dictation **degrades to the local

@@ -453,6 +453,7 @@ plugins/voice-loop/
   scripts/dictate-toggle.sh   push-to-talk launcher (stable hotkey entry point)
   scripts/dictate.py          the toggle: record -> transcribe -> clipboard/paste-into-prompt
   scripts/providers.py        the speech provider registry: one entry per provider, per direction
+  PROVIDERS.md                 provider comparison: latency, cost, language coverage and privacy
   scripts/wsclient.py         a minimal stdlib RFC 6455 client — what streaming dictation and the streaming synthesis holder talk over
   scripts/selftest.sh         hardware-free loopback proof (TTS -> STT -> compare)
   scripts/report-bug.sh       bug-report launcher (stable entry point for /report-bug)

@@ -172,7 +172,7 @@ synthesis is a normal setup.
 |---|---|---|
 | `local` | HTTP on `127.0.0.1`, or a direct command | [`server/`](../server/README.md) run on this machine; or `stt.command` / `tts.command` for engines that are not servers (`say`, whisper.cpp) |
 | `lan` | HTTP to another host, or through an ssh tunnel | `ssh -N -L 8355:127.0.0.1:8355 user@host` keeps the endpoint `127.0.0.1` and the server unexposed |
-| `cloud` | HTTPS to a provider | OpenAI-compatible or ElevenLabs; the key lives in a `key_file` or a named env var, never in the config |
+| `cloud` | HTTPS to a provider | OpenAI-compatible, ElevenLabs or Deepgram; the key lives in a `key_file` or a named env var, never in the config |
 
 The scripts speak two request shapes: the server's own (`POST /stt` multipart, `POST /tts` JSON) and
 the provider's. Nothing else in the system changes when you switch backends.
