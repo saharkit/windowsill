@@ -19,7 +19,7 @@ import io
 import threading
 
 import pytest
-import soundfile as sf
+sf = pytest.importorskip("soundfile")
 
 import voice_server
 from conftest import FakeSilero, FakeXtts

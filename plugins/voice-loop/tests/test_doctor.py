@@ -31,6 +31,8 @@ if str(_core_root) not in sys.path:
 
 from sill_core.diagnosis import Bin, Finding, diagnose
 
+import doctor
+
 
 # ---------------------------------------------------------------------------
 # Load the manifest
@@ -428,3 +430,304 @@ class TestGrepAudit:
             assert module == "__future__", (
                 f"manifest imports {module!r} — should be data-only"
             )
+
+
+# ---------------------------------------------------------------------------
+# _sill_core_root() path resolution
+# ---------------------------------------------------------------------------
+
+
+class TestSillCoreRootResolution:
+    """_sill_core_root() resolves the correct path in checkout and cache layouts."""
+
+    def test_checkout_layout_sibling_resolution(self) -> None:
+        """Checkout: voice-loop/ and sill-core/ side by side → finds sill-core/.
+
+        Gap: the old code only worked in the checkout layout, and this test
+        pins that it still does after the refactor that also handles the
+        cache layout.
+        """
+        result = doctor._sill_core_root()
+        # In the checkout, sill-core is at plugins/sill-core/ (no version dir).
+        assert result.is_dir()
+        assert result.name == "sill-core"
+        # It must contain the sill_core Python package.
+        assert (result / "sill_core" / "__init__.py").exists()
+
+    def test_cache_layout_with_version_resolution(
+        self, monkeypatch, tmp_path: Path
+    ) -> None:
+        """Cache: voice-loop/0.7.0/ and sill-core/0.1.0/ → finds sill-core/0.1.0/.
+
+        Gap: the old code returned voice-loop/sill-core (one level too deep);
+        this pins that the refactored resolver walks up to the marketplace
+        level and then into the version directory, which is the only code
+        path that would have caught the incident without a symlink.
+        """
+        # Build a cache-like layout.
+        voice_root = tmp_path / "voice-loop" / "0.7.0"
+        voice_root.mkdir(parents=True)
+        sill_version = tmp_path / "sill-core" / "0.1.0" / "sill_core"
+        sill_version.mkdir(parents=True)
+        (sill_version / "__init__.py").write_text("# sill_core")
+
+        monkeypatch.setattr(doctor, "_plugin_root", lambda: voice_root)
+
+        result = doctor._sill_core_root()
+        assert result == tmp_path / "sill-core" / "0.1.0"
+
+    def test_cache_picks_highest_version(
+        self, monkeypatch, tmp_path: Path
+    ) -> None:
+        """When multiple versions exist, the highest one wins.
+
+        Gap: without this, a stale copy could shadow a newer install —
+        a silent regression the old code could not produce because it
+        never resolved version directories at all.
+        """
+        voice_root = tmp_path / "voice-loop" / "0.7.0"
+        voice_root.mkdir(parents=True)
+
+        for ver in ("0.1.0", "0.2.0", "0.1.5"):
+            pkg = tmp_path / "sill-core" / ver / "sill_core"
+            pkg.mkdir(parents=True)
+            (pkg / "__init__.py").write_text(f"# v{ver}")
+
+        monkeypatch.setattr(doctor, "_plugin_root", lambda: voice_root)
+
+        result = doctor._sill_core_root()
+        assert result == tmp_path / "sill-core" / "0.2.0"
+
+    def test_raises_when_sill_core_absent(
+        self, monkeypatch, tmp_path: Path
+    ) -> None:
+        """FileNotFoundError when sill-core is nowhere to be found.
+
+        Gap: the error surface — a raised exception is the signal main()
+        catches to emit the diagnosis; if this function returned a wrong
+        path instead of raising, the diagnosis would never fire and the
+        doctor would crash on the import as before.
+        """
+        voice_root = tmp_path / "voice-loop" / "0.7.0"
+        voice_root.mkdir(parents=True)
+
+        monkeypatch.setattr(doctor, "_plugin_root", lambda: voice_root)
+
+        with pytest.raises(FileNotFoundError):
+            doctor._sill_core_root()
+
+    def test_cache_sill_core_at_marketplace_level_no_version_dir(
+        self, monkeypatch, tmp_path: Path
+    ) -> None:
+        """Cache layout WITHOUT version directories → the sill-core dir itself is used.
+
+        Gap: a cache where sill-core was unpacked flat (no version subdir)
+        should still resolve; the version-dir resolution is a refinement,
+        not a requirement.
+        """
+        voice_root = tmp_path / "voice-loop" / "0.7.0"
+        voice_root.mkdir(parents=True)
+        sill_dir = tmp_path / "sill-core" / "sill_core"
+        sill_dir.mkdir(parents=True)
+        (sill_dir / "__init__.py").write_text("# sill_core")
+
+        monkeypatch.setattr(doctor, "_plugin_root", lambda: voice_root)
+
+        result = doctor._sill_core_root()
+        assert result == tmp_path / "sill-core"
+
+
+# ---------------------------------------------------------------------------
+# _parse_version / _is_version_like
+# ---------------------------------------------------------------------------
+
+
+class TestVersionParsing:
+    """_parse_version and _is_version_like drive the version-dir selection."""
+
+    def test_parse_valid_semver(self) -> None:
+        assert doctor._parse_version("0.1.0") == (0, 1, 0)
+        assert doctor._parse_version("1.2.3") == (1, 2, 3)
+
+    def test_parse_two_part_version(self) -> None:
+        assert doctor._parse_version("0.1") == (0, 1)
+
+    def test_parse_higher_wins(self) -> None:
+        assert doctor._parse_version("0.2.0") > doctor._parse_version("0.1.0")
+        assert doctor._parse_version("1.0.0") > doctor._parse_version("0.9.9")
+        assert doctor._parse_version("0.1.10") > doctor._parse_version("0.1.9")
+
+    def test_parse_garbage_returns_empty(self) -> None:
+        assert doctor._parse_version("not-a-version") == ()
+        assert doctor._parse_version("") == ()
+
+    def test_is_version_like_valid(self) -> None:
+        assert doctor._is_version_like("0.1.0") is True
+        assert doctor._is_version_like("1.2") is True
+
+    def test_is_version_like_rejects_single_number(self) -> None:
+        """A lone number is not a version directory — needs at least two parts."""
+        assert doctor._is_version_like("1") is False
+        assert doctor._is_version_like("0") is False
+
+    def test_is_version_like_rejects_qualifiers(self) -> None:
+        assert doctor._is_version_like("0.1.0rc1") is False
+        assert doctor._is_version_like("v0.1.0") is False
+
+
+# ---------------------------------------------------------------------------
+# Incident symlink cleanup
+# ---------------------------------------------------------------------------
+
+
+class TestIncidentSymlinkCleanup:
+    """_remove_incident_symlink() deletes the 2026-08-10 workaround symlink."""
+
+    def test_removes_symlink_at_wrong_path(
+        self, monkeypatch, tmp_path: Path
+    ) -> None:
+        """The symlink at voice-loop/sill-core (the old wrong path) is deleted.
+
+        Gap: without cleanup, a /plugin update removes the symlink silently
+        and the old bug resurfaces; the cleanup is part of the fix so the
+        old wrong path is never followed again, even by a stale caller.
+        """
+        voice_root = tmp_path / "voice-loop" / "0.7.0"
+        voice_root.mkdir(parents=True)
+
+        # Create the symlink at the old wrong location.
+        wrong_path = tmp_path / "voice-loop" / "sill-core"
+        wrong_path.symlink_to(tmp_path / "some-target")
+
+        monkeypatch.setattr(doctor, "_plugin_root", lambda: voice_root)
+
+        doctor._remove_incident_symlink()
+        assert not wrong_path.exists()
+
+    def test_noop_when_no_symlink(
+        self, monkeypatch, tmp_path: Path
+    ) -> None:
+        """Does not raise when there is nothing to remove.
+
+        Gap: cleanup must be safe to call on a fresh install — a crash here
+        would defeat the entire fix.
+        """
+        voice_root = tmp_path / "voice-loop" / "0.7.0"
+        voice_root.mkdir(parents=True)
+
+        monkeypatch.setattr(doctor, "_plugin_root", lambda: voice_root)
+
+        # Must not raise.
+        doctor._remove_incident_symlink()
+
+    def test_noop_when_path_is_directory_not_symlink(
+        self, monkeypatch, tmp_path: Path
+    ) -> None:
+        """Only symlinks are deleted — a real directory at the wrong path is left alone.
+
+        Gap: a user who manually created a real sill-core directory at the
+        old wrong path should not lose data; the cleanup is scoped to the
+        incident symlink only.
+        """
+        voice_root = tmp_path / "voice-loop" / "0.7.0"
+        voice_root.mkdir(parents=True)
+
+        real_dir = tmp_path / "voice-loop" / "sill-core"
+        real_dir.mkdir()
+
+        monkeypatch.setattr(doctor, "_plugin_root", lambda: voice_root)
+
+        doctor._remove_incident_symlink()
+        assert real_dir.is_dir()
+
+
+# ---------------------------------------------------------------------------
+# main() — missing engine diagnosis
+# ---------------------------------------------------------------------------
+
+
+class TestDoctorMissingEngineDiagnosis:
+    """When sill-core is absent, main() emits a diagnosis instead of crashing."""
+
+    def test_missing_engine_emits_diagnosis_json(
+        self, monkeypatch, capsys
+    ) -> None:
+        """The JSON output carries a sill_core_missing finding, not a traceback.
+
+        Gap: the incident showed that a missing sill-core crashed the doctor
+        with ModuleNotFoundError — the diagnostic tool could not report its
+        own broken state.  This test pins that it now emits structured JSON
+        with rc=0 instead, which the skill can present to the operator.
+        """
+        # Prevent side effects from reaching the host filesystem.
+        monkeypatch.setattr(doctor, "read_config", lambda path: {})
+        monkeypatch.setattr(
+            doctor, "read_ledger",
+            lambda state_home: {"state": "none", "completed_steps": []},
+        )
+        monkeypatch.setattr(
+            doctor, "read_logs", lambda state_home, tail_lines=60: {},
+        )
+        monkeypatch.setattr(doctor, "load_manifest", lambda root: [])
+        monkeypatch.setattr(
+            doctor, "_sill_core_root",
+            lambda: (_ for _ in ()).throw(
+                FileNotFoundError("sill-core not found")
+            ),
+        )
+
+        rc = doctor.main([])
+        captured = capsys.readouterr()
+        output = json.loads(captured.out)
+
+        assert rc == 0
+        findings = output["findings"]
+        assert len(findings) == 1
+        assert findings[0]["key"] == "sill_core_missing"
+        assert findings[0]["bin"] == "real_anomaly"
+        assert "install sill-core" in findings[0]["fix"].lower()
+
+    def test_import_failed_emits_diagnosis_json(
+        self, monkeypatch, capsys, tmp_path: Path
+    ) -> None:
+        """When sill-core is on disk but won't import, a distinct diagnosis fires.
+
+        Gap: FileNotFoundError covers the "not there" case; ImportError covers
+        the "found but broken" case — a damaged plugin is a different diagnosis
+        than an absent one, and the operator action differs (reinstall vs install).
+        """
+        # Build a fake sill-core that exists but has no importable diagnosis module.
+        sill_root = tmp_path / "sill-core"
+        sill_root.mkdir()
+        (sill_root / "sill_core").mkdir()
+        (sill_root / "sill_core" / "__init__.py").write_text("")
+        # No diagnosis.py — importing sill_core.diagnosis will raise ImportError.
+
+        # Evict the real sill-core from sys.modules so the fake one is the only
+        # candidate — otherwise the cached import from this test module's own
+        # `from sill_core.diagnosis import ...` satisfies the import silently.
+        for key in list(sys.modules):
+            if key == "sill_core" or key.startswith("sill_core."):
+                monkeypatch.delitem(sys.modules, key)
+
+        monkeypatch.setattr(doctor, "read_config", lambda path: {})
+        monkeypatch.setattr(
+            doctor, "read_ledger",
+            lambda state_home: {"state": "none", "completed_steps": []},
+        )
+        monkeypatch.setattr(
+            doctor, "read_logs", lambda state_home, tail_lines=60: {},
+        )
+        monkeypatch.setattr(doctor, "load_manifest", lambda root: [])
+        monkeypatch.setattr(doctor, "_sill_core_root", lambda: sill_root)
+
+        rc = doctor.main([])
+        captured = capsys.readouterr()
+        output = json.loads(captured.out)
+
+        assert rc == 0
+        findings = output["findings"]
+        assert len(findings) == 1
+        assert findings[0]["key"] == "sill_core_import_failed"
+        assert findings[0]["bin"] == "real_anomaly"
+        assert "reinstall sill-core" in findings[0]["fix"].lower()

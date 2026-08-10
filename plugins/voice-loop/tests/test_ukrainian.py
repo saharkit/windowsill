@@ -13,7 +13,7 @@ import importlib
 import io
 
 import pytest
-import soundfile as sf
+sf = pytest.importorskip("soundfile")
 
 import voice_server
 from test_streaming import events, wav_of
