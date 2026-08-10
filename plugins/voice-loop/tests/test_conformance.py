@@ -57,8 +57,11 @@ def _table_rows(text: str) -> list[dict[str, str]]:
                 continue
             if not past_separator or not headers:
                 continue
-            if len(cells) == len(headers):
-                rows.append(dict(zip(headers, cells)))
+            if len(cells) != len(headers):
+                raise AssertionError(
+                    f"malformed markdown table row: expected {len(headers)} cells, got {len(cells)}"
+                )
+            rows.append(dict(zip(headers, cells)))
         else:
             in_table = False
             past_separator = False
@@ -180,6 +183,16 @@ _REQUIRED_SECTIONS = {
 }
 
 
+def test_table_rows_reject_malformed_rows():
+    """A malformed row must fail extraction instead of disappearing from validation."""
+    with pytest.raises(AssertionError, match="malformed markdown table row"):
+        _table_rows(
+            "| # | scenario | verdict | evidence |\n"
+            "| --- | --- | --- | --- |\n"
+            "| 1 | missing evidence | pass |\n"
+        )
+
+
 def test_every_scenario_row_has_verdict_and_evidence_columns():
     """Every data row in a checklist table must have 'verdict' and 'evidence' columns.
 
@@ -291,6 +304,9 @@ def test_skill_references_report_bug_transports():
     assert "report-bug" in skill_text, (
         "SKILL.md must reference the /report-bug transports it reuses"
     )
-    assert "conformance" in skill_text, (
-        "SKILL.md must reference the 'conformance' label for issue triage"
+    assert "--label conformance" in skill_text, (
+        "SKILL.md must pass the 'conformance' label to gh issue create"
+    )
+    assert "<!-- conformance -->" in skill_text, (
+        "SKILL.md must include the 'conformance' body marker for issue triage"
     )

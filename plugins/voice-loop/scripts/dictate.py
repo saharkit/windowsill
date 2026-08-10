@@ -208,8 +208,8 @@ _STREAM_RESULT_PATH = os.path.join(_STATE_DIR, "dictate-stream.json")
 _SPEAK_PID_PATH = os.path.join(_STATE_DIR, "playing.pid")
 
 # When the macOS Accessibility permission for osascript keystroke injection was declined, this
-# marker stops the paste retry for the lifetime of the state dir — the next toggle skips the
-# keystroke path and the text stays on the clipboard without another prompt.
+# marker stops the paste retry until a later permission probe confirms that Accessibility was
+# restored — the next toggle then clears the marker and retries the keystroke path.
 _PASTE_DENIED_PATH = os.path.join(_STATE_DIR, "dictate-paste-denied")
 
 # A freshly O_EXCL-claimed pidfile holds no pid for only milliseconds (until the recorder is
@@ -529,12 +529,20 @@ def same_window_guard_on(s: dict) -> bool:
 # --- paste denial: the macOS Accessibility permission, detected once per session --------------------
 
 
-def _paste_denied() -> bool:
-    """Has the macOS Accessibility permission been declined this session?
+_ACCESSIBILITY_PROBE = [
+    "osascript",
+    "-e",
+    'tell application "System Events" to get name of first application process whose frontmost is true',
+]
 
-    A marker file in the state dir persists across invocations, so a user who declines the
-    permission once is not prompted again on every toggle — the keystroke path is skipped and the
-    text stays on the clipboard."""
+
+def _paste_denied() -> bool:
+    """Has a previous invocation recorded a macOS Accessibility denial?
+
+    The marker persists across invocations, so a user who declines the permission is not prompted
+    again on every toggle.  ``_run_paste`` probes the permission before honouring the marker, which
+    lets a later grant in System Settings clear the stale denial and retry auto-paste.
+    """
     return os.path.exists(_PASTE_DENIED_PATH)
 
 
@@ -550,15 +558,46 @@ def _mark_paste_denied() -> None:
         pass
 
 
+def _clear_paste_denied() -> None:
+    """Forget a denial after an Accessibility probe confirms permission was restored."""
+    try:
+        os.unlink(_PASTE_DENIED_PATH)
+    except OSError:
+        pass
+
+
+def _accessibility_permission_regranted() -> bool:
+    """True when System Events now accepts an Accessibility query.
+
+    This is a harmless, bounded probe rather than another paste attempt: it lets a user who later
+    grants Accessibility recover from the persistent denial marker without sending a keystroke into
+    the focused application first.
+    """
+    try:
+        result = subprocess.run(
+            _ACCESSIBILITY_PROBE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=FOCUS_PROBE_TIMEOUT,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0
+
+
 def _is_accessibility_denial(stderr: bytes) -> bool:
     """True when the osascript stderr reads like a macOS Accessibility permission denial.
 
-    The dialog text is 'Claude wants to control this computer' (or the terminal app's name); the
-    osascript error reports it as not being allowed to send keystrokes or assistive-access events.
-    Both wordings are checked case-insensitively so a user running a non-English macOS still gets
-    the detection."""
+    The prose varies with the macOS locale, but the numeric OSStatus codes are stable.  Match both
+    the known English diagnostics and the locale-independent ``-1743`` / ``1002`` codes.
+    """
     text = stderr.decode("utf-8", "replace").lower()
-    return "not allowed to send keystrokes" in text or "not authorized to send apple events to system events" in text
+    return (
+        "not allowed to send keystrokes" in text
+        or "not authorized to send apple events to system events" in text
+        or re.search(r"(?<!\d)(?:-1743|1002)(?!\d)", text) is not None
+    )
 
 
 def _log_stderr(stderr_bytes: bytes) -> None:
@@ -1595,10 +1634,13 @@ def _run_paste(tool: str, paste_key: str, enter: bool, ydotool_socket: str) -> b
     path is skipped on every subsequent toggle — the text stays on the clipboard without another
     prompt. Other paste failures (tool not installed, a transient error) fall back to clipboard
     without recording a denial, so the toggle retries on the next invocation."""
-    # If the user already declined the Accessibility permission this session, skip the
-    # keystroke path without retrying — the text stays on the clipboard.
+    # A denial marker persists across invocations, but it must not make recovery depend on
+    # manually deleting a file: probe the permission and clear a stale marker after a later grant.
     if tool == "osascript" and _paste_denied():
-        return False
+        if _accessibility_permission_regranted():
+            _clear_paste_denied()
+        else:
+            return False
 
     steps = paste_plan(tool, paste_key, enter)
     if not steps:

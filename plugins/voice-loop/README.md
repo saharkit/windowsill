@@ -469,9 +469,10 @@ the first actual dictation, not during install: when it appears, you know exactl
 - **Allow** → keystrokes work and paste is hands-free from then on.
 - **Decline** → dictation still works. The text stays on your clipboard (press **Cmd+V** yourself),
   the script detects the denial in the osascript error output, and **stops retrying the keystroke
-  path** — the dialog will not reappear. Switching back to auto-paste later is just removing
-  `~/.local/state/voice-loop/dictate-paste-denied` (or re-granting the permission in System Settings
-  → Privacy & Security → Accessibility) and the next toggle retries.
+  path** — the dialog will not reappear. Switching back to auto-paste later is either removing
+  `~/.local/state/voice-loop/dictate-paste-denied` or re-granting the permission in System Settings
+  → Privacy & Security → Accessibility; the next toggle probes the permission, clears a stale
+  marker, and retries automatically.
 
 The notification the script shows on denial: *"accessibility permission denied — text is on the
 clipboard"*. Every toggle after that falls back to clipboard silently — the denial is explained once,
