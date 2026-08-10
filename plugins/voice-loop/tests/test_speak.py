@@ -783,6 +783,146 @@ def test_take_over_spares_a_real_child_without_the_marker(state):
         child.wait(timeout=10)
 
 
+# --- process-group pidfile markers (windowsill#152): tts.command children ------------------------
+#
+# The "pg" marker in the pidfile tells take_over "do not signal this PID directly — the old
+# chain's _on_sigterm handler uses killpg on its own children."  playback_is_live checks pg
+# leaders by existence alone (no identity guard needed — the marker IS the identity record).
+
+
+def test_recorded_pids_excludes_pg_marked_children(state):
+    """A pidfile with a "pg" marker: _recorded_pids returns only the non-pg PIDs — the ones
+    take_over may safely signal after identity verification."""
+    (state / "playing.pid").write_text(f"{os.getpid()} pg 222 333", encoding="utf-8")
+    assert speak._recorded_pids() == [333]  # own pid filtered, pg+222 skipped
+
+
+def test_recorded_pids_handles_legacy_format_with_no_pg_marker(state):
+    """Backward compat: a pidfile without "pg" tokens returns all non-self PIDs exactly as before."""
+    (state / "playing.pid").write_text(f"{os.getpid()} 222", encoding="utf-8")
+    assert speak._recorded_pids() == [222]
+
+
+def test_recorded_pgids_returns_process_group_leaders(state):
+    """_recorded_pgids returns only the PIDs that follow "pg" markers — the tts.command children
+    whose liveness playback_is_live checks."""
+    (state / "playing.pid").write_text(f"{os.getpid()} pg 222 333 pg 444", encoding="utf-8")
+    assert speak._recorded_pgids() == [222, 444]
+
+
+def test_recorded_pgids_empty_when_no_pg_markers(state):
+    """No "pg" tokens: _recorded_pgids returns an empty list."""
+    (state / "playing.pid").write_text(f"{os.getpid()} 222", encoding="utf-8")
+    assert speak._recorded_pgids() == []
+
+
+def test_recorded_pgids_skips_own_pid(state):
+    """A pg-marked PID that matches our own is excluded, same as _recorded_pids."""
+    (state / "playing.pid").write_text(f"{os.getpid()} pg {os.getpid()}", encoding="utf-8")
+    assert speak._recorded_pgids() == []
+
+
+def test_take_over_never_signals_pg_marked_children(state, monkeypatch):
+    """take_over signals only the PIDs _recorded_pids returns — which excludes pg-marked
+    children.  The pg child is not signalled even when every PID passes the identity guard."""
+    (state / "playing.pid").write_text(f"{os.getpid()} pg 222 333", encoding="utf-8")
+    monkeypatch.setattr(speak, "pid_looks_like_speak", lambda pid: True)
+    kills: list[tuple[int, int]] = []
+    monkeypatch.setattr(speak.os, "kill", lambda pid, sig: kills.append((pid, sig)))
+    speak.take_over()
+    assert kills == [(333, speak.signal.SIGTERM)]  # only 333, not 222
+
+
+def test_playback_is_live_detects_pg_leaders(state, monkeypatch):
+    """A pg leader that still exists makes playback_is_live return True — no identity guard
+    needed, because the "pg" marker IS the identity record."""
+    (state / "playing.pid").write_text(f"{os.getpid()} pg 222", encoding="utf-8")
+    # pid_looks_like_speak returns False for every regular PID, so only the pg leader matters
+    monkeypatch.setattr(speak, "pid_looks_like_speak", lambda pid: False)
+    monkeypatch.setattr(speak.os, "kill", lambda pid, sig: None)  # both exist
+    assert speak.playback_is_live() is True
+
+
+def test_playback_is_live_ignores_dead_pg_leaders(state, monkeypatch):
+    """A pg leader that no longer exists is not live playback."""
+    (state / "playing.pid").write_text(f"{os.getpid()} pg 222", encoding="utf-8")
+    monkeypatch.setattr(speak, "pid_looks_like_speak", lambda pid: False)
+
+    def kill_races(pid, sig):
+        if pid == 222:
+            raise ProcessLookupError
+
+    monkeypatch.setattr(speak.os, "kill", kill_races)
+    assert speak.playback_is_live() is False
+
+
+def test_on_sigterm_uses_killpg_when_pgid_is_set(monkeypatch):
+    """When _live has a "pgid", _on_sigterm calls os.killpg on it — the process-group
+    signalling that reaches the player inside the shell regardless of exec or wrapper depth."""
+    killpg_calls: list[tuple[int, int]] = []
+    monkeypatch.setattr(speak.os, "killpg", lambda pgid, sig: killpg_calls.append((pgid, sig)))
+    monkeypatch.setattr(speak.os, "_exit", lambda code: None)  # don't actually exit
+
+    class _FakeProc:
+        def poll(self):
+            return None
+
+        def terminate(self):
+            pass
+
+    speak._live["proc"] = _FakeProc()
+    speak._live["pgid"] = 999
+    try:
+        speak._on_sigterm(signal.SIGTERM, None)
+        assert killpg_calls == [(999, signal.SIGTERM)]
+    finally:
+        speak._live["proc"] = None
+        speak._live.pop("pgid", None)
+
+
+def test_on_sigterm_skips_killpg_when_pgid_not_set(monkeypatch):
+    """Without a pgid, _on_sigterm never calls killpg — the normal path is unchanged."""
+    killpg_calls: list = []
+    monkeypatch.setattr(speak.os, "killpg", lambda pgid, sig: killpg_calls.append(1))
+    monkeypatch.setattr(speak.os, "_exit", lambda code: None)
+
+    class _FakeProc:
+        def poll(self):
+            return None
+
+        def terminate(self):
+            pass
+
+    speak._live["proc"] = _FakeProc()
+    speak._live.pop("pgid", None)  # ensure clean state
+    try:
+        speak._on_sigterm(signal.SIGTERM, None)
+        assert killpg_calls == []
+    finally:
+        speak._live["proc"] = None
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="process-group signalling is POSIX; the identity check is Linux-only")
+def test_take_over_spares_a_pg_marked_child_integration(state):
+    """Real-child integration: a process-group leader marked "pg" in the pidfile is NOT signalled
+    by take_over — the identity-guess is skipped.  The child exits normally (rc=0), not by signal.
+    This is the acceptance criterion from windowsill#152: the player exits on its own rather than
+    by signal when it belongs to a process-group chain."""
+    child = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(2); print('done')"],
+    )
+    try:
+        (state / "playing.pid").write_text(f"{os.getpid()} pg {child.pid}", encoding="utf-8")
+        speak.take_over()
+        # The child should survive — it's pg-marked, so take_over skips it.
+        time.sleep(0.3)  # a delivered SIGTERM would have landed by now
+        assert child.poll() is None, f"pg-marked child was signalled (rc={child.poll()})"
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.wait(timeout=10)
+
+
 # --- the cloud synthesis request shapes, mocked at the urllib seam ------------------------------
 
 

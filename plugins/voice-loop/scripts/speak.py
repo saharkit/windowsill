@@ -931,10 +931,14 @@ def synthesize(text: str, s: dict, key: str) -> bytes | None:
     return body
 
 
-def _write_pidfile(*pids: int) -> None:
+def _write_pidfile(*tokens) -> None:
+    """Write the speaking-chain identity to ``playing.pid``.  Tokens are space-joined; the
+    first is always our own PID.  An optional ``"pg"`` marker before a child PID means the child
+    was spawned in its own process group (``tts.command``) — ``take_over`` never signals those
+    directly; the chain's ``_on_sigterm`` handler uses ``killpg`` instead."""
     try:
         with open(_PID_PATH, "w", encoding="utf-8") as fh:
-            fh.write(" ".join(str(p) for p in pids))
+            fh.write(" ".join(str(t) for t in tokens))
     except OSError:
         pass
 
@@ -984,23 +988,64 @@ def pid_looks_like_speak(pid: int, read_cmdline=_cmdline_of, platform_id: str = 
 
 
 def _recorded_pids() -> list[int]:
-    """The speaking chain playing.pid records, minus our own pid and minus an unreadable or
-    unparseable file. One reader for both users of that file — the takeover that SIGTERMs the chain
-    and the waiter that waits it out — so neither can drift into seeing it differently."""
+    """The speaking chain PIDs that THIS process may safely SIGTERM — the previous chain's python
+    process and its player children.  ``"pg"``-marked children (``tts.command`` process groups) are
+    EXCLUDED: they are terminated by the old chain's ``_on_sigterm`` handler via ``killpg``, never
+    targeted individually.  One reader for both users of this file — ``take_over`` and
+    ``playback_is_live`` — so neither can drift into seeing it differently."""
     try:
         with open(_PID_PATH, encoding="utf-8") as fh:
-            pids = [int(tok) for tok in fh.read().split()]
-    except (OSError, ValueError):
+            tokens = fh.read().split()
+    except OSError:
         return []
+    pids: list[int] = []
+    skip_next = False
+    for tok in tokens:
+        if tok == "pg":
+            skip_next = True
+            continue
+        if skip_next:
+            skip_next = False
+            continue
+        try:
+            pids.append(int(tok))
+        except ValueError:
+            continue
     return [pid for pid in pids if pid and pid != os.getpid()]
+
+
+def _recorded_pgids() -> list[int]:
+    """Process-group leader PIDs that the ``tts.command`` path recorded — process-group children
+    whose liveness ``playback_is_live`` checks but which ``take_over`` never signals directly
+    (the old chain's ``_on_sigterm`` handler uses ``killpg`` on its own children when the chain's
+    python process receives SIGTERM)."""
+    try:
+        with open(_PID_PATH, encoding="utf-8") as fh:
+            tokens = fh.read().split()
+    except OSError:
+        return []
+    pgids: list[int] = []
+    i = 0
+    while i < len(tokens):
+        if tokens[i] == "pg" and i + 1 < len(tokens):
+            try:
+                pgids.append(int(tokens[i + 1]))
+            except ValueError:
+                pass
+            i += 2
+        else:
+            i += 1
+    return [pgid for pgid in pgids if pgid and pgid != os.getpid()]
 
 
 def take_over() -> None:
     """A fresher line supersedes a still-playing older one: SIGTERM exactly the PIDs the previous
     chain recorded (its python process + its current player child) — nothing else — and only
-    after each pid passes the PID-reuse guard above. A tts.command child records no marker in its
-    own argv, but killing its identity-verified python parent stops it too (the SIGTERM handler
-    terminates the child). Same semantics as dictate.py's echo guard (cross-script contract)."""
+    after each pid passes the PID-reuse guard above.  Process-group children (``tts.command``,
+    marked ``"pg"`` in the pidfile) are NOT signalled here: the chain's python parent receives
+    SIGTERM and its ``_on_sigterm`` handler uses ``killpg`` on its own children, which reaches the
+    player inside the shell regardless of ``exec`` or temp-file naming.  Same semantics as
+    dictate.py's echo guard (cross-script contract)."""
     for pid in _recorded_pids():
         if pid_looks_like_speak(pid):
             try:
@@ -1016,7 +1061,10 @@ def playback_is_live() -> bool:
     which exits before the cleanup that would remove the file, so the record outlives the process.
     ``os.kill(pid, 0)`` is the existence probe — it delivers no signal — and pid_looks_like_speak is
     the same PID-reuse guard the takeover applies before signalling. A pid that is gone, that is not
-    ours to signal, or that the kernel has since handed to somebody else is not one to wait for."""
+    ours to signal, or that the kernel has since handed to somebody else is not one to wait for.
+
+    Process-group children (``tts.command``) are checked by pg-leader existence alone — no identity
+    guard is needed because the ``"pg"`` marker in the pidfile IS the identity record."""
     for pid in _recorded_pids():
         try:
             os.kill(pid, 0)
@@ -1024,6 +1072,12 @@ def playback_is_live() -> bool:
             continue
         if pid_looks_like_speak(pid):
             return True
+    for pgid in _recorded_pgids():
+        try:
+            os.kill(pgid, 0)
+        except OSError:
+            continue
+        return True
     return False
 
 
@@ -1356,6 +1410,14 @@ def _on_sigterm(signum, frame):  # noqa: ARG001 — signal-handler signature
             proc.terminate()
         except OSError:
             pass
+    # Process-group children (tts.command): signal the entire group so the player
+    # inside the shell receives the signal regardless of exec or wrapper depth.
+    pgid = _live.get("pgid")
+    if pgid is not None:
+        try:
+            os.killpg(pgid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            pass
     stream = _live.get("stream")
     if stream is not None:
         try:
@@ -1486,6 +1548,13 @@ def play_text(text: str, s: dict, t0: float, *, extract_ms: int) -> bool:
         # — synthesis and playback are one opaque step, so there is nothing to pipeline: the
         # whole text goes in one call. first_audio_ms keeps its definition here too: t0 -> the
         # spawn of the process that makes the sound (this command IS the player).
+        #
+        # Spawned in its own session (start_new_session=True) so the shell + its player children
+        # form a process group.  The pidfile records a "pg" marker before the child PID:
+        # take_over never signals it directly (no cmdline guessing needed — the pg marker IS the
+        # identity), and _on_sigterm uses killpg on the group so the player inside the shell
+        # receives the signal regardless of whether the shim exec's or names temp files
+        # "voice-loop-speak*".  windowsill#152.
         first_ms = int((time.monotonic() - t0) * 1000)
         try:
             proc = subprocess.Popen(
@@ -1493,14 +1562,17 @@ def play_text(text: str, s: dict, t0: float, *, extract_ms: int) -> bool:
                 stdin=subprocess.PIPE,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
+                start_new_session=True,
             )
         except OSError as err:
             log(f"local command failed: {err}")
             return False
         _live["proc"] = proc
-        _write_pidfile(os.getpid(), proc.pid)
+        _live["pgid"] = proc.pid  # session leader -> process group leader
+        _write_pidfile(os.getpid(), "pg", proc.pid)
         proc.communicate(input=text.encode("utf-8"))
         _live["proc"] = None
+        _live.pop("pgid", None)
         log(f"local command rc={proc.returncode}")
         total_ms = int((time.monotonic() - t0) * 1000)
         log(f"timings extract_ms={extract_ms} first_audio_ms={first_ms} total_ms={total_ms}")
