@@ -101,10 +101,11 @@ between, but the recording is genuinely still running until you do.
 → Function Keys → "F1, F2, etc. keys always shown in Touch Bar"* is enabled, `F9` exists only while
 `fn` is held — so a binding on plain `f9` may never receive a keycode.
 
-Bind a **physical chord** instead. With `skhd` (`brew install skhd`), in `~/.config/skhd/skhdrc`:
+Bind a **physical chord** instead. `/voice-setup` installs the stable launcher first. With `skhd`
+(`brew install skhd`), in `~/.config/skhd/skhdrc`:
 
 ```
-cmd - i : /path/to/plugins/voice-loop/scripts/dictate-toggle.sh send
+cmd - i : ~/.local/bin/voice-loop-dictate send
 ```
 
 then `skhd --restart-service`. Any chord works — `cmd + shift - d`, `ctrl + alt - d`; ⌘I collides
@@ -285,9 +286,14 @@ The message distinguishes the cases on purpose:
 
 ## Everything works, but only when I run it by hand
 
-The desktop does not expand `${CLAUDE_PLUGIN_ROOT}` — a hotkey needs the **absolute path** to
-`dictate-toggle.sh`. And a hotkey launched by the desktop gets a minimal environment: if your config
-references tools installed in a shell-only `PATH` (Homebrew, `~/.local/bin`), use absolute paths in
+The desktop does not expand `${CLAUDE_PLUGIN_ROOT}`. `/voice-setup` therefore installs
+`~/.local/bin/voice-loop-dictate` as a stable launcher and binds the desktop hotkey to that path.
+The launcher reads Claude Code's installed-plugin registry at each press, so a plugin update can swap
+versioned cache directories without breaking dictation. If the key is silent, check that the launcher
+exists and that `~/.claude/plugins/installed_plugins.json` contains exactly one current
+`voice-loop@windowsill` entry with an `installPath`; it refuses to guess when that registry is absent
+or ambiguous. A hotkey launched by the desktop gets a minimal environment: if your config references
+tools installed in a shell-only `PATH` (Homebrew, `~/.local/bin`), use absolute paths in
 `config.json`.
 
 ### Dictation echoes the assistant back

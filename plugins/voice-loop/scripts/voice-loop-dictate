@@ -1,0 +1,80 @@
+#!/usr/bin/env python3
+"""Stable desktop entry point for voice-loop dictation.
+
+Claude Code replaces versioned cache directories on plugin updates.  The desktop
+cannot expand ``CLAUDE_PLUGIN_ROOT``, so this launcher asks Claude Code's own
+installed-plugin registry for the current install path at every invocation.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import sys
+from pathlib import Path
+from typing import Any
+
+_PLUGIN_KEY = "voice-loop@windowsill"
+_SCRIPT = Path("scripts/dictate-toggle.sh")
+
+
+def _config_dir() -> Path:
+    return Path(os.environ.get("CLAUDE_CONFIG_DIR", "~/.claude")).expanduser()
+
+
+def _registry_paths() -> tuple[Path, ...]:
+    """Return registry locations in precedence order."""
+    return (_config_dir() / "plugins" / "installed_plugins.json",)
+
+
+def _entries(raw: Any) -> list[dict[str, Any]]:
+    plugins = raw.get("plugins", {}) if isinstance(raw, dict) else {}
+    value = plugins.get(_PLUGIN_KEY, []) if isinstance(plugins, dict) else []
+    if isinstance(value, dict):
+        value = [value]
+    return [entry for entry in value if isinstance(entry, dict)] if isinstance(value, list) else []
+
+
+def _current_script() -> Path | None:
+    """Find the current plugin script from Claude Code's install registry.
+
+    An ambiguous or malformed registry is a refusal, not an invitation to guess
+    by sorting cache directory names. Claude Code refreshes this registry when
+    the plugin is updated, which is the indirection the desktop binding needs.
+    """
+    for registry in _registry_paths():
+        try:
+            raw = json.loads(registry.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        candidates: list[tuple[Path, dict[str, Any]]] = []
+        for entry in _entries(raw):
+            install_path = entry.get("installPath")
+            if not isinstance(install_path, str) or not install_path:
+                continue
+            script = Path(install_path).expanduser() / _SCRIPT
+            if script.is_file():
+                candidates.append((script, entry))
+        user_candidates = [script for script, entry in candidates if entry.get("scope") == "user"]
+        if len(user_candidates) == 1:
+            return user_candidates[0]
+        if len(user_candidates) > 1 or len(candidates) > 1:
+            return None
+        if candidates:
+            return candidates[0][0]
+    return None
+
+
+def main() -> int:
+    script = _current_script()
+    if script is None:
+        return 0
+    try:
+        os.execv(str(script), [str(script), *sys.argv[1:]])
+    except OSError:
+        return 0
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

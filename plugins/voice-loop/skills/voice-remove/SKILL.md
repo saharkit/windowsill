@@ -64,7 +64,9 @@ ls -1 "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/voice-loop-contour.timer" 
 systemctl --user is-enabled voice-loop-contour.timer 2>/dev/null; \
 crontab -l 2>/dev/null | grep -n 'contour-poll'; \
 echo "== hotkey"; gsettings get org.gnome.settings-daemon.plugins.media-keys custom-keybindings 2>/dev/null; \
-grep -n 'dictate-toggle' "$HOME/.config/skhd/skhdrc" 2>/dev/null; \
+gsettings get org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/voice-loop/ command 2>/dev/null; \
+grep -nE 'dictate-toggle|voice-loop-dictate' "$HOME/.config/skhd/skhdrc" 2>/dev/null; \
+echo "== stable launcher"; ls -l "$HOME/.local/bin/voice-loop-dictate" 2>/dev/null; \
 echo "== convention"; grep -n 'spoken summary' "$HOME/.claude/CLAUDE.md" ./CLAUDE.md 2>/dev/null; \
 echo "== pipewire aec"; ls -l ~/.config/pipewire/pipewire.conf.d/voice-loop-echo-cancel.conf 2>/dev/null; \
 echo "== root-installed (left alone, reported only)"; systemctl is-active ydotoold 2>/dev/null
@@ -142,12 +144,28 @@ gsettings reset-recursively org.gnome.settings-daemon.plugins.media-keys.custom-
 
 The `reset-recursively` clears the orphaned name/command/binding keys the list no longer points at.
 
+If the command read during inventory contains an absolute versioned `dictate-toggle.sh` path, this
+is also an existing-install migration opportunity: before removing the binding, offer to replace its
+command with `$HOME/.local/bin/voice-loop-dictate send` and leave the binding in place. The stable
+launcher is the file setup installs for future updates. When the user is removing the hotkey, remove
+that launcher too (only after showing its path and size); it is owned by this skill, not by the plugin
+cache. If the user keeps the hotkey, keep the launcher and say so explicitly.
+
+For a GNOME hotkey the stable launcher is a separate file, so after the binding is removed offer:
+
+```sh
+rm -f "$HOME/.local/bin/voice-loop-dictate"
+```
+
+Run it only after the user accepts that launcher deletion; `rm -f` is limited to this literal path.
+
 ### macOS (skhd)
 
-Delete only the line that names `dictate-toggle.sh` — the file is the user's, and other bindings
-live in it. Read the file, `Edit` out that one line, then `skhd --restart-service`. If the file is
-left empty and skhd was installed for voice-loop alone, print — do not run — the two lines that
-finish the job:
+Delete only the line that names `dictate-toggle.sh` or `voice-loop-dictate` — the file is the user's,
+and other bindings live in it. Read the file, `Edit` out that one line, then `skhd --restart-service`.
+If the stable launcher is no longer referenced by any retained binding, offer to remove
+`$HOME/.local/bin/voice-loop-dictate` after showing its size. If the file is left empty and skhd was
+installed for voice-loop alone, print — do not run — the two lines that finish the job:
 
 ```sh
 skhd --stop-service && brew uninstall skhd
