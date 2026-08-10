@@ -56,6 +56,7 @@ def state(monkeypatch, tmp_path):
     monkeypatch.setattr(dictate, "_PASTE_DENIED_PATH", str(tmp_path / "dictate-paste-denied"))
     monkeypatch.setattr(dictate, "_STREAM_PID_PATH", str(tmp_path / "dictate-stream.pid"))
     monkeypatch.setattr(dictate, "_STREAM_RESULT_PATH", str(tmp_path / "dictate-stream.json"))
+    monkeypatch.setattr(dictate, "_PREVIEW_PATH", str(tmp_path / "dictate-preview.json"))
     return tmp_path
 
 
@@ -2501,3 +2502,239 @@ class TestTheWorkerEntryPoint:
         )
         assert dictate.stream_worker(s, []) == 1
         assert dictate._read_stream_result()["reason"] == "stub"
+
+
+# --- live preview surface (windowsill#115) --------------------------------------------------------
+
+
+class TestPreviewConfig:
+    """``dictate.preview`` is opt-in, same spelling as every other boolean config key."""
+
+    def test_preview_is_off_by_default(self):
+        assert dictate.resolve_settings({}, "Linux")["preview"] is False
+
+    @pytest.mark.parametrize("value", [True, "true"])
+    def test_it_accepts_json_true_and_the_shell_string(self, value):
+        s = dictate.resolve_settings({"dictate": {"preview": value}}, "Linux")
+        assert s["preview"] is True
+
+    @pytest.mark.parametrize("value", [False, "false", "yes", 1, None])
+    def test_nothing_else_turns_it_on(self, value):
+        s = dictate.resolve_settings({"dictate": {"preview": value}}, "Linux")
+        assert s["preview"] is False
+
+
+class TestPreviewState:
+    """The atomic write/clear helpers — the file the preview process reads."""
+
+    def test_write_preview_writes_atomic_json(self, state):
+        preview = state / "dictate-preview.json"
+        dictate._write_preview({"interim": "Hel", "assembled": "Hello world"}, str(preview))
+        assert json.loads(preview.read_text(encoding="utf-8")) == {"interim": "Hel", "assembled": "Hello world"}
+        # no temp file left behind: the temp was renamed over, not left half-written
+        assert not list(state.glob("voice-loop-preview-*"))
+
+    def test_write_preview_is_best_effort_on_unwritable_dir(self, state, monkeypatch):
+        """An unwritable state dir is a silent degrade, never a traceback into the worker."""
+        monkeypatch.setattr(dictate, "_PREVIEW_PATH", str(state / "nope" / "dictate-preview.json"))
+        dictate._write_preview({"interim": "x"}, str(state / "nope" / "dictate-preview.json"))
+        # no raise, no state — silently off
+
+    def test_clear_preview_removes_file(self, state):
+        preview = state / "dictate-preview.json"
+        preview.write_text('{"interim":"","assembled":"done"}', encoding="utf-8")
+        dictate._clear_preview(str(preview))
+        assert not preview.exists()
+
+    def test_clear_preview_is_best_effort_when_file_absent(self, state):
+        dictate._clear_preview(str(state / "never-existed.json"))
+        # no raise
+
+
+class TestOnInterimCallback:
+    """The ``on_interim`` seam in ``run_stream_session`` — what the preview reads from."""
+
+    def test_the_callback_sees_interim_then_final_then_cleared(self, state):
+        """An interim arrives (dim guess), then a final settles it (solid), clearing the interim.
+        The callback fires after each message so the preview updates in real time."""
+        (state / "dictate.wav").write_bytes(_wav_bytes(b"\x01\x02" * 500))
+        fake = FakeDeepgram()
+        s = _streaming_settings(fake.endpoint)
+        entry = providers.STT_PROVIDERS["deepgram"]
+
+        calls: list[tuple[str, str]] = []
+
+        def on_interim(interim, assembled):
+            calls.append((interim, assembled))
+
+        result = dictate.run_stream_session(
+            s, entry, "dg-secret",
+            stopping=_stop_after(4),
+            recorder_alive=lambda: True,
+            wav_path=str(state / "dictate.wav"),
+            on_interim=on_interim,
+        )
+        fake.server.stop()
+
+        assert result["status"] == "ok"
+        # At least three calls: the interim ("привет это"), the first final ("Привет, это"),
+        # and the trailing final after CloseStream ("диктовка.")
+        assert len(calls) >= 3, f"expected at least 3 preview updates, got {len(calls)}: {calls}"
+        # The first call is the interim — assembled is empty because no final has landed yet
+        assert calls[0] == ("привет это", "")
+        # After the first final, the interim is cleared, and the assembled text appears
+        assert ("", "Привет, это") in calls
+        # After the trailing final, both are cleared — the interim is empty, assembled is complete
+        assert calls[-1] == ("", "Привет, это диктовка.")
+
+    def test_no_callback_when_not_set(self, state):
+        """The default path — no on_interim — never fires and never raises."""
+        (state / "dictate.wav").write_bytes(_wav_bytes(b"\x01\x02" * 500))
+        fake = FakeDeepgram()
+        s = _streaming_settings(fake.endpoint)
+        entry = providers.STT_PROVIDERS["deepgram"]
+
+        result = dictate.run_stream_session(
+            s, entry, "dg-secret",
+            stopping=_stop_after(4),
+            recorder_alive=lambda: True,
+            wav_path=str(state / "dictate.wav"),
+            # on_interim omitted — the default None
+        )
+        fake.server.stop()
+        assert result["status"] == "ok"
+        # the contract is: it worked, exactly as before — no crash, no side effect
+
+
+class TestPreviewLifecycle:
+    """Preview starts with the recording and clears when the text is delivered."""
+
+    def test_stream_worker_writes_preview_when_enabled(self, state, monkeypatch):
+        """When preview is on, the worker emits interims to the preview state file."""
+        monkeypatch.setenv("VOICE_LOOP_STT_API_KEY", "dg-secret")
+        (state / "dictate.wav").write_bytes(_wav_bytes(b"\x01\x02" * 500))
+        fake = FakeDeepgram()
+        s = _streaming_settings(fake.endpoint)
+        s["preview"] = True
+
+        original = dictate.run_stream_session
+
+        def session(*args, **kwargs):
+            kwargs["stopping"] = _stop_after(3)
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(dictate, "run_stream_session", session)
+        assert dictate.stream_worker(s, ["4242"]) == 0
+        fake.server.stop()
+
+        # The worker wrote the preview file and then cleared it on exit
+        assert not (state / "dictate-preview.json").exists()
+        # But the worker DID produce a stream result as always
+        assert dictate._read_stream_result()["status"] == "ok"
+
+    def test_stream_worker_does_not_write_preview_when_disabled(self, state, monkeypatch):
+        """The default — preview off — never touches the preview file."""
+        monkeypatch.setenv("VOICE_LOOP_STT_API_KEY", "dg-secret")
+        (state / "dictate.wav").write_bytes(_wav_bytes(b"\x01\x02" * 500))
+        fake = FakeDeepgram()
+        s = _streaming_settings(fake.endpoint)
+        s["preview"] = False
+
+        original = dictate.run_stream_session
+
+        def session(*args, **kwargs):
+            kwargs["stopping"] = _stop_after(3)
+            # confirm no on_interim was wired
+            assert kwargs.get("on_interim") is None
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(dictate, "run_stream_session", session)
+        assert dictate.stream_worker(s, ["4242"]) == 0
+        fake.server.stop()
+
+        assert not (state / "dictate-preview.json").exists()
+
+    def test_preview_is_not_started_without_streaming(self, state, monkeypatch):
+        """Preview is only started inside the streaming_wanted guard — batch dictation has no
+        interims to show, so there is nothing to render."""
+        started: list[bool] = []
+        monkeypatch.setattr(dictate, "_start_preview", lambda: started.append(True))
+        monkeypatch.setattr(dictate.subprocess, "Popen", lambda argv, **kw: FakeProc())
+        monkeypatch.setattr(dictate, "stop_speak_playback", lambda: None)
+        monkeypatch.setattr(dictate, "note", lambda message, system: None)
+        monkeypatch.setattr(dictate, "streaming_wanted", lambda s: False)  # streaming is OFF
+        s = dictate.resolve_settings({"dictate": {"recorder": "arecord", "preview": True}}, "Linux")
+        assert dictate.start_recording(s, "Linux", dictate.claim_pidfile()) == 0
+        assert started == []  # never started — nothing to preview
+
+    def test_start_preview_spawns_the_process(self, state, monkeypatch):
+        """The preview renderer is spawned as a detached child."""
+        spawned: list[list[str]] = []
+
+        class _Proc:
+            pid = 6000
+
+        monkeypatch.setattr(
+            dictate.subprocess, "Popen", lambda argv, **kw: spawned.append((argv, kw)) or _Proc()
+        )
+        monkeypatch.setattr(dictate, "_PREVIEW_SCRIPT", "/opt/voice-loop/scripts/preview.py")
+        dictate._start_preview()
+
+        assert len(spawned) == 1
+        argv, kw = spawned[0]
+        assert argv[0] == sys.executable
+        assert argv[1] == "/opt/voice-loop/scripts/preview.py"
+        assert argv[2] == dictate._PREVIEW_PATH
+        assert kw["start_new_session"] is True
+
+    def test_start_preview_is_best_effort(self, monkeypatch):
+        """A preview that won't start is silence, not a failed recording."""
+        def refuse(argv, **kw):
+            raise OSError("cannot fork")
+
+        monkeypatch.setattr(dictate.subprocess, "Popen", refuse)
+        dictate._start_preview()  # does not raise
+
+    def test_preview_is_cleared_on_min_clip_guard(self, state, monkeypatch):
+        """A bounced hotkey clears the preview — there is nothing to transcribe."""
+        cleared: list[str] = []
+        monkeypatch.setattr(dictate, "_clear_preview", lambda path=None: cleared.append(path or ""))
+        monkeypatch.setattr(dictate, "_pid_alive", lambda pid: False)
+        monkeypatch.setattr(dictate.os, "kill", lambda pid, sig: None)
+        monkeypatch.setattr(dictate.time, "sleep", lambda seconds: None)
+        monkeypatch.setattr(dictate, "note", lambda message, system: None)
+        s = dictate.resolve_settings({"dictate": {"preview": True}}, "Linux")
+        assert dictate.stop_and_transcribe(s, "Linux", "send", 12345) == 0
+        assert len(cleared) >= 1  # preview was cleared
+
+    def test_preview_is_cleared_on_empty_transcript(self, state, monkeypatch):
+        """A silent dictation clears the preview — nothing to put anywhere."""
+        (state / "dictate.wav").write_bytes(b"\0" * (dictate.WAV_HEADER_BYTES + dictate.BYTES_PER_SECOND))
+        cleared: list[str] = []
+        monkeypatch.setattr(dictate, "_clear_preview", lambda path=None: cleared.append(path or ""))
+        monkeypatch.setattr(dictate, "transcribe", lambda s: "")
+        monkeypatch.setattr(dictate, "_pid_alive", lambda pid: False)
+        monkeypatch.setattr(dictate.os, "kill", lambda pid, sig: None)
+        monkeypatch.setattr(dictate.time, "sleep", lambda seconds: None)
+        monkeypatch.setattr(dictate, "note", lambda message, system: None)
+        s = dictate.resolve_settings({"dictate": {"clipboard": "xclip", "preview": True}}, "Linux")
+        assert dictate.stop_and_transcribe(s, "Linux", "send", 12345) == 0
+        assert len(cleared) >= 1
+
+    def test_preview_is_cleared_after_successful_clipboard_write(self, state, monkeypatch, paste_run):
+        """When the text lands on the clipboard (no auto-paste), the preview clears."""
+        cleared: list[str] = []
+        monkeypatch.setattr(dictate, "_clear_preview", lambda path=None: cleared.append(path or ""))
+        s = dictate.resolve_settings({"dictate": {"clipboard": "xclip", "preview": True}}, "Linux")
+        assert dictate.stop_and_transcribe(s, "Linux", "paste", 12345) == 0
+        # both clipboard selections succeeded AND the preview cleared
+        assert paste_run.clipboard == [b"hello agent", b"hello agent"]
+        assert len(cleared) >= 1
+
+    def test_preview_is_cleared_after_successful_paste(self, state, monkeypatch, paste_run):
+        """Auto-paste success clears the preview — the text is where it goes."""
+        cleared: list[str] = []
+        monkeypatch.setattr(dictate, "_clear_preview", lambda path=None: cleared.append(path or ""))
+        s = _guarded(preview=True)
+        assert dictate.stop_and_transcribe(s, "Linux", "send", 12345) == 0
+        assert cleared  # preview cleared
