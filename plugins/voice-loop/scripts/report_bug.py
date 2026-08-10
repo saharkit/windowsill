@@ -72,11 +72,23 @@ _STATE_FILES = (
     ("dictate-last.wav", "the last recorded clip"),
     ("dictate-last-toggle", "the key-repeat debounce stamp"),
     ("dictate-stream.pid", "the streaming worker's pidfile"),
-    # the streamed transcript itself — size only, never its text, exactly like last-spoken above
-    ("dictate-stream.json", "the streaming session's result — size only, never its text"),
     ("contour.json", "the contour poller's status — size only, it names the operator's services"),
     ("contour-announced", "the contour alerts already voiced (opaque alert keys)"),
 )
+
+# The one state file whose NAME is not fixed: the streaming worker's result document is
+# `dictate-stream.<pid>.json` (windowsill#112 — the pid in the name is what keeps a late worker from
+# overwriting a live one's answer). It contributes exactly what `last-spoken` above does — its size
+# and its mtime, never a byte of its text, and no code path opens it. The pattern is anchored on the
+# digits and FULL-matched, so widening the inventory by one entry cannot pull in a neighbour: not
+# `dictate-stream.pid`, not `dictate.log`, nothing but a document dictate.py itself wrote. Every
+# match is listed, because a leftover from an earlier worker is precisely what a report about a
+# dictation that went missing needs to show.
+_STREAM_RESULT_RE = re.compile(r"dictate-stream\.\d+\.json")
+_STREAM_RESULT_WHAT = "the streaming session's result — size only, never its text"
+# What the row is called when the dir holds none: the absence of this file is itself diagnostic, so
+# the inventory says so rather than silently dropping the whole category.
+_STREAM_RESULT_ABSENT_NAME = "dictate-stream.<pid>.json"
 
 # How much of each log travels. Sixty lines is two or three full turns of speak.log — enough to see
 # a failure and what led to it, small enough that a human reads the whole bundle before consenting.
@@ -723,11 +735,24 @@ def endpoints(config: dict) -> list[str]:
     return found
 
 
+def _state_inventory(state_dir: str) -> tuple[tuple[str, str], ...]:
+    """The exact names, then whatever per-worker stream results this dir actually holds.
+
+    Nothing is inventoried that is not named here or matched by `_STREAM_RESULT_RE` — reading the
+    dir listing is how the pid-carrying name is FOUND, never a licence to report what it finds."""
+    try:
+        found = sorted(name for name in os.listdir(state_dir) if _STREAM_RESULT_RE.fullmatch(name))
+    except OSError:
+        found = []
+    names = found or [_STREAM_RESULT_ABSENT_NAME]
+    return (*_STATE_FILES, *((name, _STREAM_RESULT_WHAT) for name in names))
+
+
 def collect_state(state_dir: str = _STATE_DIR, clock: Clock = _default_clock) -> list[dict[str, object]]:
     """Size and age of each state file. Never a byte of any of their contents."""
     now = clock()
     rows = []
-    for name, what in _STATE_FILES:
+    for name, what in _state_inventory(state_dir):
         path = os.path.join(state_dir, name)
         try:
             stat = os.stat(path)
@@ -875,9 +900,10 @@ def render_digest(bundle: dict) -> str:
 
 def _state_row(row: dict) -> str:
     if not row.get("present"):
-        return f"{row.get('name', ''):<22} {'absent':>11}  {'':>14}  {row.get('what', '')}"
+        # 26: wide enough for `dictate-stream.<pid>.json` and a real six-digit pid's spelling of it
+        return f"{row.get('name', ''):<26} {'absent':>11}  {'':>14}  {row.get('what', '')}"
     return (
-        f"{row.get('name', ''):<22} {row.get('bytes', 0):>9} B  "
+        f"{row.get('name', ''):<26} {row.get('bytes', 0):>9} B  "
         f"{row.get('age_seconds', 0):>10.1f}s ago  {row.get('what', '')}"
     )
 

@@ -2600,17 +2600,30 @@ class TestFinishStreamWorker:
 
 
 class TestStreamWorkerState:
-    def test_clear_stream_state_removes_both_files_and_stops_a_survivor(self, state, monkeypatch):
+    def test_clear_stream_state_sweeps_every_result_document_and_stops_a_survivor(self, state, monkeypatch):
+        """Forgetting a stream leaves no transcript behind — including the one nobody holds a pid
+        for any more. A worker that wrote its document LATE named it after ITS pid, and by the time
+        this runs the pidfile is somebody else's; removing only the pid we hold would leave that
+        file, dictated words and all, on disk for good. The sweep is by PATTERN, and the neighbour
+        below is why it is anchored on the digits rather than on `dictate-stream.*`."""
         signalled: list[tuple[int, int]] = []
         monkeypatch.setattr(dictate, "pid_looks_like_stream_worker", lambda pid, **kw: True)
         monkeypatch.setattr(dictate.os, "kill", lambda pid, sig: signalled.append((pid, sig)))
         _plant_worker(state, {"status": "ok", "text": "from a previous recording"}, pid=4321)
+        # a predecessor's document, written after its own stop had already cleared up: the pidfile
+        # names 4321, so nothing on disk connects this file to any live worker
+        orphan = state / "dictate-stream.4242.json"
+        orphan.write_text(json.dumps({"status": "ok", "text": "words from two recordings ago"}), encoding="utf-8")
+        neighbour = state / "last-spoken"
+        neighbour.write_text("a spoken line the sweep has no business touching", encoding="utf-8")
 
         dictate.clear_stream_state()
 
         assert signalled == [(4321, dictate.signal.SIGTERM)]
         assert not (state / "dictate-stream.pid").exists()
         assert not (state / "dictate-stream.4321.json").exists()
+        assert not orphan.exists()
+        assert neighbour.read_text(encoding="utf-8").startswith("a spoken line")
 
     def test_a_recycled_pid_is_not_signalled(self, state, monkeypatch):
         """Same PID-reuse guard the echo guard uses: a pidfile outlives its process, and the
