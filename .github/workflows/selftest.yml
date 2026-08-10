@@ -1101,8 +1101,13 @@ jobs:
           if grep -q -e "unexpected error" -e "Traceback" "$state/dictate.log"; then
             echo "the streaming path hit an error"; exit 1
           fi
-          # nothing outlives the recording: no worker still running, no state left for the next one
-          [ ! -e "$state/dictate-stream.pid" ] && [ ! -e "$state/dictate-stream.json" ] \
+          # nothing outlives the recording: no worker still running, no state left for the next one.
+          # The result document's name carries the worker's pid (windowsill#112), so the leftover
+          # check must go by PATTERN — naming the old fixed `dictate-stream.json` here would be an
+          # assertion that can no longer fail, and this real-invocation step is the one place a
+          # leaked transcript would actually be visible.
+          leftover=$(find "$state" -maxdepth 1 -name 'dictate-stream.*.json')
+          [ ! -e "$state/dictate-stream.pid" ] && [ -z "$leftover" ] \
             || { echo "the stream worker left its state behind"; ls -l "$state"; exit 1; }
           if pgrep -f "dictate.py stream-worker" >/dev/null 2>&1; then
             echo "a stream worker is still running after the stop toggle"; exit 1

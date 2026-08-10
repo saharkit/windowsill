@@ -179,6 +179,10 @@ class TestFraming:
         frame = wsclient.build_frame(wsclient.OP_BINARY, payload, b"\xaa\xbb\xcc\xdd")
         assert parse_client_frame(bytearray(frame)) == (wsclient.OP_BINARY, payload)
 
+    def test_a_server_frame_can_be_built_without_masking(self):
+        frame = wsclient.build_frame(wsclient.OP_TEXT, b"hello", None)
+        assert frame == b"\x81\x05hello"
+
     def test_the_accept_token_is_the_rfc_s(self):
         # the RFC's own worked example, so the maths is pinned to the spec rather than to itself
         assert wsclient._accept_token("dGhlIHNhbXBsZSBub25jZQ==") == "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
@@ -248,6 +252,47 @@ class TestHandshake:
             wsclient.connect(server.url, {})
         server.stop()
 
+    def test_a_handshake_timeout_is_one_websocket_error(self):
+        class HangingSocket:
+            def settimeout(self, timeout):
+                pass
+
+            def sendall(self, payload):
+                pass
+
+            def recv(self, size):
+                raise socket.timeout("proxy hung")
+
+            def close(self):
+                pass
+
+        with pytest.raises(wsclient.WebSocketError, match="handshake timed out"):
+            wsclient.connect("ws://api.example/v1/listen", {}, connector=lambda address, timeout: HangingSocket())
+
+    def test_a_handshake_oserror_is_one_websocket_error(self):
+        class BrokenSocket:
+            def sendall(self, payload):
+                raise OSError("broken proxy")
+
+            def close(self):
+                pass
+
+        with pytest.raises(wsclient.WebSocketError, match="handshake failed"):
+            wsclient.connect("ws://api.example/v1/listen", {}, connector=lambda address, timeout: BrokenSocket())
+
+    def test_a_101_without_upgrade_header_is_not_accepted(self):
+        def handler(server, conn):
+            head = read_http_head(conn)
+            conn.sendall(
+                b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\n"
+                b"Sec-WebSocket-Accept: " + accept_for(head).encode() + b"\r\n\r\n"
+            )
+
+        server = Server(handler)
+        with pytest.raises(wsclient.WebSocketError, match="did not upgrade"):
+            wsclient.connect(server.url, {})
+        server.stop()
+
     def test_a_peer_that_never_ends_its_headers_is_refused(self):
         def handler(server, conn):
             read_http_head(conn)
@@ -296,6 +341,22 @@ class TestFrames:
             (wsclient.OP_BINARY, b"\x03\x04" * 100),
             (wsclient.OP_TEXT, b'{"type":"CloseStream"}'),
         ]
+
+    def test_an_extended_length_header_split_across_recvs_is_buffered(self, upgrade):
+        def handler(server, conn):
+            upgrade(conn)
+            frame = server_frame(wsclient.OP_BINARY, b"x" * 126)
+            conn.sendall(frame[:3])
+            conn.sendall(frame[3:])
+
+        server = Server(handler)
+        ws = wsclient.connect(server.url, {})
+        frames = []
+        while not frames:
+            frames = ws.poll(5.0)
+        assert frames == [(wsclient.OP_BINARY, b"x" * 126)]
+        ws.close()
+        server.stop()
 
     def test_a_fragmented_message_is_one_message(self, upgrade):
         def handler(server, conn):
