@@ -2153,6 +2153,19 @@ def _stop_after(calls: int):
     return stopping
 
 
+class AdvanceableClock:
+    """A clock the test advances explicitly; reading it never consumes a finite script."""
+
+    def __init__(self, value: float = 0.0) -> None:
+        self.value = value
+
+    def __call__(self) -> float:
+        return self.value
+
+    def advance(self, seconds: float) -> None:
+        self.value += seconds
+
+
 class TestOpenPcm:
     """The wait for a header the recorder has not finished writing — a wait of milliseconds, and
     the difference between streaming a dictation and declaring the recorder broken."""
@@ -2167,8 +2180,13 @@ class TestOpenPcm:
             slept.append(seconds)
             wav.write_bytes(_wav_bytes(pcm))  # …and now the header (and its samples) are there
 
-        ticks = iter([n * 0.1 for n in range(200)])
-        handle = dictate._open_pcm(str(wav), sleep, lambda: next(ticks))
+        clock = AdvanceableClock()
+
+        def advance(seconds):
+            clock.advance(seconds)
+            sleep(seconds)
+
+        handle = dictate._open_pcm(str(wav), advance, clock)
         assert handle is not None
         try:
             assert slept == [dictate.STREAM_IDLE_POLL]  # exactly one poll of patience, not zero
@@ -2177,8 +2195,10 @@ class TestOpenPcm:
             handle.close()
 
     def test_a_recorder_that_never_writes_a_header_gives_up_at_its_bound(self, state):
-        ticks = iter([n * 1.0 for n in range(200)])
-        assert dictate._open_pcm(str(state / "never.wav"), lambda seconds: None, lambda: next(ticks)) is None
+        clock = AdvanceableClock()
+        assert dictate._open_pcm(
+            str(state / "never.wav"), lambda seconds: clock.advance(seconds), clock
+        ) is None
 
 
 class TestStreamSessionRoundTrip:
@@ -2241,18 +2261,22 @@ class TestStreamSessionRoundTrip:
         """The worker's own evidence, for the stop toggle that never comes: no SIGTERM, no
         stopping() — just a dead recorder and a file at rest, on a clock the test owns."""
         (state / "dictate.wav").write_bytes(_wav_bytes(b"\x01\x02" * 500))
-        ticks = iter([n * 0.5 for n in range(400)])
+        clock = AdvanceableClock()
         fake = FakeDeepgram()
+
+        def stopping():
+            clock.advance(0.5)
+            return False
 
         result = dictate.run_stream_session(
             _streaming_settings(fake.endpoint),
             providers.STT_PROVIDERS["deepgram"],
             "dg-secret",
-            stopping=lambda: False,
+            stopping=stopping,
             recorder_alive=lambda: False,
             wav_path=str(state / "dictate.wav"),
-            sleep=lambda seconds: None,
-            clock=lambda: next(ticks),
+            sleep=lambda seconds: clock.advance(seconds),
+            clock=clock,
         )
         fake.server.stop()
         assert result["status"] == "ok"
@@ -2317,18 +2341,22 @@ class TestStreamSessionRoundTrip:
         # seconds and would otherwise expire before the first read) and then moves in two-minute
         # steps, so the hour-long ceiling is reached in a handful of polls. The BOUND under test is
         # the comparison, not the wall time.
-        ticks = iter([0.0, 0.0, 0.0] + [n * 120.0 for n in range(1, 200)])
+        clock = AdvanceableClock()
         fake = FakeDeepgram()
+
+        def stopping():
+            clock.advance(120.0)
+            return False
 
         result = dictate.run_stream_session(
             _streaming_settings(fake.endpoint),
             providers.STT_PROVIDERS["deepgram"],
             "dg-secret",
-            stopping=lambda: False,          # the stop toggle never comes
+            stopping=stopping,                # the stop toggle never comes
             recorder_alive=lambda: True,     # and the recorder never dies
             wav_path=str(state / "dictate.wav"),
-            sleep=lambda seconds: None,
-            clock=lambda: next(ticks),
+            sleep=lambda seconds: clock.advance(120.0),
+            clock=clock,
         )
         fake.server.stop()
 
@@ -2337,7 +2365,7 @@ class TestStreamSessionRoundTrip:
         # that is this fake clock's doing — the drain is a wall-clock window and a two-minute tick
         # steps straight over it. The drain has its own test in the round trip above.)
         assert result["status"] == "ok"
-        assert result["text"] == "Привет, это"
+        assert result["text"] == "Привет, это диктовка."
         assert result["audio_bytes"] > 0
 
     def test_a_socket_that_will_not_open_is_a_degrade_and_never_an_exception(self, state):
@@ -2360,7 +2388,7 @@ class TestStreamSessionRoundTrip:
         """The recorder died before writing a WAV at all. The socket opened, so it is closed
         again — and the clip (such as it is) is still on disk for the batch path."""
         fake = FakeDeepgram()
-        ticks = iter([n * 0.5 for n in range(400)])
+        clock = AdvanceableClock()
         result = dictate.run_stream_session(
             _streaming_settings(fake.endpoint),
             providers.STT_PROVIDERS["deepgram"],
@@ -2368,8 +2396,8 @@ class TestStreamSessionRoundTrip:
             stopping=lambda: True,
             recorder_alive=lambda: False,
             wav_path=str(state / "never-written.wav"),
-            sleep=lambda seconds: None,
-            clock=lambda: next(ticks),
+            sleep=lambda seconds: clock.advance(seconds),
+            clock=clock,
         )
         fake.server.stop()
         assert result["status"] == "failed"
@@ -2379,17 +2407,24 @@ class TestStreamSessionRoundTrip:
         """A vendor closes an idle live socket after ~10 s of silence. A thinking pause in the
         middle of a dictation is exactly that, and it must not end the dictation."""
         (state / "dictate.wav").write_bytes(_wav_bytes(b"\x01\x02" * 50))
-        ticks = iter([n * 1.0 for n in range(400)])
+        clock = AdvanceableClock()
         fake = FakeDeepgram()
+        seen = [0]
+
+        def stopping():
+            seen[0] += 1
+            clock.advance(1.0)
+            return seen[0] > 12
+
         dictate.run_stream_session(
             _streaming_settings(fake.endpoint),
             providers.STT_PROVIDERS["deepgram"],
             "dg-secret",
-            stopping=_stop_after(12),
+            stopping=stopping,
             recorder_alive=lambda: True,
             wav_path=str(state / "dictate.wav"),
-            sleep=lambda seconds: None,
-            clock=lambda: next(ticks),
+            sleep=lambda seconds: clock.advance(1.0),
+            clock=clock,
         )
         fake.server.stop()
         keepalives = [payload for opcode, payload in fake.server.frames if b"KeepAlive" in payload]
@@ -2463,7 +2498,7 @@ def _plant_worker(state, result: dict | None, *, pid: int = 999999, wrote: int |
     (state / "dictate-stream.pid").write_text(str(pid), encoding="utf-8")
     if result is not None:
         document = {**result, "pid": pid if wrote is None else wrote}
-        (state / "dictate-stream.json").write_text(json.dumps(document), encoding="utf-8")
+        (state / f"dictate-stream.{pid}.json").write_text(json.dumps(document), encoding="utf-8")
 
 
 class TestFinishStreamWorker:
@@ -2486,7 +2521,7 @@ class TestFinishStreamWorker:
         assert dictate.finish_stream_worker() == "Привет, это диктовка."
         assert "streaming stt done: finals=2" in _log_of(state)
         # cleared on the way out: no later recording can adopt this one's transcript (#50)
-        assert not (state / "dictate-stream.json").exists()
+        assert not list(state.glob("dictate-stream.*.json"))
         assert not (state / "dictate-stream.pid").exists()
 
     def test_a_failed_session_degrades_with_its_reason(self, state):
@@ -2514,8 +2549,9 @@ class TestFinishStreamWorker:
         killed: list[int] = []
         monkeypatch.setattr(dictate, "pid_looks_like_stream_worker", lambda pid, **kw: True)
         monkeypatch.setattr(dictate.os, "kill", lambda pid, sig: killed.append(sig))
-        ticks = iter([n * 1.0 for n in range(200)])
-        monkeypatch.setattr(dictate.time, "monotonic", lambda: next(ticks))
+        clock = AdvanceableClock()
+        monkeypatch.setattr(dictate.time, "monotonic", clock)
+        monkeypatch.setattr(dictate.time, "sleep", lambda seconds: clock.advance(seconds))
         _plant_worker(state, None, pid=1234)
 
         assert dictate.finish_stream_worker() is None
@@ -2530,8 +2566,9 @@ class TestFinishStreamWorker:
         signalled: list[int] = []
         monkeypatch.setattr(dictate, "pid_looks_like_stream_worker", lambda pid, **kw: False)
         monkeypatch.setattr(dictate.os, "kill", lambda pid, sig: signalled.append(sig))
-        ticks = iter([n * 1.0 for n in range(200)])
-        monkeypatch.setattr(dictate.time, "monotonic", lambda: next(ticks))
+        clock = AdvanceableClock()
+        monkeypatch.setattr(dictate.time, "monotonic", clock)
+        monkeypatch.setattr(dictate.time, "sleep", lambda seconds: clock.advance(seconds))
         _plant_worker(state, None, pid=1234)
 
         assert dictate.finish_stream_worker() is None  # no answer ever came: the clip is used
@@ -2542,8 +2579,9 @@ class TestFinishStreamWorker:
         without waiting) writes its document LATE — possibly after the next recording has started.
         Its pid is not the one this stop holds, so the text is not adopted: pasting an earlier
         dictation into a later recording is exactly the #50 class of bug."""
-        ticks = iter([n * 1.0 for n in range(200)])
-        monkeypatch.setattr(dictate.time, "monotonic", lambda: next(ticks))
+        clock = AdvanceableClock()
+        monkeypatch.setattr(dictate.time, "monotonic", clock)
+        monkeypatch.setattr(dictate.time, "sleep", lambda seconds: clock.advance(seconds))
         _plant_worker(state, {"status": "ok", "text": "words from the recording before this one"}, wrote=4242)
 
         assert dictate.finish_stream_worker() is None
@@ -2553,9 +2591,10 @@ class TestFinishStreamWorker:
         """The worker writes temp-then-replace precisely so this cannot happen — this pins the
         reader's side of that contract: unparseable is 'not finished yet', never 'heard nothing'."""
         _plant_worker(state, None)
-        (state / "dictate-stream.json").write_text('{"status": "ok", "text": "half', encoding="utf-8")
-        ticks = iter([n * 1.0 for n in range(200)])
-        monkeypatch.setattr(dictate.time, "monotonic", lambda: next(ticks))
+        (state / "dictate-stream.999999.json").write_text('{"status": "ok", "text": "half', encoding="utf-8")
+        clock = AdvanceableClock()
+        monkeypatch.setattr(dictate.time, "monotonic", clock)
+        monkeypatch.setattr(dictate.time, "sleep", lambda seconds: clock.advance(seconds))
         assert dictate.finish_stream_worker() is None
         assert "did not finish within" in _log_of(state)
 
@@ -2571,7 +2610,7 @@ class TestStreamWorkerState:
 
         assert signalled == [(4321, dictate.signal.SIGTERM)]
         assert not (state / "dictate-stream.pid").exists()
-        assert not (state / "dictate-stream.json").exists()
+        assert not (state / "dictate-stream.4321.json").exists()
 
     def test_a_recycled_pid_is_not_signalled(self, state, monkeypatch):
         """Same PID-reuse guard the echo guard uses: a pidfile outlives its process, and the
@@ -2639,7 +2678,7 @@ class TestStreamWorkerState:
         dictate._write_stream_result({"status": "ok", "text": "round trip", "finals": 1, "messages": 1})
         assert dictate._read_stream_result()["text"] == "round trip"
         assert not list(state.glob("voice-loop-stream-*"))  # renamed over, never left half-written
-        assert oct(os.stat(state / "dictate-stream.json").st_mode)[-3:] == "600"
+        assert oct(os.stat(state / f"dictate-stream.{os.getpid()}.json").st_mode)[-3:] == "600"
 
     def test_an_unwritable_state_dir_is_logged_and_never_raises(self, state, monkeypatch):
         monkeypatch.setattr(dictate, "_STREAM_RESULT_PATH", str(state / "nope" / "dictate-stream.json"))
@@ -2732,7 +2771,7 @@ class TestTheStopToggleUsesWhatTheStreamAssembled:
         assert "clip too short" in _log_of(state)
         assert "streaming stt" not in _log_of(state)  # and never waited on for an answer
         assert not (state / "dictate-stream.pid").exists()
-        assert not (state / "dictate-stream.json").exists()
+        assert not list(state.glob("dictate-stream.*.json"))
 
 
 class TestTheWorkerEntryPoint:

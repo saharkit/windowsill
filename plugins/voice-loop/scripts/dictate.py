@@ -209,6 +209,8 @@ _FOCUS_PATH = os.path.join(_STATE_DIR, "dictate-focus")
 # either sees a complete answer or no answer at all. Its `text` field is the dictated words
 # themselves, which is why /report-bug lists it for its SIZE and never opens it.
 _STREAM_PID_PATH = os.path.join(_STATE_DIR, "dictate-stream.pid")
+# The result filename carries the worker PID. A predecessor that outlives its stop can therefore
+# finish writing its own document without replacing the current worker's answer.
 _STREAM_RESULT_PATH = os.path.join(_STATE_DIR, "dictate-stream.json")
 
 # The live preview surface (windowsill#115): the stream worker writes the current interim and the
@@ -217,6 +219,12 @@ _STREAM_RESULT_PATH = os.path.join(_STATE_DIR, "dictate-stream.json")
 _PREVIEW_PATH = os.path.join(_STATE_DIR, "dictate-preview.json")
 # Beside dictate.py; the short name is how the launcher checks for it.
 _PREVIEW_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "preview.py")
+
+
+def _stream_result_path(pid: int | None = None) -> str:
+    """The result document for one worker, fenced by its process identity."""
+    pid = os.getpid() if pid is None else pid
+    return os.path.join(os.path.dirname(_STREAM_RESULT_PATH), f"dictate-stream.{pid}.json")
 
 # CROSS-SCRIPT CONTRACT (keep in sync with speak.py): speak.py records its live speaking chain in
 # playing.pid — space-separated PIDs, its python process first, then the current player/command
@@ -1125,16 +1133,17 @@ def _write_stream_result(result: dict) -> None:
     """The worker's ONE write, temp-then-replace so the stop toggle cannot read a half-written
     answer and conclude the stream produced nothing. 0600: it holds the dictated words.
 
-    Its own pid rides along as the fencing token the reader checks (see _read_stream_result), so a
-    document written late — by a worker whose recording is already over — cannot be mistaken for
-    the answer to somebody else's."""
-    result = {**result, "pid": os.getpid()}
+    The result path carries this worker's pid, so a late predecessor can never replace the current
+    worker's answer. The pid is also retained in the document as a defensive fence for readers."""
+    pid = os.getpid()
+    result = {**result, "pid": pid}
+    result_path = _stream_result_path(pid)
     try:
-        fd, tmp = tempfile.mkstemp(prefix="voice-loop-stream-", dir=os.path.dirname(_STREAM_RESULT_PATH))
+        fd, tmp = tempfile.mkstemp(prefix="voice-loop-stream-", dir=os.path.dirname(result_path))
         os.fchmod(fd, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             json.dump(result, fh)
-        os.replace(tmp, _STREAM_RESULT_PATH)
+        os.replace(tmp, result_path)
     except OSError as err:
         # The stop toggle will see no result and use the recorded clip — the degrade, reached by a
         # different road. Worth one line, because a state dir that will not write is a real fault.
@@ -1150,7 +1159,7 @@ def _read_stream_result(pid: int | None = None) -> dict | None:
     result is only this stop's answer if the worker that wrote it is the one whose pid we hold; an
     older worker's transcript pasted into a later recording is precisely the #50 class of bug."""
     try:
-        with open(_STREAM_RESULT_PATH, encoding="utf-8") as fh:
+        with open(_stream_result_path(pid), encoding="utf-8") as fh:
             loaded = json.load(fh)
     except (OSError, ValueError):
         return None
@@ -1198,7 +1207,10 @@ def clear_stream_state(*, stop_survivor: bool = True) -> None:
             os.kill(pid, signal.SIGTERM)
         except OSError:
             pass
-    for path in (_STREAM_PID_PATH, _STREAM_RESULT_PATH):
+    paths = [_STREAM_PID_PATH]
+    if pid is not None:
+        paths.append(_stream_result_path(pid))
+    for path in paths:
         try:
             os.unlink(path)
         except OSError:
