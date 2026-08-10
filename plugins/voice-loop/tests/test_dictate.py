@@ -54,6 +54,7 @@ def state(monkeypatch, tmp_path):
     monkeypatch.setattr(dictate, "_TOGGLE_PATH", str(tmp_path / "dictate-last-toggle"))
     monkeypatch.setattr(dictate, "_FOCUS_PATH", str(tmp_path / "dictate-focus"))
     monkeypatch.setattr(dictate, "_PASTE_DENIED_PATH", str(tmp_path / "dictate-paste-denied"))
+    monkeypatch.setattr(dictate, "_PASTE_LOCK_PATH", str(tmp_path / "dictate-paste-lock"))
     monkeypatch.setattr(dictate, "_STREAM_PID_PATH", str(tmp_path / "dictate-stream.pid"))
     monkeypatch.setattr(dictate, "_STREAM_RESULT_PATH", str(tmp_path / "dictate-stream.json"))
     monkeypatch.setattr(dictate, "_PREVIEW_PATH", str(tmp_path / "dictate-preview.json"))
@@ -849,6 +850,134 @@ def test_subsequent_denial_shows_regular_clipboard_note(state, monkeypatch, past
     s = dictate.resolve_settings({"dictate": {"auto_paste": True, "clipboard": "xclip"}}, "Darwin")
     assert dictate.stop_and_transcribe(s, "Darwin", "send", 12345) == 0
     assert notes[-1] == "copied — press cmd+v to paste"
+
+
+# --- paste-lock guard (windowsill#50): one paste at a time ---------------------------------------
+
+
+class TestPasteLock:
+    def test_no_lock_file_means_not_locked(self, state):
+        assert dictate._paste_locked() is False
+
+    def test_live_lock_is_detected(self, state, monkeypatch):
+        """A lock file whose pid is alive means another process is transcribing/pasting."""
+        (state / "dictate-paste-lock").write_text("99999", encoding="utf-8")
+        monkeypatch.setattr(dictate, "_pid_alive", lambda pid: pid == 99999)
+        assert dictate._paste_locked() is True
+
+    def test_stale_lock_is_cleared(self, state, monkeypatch):
+        """A lock whose pid is dead is stale garbage — removed so the toggle is not wedged."""
+        (state / "dictate-paste-lock").write_text("99999", encoding="utf-8")
+        monkeypatch.setattr(dictate, "_pid_alive", lambda pid: False)
+        assert dictate._paste_locked() is False
+        assert not (state / "dictate-paste-lock").exists()
+
+    def test_own_pid_is_not_a_lock(self, state):
+        """This process's own lock must not block itself: each toggle is a separate process, but in
+        tests main() and stop_and_transcribe() run in the same one."""
+        (state / "dictate-paste-lock").write_text(str(os.getpid()), encoding="utf-8")
+        assert dictate._paste_locked() is False
+
+    @pytest.mark.parametrize("content", ["", "not-a-pid", "-1", "0"])
+    def test_garbage_lock_file_is_not_a_lock(self, state, content):
+        (state / "dictate-paste-lock").write_text(content, encoding="utf-8")
+        assert dictate._paste_locked() is False
+
+    def test_claim_and_release_cycle(self, state):
+        dictate._claim_paste_lock()
+        assert (state / "dictate-paste-lock").exists()
+        assert (state / "dictate-paste-lock").read_text(encoding="utf-8") == str(os.getpid())
+        dictate._release_paste_lock()
+        assert not (state / "dictate-paste-lock").exists()
+
+    def test_claim_is_best_effort_on_unwritable_state_dir(self, state, monkeypatch):
+        monkeypatch.setattr(dictate, "_PASTE_LOCK_PATH", str(state / "not-created" / "paste-lock"))
+        dictate._claim_paste_lock()  # does not raise
+        assert "paste lock not written" in (state / "dictate.log").read_text(encoding="utf-8")
+
+    def test_release_is_best_effort(self, state):
+        """Releasing a lock that does not exist is a no-op, not a crash."""
+        assert not (state / "dictate-paste-lock").exists()
+        dictate._release_paste_lock()  # does not raise
+
+    def test_main_ignores_toggle_when_paste_locked(self, state, monkeypatch):
+        """The acceptance case: a start-toggle during transcription/paste is ignored with a log line
+        and an audible cue — the previous paste cannot land mid-recording."""
+        (state / "dictate-paste-lock").write_text("99999", encoding="utf-8")
+        monkeypatch.setattr(dictate, "_pid_alive", lambda pid: pid == 99999)
+        sounds: list[str] = []
+        monkeypatch.setattr(dictate, "sound", lambda path, player: sounds.append(path))
+        # No pidfile — this would normally be a start, but the paste lock blocks it.
+        assert not (state / "dictate.pid").exists()
+
+        _write_config(monkeypatch, state, {"dictate": {"debounce_ms": 0}})
+        assert dictate.main(["dictate.py"]) == 0
+
+        log_text = (state / "dictate.log").read_text(encoding="utf-8")
+        assert "toggle ignored — previous dictation still finishing" in log_text
+        assert sounds != []  # the audible cue fired
+
+    def test_main_admits_toggle_when_lock_is_stale(self, state, monkeypatch):
+        """A stale lock is cleaned by _paste_locked and the toggle proceeds normally."""
+        (state / "dictate-paste-lock").write_text("99999", encoding="utf-8")
+        monkeypatch.setattr(dictate, "_pid_alive", lambda pid: False)
+
+        class FakeProc:
+            pid = 4242
+
+        spawned: list[list[str]] = []
+        monkeypatch.setattr(dictate.subprocess, "Popen", lambda argv, **kw: spawned.append(argv) or FakeProc())
+        monkeypatch.setattr(dictate, "stop_speak_playback", lambda: None)
+        monkeypatch.setattr(dictate, "note", lambda message, system: None)
+        _write_config(monkeypatch, state, {"dictate": {"recorder": "arecord", "debounce_ms": 0}})
+
+        assert dictate.main(["dictate.py"]) == 0
+        assert len(spawned) == 1  # the recording started
+        assert not (state / "dictate-paste-lock").exists()  # stale lock was cleaned
+
+    def test_stop_and_transcribe_claims_the_lock(self, state, monkeypatch):
+        """The stop path records its pid so a concurrent start is blocked."""
+        (state / "dictate.wav").write_bytes(b"\0" * (dictate.WAV_HEADER_BYTES + dictate.BYTES_PER_SECOND))
+        monkeypatch.setattr(dictate, "transcribe", lambda s: "hello")
+        monkeypatch.setattr(dictate, "_pid_alive", lambda pid: False)
+        monkeypatch.setattr(dictate.os, "kill", lambda pid, sig: None)
+        monkeypatch.setattr(dictate.time, "sleep", lambda seconds: None)
+        monkeypatch.setattr(dictate, "note", lambda message, system: None)
+        monkeypatch.setattr(dictate.subprocess, "run", lambda argv, **kw: None)
+        # Suppress atexit registration so handlers don't accumulate across tests.
+        registered: list = []
+        monkeypatch.setattr(dictate.atexit, "register", lambda fn: registered.append(fn))
+
+        s = dictate.resolve_settings({"dictate": {"clipboard": "xclip"}}, "Linux")
+        assert dictate.stop_and_transcribe(s, "Linux", "send", 12345) == 0
+
+        assert (state / "dictate-paste-lock").exists()
+        assert (state / "dictate-paste-lock").read_text(encoding="utf-8") == str(os.getpid())
+        assert len(registered) == 1  # atexit handler registered
+
+
+# --- macOS sound defaults (windowsill#50) ---------------------------------------------------------
+
+
+def test_darwin_sound_defaults_use_system_sounds():
+    """macOS system sounds are the natural pacing cue — default ON so the user hears when a toggle
+    was ignored during the paste-lock window."""
+    s = dictate.resolve_settings({}, "Darwin")
+    assert s["start_sound"] == "/System/Library/Sounds/Pop.aiff"
+    assert s["stop_sound"] == "/System/Library/Sounds/Blow.aiff"
+
+
+def test_linux_sound_defaults_stay_empty():
+    """No single default sound works across Linux distros — silence is the safe default."""
+    s = dictate.resolve_settings({}, "Linux")
+    assert s["start_sound"] == ""
+    assert s["stop_sound"] == ""
+
+
+def test_explicit_sound_overrides_the_default():
+    s = dictate.resolve_settings({"dictate": {"start_sound": "/my/beep.wav"}}, "Darwin")
+    assert s["start_sound"] == "/my/beep.wav"
+    assert s["stop_sound"] == "/System/Library/Sounds/Blow.aiff"  # only the overridden one
 
 
 # --- the PID-reuse identity check (duplicated helper — kept in sync with speak.py) --------------
