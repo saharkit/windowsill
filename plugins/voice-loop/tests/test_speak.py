@@ -2444,3 +2444,56 @@ def test_an_alert_key_naming_a_service_with_a_space_survives_the_ledger(state, m
     speak.contour_check({}, 0.0)
     assert spoken == ["Voice contour: tts worker is serving on cpu, expected gpu"]
     assert (state / "contour-announced").read_text(encoding="utf-8").splitlines() == ["device-demoted:tts worker"]
+
+
+# --- Latin → Cyrillic transliteration for contour alerts (#104) ------------------------------------
+
+
+def test_transliterate_to_cyrillic_maps_every_latin_letter():
+    """The mapping covers every letter A-Z, a-z — a gap would leave a Latin character untransliterated
+    and the alert still unsynthesizable on a Cyrillic voice."""
+    text = "The quick brown fox jumps over the lazy dog. ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    result = speak._transliterate_to_cyrillic(text)
+    # Every Latin letter is gone — the text is now pure Cyrillic + punctuation
+    assert not any("a" <= ch <= "z" or "A" <= ch <= "Z" for ch in result)
+    # Non-Latin characters pass through unchanged
+    assert speak._transliterate_to_cyrillic("Привет! 123.") == "Привет! 123."
+    assert speak._transliterate_to_cyrillic("") == ""
+
+
+def test_contour_alert_is_transliterated_for_russian_voice(state, monkeypatch):
+    """The acceptance case: a ru-configured contour with an English alert. The alert text is
+    transliterated to Cyrillic before synthesis, so the Russian voice CAN pronounce it — rather
+    than the server returning 400 and the page going silent.
+
+    Mutation gap: without the transliteration, contour_check sends pure-Latin text to a ru voice,
+    the server returns 400, and the page is never heard. The test captures what `synthesize`
+    receives — transliterated Cyrillic text — which is what makes the alert audible."""
+    _contour_status(state, [_DEMOTED])
+    # a ru-configured voice — the exact setup from the bug report
+    cfg = {"language": "ru"}
+    spoken = _record_speech(monkeypatch)
+    speak.contour_check(cfg, 0.0)
+    assert len(spoken) == 1
+    result = spoken[0]
+    # The transliteration replaced every Latin letter with a Cyrillic one.
+    # "Voice contour: rvc is serving on cpu, expected gpu" becomes e.g.
+    # "Воике контоур: рвк ис сервинг он кпу, експектед гпу"
+    assert "Voice" not in result  # the Latin prefix is gone
+    assert "rvc" not in result.lower()  # Latin letters in the message are gone
+    assert "cpu" not in result.lower()
+    # Cyrillic characters are present — the text is synthesizable by a ru voice
+    assert any("Ѐ" <= ch <= "ӿ" for ch in result)
+
+
+def test_contour_alert_is_not_transliterated_for_english_voice(state, monkeypatch):
+    """An English voice can pronounce the Latin alert as-is — the transliteration must not fire
+    and corrupt a perfectly speakable text."""
+    _contour_status(state, [_DEMOTED])
+    cfg = {"language": "en"}
+    spoken = _record_speech(monkeypatch)
+    speak.contour_check(cfg, 0.0)
+    assert len(spoken) == 1
+    # The English text is unchanged — no transliteration fired
+    assert "Voice contour:" in spoken[0]
+    assert "rvc" in spoken[0]

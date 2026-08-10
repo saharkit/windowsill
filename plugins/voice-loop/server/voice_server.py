@@ -456,6 +456,24 @@ def matched_hallucination(text: str) -> str | None:
 # model started a new sentence, which is where the appended caption begins.
 SENTENCE_BREAK = re.compile(r"(?<=[.!?…])\s+")
 
+# Character ranges for the speakable-characters check in tts_request_error. A Silero voice for a
+# Cyrillic language (ru, uk) needs at least one Cyrillic character; a Latin-language voice
+# (en, de, es, fr) needs at least one Latin letter. Without one the model returns garbage or a 500.
+_CYRILLIC_CHAR = re.compile(r"[Ѐ-ӿ]")
+_LATIN_CHAR = re.compile(r"[a-zA-Z]")
+
+
+def _has_speakable_chars(text: str, language: str) -> bool:
+    """True when `text` contains at least one character a Silero voice for `language` can pronounce.
+
+    A Russian or Ukrainian Silero voice fed pure Latin text returns garbage or raises inside the
+    model (an unhandled 500). The same happens in reverse: a Latin voice fed pure Cyrillic. This is
+    the check that turns that failure into a named 400 before synthesis is attempted.
+    """
+    if language in ("ru", "uk"):
+        return bool(_CYRILLIC_CHAR.search(text))
+    return bool(_LATIN_CHAR.search(text))
+
 
 def strip_hallucinated_tail(text: str) -> tuple[str, list[tuple[str, str]]]:
     """Peel blocklisted closing captions off the END of a transcript, keeping the speech before them.
@@ -991,6 +1009,19 @@ def tts_request_error(text: str, language: str, engine: str = "") -> JSONRespons
                 "error": f"no local TTS model for language {language!r}",
                 "supported": sorted(SILERO_VOICES),
                 "hint": f"{switch}; {hint}" if switch else hint,
+            },
+            status_code=400,
+        )
+    if not _has_speakable_chars(text, language):
+        speaker = default_speaker(language)
+        return JSONResponse(
+            {
+                "error": f"no speakable characters for the {language!r} voice ({speaker})",
+                "hint": (
+                    "the text contains no characters this voice can pronounce; "
+                    "transliterate Latin text to Cyrillic for ru/uk voices, "
+                    "or switch to a matching voice"
+                ),
             },
             status_code=400,
         )

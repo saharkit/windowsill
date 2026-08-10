@@ -211,6 +211,50 @@ def test_tts_language_is_case_insensitive(client, fake_silero):
     assert fake_silero.calls[0]["speaker"] == "en_0"
 
 
+# --- speakable-characters validation ----------------------------------------------------------------
+
+
+def test_tts_rejects_pure_latin_for_cyrillic_voice(client, fake_silero):
+    """A Russian voice fed pure Latin text returns 400 naming the voice — never a 500."""
+    response = client.post(
+        "/tts", json={"text": "Voice contour: rvc is serving on cpu, expected gpu", "language": "ru"}
+    )
+
+    assert response.status_code == 400
+    body = response.json()
+    assert "no speakable characters" in body["error"]
+    assert "ru" in body["error"]
+    assert "baya" in body["error"]  # the default speaker for ru
+    assert fake_silero.calls == []
+
+
+def test_tts_rejects_pure_cyrillic_for_latin_voice(client, fake_silero):
+    """An English voice fed pure Cyrillic text returns 400 — the reverse direction."""
+    response = client.post("/tts", json={"text": "Привет мир", "language": "en"})
+
+    assert response.status_code == 400
+    body = response.json()
+    assert "no speakable characters" in body["error"]
+    assert "en" in body["error"]
+    assert "en_0" in body["error"]  # the default speaker for en
+    assert fake_silero.calls == []
+
+
+def test_tts_accepts_mixed_latin_cyrillic_for_russian_voice(client, fake_silero):
+    """One Cyrillic character is enough — the voice has something to pronounce."""
+    response = client.post("/tts", json={"text": "Status: ок", "language": "ru"})
+    assert response.status_code == 200
+    assert response.content[:4] == b"RIFF"
+    assert len(fake_silero.calls) >= 1
+
+
+def test_tts_accepts_cyrillic_text_for_russian_voice(client, fake_silero):
+    """The ordinary happy case: Russian text on a Russian voice. The check must not false-positive."""
+    response = client.post("/tts", json={"text": "Привет, мир!", "language": "ru"})
+    assert response.status_code == 200
+    assert response.content[:4] == b"RIFF"
+
+
 # --- request-level caps ----------------------------------------------------------------------------
 
 
@@ -243,7 +287,7 @@ def test_tts_stream_carries_its_own_larger_cap(client, fake_silero, monkeypatch)
 def test_tts_text_cap_defaults_are_the_documented_ones(client, fake_silero):
     assert voice_server.MAX_TTS_TEXT == 20000
     assert voice_server.MAX_TTS_TEXT_BLOB == 3000
-    response = client.post("/tts", json={"text": "Ok."})
+    response = client.post("/tts", json={"text": "Ok.", "language": "en"})
     assert response.status_code == 200
 
 
