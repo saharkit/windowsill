@@ -121,8 +121,9 @@ the real runtime. So the guarantee is layered differently:
    so a second test reads `speak.py` and `dictate.py` and fails if either grows a log call the table
    does not know, or keeps a row nothing writes any more. That second direction is what keeps the
    table honest when a message MOVES: the per-provider "no key" wording collapsed into one line when
-   the provider registry landed, and the row it replaced could not be left behind quietly. An unclassified line is redacted at
-   runtime regardless — the table falling behind costs diagnostics, never a leak. The transports are
+   the provider registry landed, and the row it replaced could not be left behind quietly. An
+   unclassified line is redacted at runtime regardless — the table falling behind costs diagnostics,
+   never a leak. The transports are
    unit-tested at their seams (an injected subprocess runner for `gh`, URL round-trips through
    `urlsplit`/`parse_qs` for the other two): no issue is ever created, no mail is ever sent.
 7. **`tests/test_tls_probe.py`** unit-tests `tls-probe.py` the same way — the https request and the

@@ -472,7 +472,8 @@ def resolve_settings(config: dict, system: str) -> dict:
         "backend": str(cfg(config, "tts.backend", "lan")),
         # left empty here: the per-backend default differs (see synthesize) — the LAN server and a
         # provider with no remote default host both land on the local speech server, while a
-        # provider that HAS one (ElevenLabs, Deepgram) lands there. That choice is the entry's.
+        # provider that HAS one (ElevenLabs, Deepgram) lands on its own remote API host. That choice
+        # is the entry's.
         "endpoint": str(cfg(config, "tts.endpoint", "")),
         "speaker": speaker,
         # top-level "language" is the one the user sets; ".tts.language" is the advanced escape for

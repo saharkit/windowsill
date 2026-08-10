@@ -36,7 +36,7 @@ def test_no_dispatch_path_compares_a_provider_against_a_literal():
     This file is exempt from its own rule: the pattern below is data, and the string it looks for
     has to be written down somewhere.
     """
-    forbidden = re.compile(r"""\[.(stt_)?provider.\]\s*==|\bprovider\s*==""")
+    forbidden = re.compile(r"""\[.(stt_)?provider.\]\s*==|\b\w*provider\s*==""")
     offenders = []
     for path in sorted(_SCRIPTS.glob("*.py")):
         for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
