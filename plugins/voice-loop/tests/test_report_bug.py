@@ -483,6 +483,96 @@ class TestHostRedaction:
         )
 
 
+# --- round-6 residue (#127): edge host spellings the rebuilt grammar left out ----------------------
+#
+# Each test below pins ONE edge spelling the host grammar missed before #127 (the non-blocking
+# basket from PR #121's round-6 review: no realistic log line was shown to leak, but the grammar's
+# own shape left these out). The fail-closed allowlist flip recorded on #121 is the standing
+# disposition if any of these ever grows a real leak repro; these are the narrower grammar fixes.
+
+
+class TestRedactionRoundSixResidue:
+    """#127: one edge host spelling per test, each closing a gap the rebuilt grammar left open."""
+
+    def test_a_dotted_host_separated_from_its_port_by_whitespace_is_still_a_host(self):
+        # F1: the port "spelled other than :port" — whitespace on either side of the colon. Without
+        # the tolerance a private name plus its port in pasted prose or a looser log format leaks.
+        assert report_bug.redact("refused to deepgram.corp.internal :443") == "refused to <host>:443"
+        assert report_bug.redact("refused to deepgram.corp.internal: 443") == "refused to <host>:443"
+
+    def test_a_fully_qualified_dotted_host_with_a_root_dot_is_still_a_host(self):
+        # F1: `host.` (a trailing dot is the DNS root label, as `dig`/`nslookup` print it) then a
+        # port — the trailing dot used to break the `name:port` join and the host leaked.
+        assert report_bug.redact("refused to deepgram.corp.internal.:443") == "refused to <host>:443"
+
+    def test_a_unicode_idn_host_is_redacted(self):
+        # F2/F8: a host typed in its native script is invisible to an ASCII-only label charset, so
+        # the most identifying form of a private host survived verbatim.
+        assert report_bug.redact("refused to café.example.com:443") == "refused to <host>:443"
+        assert report_bug.redact("refused to тест.рф:443") == "refused to <host>:443"
+
+    def test_a_punycode_host_is_redacted(self):
+        # F2/F8: the ASCII punycode form is the same host — pinning both spellings keeps a future
+        # charset change from fixing one and re-breaking the other.
+        assert report_bug.redact("refused to xn--80ak6aa92e.com:443") == "refused to <host>:443"
+
+    def test_a_subdomained_host_whose_suffix_is_also_a_tld_is_redacted(self):
+        # F3/F9: `api.evil.py:443` is a host on the .py TLD (Paraguay), not a Python file. Two or
+        # more labels before a file-suffix-colliding TLD is a domain; only one label stays ambiguous.
+        assert report_bug.redact("refused to api.evil.py:443") == "refused to <host>:443"
+        assert report_bug.redact("refused to relay.corp.sh:443") == "refused to <host>:443"
+
+    def test_a_single_label_file_shaped_token_with_a_port_stays_ambiguous_and_kept(self):
+        # F3 boundary: `evil.py:443` is shape-identical to the source location `app.py:42`. No shape
+        # rule can tell them apart, so the single-label form is kept (the safe direction) — this
+        # pins that the wider suffix rule did NOT reach back and start eating real source locations.
+        assert report_bug.redact("refused to evil.py:443") == "refused to evil.py:443"
+        assert report_bug.redact("File app.py:42") == "File app.py:42"
+
+    def test_a_label_then_a_bare_ipv6_is_a_host(self):
+        # F4/F10: the bare-IPv6 lookbehind treated a preceding colon as part of a longer address, so
+        # `gateway:fd00::1234` (a config-style label:address spelling) was never examined.
+        assert report_bug.redact("default route via gateway:fd00::1234") == (
+            "default route via gateway:<host>"
+        )
+
+    def test_a_bare_ipv6_does_not_swallow_a_clock_after_a_label_colon(self):
+        # F4 two-way falsification: the loosened lookbehind lets `gateway:` through, but it must not
+        # then turn a clock tail into a host — `12:34:56` is three groups with no `::`, so the IPv6
+        # grammar still refuses it even though the colon in front is now allowed.
+        assert report_bug.redact("ping at time:12:34:56 elapsed") == "ping at time:12:34:56 elapsed"
+        assert report_bug.redact("mac 00:1a:2b:3c:4d:5e seen") == "mac 00:1a:2b:3c:4d:5e seen"
+
+    def test_a_full_form_ipv6_with_an_ipv4_tail_is_redacted_whole(self):
+        # F5: `0:0:0:0:0:ffff:10.0.0.1` — the IPv4 rule caught the dotted quad but left the six hex
+        # groups in front of it standing, so the address prefix leaked even as its tail did not.
+        assert report_bug.redact("refused to 0:0:0:0:0:ffff:10.0.0.1") == "refused to <host>"
+        assert report_bug.redact("refused to 1:2:3:4:5:6:10.0.0.1") == "refused to <host>"
+
+    def test_an_uppercase_scheme_url_is_redacted(self):
+        # F6/F11: the scheme alternation was case-sensitive lowercase, so `HTTP://host` bypassed the
+        # URL pass and (with no port to rescue it through the bare pass) the host leaked outright.
+        assert report_bug.redact("HTTP://deepgram.corp.internal:443") == "HTTP://<host>:443"
+        assert report_bug.redact("HTTPS://api.example.com/v1") == "HTTPS://<host>/v1"
+
+    def test_a_non_http_scheme_url_is_redacted_with_its_credentials(self):
+        # F6: `ftp://`, `ssh://`, `postgres://` and the like bypassed the URL pass, leaking the
+        # scheme and — worse — the `user:pass@` credentials riding in front of the host.
+        assert report_bug.redact("ftp://user:pw@deepgram.corp.internal:21") == (
+            "ftp://<user>@<host>:21"
+        )
+        assert report_bug.redact("postgres://user:pw@db.example.com:5432/x") == (
+            "postgres://<user>@<host>:5432/x"
+        )
+
+    def test_looks_like_a_file_is_exactly_one_label_then_a_suffix(self):
+        # F7/F9 unit (the decision lives here, so it is pinned here, once): the predicate keeps a
+        # source file (`name.ext`) and lets through both a bare loopback and a subdomained host.
+        assert report_bug._looks_like_a_file("session.py") is True
+        assert report_bug._looks_like_a_file("api.evil.py") is False
+        assert report_bug._looks_like_a_file("localhost") is False
+
+
 # --- the log vocabulary ------------------------------------------------------------------------------
 
 
