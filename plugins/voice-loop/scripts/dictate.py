@@ -200,6 +200,13 @@ _FOCUS_PATH = os.path.join(_STATE_DIR, "dictate-focus")
 _STREAM_PID_PATH = os.path.join(_STATE_DIR, "dictate-stream.pid")
 _STREAM_RESULT_PATH = os.path.join(_STATE_DIR, "dictate-stream.json")
 
+# The live preview surface (windowsill#115): the stream worker writes the current interim and the
+# assembled finals here, atomically (temp-then-replace — see _write_preview), and a separate
+# preview.py process reads and renders it. Absent file → nothing to show; a delete → clear.
+_PREVIEW_PATH = os.path.join(_STATE_DIR, "dictate-preview.json")
+# Beside dictate.py; the short name is how the launcher checks for it.
+_PREVIEW_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "preview.py")
+
 # CROSS-SCRIPT CONTRACT (keep in sync with speak.py): speak.py records its live speaking chain in
 # playing.pid — space-separated PIDs, its python process first, then the current player/command
 # child. The echo guard below reads THIS file to stop in-flight playback before recording, and
@@ -350,6 +357,10 @@ def resolve_settings(config: dict, system: str) -> dict:
         # The PCM shape the recorder table pins, handed to the streaming entry because a live URL
         # declares what the client is about to send and only the client knows that.
         "stream_rate": RECORD_RATE,
+        # Live transcript preview while speaking (windowsill#115): opt-in, streaming-only, and
+        # silently off when there is no display surface. Same "true"/JSON-true spelling as the rest.
+        "preview": cfg(config, "dictate.preview", False) is True
+        or cfg(config, "dictate.preview", False) == "true",
     }
 
 
@@ -1077,6 +1088,44 @@ def clear_stream_state(*, stop_survivor: bool = True) -> None:
             pass
 
 
+# --- live preview surface (windowsill#115) --------------------------------------------------------
+
+
+def _write_preview(data: dict, path: str) -> None:
+    """Write the current preview state atomically — temp-then-replace so the reader (preview.py)
+    sees a complete JSON document or no document at all. Best-effort: an unwritable state dir
+    means the preview surface is silently off, which is the documented degrade."""
+    try:
+        fd, tmp = tempfile.mkstemp(prefix="voice-loop-preview-", dir=os.path.dirname(path))
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(data, fh)
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
+def _clear_preview(path: str = _PREVIEW_PATH) -> None:
+    """Remove the preview state file so the overlay knows to clear itself. Best-effort."""
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
+def _start_preview() -> None:
+    """Launch the preview overlay process. Best-effort: no display surface → silently off."""
+    try:
+        subprocess.Popen(
+            [sys.executable, _PREVIEW_SCRIPT, _PREVIEW_PATH],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except OSError:
+        pass
+
+
 def start_stream_worker(recorder_pid: int) -> None:
     """Spawn the child that holds the socket open. Never fatal: a worker that will not start is a
     recording that transcribes the old way, which is exactly the fallback."""
@@ -1192,6 +1241,7 @@ def run_stream_session(
     connect=wsclient.connect,
     sleep=time.sleep,
     clock=time.monotonic,
+    on_interim=None,
 ) -> dict:
     """Forward the growing recording to the provider's socket and collect what comes back.
 
@@ -1201,11 +1251,16 @@ def run_stream_session(
     and the counts that let the stop toggle tell "a silent clip" from "a stream that carried
     nothing".
 
+    ``on_interim(interim: str, assembled: str)`` is called after every transcript update when the
+    caller wants a live signal — the live preview surface (windowsill#115). None means no one is
+    listening.
+
     It never raises: every failure of the socket is caught here and becomes ``status: failed``,
     because the caller's only response to any of them is the same batch fallback.
     """
     streaming = entry.streaming
     finals: list[str] = []
+    current_interim = ""
     messages = 0
     sent = 0
 
@@ -1235,7 +1290,7 @@ def run_stream_session(
 
     def collect(frames) -> bool:
         """Fold every frame into the finals; True when the peer said goodbye."""
-        nonlocal messages
+        nonlocal messages, current_interim
         closed = False
         for opcode, payload in frames:
             if opcode == wsclient.OP_CLOSE:
@@ -1247,8 +1302,14 @@ def run_stream_session(
             if update is None:
                 continue
             messages += 1
-            if update.is_final and update.text:
-                finals.append(update.text)
+            if update.is_final:
+                if update.text:
+                    finals.append(update.text)
+                current_interim = ""  # a final settles the span — the interim guess is cleared
+            else:
+                current_interim = update.text
+            if on_interim:
+                on_interim(current_interim, assemble_stream_text(finals))
         return closed
 
     try:
@@ -1341,13 +1402,21 @@ def stream_worker(s: dict, args: list[str]) -> int:
         _write_stream_result({"status": "failed", "reason": f"no key (key_file unset/unreadable, and {tried} empty)"})
         return 1
 
+    preview_path = _PREVIEW_PATH if s.get("preview") else ""
+
+    def on_interim(interim: str, assembled: str) -> None:
+        _write_preview({"interim": interim, "assembled": assembled}, preview_path)
+
     result = run_stream_session(
         s,
         entry,
         key,
         stopping=lambda: stopping["now"],
         recorder_alive=lambda: _pid_alive(recorder_pid),
+        on_interim=on_interim if preview_path else None,
     )
+    if preview_path:
+        _clear_preview(preview_path)
     _write_stream_result(result)
     return 0 if result["status"] == "ok" else 1
 
@@ -1492,6 +1561,10 @@ def start_recording(s: dict, system: str, pidfile_fd: int) -> int:
     # below can spend up to FOCUS_PROBE_TIMEOUT and is deliberately behind it.
     if streaming_wanted(s):
         start_stream_worker(proc.pid)
+        # The live preview surface (windowsill#115) only exists when there is a live socket to
+        # show interims from; in batch mode there is nothing to preview.
+        if s.get("preview"):
+            _start_preview()
     # After the recorder is live, never before it: the probe may spend up to FOCUS_PROBE_TIMEOUT,
     # and none of that may be time the microphone is not yet capturing.
     if same_window_guard_on(s):
@@ -1550,6 +1623,7 @@ def stop_and_transcribe(s: dict, system: str, mode: str, recorder_pid: int) -> i
         # as it has always been, and there is no transcript anybody wants. Its late document (if it
         # writes one at all) carries a pid this stop never held, so no later recording can adopt it.
         clear_stream_state()
+        _clear_preview()
         note("clip too short — ignored", system)
         log(f"clip too short ({size} bytes ≈ {clip_seconds(size):.2f}s) — stt skipped")
         try:
@@ -1584,6 +1658,7 @@ def stop_and_transcribe(s: dict, system: str, mode: str, recorder_pid: int) -> i
         pass
 
     if not text:
+        _clear_preview()
         note("nothing recognized", system)
         log("empty transcription")
         # A silent clip is a RESULT, and a streaming one is the fastest result this file produces —
@@ -1596,6 +1671,7 @@ def stop_and_transcribe(s: dict, system: str, mode: str, recorder_pid: int) -> i
     )
     commands = clipboard_commands(tool)
     if not commands:
+        _clear_preview()
         log("no clipboard tool (install wl-clipboard or xclip)")
         note("no clipboard tool available", system)
         return 1
@@ -1604,6 +1680,7 @@ def stop_and_transcribe(s: dict, system: str, mode: str, recorder_pid: int) -> i
             with open(_LOG_PATH, "a", encoding="utf-8") as errlog:
                 subprocess.run(argv, input=text.encode("utf-8"), stdout=subprocess.DEVNULL, stderr=errlog, check=False)
         except OSError as err:
+            _clear_preview()
             log(f"clipboard failed: {err}")
             note("no clipboard tool available", system)
             return 1
@@ -1614,6 +1691,7 @@ def stop_and_transcribe(s: dict, system: str, mode: str, recorder_pid: int) -> i
         # never meant to go. Probing again only when start left an identity to compare against —
         # an unknown at either end degrades to "any", which is the documented default.
         if same_window_guard_on(s) and started_focus and focus_changed(started_focus, current_focus(system)):
+            _clear_preview()
             note("focus moved — text is in the clipboard", system)
             log("focus moved since this recording started — paste suppressed (dictate.paste_target=same-window)")
             latency("clipboard")
@@ -1626,17 +1704,20 @@ def stop_and_transcribe(s: dict, system: str, mode: str, recorder_pid: int) -> i
         paste_tool = pick_paste_tool(system, shutil.which, sock_ok, os.environ.get("DISPLAY", ""))
         paste_was_denied = paste_tool == "osascript" and _paste_denied()
         if _run_paste(paste_tool, s["paste_key"], mode == "send", sock):
+            _clear_preview()
             log(f"auto-pasted (mode={mode} key={s['paste_key']})")
             latency("paste")
             return 0
         if paste_tool == "osascript" and _paste_denied() and not paste_was_denied:
             # The user just declined the macOS Accessibility permission — tell them once that
             # the text is on the clipboard and the keystroke path won't be retried.
+            _clear_preview()
             note("accessibility permission denied — text is on the clipboard", system)
             log("auto-paste denied — Accessibility permission not granted")
             latency("clipboard")
             return 0
         log("auto-paste unavailable — clipboard fallback")
+    _clear_preview()
     note(f"copied — press {s['paste_key']} to paste", system)
     latency("clipboard")
     return 0
