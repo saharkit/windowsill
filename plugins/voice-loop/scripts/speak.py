@@ -291,6 +291,10 @@ def _transliterate_to_cyrillic(text: str) -> str:
 _STATE_DIR = os.path.join(os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state")), "voice-loop")
 _LOG_PATH = os.path.join(_STATE_DIR, "speak.log")
 _LAST_PATH = os.path.join(_STATE_DIR, "last-spoken")
+# The opaque identity beside last-spoken keeps the dictation echo guard's text contract intact while
+# letting eager-off dedup distinguish a repeated line in a new assistant message from a still-flushing
+# read of the previous message.
+_LAST_KEY_PATH = os.path.join(_STATE_DIR, "last-spoken-key")
 
 # One line per line ever spoken (plus one seed marker per transcript) — the cross-event memory that
 # makes Stop and PostToolUse idempotent with respect to each other.
@@ -397,6 +401,22 @@ def log(message: str) -> None:
 def _default_wall_clock() -> float:
     """Epoch seconds. Wall time is an INPUT here, injected so a test needs no real clock."""
     return time.time()
+
+
+def _write_last_key(key: str) -> None:
+    """Persist the opaque eager-off identity atomically; a reader sees the old key or the new one."""
+    try:
+        fd, tmp = tempfile.mkstemp(prefix="voice-loop-last-key-", dir=os.path.dirname(_LAST_KEY_PATH))
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(key)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, _LAST_KEY_PATH)
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except (OSError, UnboundLocalError):
+            pass
 
 
 def stamp_hook_fired(clock: Callable[[], float] = _default_wall_clock) -> None:
@@ -2074,17 +2094,43 @@ def main() -> int:
                 prev = fh.read()
         except OSError:
             prev = ""
+        try:
+            with open(_LAST_KEY_PATH, encoding="utf-8") as fh:
+                prev_key = fh.read().strip()
+        except OSError:
+            prev_key = ""
 
         claimed: list[str] = []
         vetoed: list[str] = []
 
+        current_key = ""
+        current_text: str | None = None
+        fresh_reads = 0
+
         def read_fresh() -> str | None:
             """One transcript read: the marked lines this event owns, minus everything the ledger
             already accounts for. The ledger is re-read every time — a firing that ran between our
-            rounds may have claimed a line since. With eager off there is no ledger and no veto:
-            the read is exactly the pre-0.3.2 one, the last message's marked lines, all of them."""
+            rounds may have claimed a line since. Eager-off also carries the last message identity so
+            a repeated line in a new message is decided dedup rather than a flush race."""
+            nonlocal current_key, current_text, fresh_reads
             if not ledger_on:
-                return extract(transcript, s["marker"], s["max_chars"])
+                fresh_reads += 1
+                message_index: int | None = None
+
+                def remember_message(index: int, line: str) -> bool:
+                    nonlocal message_index
+                    message_index = index
+                    return True
+
+                text = extract(transcript, s["marker"], s["max_chars"], accept=remember_message)
+                current_text = text
+                current_key = ledger_key(transcript, message_index, text) if text and message_index is not None else ""
+                # A matching key is the same message still being observed: return None so the only
+                # retry gate below sees the canonical race signature. Keep the text separately for
+                # the final dedup verdict once the bounded wait has finished.
+                if current_key and current_key == prev_key and fresh_reads > 1:
+                    return None
+                return text
             claimed.clear()
             vetoed.clear()  # what the ledger turned away, so a quiet exit can say WHY it was quiet
             seen = set(read_ledger())
@@ -2101,10 +2147,17 @@ def main() -> int:
             return extract(transcript, s["marker"], s["max_chars"], all_messages=eager, accept=accept)
 
         def settled(value: str | None) -> bool:
-            """Is this read final? '' is: a parsed message with no marked text in it cannot change
-            on a re-read. A non-empty extract is, unless the eager-off dedup recognises it as the
-            previous utterance. None never is — that is the flush race's own signature."""
-            return value == "" or bool(value and (ledger_on or value != prev))
+            """Is this read final? A parsed empty message is final; None is the flush race. An
+            eager-off read of the previous message's same line is also a race, identified by its
+            transcript/message/line key rather than text alone."""
+            return value == "" or bool(
+                value
+                and (
+                    ledger_on
+                    or value != prev
+                    or (prev_key and current_key != prev_key)
+                )
+            )
 
         # Flush race: read immediately; retry ONLY on the race signatures — nothing new extracted
         # (None: no assistant message yet, or nothing but lines already spoken), or, with the ledger
@@ -2128,7 +2181,7 @@ def main() -> int:
                 # be dropped, in silence. The retry condition has not changed — we are here only
                 # because there is still nothing new — so waiting out the line in front costs a
                 # ready line nothing and buys a late one its turn.
-                log(f"stop: waiting because extract was {'EMPTY' if text is None else 'IDENTICAL'}")
+                log(f"stop: waiting because extract was {'IDENTICAL' if text is not None or (current_key == prev_key and current_text == prev) else 'EMPTY'}")
                 text = wait_out_playback(read_fresh, settled, text, deadline=deadline)
             if not ledger_on and not settled(text):
                 # …and the other reason a line can be missing: nobody is playing, the ladder simply
@@ -2143,8 +2196,12 @@ def main() -> int:
                 # ledger's veto, which only exists with the ledger on: "eager already said it" is a
                 # decided answer, never a race.) #106 was reported on the default, eager-off
                 # install, which is exactly the configuration that has no successor to fall back on.
-                log(f"stop: waiting because extract was {'EMPTY' if text is None else 'IDENTICAL'}")
+                log(f"stop: waiting because extract was {'IDENTICAL' if text is not None or (current_key == prev_key and current_text == prev) else 'EMPTY'}")
                 text = wait_out_flush(transcript, read_fresh, settled, text, activity, deadline=deadline)
+        if text is None and current_key and current_key == prev_key:
+            # The race wait uses None as its public signature, but once its bound expires the
+            # candidate is still the previous utterance and must reach the ordinary dedup verdict.
+            text = current_text
         if not text:
             if not eager:
                 # A Stop that leaves without speaking has abandoned the turn for good: unlike an
@@ -2172,6 +2229,7 @@ def main() -> int:
         try:
             with open(_LAST_PATH, "w", encoding="utf-8") as fh:
                 fh.write(text)
+            _write_last_key(current_key)
         except OSError:
             pass
         # Claimed BEFORE a single byte is synthesized: a line lost to a failing server is silence

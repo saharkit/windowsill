@@ -64,6 +64,7 @@ _STATE_FILES = (
     ("speak.log", "the speaking hook's log"),
     ("spoken.ledger", "the spoken-ledger (opaque line hashes)"),
     ("last-spoken", "the previous utterance — size only, never its text"),
+    ("last-spoken-key", "the previous utterance's opaque transcript identity — size only"),
     ("speaking.lock", "the inter-firing speaking lock"),
     ("playing.pid", "the playback pidfile"),
     ("hook-last-fired", "the hook heartbeat stamp"),
