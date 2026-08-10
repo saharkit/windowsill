@@ -54,6 +54,11 @@ External, and every rung is measurable by someone who does not work here.
   issue, opened by an account with no school affiliation.
 - **`shelf-outside-pr`** — first outside pull request merged, through the passport's own two-lens
   bar with no exemption. *Proof:* the merged PR with both review lenses recorded on it.
+- **`shelf-outside-tale`** — first tale accepted from outside the school, through the
+  tale-contribution path (#63). Canon authorship is curated, not merged by CI: the lore-keeper
+  continuity lens (registry resolution + non-contradiction) advises, and the teller-editor's cold
+  read + signature accepts. *Proof:* the merged tale's pull request together with the
+  teller-editor's signature on it.
 
 ## School ladder
 
