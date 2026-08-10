@@ -1488,6 +1488,17 @@ class _FailingOpener:
         raise OSError("Network unreachable")
 
 
+class _FailingConnect:
+    """A connect whose call raises WebSocketError — simulating a refused socket, without actually
+    opening one. The warning fires BEFORE connect, so a test that only cares about the log can
+    skip the network."""
+    def __init__(self, reason: str = "connection refused"):
+        self._reason = reason
+
+    def __call__(self, url, headers, *, timeout=10.0, connector=None, context=None):
+        raise dictate.wsclient.WebSocketError(self._reason)
+
+
 def test_cloud_network_failure_degrades_to_local_whisper(state, monkeypatch):
     """On a network error the cloud path returns None, and the caller degrades to the
     local whisper server with a logged reason — never a silent dead mic."""
@@ -1535,6 +1546,45 @@ def test_cloud_error_response_degrades_to_local_whisper(state, monkeypatch, open
     assert len(opener_seq.requests) == 2
     log_text = (state / "dictate.log").read_text(encoding="utf-8")
     assert "cloud stt failed — falling back to local whisper" in log_text
+
+
+# --- plaintext endpoint warning: http:// on non-loopback -----------------------------------------
+
+
+def test_non_loopback_http_batch_endpoint_is_warned(state, monkeypatch, opener):
+    """A user-configured http:// endpoint resolves to plaintext — the API key, the raw audio
+    and the transcript all travel in the clear. Warn once, and let the call proceed."""
+    (state / "dictate.wav").write_bytes(b"RIFFfakewav")
+    fake = opener(b'{"text": " hello "}')
+    monkeypatch.setenv("VOICE_LOOP_STT_API_KEY", "sk-secret")
+    s = dictate.resolve_settings(
+        {"stt": {"backend": "cloud", "cloud": {"endpoint": "http://192.168.1.100:8080"}}}, "Linux"
+    )
+    assert dictate.transcribe(s) == "hello"
+    log_text = _log_of(state)
+    assert "cloud stt endpoint is http:// to 192.168.1.100" in log_text
+    assert "api key" in log_text.lower()
+
+
+def test_loopback_http_batch_endpoint_is_silent(state, monkeypatch, opener):
+    """The local voice-loop server on http://127.0.0.1 is the DEFAULT and must never warn."""
+    (state / "dictate.wav").write_bytes(b"RIFFfakewav")
+    fake = opener(b'{"text": " hello "}')
+    s = dictate.resolve_settings({}, "Linux")  # default: stt.endpoint = http://127.0.0.1:8355
+    assert dictate.transcribe(s) == "hello"
+    assert "api key" not in _log_of(state).lower()
+
+
+def test_https_batch_endpoint_is_silent(state, monkeypatch, opener):
+    """A correctly configured https endpoint warrants no warning."""
+    (state / "dictate.wav").write_bytes(b"RIFFfakewav")
+    fake = opener(b'{"text": " hello "}')
+    monkeypatch.setenv("VOICE_LOOP_STT_API_KEY", "sk-secret")
+    s = dictate.resolve_settings(
+        {"stt": {"backend": "cloud", "endpoint": "https://api.example.com"}}, "Linux"
+    )
+    assert dictate.transcribe(s) == "hello"
+    assert "api key" not in _log_of(state).lower()
 
 
 # --- the degrade, on every shape of answer that is not a transcript -----------------------------
@@ -2149,6 +2199,60 @@ class TestStreamSessionRoundTrip:
         fake.server.stop()
         keepalives = [payload for opcode, payload in fake.server.frames if b"KeepAlive" in payload]
         assert keepalives, "an idle stretch sent no keepalive — the vendor would have hung up"
+
+    def test_plaintext_non_loopback_streaming_endpoint_is_warned(self, state):
+        """A ws:// URL to a non-loopback host carries credentials in the clear — warn before
+        the connect attempt, so the warning always reaches the log."""
+        (state / "dictate.wav").write_bytes(_wav_bytes(b"\x01\x02" * 500))
+        fake_connect = _FailingConnect("connection refused")
+
+        result = dictate.run_stream_session(
+            _streaming_settings("http://192.168.1.100:8080"),
+            providers.STT_PROVIDERS["deepgram"],
+            "dg-secret",
+            stopping=lambda: True,
+            recorder_alive=lambda: False,
+            wav_path=str(state / "dictate.wav"),
+            connect=fake_connect,
+        )
+        assert result["status"] == "failed"
+        log_text = _log_of(state)
+        assert "streaming stt endpoint is ws:// to 192.168.1.100" in log_text
+        assert "api key" in log_text.lower()
+
+    def test_loopback_ws_streaming_endpoint_is_silent(self, state):
+        """The local voice-loop server on ws://127.0.0.1 is the DEFAULT local path — never warn."""
+        (state / "dictate.wav").write_bytes(_wav_bytes(b"\x01\x02" * 500))
+        fake_connect = _FailingConnect("connection refused")
+
+        result = dictate.run_stream_session(
+            _streaming_settings("http://127.0.0.1:8355"),
+            providers.STT_PROVIDERS["deepgram"],
+            "dg-secret",
+            stopping=lambda: True,
+            recorder_alive=lambda: False,
+            wav_path=str(state / "dictate.wav"),
+            connect=fake_connect,
+        )
+        assert result["status"] == "failed"
+        assert "api key" not in _log_of(state).lower()
+
+    def test_wss_streaming_endpoint_is_silent(self, state):
+        """A correctly configured wss:// endpoint warrants no warning."""
+        (state / "dictate.wav").write_bytes(_wav_bytes(b"\x01\x02" * 500))
+        fake_connect = _FailingConnect("connection refused")
+
+        result = dictate.run_stream_session(
+            _streaming_settings("https://api.deepgram.com"),
+            providers.STT_PROVIDERS["deepgram"],
+            "dg-secret",
+            stopping=lambda: True,
+            recorder_alive=lambda: False,
+            wav_path=str(state / "dictate.wav"),
+            connect=fake_connect,
+        )
+        assert result["status"] == "failed"
+        assert "api key" not in _log_of(state).lower()
 
 
 # --- the worker's lifecycle: spawned by start, stopped by stop, never outliving either -----------

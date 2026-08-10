@@ -463,6 +463,10 @@ LOG_RULES: tuple[tuple[str, str | None], ...] = (
     ("dictation latency stop_to_paste_ms=", None),
     ("cloud stt returned an error: ", "error: "),
     ("cloud stt returned undecodable response: ", "response: "),
+    # plaintext endpoint warnings (#110): the hostname is config metadata (the operator's own
+    # endpoint), and the prose is fixed — nothing sensitive travels through these lines
+    ("cloud stt endpoint is http:// to ", None),
+    ("streaming stt endpoint is ws:// to ", None),
     ("debounce stamp unavailable (", None),
     ("debounce stamp locked by another toggle", None),
     ("debounce stamp not written: ", None),

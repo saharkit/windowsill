@@ -228,6 +228,11 @@ def log(message: str) -> None:
         pass
 
 
+def _is_loopback_host(host: str) -> bool:
+    """True only for addresses that point at the local machine — the one case where plaintext is safe."""
+    return host == "localhost" or host == "::1" or host.startswith("127.")
+
+
 def load_config(path: str) -> dict:
     try:
         with open(path, encoding="utf-8") as fh:
@@ -830,6 +835,12 @@ def _transcribe_cloud(s: dict, wav_bytes: bytes, boundary: str) -> str | None:
         return None
 
     request = entry.request(s, key, wav_bytes, boundary)
+    parsed = urllib.parse.urlsplit(request.url)
+    if parsed.scheme == "http" and parsed.hostname and not _is_loopback_host(parsed.hostname):
+        log(
+            f"cloud stt endpoint is http:// to {parsed.hostname} — "
+            "the API key, audio and transcript travel in the clear"
+        )
     raw = _post_bytes(request.url, request.headers, request.body, request.content_type, s["timeout"])
     if raw is None:
         return None  # network error — already logged by _post_bytes
@@ -1210,10 +1221,15 @@ def run_stream_session(
             "audio_bytes": sent,
         }
 
-    try:
-        socket_ = connect(
-            streaming.url(streaming, entry, s), streaming.headers(key), timeout=STREAM_CONNECT_TIMEOUT
+    url = streaming.url(streaming, entry, s)
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme == "ws" and parsed.hostname and not _is_loopback_host(parsed.hostname):
+        log(
+            f"streaming stt endpoint is ws:// to {parsed.hostname} — "
+            "the API key, audio and transcript travel in the clear"
         )
+    try:
+        socket_ = connect(url, streaming.headers(key), timeout=STREAM_CONNECT_TIMEOUT)
     except wsclient.WebSocketError as err:
         return snapshot("failed", str(err))
 
