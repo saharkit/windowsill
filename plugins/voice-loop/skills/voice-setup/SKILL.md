@@ -688,11 +688,25 @@ if key not in lst: lst.append(key)
 print(lst)" "$CUR" "$KEY")
 gsettings set org.gnome.settings-daemon.plugins.media-keys custom-keybindings "$NEW"
 gsettings set org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:$KEY name 'voice-loop dictate'
-gsettings set org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:$KEY command '<PLUGIN_ROOT>/scripts/dictate-toggle.sh send'
+gsettings set org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:$KEY command "$HOME/.local/bin/voice-loop-dictate send"
 gsettings set org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:$KEY binding 'F9'
 ```
 
-Substitute the real absolute path — `${CLAUDE_PLUGIN_ROOT}` is not expanded by the desktop.
+Install the stable launcher before binding the key. It resolves the current version from Claude Code's
+installed-plugin registry at each press, so the binding never contains a version-scoped cache path:
+
+```sh
+mkdir -p "$HOME/.local/bin" && \
+install -m 755 "${CLAUDE_PLUGIN_ROOT}/scripts/voice-loop-dictate" "$HOME/.local/bin/voice-loop-dictate"
+```
+
+The launcher is a Python entry point; the desktop invokes it through the shebang, so no shell
+expansion or plugin-root variable is needed. It is deliberately installed outside the plugin cache. Do not replace it with a glob over
+`~/.claude/plugins/cache`: sorting version directories is not a safe resolver. The registry is refreshed
+by Claude Code during `/plugin update`, and the launcher fails closed if it cannot identify exactly one
+current `voice-loop` install. If a previous binding contains an absolute versioned
+`dictate-toggle.sh` path, replace that command with the stable launcher during this step; this migrates
+existing installs in place rather than waiting for the next update to break them.
 
 ### macOS — ASK, and default to a physical chord
 
@@ -712,11 +726,22 @@ confirm) and ask **one** question either way — the probe only sees the machine
 ```sh
 brew install skhd && \
 mkdir -p ~/.config/skhd && \
-printf 'cmd - i : %s\n' '<PLUGIN_ROOT>/scripts/dictate-toggle.sh send' >> ~/.config/skhd/skhdrc && \
+printf 'cmd - i : %s\n' "$HOME/.local/bin/voice-loop-dictate send" >> ~/.config/skhd/skhdrc && \
 skhd --start-service
 ```
 
-Substitute the real absolute path — `${CLAUDE_PLUGIN_ROOT}` is not expanded outside the session.
+Install the same stable launcher before adding the line (the command is identical on macOS):
+
+```sh
+mkdir -p "$HOME/.local/bin" && \
+install -m 755 "${CLAUDE_PLUGIN_ROOT}/scripts/voice-loop-dictate" "$HOME/.local/bin/voice-loop-dictate"
+```
+
+The launcher resolves the current plugin version from Claude Code's installed-plugin registry at each
+press. It fails closed when the registry is missing or ambiguous; it never guesses by globbing cache
+folders. If `skhdrc` already contains a version-scoped absolute `dictate-toggle.sh` command, replace
+that line with the stable launcher while migrating the existing install.
+
 `skhd --restart-service` after any later edit of `skhdrc`. skhd costs **one Accessibility consent**
 (System Settings → Privacy & Security → Accessibility) — the same class of grant as the tier-2 paste
 in Step 5, and still no root.
@@ -733,7 +758,7 @@ Notes to give the user:
 
 - **KDE**: System Settings → Shortcuts → Custom Shortcuts → new → command.
 - **Sway/Hyprland**: one config line, print it ready to paste
-  (`bindsym F9 exec /path/to/dictate-toggle.sh send`).
+  (`bindsym F9 exec ~/.local/bin/voice-loop-dictate send`).
 
 Always tell the user the script is a **toggle**: press to start, press again to stop and transcribe.
 Tapping is the gesture — *holding* the key does not queue up toggles, because a re-fire within
