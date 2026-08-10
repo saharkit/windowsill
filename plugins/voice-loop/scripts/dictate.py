@@ -89,6 +89,7 @@ Deliberate behaviours, found by live debugging — do not "simplify" them away:
 
 from __future__ import annotations
 
+import atexit
 import json
 import math
 import os
@@ -212,6 +213,11 @@ _SPEAK_PID_PATH = os.path.join(_STATE_DIR, "playing.pid")
 # restored — the next toggle then clears the marker and retries the keystroke path.
 _PASTE_DENIED_PATH = os.path.join(_STATE_DIR, "dictate-paste-denied")
 
+# Paste-lock guard (windowsill#50): from stop-toggle until paste completes, the process that is
+# transcribing/pasting records its pid here.  A start-toggle during that window is ignored so the
+# previous paste cannot land mid-recording — the "lags one recording behind" symptom.
+_PASTE_LOCK_PATH = os.path.join(_STATE_DIR, "dictate-paste-lock")
+
 # A freshly O_EXCL-claimed pidfile holds no pid for only milliseconds (until the recorder is
 # spawned and its pid written). An EMPTY/unparseable pidfile older than this is dead garbage from
 # a crashed invocation and is removed — otherwise the toggle would wedge until a manual rm.
@@ -322,8 +328,12 @@ def resolve_settings(config: dict, system: str) -> dict:
         # milliseconds in the config (what a human reasons about for a keypress), seconds inside
         "debounce_ms": resolve_debounce_ms(cfg(config, "dictate.debounce_ms", DEBOUNCE_SECONDS * 1000)),
         "clipboard": str(cfg(config, "dictate.clipboard", "auto")),
-        "start_sound": str(cfg(config, "dictate.start_sound", "")),
-        "stop_sound": str(cfg(config, "dictate.stop_sound", "")),
+        # On macOS the system sounds are a natural pacing cue (windowsill#50); on other platforms
+        # there is no single default sound that works everywhere, so the default is silence.
+        "start_sound": str(cfg(config, "dictate.start_sound",
+                               "/System/Library/Sounds/Pop.aiff" if system == "Darwin" else "")),
+        "stop_sound": str(cfg(config, "dictate.stop_sound",
+                              "/System/Library/Sounds/Blow.aiff" if system == "Darwin" else "")),
         "player": str(cfg(config, "speak.player", "afplay" if system == "Darwin" else "aplay -q")),
         "backend": str(cfg(config, "stt.backend", "lan")),
         "endpoint": str(cfg(config, "stt.endpoint", "http://127.0.0.1:8355")),
@@ -562,6 +572,52 @@ def _clear_paste_denied() -> None:
     """Forget a denial after an Accessibility probe confirms permission was restored."""
     try:
         os.unlink(_PASTE_DENIED_PATH)
+    except OSError:
+        pass
+
+
+# --- paste-lock guard (windowsill#50): one paste at a time ----------------------------------------
+
+
+def _paste_locked() -> bool:
+    """Is a previous stop still transcribing/pasting?
+
+    Checks that the lock file exists and its pid is still alive — the same staleness pattern the
+    recorder pidfile uses.  A stale lock (dead pid) is removed so one crashed stop cannot wedge
+    the toggle forever."""
+    try:
+        with open(_PASTE_LOCK_PATH, encoding="utf-8") as fh:
+            lock_pid = int(fh.read().strip() or "-1")
+    except (OSError, ValueError):
+        return False
+    if lock_pid <= 0 or lock_pid == os.getpid():
+        return False
+    if _pid_alive(lock_pid):
+        return True
+    # Stale: the process that held the lock is gone — clean up so the toggle is not wedged.
+    try:
+        os.unlink(_PASTE_LOCK_PATH)
+    except OSError:
+        pass
+    return False
+
+
+def _claim_paste_lock() -> None:
+    """Record that THIS process owns the transcription-and-paste tail — best-effort.
+
+    A lock that cannot be written fails open (like the debounce stamp): the guard degrades to
+    the old behaviour rather than wedging the toggle."""
+    try:
+        with open(_PASTE_LOCK_PATH, "w", encoding="utf-8") as fh:
+            fh.write(str(os.getpid()))
+    except OSError as err:
+        log(f"paste lock not written: {err}")
+
+
+def _release_paste_lock() -> None:
+    """The paste tail is done — free the lock for the next recording cycle."""
+    try:
+        os.unlink(_PASTE_LOCK_PATH)
     except OSError:
         pass
 
@@ -1497,6 +1553,13 @@ def stop_and_transcribe(s: dict, system: str, mode: str, recorder_pid: int) -> i
     # END OF SPEECH. Every latency number this file reports is an offset from this instant — the
     # toggle that stopped the recording — because that is the wait the user actually feels, and the
     # one windowsill#99 exists to remove. It covers both paths, so the two are comparable.
+    #
+    # The paste-lock guard (windowsill#50): from this instant until this process exits (normal or
+    # otherwise), no new recording may start — the lock keeps the "lags one recording behind"
+    # symptom from surfacing.  Released by an atexit handler; a crash leaves a stale pid that the
+    # next toggle's staleness check clears.
+    _claim_paste_lock()
+    atexit.register(_release_paste_lock)
     stopped_at = time.monotonic()
     # Consumed unconditionally, whatever this stop goes on to do (see take_remembered_focus): an
     # identity must never outlive its own recording. Only the same-window guard below reads it.
@@ -1700,6 +1763,15 @@ def main(argv: list[str]) -> int:
     age = debounce_toggle(s["debounce_ms"] / 1000.0)
     if age is not None:
         log(f"toggle ignored — key repeat ({age * 1000:.0f} ms after the previous one)")
+        return 0
+
+    # Paste-lock guard (windowsill#50): if a previous stop is still transcribing or pasting,
+    # ignore this toggle — starting a new recording now would interleave pastes, producing the
+    # "lags one recording behind" symptom.  The stop_sound is the audible cue that the previous
+    # cycle is not done yet (on macOS it defaults on — see resolve_settings).
+    if _paste_locked():
+        log("toggle ignored — previous dictation still finishing (transcription/paste in progress)")
+        sound(s["stop_sound"], s["player"])
         return 0
 
     try:
