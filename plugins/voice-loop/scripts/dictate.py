@@ -532,7 +532,7 @@ def same_window_guard_on(s: dict) -> bool:
 _ACCESSIBILITY_PROBE = [
     "osascript",
     "-e",
-    'tell application "System Events" to get name of first application process whose frontmost is true',
+    'tell application "System Events" to get name of every window of first application process whose frontmost is true',
 ]
 
 
@@ -569,9 +569,11 @@ def _clear_paste_denied() -> None:
 def _accessibility_permission_regranted() -> bool:
     """True when System Events now accepts an Accessibility query.
 
-    This is a harmless, bounded probe rather than another paste attempt: it lets a user who later
-    grants Accessibility recover from the persistent denial marker without sending a keystroke into
-    the focused application first.
+    The probe reads window data from the frontmost process, which crosses the Accessibility grant;
+    merely reading the frontmost process itself would only exercise the Automation grant.  This is
+    a harmless, bounded probe rather than another paste attempt: it lets a user who later grants
+    Accessibility recover from the persistent denial marker without sending a keystroke into the
+    focused application first.
     """
     try:
         result = subprocess.run(
@@ -596,7 +598,7 @@ def _is_accessibility_denial(stderr: bytes) -> bool:
     return (
         "not allowed to send keystrokes" in text
         or "not authorized to send apple events to system events" in text
-        or re.search(r"(?<!\d)(?:-1743|1002)(?!\d)", text) is not None
+        or re.search(r"\((?:-1743|1002)\)\s*\Z", text) is not None
     )
 
 

@@ -333,6 +333,16 @@ def test_focus_probe_asks_system_events_on_macos():
     assert dictate.focus_probe_argv("Darwin", have_none, wayland=False, display="") == []
 
 
+def test_accessibility_probe_reads_frontmost_windows_not_just_process_name():
+    """The probe must cross Accessibility, not merely Automation.
+
+    Mutation gap: replacing the window query with the old process-name query would still return 0
+    in the stubbed subprocess test, so this assertion catches the wrong TCC permission probe.
+    """
+    assert "get name of every window" in dictate._ACCESSIBILITY_PROBE[2]
+    assert "first application process whose frontmost is true" in dictate._ACCESSIBILITY_PROBE[2]
+
+
 def test_focus_probe_uses_xdotool_on_x11_only():
     assert dictate.focus_probe_argv("Linux", have("xdotool"), wayland=False, display=":0") == [
         "xdotool",
@@ -659,6 +669,8 @@ def test_mark_paste_denied_is_best_effort_on_unwritable_state_dir(state, monkeyp
         (b"System Events: permiso denegado (1002)", True),
         (b"a version number 10020 is not a denial", False),
         (b"a different status -17430 is not a denial", False),
+        (b'execution error: Can\'t open file "/tmp/voice-loop-1002.wav". (-43)', False),
+        (b"execution error: a different error (-1002)", False),
         ("System Events: отказано (-1743)".encode("utf-8"), True),
         ("System Events: отказано (1002)".encode("utf-8"), True),
         (b"", False),
