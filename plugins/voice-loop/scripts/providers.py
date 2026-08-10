@@ -103,6 +103,21 @@ class StreamResult:
 
 
 @dataclass(frozen=True)
+class StreamAudio:
+    """One audio fragment off a streaming TTS socket — the voice-back counterpart of ``StreamResult``.
+
+    ``audio_b64`` is the vendor's base64 PCM exactly as it arrived. The DECODE is the step that can
+    fail on a truncated fragment, so it lives where the failure is handled (the holder, which can
+    skip a bad fragment rather than abort a line), not in the pure parser — which only reads the
+    field. ``is_final`` is True only on the LAST fragment of the utterance a flush closed out: the
+    marker the holder waits for before it knows a line is complete. A terminal frame the vendor
+    sends with no audio at all is ``StreamAudio("", True)``."""
+
+    audio_b64: str
+    is_final: bool
+
+
+@dataclass(frozen=True)
 class SttStreaming:
     """The STREAMING variant of an STT provider — the same provider, a different transport.
 
@@ -130,6 +145,43 @@ class SttStreaming:
     # idle socket alive; both are provider-private JSON strings, hence text frames
     close_message: str
     keepalive_message: str
+
+
+@dataclass(frozen=True)
+class TtsStreaming:
+    """The STREAMING variant of a TTS provider — the same vendor, the same key, the same model
+    family, reached over a websocket while the audio plays back instead of by POSTing a whole line.
+
+    The mirror of ``SttStreaming`` (windowsill#113, the voice-back counterpart of #99): it sits ON
+    the batch entry rather than in a table of its own because it is not a different provider — only
+    a different transport — and a provider with no streaming variant carries ``streaming=None``,
+    which is what the speak path branches on. Pure like everything else in this module: it BUILDS a
+    URL, a begin-of-stream frame and a text frame, and READS a decoded message. The socket, the
+    resident holder, the retry and the degrade decision all belong to the script.
+
+    The audio SHAPE is the entry's own (``default_output_format``): a streaming socket sends raw
+    samples, so the container the player must handle is decided HERE — ElevenLabs' ``pcm_22050`` is
+    raw s16le straight to ``aplay`` with no decoder, which is why a streaming variant carries an
+    output format its batch entry need not share (the batch path returns a WAV/mp3 blob)."""
+
+    url: Callable[["TtsStreaming", "TtsProvider", dict], str]
+    headers: Callable[[str], dict[str, str]]
+    # the begin-of-stream frame — voice_settings (stability, similarity_boost, speed…) ride here.
+    # Sent ONCE on connect; the resident holder keeps the socket for the lines that follow.
+    bos: Callable[[dict], str]
+    # one line (or chunk) of text as a frame
+    text_message: Callable[[str], str]
+    # forces the server to emit audio for the text buffered since the last flush — sent per line,
+    # because the default chunk schedule generates nothing until a flush or EOS
+    flush_message: str
+    # a decoded message -> an audio fragment, or None for everything that is not one (metadata, an
+    # error document — a live socket says a great deal besides audio)
+    result: Callable[[object], StreamAudio | None]
+    # whitespace keepalive: an idle text frame that holds the socket open past the vendor's idle
+    # close without producing audio (no flush). Provider-private JSON, hence a text frame.
+    keepalive_message: str
+    # the audio container the player must handle — pcm_22050 means raw s16le, no decoder
+    default_output_format: str = "pcm_22050"
 
 
 @dataclass(frozen=True)
@@ -198,6 +250,9 @@ class TtsProvider:
     default_output_format: str
     build: Callable[["TtsProvider", dict, str, str], TtsRequest]
     comparison: Comparison
+    # the live-socket variant of this same provider, or None where the vendor has none / we have
+    # not built one. The batch path above is unaffected by its presence and is the fallback for it.
+    streaming: "TtsStreaming | None" = None
 
     def endpoint(self, s: dict) -> str:
         """An explicit tts.endpoint wins, then the provider's remote default, then this plugin's
@@ -458,6 +513,80 @@ def _deepgram_tts(entry: TtsProvider, s: dict, key: str, text: str) -> TtsReques
     )
 
 
+# --- TTS streaming variants ----------------------------------------------------------------------
+
+
+def _elevenlabs_stream_url(stream: TtsStreaming, entry: TtsProvider, s: dict) -> str:
+    """ElevenLabs stream-input, live: the same text-to-speech voice as the batch call, over a
+    websocket that stays open across lines. The model and the OUTPUT FORMAT are query parameters —
+    there is no container on the way back, only raw PCM frames, so the format the player must
+    handle is declared here (pcm_22050 = raw s16le, no decoder in the critical path)."""
+    host = websocket_scheme(str(s.get("endpoint") or entry.default_host))
+    voice_id = urllib.parse.quote(str(s.get("voice_id") or ""), safe="")
+    query = urllib.parse.urlencode(
+        {
+            "model_id": s["cloud_model"],
+            "output_format": s.get("stream_output_format") or stream.default_output_format,
+        }
+    )
+    return f"{host}/v1/text-to-speech/{voice_id}/stream-input?{query}"
+
+
+def _elevenlabs_stream_bos(s: dict) -> str:
+    """The begin-of-stream frame: a near-empty text frame carrying the voice settings. Sent once on
+    connect; the resident holder keeps the socket for the lines that follow. An unset voice_settings
+    sends a bare BOS and the vendor defaults apply — speed is folded in by the holder before this
+    runs, so it rides whenever the operator set one."""
+    payload: dict = {"text": " "}
+    settings = s.get("voice_settings")
+    if isinstance(settings, dict):
+        payload["voice_settings"] = settings
+    return json.dumps(payload)
+
+
+def _elevenlabs_stream_text(text: str) -> str:
+    """One line of text as a frame. A trailing space is intentional: ElevenLabs concatenates the
+    text frames between flushes, and a line whose first word runs straight into the previous line's
+    last word is a word neither the model nor the listener can recover."""
+    return json.dumps({"text": f"{text} "})
+
+
+def _elevenlabs_stream_result(data: object) -> StreamAudio | None:
+    """A live message -> an audio fragment, or None for everything that is not one.
+
+    ElevenLabs' stream-input answers each flushed text with base64 PCM under ``audio`` and a final
+    marker: ``{"audio": "<b64>", "isFinal": false}`` per fragment, then ``{"isFinal": true}``
+    (audio null) to close the utterance the flush ended. The marker is NOT an error: the holder
+    waits on it to know a line is complete, so it must read as ``StreamAudio("", True)`` — which is
+    why the test is "carries ``audio`` OR ``isFinal``", not "carries ``audio``" alone. A document
+    with neither — metadata, an error document — is not part of the audio stream, and reads None."""
+    if not isinstance(data, dict):
+        return None
+    if "audio" not in data and "isFinal" not in data:
+        return None
+    audio = data.get("audio")
+    if audio is not None and not isinstance(audio, str):
+        return None
+    return StreamAudio(audio or "", bool(data.get("isFinal")))
+
+
+ELEVENLABS_STREAMING = TtsStreaming(
+    url=_elevenlabs_stream_url,
+    headers=lambda key: {"xi-api-key": key},
+    bos=_elevenlabs_stream_bos,
+    text_message=_elevenlabs_stream_text,
+    # documented flush: forces the server to emit audio for the buffered text without ending the
+    # stream — sent per line, because the default chunk schedule generates nothing until a flush
+    # or EOS (live probe: +174-212 ms per flushed fragment on one connection).
+    flush_message=json.dumps({"flush": True}),
+    result=_elevenlabs_stream_result,
+    # whitespace keepalive: a text frame with no flush produces no audio and resets the vendor's
+    # ~20 s idle close (WS 1008). Sent by the holder between turns, every <= KEEPALIVE_SECONDS.
+    keepalive_message=json.dumps({"text": " "}),
+    default_output_format="pcm_22050",
+)
+
+
 # --- the registry --------------------------------------------------------------------------------
 #
 # One entry per provider. Adding a provider is a row here plus its builder above — no dispatch
@@ -543,6 +672,10 @@ TTS_PROVIDERS: dict[str, TtsProvider] = {
         # use mpg123 or ffplay). The value is one opaque ElevenLabs token.
         default_output_format="mp3_44100_128",
         build=_elevenlabs_tts,
+        # the one entry with a live socket on the TTS side (windowsill#113) — opt in with
+        # tts.cloud.streaming. The resident holder keeps one stream-input socket open across turns,
+        # so the TLS+WS dial is paid once per session, not once per line; pcm_22050 out, no decoder.
+        streaming=ELEVENLABS_STREAMING,
         comparison=Comparison(
             latency="around a second to first byte; flash models are quicker at some quality cost",
             cost="credit-based; the character rate depends on the plan tier",
@@ -601,6 +734,25 @@ def _validate_streaming(key: str, streaming: "SttStreaming | None") -> None:
             raise ValueError(f"provider registry: {key!r}'s streaming {field} is not JSON: {err}") from err
 
 
+def _validate_tts_streaming(key: str, streaming: "TtsStreaming | None") -> None:
+    """A TTS streaming variant validates like a row of its own — same reasoning as the STT one:
+    everything here would otherwise surface at runtime as a socket that will not open or a frame
+    nobody parses, in a path whose failure mode is a quiet degrade."""
+    if streaming is None:
+        return
+    for field in ("url", "headers", "bos", "text_message", "result"):
+        if not callable(getattr(streaming, field)):
+            raise ValueError(f"provider registry: {key!r}'s TTS streaming variant has no {field}")
+    for field in ("flush_message", "keepalive_message"):
+        value = getattr(streaming, field)
+        try:
+            json.loads(value)
+        except ValueError as err:
+            raise ValueError(f"provider registry: {key!r}'s TTS streaming {field} is not JSON: {err}") from err
+    if not streaming.default_output_format:
+        raise ValueError(f"provider registry: {key!r}'s TTS streaming variant has no output format")
+
+
 def _validate_registry() -> None:
     """Run at import (ADR-shaped: a vocabulary other artifacts cite by id validates its own rows).
 
@@ -617,7 +769,12 @@ def _validate_registry() -> None:
             missing = [f for f in ("latency", "cost", "languages", "privacy") if not getattr(entry.comparison, f)]
             if missing:
                 raise ValueError(f"provider registry: {key!r} has an empty comparison field {missing[0]}")
-            _validate_streaming(key, getattr(entry, "streaming", None))
+            # the two tables carry DIFFERENT streaming shapes (SttStreaming vs TtsStreaming), so the
+            # validator is chosen by the table — a row never reaches the wrong one.
+            if table is STT_PROVIDERS:
+                _validate_streaming(key, getattr(entry, "streaming", None))
+            else:
+                _validate_tts_streaming(key, getattr(entry, "streaming", None))
     if DEFAULT_STT not in STT_PROVIDERS:
         raise ValueError(f"provider registry: the default STT provider {DEFAULT_STT!r} has no entry")
     if DEFAULT_TTS not in TTS_PROVIDERS:

@@ -447,3 +447,165 @@ class TestTheStreamingVariantIsDocumented:
         claimed = set(re.findall(r"`([a-z0-9-]+)` \(STT\) \| \*\*yes\*\*", doc))
         streams = {name for name, entry in providers.STT_PROVIDERS.items() if entry.streaming is not None}
         assert claimed == streams, f"PROVIDERS.md claims {sorted(claimed)} stream; the registry says {sorted(streams)}"
+
+
+# --- the TTS streaming variant (windowsill#113) --------------------------------------------------
+
+
+class TestTheTtsStreamingVariantIsAnEntryToo:
+    """The voice-back counterpart of #99: a live socket is an axis on the SAME TTS entry, not a
+    second table and not a branch."""
+
+    def test_a_provider_without_one_carries_none_rather_than_a_guess(self):
+        assert providers.TTS_PROVIDERS["openai"].streaming is None
+        assert providers.TTS_PROVIDERS["deepgram"].streaming is None
+        assert providers.TTS_PROVIDERS["elevenlabs"].streaming is not None
+
+    def test_the_variant_carries_every_axis_a_socket_needs(self):
+        for entry in providers.TTS_PROVIDERS.values():
+            if entry.streaming is None:
+                continue
+            assert callable(entry.streaming.url)
+            assert callable(entry.streaming.headers)
+            assert callable(entry.streaming.bos)
+            assert callable(entry.streaming.text_message)
+            assert callable(entry.streaming.result)
+            assert json.loads(entry.streaming.flush_message)
+            assert json.loads(entry.streaming.keepalive_message)
+            assert entry.streaming.default_output_format
+
+    def test_the_elevenlabs_live_url_carries_the_model_and_the_pcm_output_format(self):
+        """There is no container coming back — only raw PCM frames — so the format the player must
+        handle is declared in the URL (pcm_22050 = raw s16le, no decoder in the critical path)."""
+        entry = providers.TTS_PROVIDERS["elevenlabs"]
+        s = {"endpoint": "", "voice_id": "vX", "cloud_model": "eleven_flash_v2_5",
+             "stream_output_format": "pcm_22050", "voice_settings": None, "speed": 1.0}
+        url = entry.streaming.url(entry.streaming, entry, s)
+        assert url.startswith("wss://api.elevenlabs.io/v1/text-to-speech/vX/stream-input?")
+        assert "model_id=eleven_flash_v2_5" in url
+        assert "output_format=pcm_22050" in url
+        assert entry.streaming.headers("xi-secret") == {"xi-api-key": "xi-secret"}
+
+    def test_a_self_hosted_endpoint_becomes_a_websocket_of_the_same_scheme(self):
+        entry = providers.TTS_PROVIDERS["elevenlabs"]
+        s = {"endpoint": "http://127.0.0.1:9999", "voice_id": "v", "cloud_model": "eleven_flash_v2_5",
+             "stream_output_format": "pcm_22050", "voice_settings": None, "speed": 1.0}
+        assert entry.streaming.url(entry.streaming, entry, s).startswith(
+            "ws://127.0.0.1:9999/v1/text-to-speech/v/stream-input?"
+        )
+
+    def test_the_bos_carries_voice_settings_and_a_space(self):
+        entry = providers.TTS_PROVIDERS["elevenlabs"]
+        bos = json.loads(entry.streaming.bos({"voice_settings": {"speed": 0.9, "stability": 0.5}}))
+        assert bos["text"] == " "
+        assert bos["voice_settings"]["speed"] == 0.9
+        bare = json.loads(entry.streaming.bos({"voice_settings": None}))
+        assert bare == {"text": " "}
+
+    def test_a_text_frame_carries_the_line_with_a_trailing_separator(self):
+        entry = providers.TTS_PROVIDERS["elevenlabs"]
+        assert json.loads(entry.streaming.text_message("hello")) == {"text": "hello "}
+
+    def test_the_flush_forces_audio_and_the_keepalive_does_not(self):
+        """The distinction that lets a held socket sit idle: flush emits audio per line, keepalive
+        is a whitespace text frame (no flush) that only resets the vendor's idle close."""
+        entry = providers.TTS_PROVIDERS["elevenlabs"]
+        assert json.loads(entry.streaming.flush_message) == {"flush": True}
+        assert "flush" not in json.loads(entry.streaming.keepalive_message)
+
+    def test_the_live_parser_reads_audio_fragments_and_the_final_marker(self):
+        entry = providers.TTS_PROVIDERS["elevenlabs"]
+        assert entry.streaming.result({"audio": "AAEC", "isFinal": False}) == providers.StreamAudio("AAEC", False)
+        # the terminal marker (audio null, isFinal true) is NOT an error — the holder waits on it
+        assert entry.streaming.result({"isFinal": True}) == providers.StreamAudio("", True)
+        assert entry.streaming.result({"audio": None, "isFinal": True}) == providers.StreamAudio("", True)
+
+    @pytest.mark.parametrize(
+        "message",
+        [
+            {"type": "Metadata"},
+            {"detail": "quota_exceeded"},
+            {"audio": 123, "isFinal": False},  # a non-string audio is not a fragment
+            ["not", "a", "dict"],
+            None,
+            {},
+        ],
+    )
+    def test_everything_that_is_not_audio_reads_as_none(self, message):
+        assert providers.TTS_PROVIDERS["elevenlabs"].streaming.result(message) is None
+
+
+class TestTheTtsStreamingVariantValidatesItself:
+    """Same import-time bar as the batch rows and the STT variant: a broken TTS variant is a socket
+    that will not open or a frame nobody parses, in a path whose failure mode is a quiet degrade."""
+
+    def _variant(self, **overrides) -> providers.TtsStreaming:
+        base = providers.ELEVENLABS_STREAMING
+        fields = {
+            "url": base.url,
+            "headers": base.headers,
+            "bos": base.bos,
+            "text_message": base.text_message,
+            "flush_message": base.flush_message,
+            "result": base.result,
+            "keepalive_message": base.keepalive_message,
+            "default_output_format": base.default_output_format,
+        }
+        fields.update(overrides)
+        return providers.TtsStreaming(**fields)
+
+    @pytest.mark.parametrize(
+        "overrides",
+        [
+            {"url": "not callable"},
+            {"headers": None},
+            {"bos": 42},
+            {"text_message": "not callable"},
+            {"result": "x"},
+            {"flush_message": "not json"},
+            {"keepalive_message": ""},
+            {"default_output_format": ""},
+        ],
+    )
+    def test_a_broken_variant_is_refused_at_import(self, monkeypatch, overrides):
+        table = dict(providers.TTS_PROVIDERS)
+        table["elevenlabs"] = _replace_tts_streaming(table["elevenlabs"], self._variant(**overrides))
+        monkeypatch.setattr(providers, "TTS_PROVIDERS", table)
+        with pytest.raises(ValueError):
+            providers._validate_registry()
+
+    def test_a_variant_that_is_absent_is_not_an_error(self, monkeypatch):
+        table = dict(providers.TTS_PROVIDERS)
+        table["elevenlabs"] = _replace_tts_streaming(table["elevenlabs"], None)
+        monkeypatch.setattr(providers, "TTS_PROVIDERS", table)
+        providers._validate_registry()
+
+
+def _replace_tts_streaming(entry: providers.TtsProvider, streaming) -> providers.TtsProvider:
+    return providers.TtsProvider(
+        name=entry.name,
+        default_model=entry.default_model,
+        default_host=entry.default_host,
+        default_output_format=entry.default_output_format,
+        build=entry.build,
+        comparison=entry.comparison,
+        streaming=streaming,
+    )
+
+
+class TestTheTtsStreamingVariantIsDocumented:
+    """PROVIDERS.md drifts the moment nothing checks — the TTS side gets the same bidirectional
+    guard the STT side has."""
+
+    def test_every_provider_says_whether_it_streams(self):
+        doc = (Path(__file__).resolve().parents[1] / "PROVIDERS.md").read_text(encoding="utf-8")
+        assert "`tts.cloud.streaming`" in doc
+        for name, entry in providers.TTS_PROVIDERS.items():
+            if entry.streaming is not None:
+                assert f"`{name}` (TTS) | **yes**" in doc, f"{name} streams but the table does not say so"
+
+    def test_and_nothing_claims_to_stream_that_does_not(self):
+        doc = (Path(__file__).resolve().parents[1] / "PROVIDERS.md").read_text(encoding="utf-8")
+        claimed = set(re.findall(r"`([a-z0-9-]+)` \(TTS\) \| \*\*yes\*\*", doc))
+        streams = {name for name, entry in providers.TTS_PROVIDERS.items() if entry.streaming is not None}
+        assert claimed == streams, f"PROVIDERS.md claims {sorted(claimed)} stream; the registry says {sorted(streams)}"

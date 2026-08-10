@@ -161,6 +161,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import io
 import itertools
 import json
 import os
@@ -168,19 +169,24 @@ import platform
 import re
 import shlex
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
 import time
 import urllib.error
 import urllib.request
-from collections.abc import Callable
+import wave
+from collections.abc import Callable, Iterator
 from datetime import datetime, timezone
 
 # The one module in scripts/ this file imports: the provider registry (see providers.py). It
 # resolves because sys.path[0] is this file's directory when speak.sh runs it; the tests, which
 # load this file by spec_from_file_location, put scripts/ on sys.path themselves.
 import providers
+# The stdlib-only websocket client the streaming TTS holder needs (see wsclient.py). The launcher
+# checks for what it needs the same way it checks for providers.py and this file's own .py.
+import wsclient
 
 try:
     import fcntl
@@ -322,6 +328,48 @@ _CONTOUR_ANNOUNCED_PATH = os.path.join(_STATE_DIR, "contour-announced")
 # and that wins; this is the fallback for a file written before the bound existed.
 CONTOUR_MAX_AGE = 900
 
+# --- streaming TTS over a resident ElevenLabs websocket (windowsill#113) -------------------------
+#
+# The voice-back counterpart of #99's streaming dictation. A cloud TTS provider with a streaming
+# variant (only ElevenLabs today — see providers.TtsStreaming) is reached over a websocket a
+# RESIDENT holder keeps open ACROSS TURNS: the TLS+WS dial is ~300-420 ms (more than the synthesis
+# itself, per the live probe), so paying it once per session roughly halves first-sound, and a held
+# socket renders at ~170 ms warm with ZERO latency penalty. The holder is a lazily-spawned daemon
+# tracked by pidfile (the speak-path mirror of #99's stream-worker), spoken to over a unix-domain
+# socket that carries the SAME SSE chunk protocol as the server's /tts/stream — so play_text reuses
+# its stream_source/_play_stream verbatim. Every number here bounds something otherwise unbounded.
+
+# The argv the holder daemon is spawned with — this script calling itself, one file, one launcher.
+STREAM_HOLDER_ARG = "stream-holder"
+# A vendor closes an idle stream-input socket at ~20 s (WS 1008); a whitespace keepalive every
+# few seconds holds it open between turns without producing audio (the frame carries no flush).
+STREAM_KEEPALIVE_SECONDS = 15.0
+# How long a poll waits for the next audio fragment when none has arrived — the loop's idle cost.
+STREAM_IDLE_POLL = 0.05
+# The socket must open fast or not at all — this feature exists to REMOVE a wait.
+STREAM_CONNECT_TIMEOUT = 5.0
+# A line's synthesis must finish or be abandoned (and degraded): a held socket that stalls cannot
+# hold a turn open forever. Per the probe, a flushed fragment is +174-212 ms; this is the ceiling.
+STREAM_LINE_TIMEOUT = 30.0
+# The throwaway priming synthesis (sent once on connect so the session's first REAL line is warm)
+# is bounded the same way a real line is. Best-effort: a prime that fails costs the first line its
+# warmth, nothing more — the holder serves regardless.
+STREAM_PRIME_TIMEOUT = 15.0
+# A self-cleaning holder: with no request for this long it exits, so a session that ended leaves
+# nothing running. The next streaming turn spawns a fresh one (and re-primes).
+STREAM_HOLDER_IDLE_EXIT = 300.0
+# How long a turn waits for a just-spawned holder to bind its socket before using the blob path
+# for that one turn only — the holder that would not start must not stall a turn.
+STREAM_HOLDER_READY_TIMEOUT = 6.0
+
+# The resident holder's two files: its pidfile (how a new turn tells a live holder from a stale
+# one) and its unix-domain socket (the per-turn request channel). The pidfile carries a DIGEST of
+# the synthesis settings the holder was started with, so a settings edit (e.g. voice_settings.speed)
+# is a RECONNECT TRIGGER: a mismatched digest respawns the holder with the new settings, because a
+# voice_settings change on a held socket may require reopening the stream.
+_STREAM_HOLDER_PID = os.path.join(_STATE_DIR, "speak-stream.pid")
+_STREAM_HOLDER_SOCK = os.path.join(_STATE_DIR, "speak-stream.sock")
+
 # The event this invocation was fired for, recorded by main() the moment stdin is read so the
 # contour check can tell which path it is on. A module cell rather than a return value: main()'s
 # return IS the process exit code, and hooks.json reads that.
@@ -436,6 +484,25 @@ def resolve_settings(config: dict, system: str) -> dict:
         # provider-specific synthesis knobs, passed through verbatim (ElevenLabs: stability,
         # similarity_boost, style, use_speaker_boost — see the anti-robovoice notes in voice-design)
         "voice_settings": voice_settings if isinstance(voice_settings, dict) else None,
+        # streaming TTS over the resident websocket (windowsill#113): opt-in, OFF by default. The
+        # batch blob path is the proven one; streaming is the latency win for a cloud voice that
+        # carries a streaming variant (only ElevenLabs today).
+        "streaming": cfg(config, "tts.cloud.streaming", False) is True
+        or cfg(config, "tts.cloud.streaming", False) == "true",
+        # voice_settings.speed — ElevenLabs accepts ~0.7-1.2; the operator's contour runs ~0.9.
+        # Read off the voice_settings object the same place the other knobs live, default 1.0 (no
+        # change). Folded into voice_settings at BOS time so it rides the held socket's first frame.
+        "speed": float(cfg(config, "tts.cloud.voice_settings.speed", 1.0)),
+        # the audio container the STREAMING path asks for — raw s16le (pcm_22050) by default, so the
+        # holder wraps it in a WAV and the player queue needs no decoder. Distinct from the batch
+        # output_format (mp3), because a streaming socket sends samples, not a compressed blob.
+        "stream_output_format": str(
+            cfg(
+                config,
+                "tts.cloud.stream_output_format",
+                entry.streaming.default_output_format if entry.streaming else "",
+            )
+        ),
     }
 
 
@@ -1406,7 +1473,31 @@ def play_text(text: str, s: dict, t0: float, *, extract_ms: int) -> bool:
 
     result = None
     via = "tts"
-    if s["backend"] != "cloud":
+    cloud_stream_degraded = False
+    if s["backend"] == "cloud" and cloud_streaming_wanted(s):
+        # Cloud streaming over the resident ElevenLabs websocket (windowsill#113): the holder emits
+        # the SAME SSE chunk protocol as the server's /tts/stream, so the chunk reader is reused
+        # verbatim. A holder that could not be readied falls through to the blob path below; one
+        # that DEGRADED the line (quota/auth, a mid-line hang-up) is flagged so the blob fallback
+        # speaks the LOCAL voice rather than re-hit the cloud — never silence.
+        conn = _connect_stream_holder(text, s)
+        if conn is not None:
+            _live["stream"] = conn
+            try:
+                source = stream_source(conn.makefile("rb"))
+                if source is not None:
+                    result = _play_stream(source, s, t0)
+                    via = "stream-cloud"
+                else:
+                    cloud_stream_degraded = True
+                    log("cloud stream degraded before the first chunk — falling back to the local voice")
+            finally:
+                _live["stream"] = None
+                try:
+                    conn.close()
+                except OSError:
+                    pass
+    if result is None and s["backend"] != "cloud":
         # Server-side streaming: one cheap /health probe per invocation decides the path. Only
         # a stream that dies BEFORE its first chunk falls back to the blob endpoint (once);
         # after the first chunk we play what arrives and stop where the stream stops.
@@ -1434,8 +1525,18 @@ def play_text(text: str, s: dict, t0: float, *, extract_ms: int) -> bool:
                     except OSError:
                         pass
     if result is None:
-        # blob path: the client does the sentence chunking (older server, cloud, or fallback)
-        result = _play_stream(_synthesized_audio(chunk_sentences(text), s, key), s, t0)
+        if cloud_stream_degraded:
+            # The held socket degraded this line — often quota/auth, which the cloud BATCH path
+            # would hit too. Speak the line on the LOCAL server instead: the cloud's loss is the
+            # bundled Silero voice's turn, never silence (windowsill#113). tts.command, when set,
+            # took the turn above and never reached here.
+            local = dict(s)
+            local["backend"] = "lan"
+            result = _play_stream(_synthesized_audio(chunk_sentences(text), local, ""), s, t0)
+            via = "stream-cloud-degraded"
+        else:
+            # blob path: the client does the sentence chunking (older server, cloud, or fallback)
+            result = _play_stream(_synthesized_audio(chunk_sentences(text), s, key), s, t0)
     played, total_bytes, first_ms, rc = result
     total_ms = int((time.monotonic() - t0) * 1000)
     if played:
@@ -1447,6 +1548,418 @@ def play_text(text: str, s: dict, t0: float, *, extract_ms: int) -> bool:
         log(f"nothing played via={via} — the line was claimed but no audio reached the player")
     log(f"timings extract_ms={extract_ms} first_audio_ms={first_ms} total_ms={total_ms}")
     return bool(played)
+
+
+def stream_settings_digest(s: dict) -> str:
+    """A hash of the settings the holder bakes into its held socket — the ones a change to MUST
+    respawn it (provider, voice, model, output format, voice settings incl. speed, endpoint). The
+    KEY is deliberately not in it: the holder reads the key itself, and a rotated key is no reason
+    to drop a warm socket."""
+    parts = {
+        "provider": s["provider"],
+        "voice_id": s["voice_id"],
+        "cloud_model": s["cloud_model"],
+        "stream_output_format": s["stream_output_format"],
+        "voice_settings": s["voice_settings"],
+        "speed": s["speed"],
+        "endpoint": s["endpoint"],
+    }
+    return hashlib.sha1(json.dumps(parts, sort_keys=True).encode()).hexdigest()[:16]
+
+
+def stream_pcm_rate(output_format: str) -> int:
+    """The sample rate hidden in an ElevenLabs ``pcm_<rate>`` token (pcm_22050 -> 22050), defaulting
+    to 22050 for anything that does not name one. The holder wraps the raw samples in a WAV at THIS
+    rate, so a silent upstream format change cannot pitch every utterance."""
+    match = re.match(r"pcm_(\d+)", output_format)
+    return int(match.group(1)) if match else 22050
+
+
+def pcm_to_wav(pcm: bytes, sample_rate: int = 22050, channels: int = 1, sample_width: int = 2) -> bytes:
+    """Wrap raw s16le PCM in a minimal WAV container — the player queue plays WAVs, and a 44-byte
+    header is all that separates raw pcm_22050 from something afplay and aplay both accept. No
+    re-encoding: the samples are copied verbatim (stdlib ``wave``), which is what keeps the
+    streaming path decoder-free."""
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wav:
+        wav.setnchannels(channels)
+        wav.setsampwidth(sample_width)
+        wav.setframerate(sample_rate)
+        wav.writeframes(pcm)
+    return buf.getvalue()
+
+
+def sse_event(name: str, data: dict) -> bytes:
+    """One SSE frame in the strict shape parse_sse reads: ``event: <name>`` then ``data: <one JSON
+    line>`` then a blank line. The holder speaks the SAME protocol as the server's /tts/stream so
+    play_text's chunk reader is reused verbatim on either source."""
+    return f"event: {name}\ndata: {json.dumps(data)}\n\n".encode("utf-8")
+
+
+class TtsStreamClosed(Exception):
+    """A held websocket could not finish a line — the vendor hung up (its ~20 s idle close, a quota
+    close), the line outran its deadline, or the read failed. The caller degrades that line to the
+    local path; the holder drops the socket and reconnects on the next line."""
+
+
+class TtsStreamHolder:
+    """One resident stream-input websocket held open across lines: prime on connect, synthesize a
+    line on demand, keep an idle socket alive past the vendor's idle close, reconnect after the
+    vendor hangs up. Every socket and time seam is injected so the whole holder is exercisable
+    against a fake provider on a real loopback socket with no network — the voice-back mirror of
+    dictate.run_stream_session's testability."""
+
+    def __init__(
+        self, entry, s, key, *, connect=wsclient.connect, clock=time.monotonic,
+        sleep=time.sleep, connect_timeout=STREAM_CONNECT_TIMEOUT,
+    ) -> None:
+        self.streaming = entry.streaming
+        self.entry = entry
+        self.s = s
+        self.key = key
+        self._connect = connect
+        self._clock = clock
+        self._sleep = sleep
+        self._connect_timeout = connect_timeout
+        self._ws = None
+        self._last_send: float | None = None  # clock of the last frame SENT — the keepalive-due clock
+
+    def ensure_open(self) -> None:
+        """Connect and send the begin-of-stream frame if the socket is not live; a no-op when it is.
+        The BOS IS the priming frame: it goes out the moment the socket opens, so the session's
+        first real line is not the one paying connect+init. Reconnects after a vendor close."""
+        if self._ws is not None and not self._ws.closed:
+            return
+        url = self.streaming.url(self.streaming, self.entry, self.s)
+        self._ws = self._connect(url, self.streaming.headers(self.key), timeout=self._connect_timeout)
+        self._ws.send_text(self.streaming.bos(self.s))
+        self._last_send = self._clock()
+
+    def prime(self, text: str = " ") -> None:
+        """Send a throwaway text+flush and drain its audio, so the session's first REAL line is warm
+        (the probe measured a 2247 ms cold first call). Best-effort: a prime that fails only costs
+        the first line its warmth — the holder serves regardless, and the next line reconnects."""
+        self.ensure_open()
+        self._ws.send_text(self.streaming.text_message(text))
+        self._ws.send_text(self.streaming.flush_message)
+        self._last_send = self._clock()
+        try:
+            for _ in self._drain_until_final(self._clock() + STREAM_PRIME_TIMEOUT):
+                pass
+        except (TtsStreamClosed, wsclient.WebSocketError, OSError) as err:
+            log(f"stream holder priming failed (non-fatal): {err}")
+            self._ws = None
+
+    def synthesize_line(self, text: str, *, deadline: float) -> Iterator[bytes]:
+        """Send text+flush on the held socket and yield raw PCM fragments until the final marker.
+        Raises TtsStreamClosed when the vendor hung up or the line outran its deadline — the caller
+        degrades the line, and the next line reconnects (ensure_open sees the dropped socket)."""
+        self.ensure_open()
+        self._ws.send_text(self.streaming.text_message(text))
+        self._ws.send_text(self.streaming.flush_message)
+        self._last_send = self._clock()
+        yield from self._drain_until_final(deadline)
+
+    def _drain_until_final(self, deadline: float) -> Iterator[bytes]:
+        ws = self._ws
+        while self._clock() < deadline:
+            closed = False
+            for opcode, payload in ws.poll(STREAM_IDLE_POLL):
+                if opcode == wsclient.OP_CLOSE:
+                    closed = True
+                    continue
+                if opcode != wsclient.OP_TEXT:
+                    continue
+                fragment = self.streaming.result(providers.decode(payload))
+                if fragment is None:
+                    continue
+                if fragment.audio_b64:
+                    try:
+                        yield base64.b64decode(fragment.audio_b64)
+                    except (ValueError, TypeError):
+                        continue  # a bad fragment is skipped, not a failed line
+                if fragment.is_final:
+                    return
+            if closed:
+                self._ws = None
+                raise TtsStreamClosed("the server closed the stream before the final fragment")
+        self._ws = None
+        raise TtsStreamClosed("a line's synthesis outran its deadline")
+
+    def keepalive_if_due(self) -> None:
+        """Send a whitespace keepalive when the socket has been idle past the interval — the frame
+        carries no flush, so it produces no audio, and it resets the vendor's ~20 s idle close."""
+        if self._ws is None or self._ws.closed or self._last_send is None:
+            return
+        if self._clock() - self._last_send < STREAM_KEEPALIVE_SECONDS:
+            return
+        try:
+            self._ws.send_text(self.streaming.keepalive_message)
+            self._last_send = self._clock()
+        except wsclient.WebSocketError:
+            self._ws = None  # a dead socket; reconnect on the next ensure_open
+
+    def close(self) -> None:
+        if self._ws is not None:
+            try:
+                self._ws.close()
+            except OSError:
+                pass
+            self._ws = None
+
+
+# --- the holder daemon: pidfile lifecycle + the accept loop -------------------------------------
+
+
+def _write_stream_holder_pid(pid: int, digest: str) -> None:
+    try:
+        with open(_STREAM_HOLDER_PID, "w", encoding="utf-8") as fh:
+            fh.write(f"{pid} {digest}")
+    except OSError:
+        pass
+
+
+def _read_stream_holder_pid() -> tuple[int | None, str]:
+    """(pid, digest) the holder recorded, or (None, '') when there is no readable pidfile. The
+    digest fences staleness: a holder for DIFFERENT settings is stale by construction."""
+    try:
+        with open(_STREAM_HOLDER_PID, encoding="utf-8") as fh:
+            parts = fh.read().split()
+    except OSError:
+        return None, ""
+    if len(parts) >= 2 and parts[0].isdigit():
+        return int(parts[0]), parts[1]
+    return None, ""
+
+
+def _clear_stream_holder_pid() -> None:
+    try:
+        os.unlink(_STREAM_HOLDER_PID)
+    except OSError:
+        pass
+
+
+def _remove_socket_file(path: str) -> None:
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
+def pid_looks_like_stream_holder(pid: int, read_cmdline=_cmdline_of, platform_id: str = sys.platform) -> bool:
+    """PID-reuse guard for the holder — the same shape as the speak-chain and stream-worker ones: a
+    pidfile outlives its process and the kernel recycles PIDs, so before trusting a recorded pid,
+    confirm it still looks like the holder (its argv carries this script's name and the stream-holder
+    word, which nothing else on the machine does)."""
+    if not platform_id.startswith("linux"):
+        return True
+    cmdline = read_cmdline(pid)
+    if cmdline is None:
+        return False
+    return "speak.py" in cmdline and STREAM_HOLDER_ARG in cmdline
+
+
+def cloud_streaming_wanted(s: dict) -> bool:
+    """True when the cloud path should try the resident websocket: streaming opted in AND the
+    configured provider's entry actually carries a streaming variant. A config that asks streaming
+    of a provider that has none is answered by the blob path — never an error."""
+    if not s["streaming"]:
+        return False
+    return resolve_tts_provider(s["provider"]).streaming is not None
+
+
+def ensure_stream_holder(
+    s: dict, *, popen=subprocess.Popen, sleep=time.sleep, clock=time.monotonic,
+) -> bool:
+    """Make sure a resident holder matching THESE settings is running and bound. True when one is (or
+    was just made) live; False when one could not be readied in time (the caller uses the blob path
+    for this one turn).
+
+    The digest is the reconnect trigger: a holder started with different settings (a speed edit, a
+    new voice) is stale by construction, stopped, and replaced. The speaking lock serializes turns,
+    so two spawns never race for one socket."""
+    digest = stream_settings_digest(s)
+    pid, pid_digest = _read_stream_holder_pid()
+    if pid is not None and pid_looks_like_stream_holder(pid) and pid_digest == digest:
+        return True  # a warm socket for exactly these settings
+    if pid is not None and pid_looks_like_stream_holder(pid):
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            pass
+    _clear_stream_holder_pid()
+    _remove_socket_file(_STREAM_HOLDER_SOCK)
+    try:
+        popen(
+            [sys.executable, os.path.abspath(__file__), STREAM_HOLDER_ARG, digest],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+    except OSError as err:
+        log(f"stream holder did not start: {err} — this turn uses the blob path")
+        return False
+    # the holder writes its own pidfile on startup; wait for it (matching digest) AND the socket.
+    deadline = clock() + STREAM_HOLDER_READY_TIMEOUT
+    while clock() < deadline:
+        got_pid, got_digest = _read_stream_holder_pid()
+        if got_digest == digest and got_pid is not None and os.path.exists(_STREAM_HOLDER_SOCK):
+            return True
+        sleep(0.05)
+    log("stream holder did not bind its socket in time — this turn uses the blob path")
+    return False
+
+
+def _connect_stream_holder(text: str, s: dict):
+    """Connect to the resident holder, send the request, half-close the write side, and return the
+    open connection (whose read side plays back as SSE). None when the holder could not be reached
+    so play_text uses the blob path for this one turn."""
+    if not ensure_stream_holder(s):
+        return None
+    conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        conn.settimeout(s["timeout"])
+        conn.connect(_STREAM_HOLDER_SOCK)
+        conn.sendall((json.dumps({"text": text}) + "\n").encode("utf-8"))
+        conn.shutdown(socket.SHUT_WR)
+    except OSError as err:
+        log(f"cloud stream: could not reach the holder: {err} — using the blob path")
+        try:
+            conn.close()
+        except OSError:
+            pass
+        return None
+    return conn
+
+
+def _send_all(conn, data: bytes) -> None:
+    try:
+        conn.sendall(data)
+    except OSError:
+        pass  # the client gone (a takeover, a closed turn) — nothing more to send
+
+
+def _serve_stream_connection(conn, holder, s, *, clock=time.monotonic) -> None:
+    """One per-turn connection: read the request, synthesize it chunk by chunk, emit the SAME SSE
+    stream the server's /tts/stream does. Degrade is an ``error`` event (never silence): the client
+    falls back to the blob path, and the holder stays up for the next turn."""
+    reader = conn.makefile("rb")
+    try:
+        line = reader.readline()
+    finally:
+        reader.close()
+    try:
+        request = json.loads(line.decode("utf-8")) if line else {}
+    except ValueError:
+        request = {}
+    text = str(request.get("text", "")).strip() if isinstance(request, dict) else ""
+    if not text:
+        _send_all(conn, sse_event("end", {"chunks": 0, "engine": s["provider"]}))
+        return
+    rate = stream_pcm_rate(s.get("stream_output_format", ""))
+    sent = 0
+    try:
+        for chunk_text in chunk_sentences(text) or [text]:
+            pcm = bytearray()
+            for fragment in holder.synthesize_line(chunk_text, deadline=clock() + STREAM_LINE_TIMEOUT):
+                pcm.extend(fragment)
+            _send_all(conn, sse_event("chunk", {"audio": base64.b64encode(pcm_to_wav(bytes(pcm), rate)).decode("ascii")}))
+            sent += 1
+    except (TtsStreamClosed, wsclient.WebSocketError, OSError) as err:
+        log(f"stream holder: a line failed after {sent} chunk(s): {err} — signalling degrade")
+        _send_all(conn, sse_event("error", {"error": f"cloud stream failed ({type(err).__name__})", "chunks": sent}))
+        return
+    _send_all(conn, sse_event("end", {"chunks": sent, "engine": s["provider"]}))
+
+
+def _bind_unix_listener(path: str):
+    """A fresh AF_UNIX listener at `path` (any stale socket file removed first). NOT yet accepting."""
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(path)
+    listener.listen(1)
+    return listener
+
+
+def run_holder(
+    s, entry, key, digest, *, connect=wsclient.connect, clock=time.monotonic,
+    sleep=time.sleep, bind_socket=_bind_unix_listener,
+) -> int:
+    """The resident holder loop: bind the unix socket, hold the ElevenLabs websocket across turns,
+    keepalive it when idle, self-exit after STREAM_HOLDER_IDLE_EXIT of silence. Returns the exit
+    code (0 self-exit / 1 could not bind). Every socket seam is injected for the loopback tests."""
+    stopping = {"now": False}
+
+    def _stop(signum, frame):  # noqa: ARG001 — signal-handler signature
+        stopping["now"] = True
+
+    signal.signal(signal.SIGTERM, _stop)
+    signal.signal(signal.SIGINT, _stop)
+    # announce before anything that can block: ensure_stream_holder waits on pidfile + socket
+    _write_stream_holder_pid(os.getpid(), digest)
+    try:
+        listener = bind_socket(_STREAM_HOLDER_SOCK)
+    except OSError as err:
+        log(f"stream holder could not bind its socket: {err}")
+        _clear_stream_holder_pid()
+        return 1
+    holder = TtsStreamHolder(entry, s, key, connect=connect, clock=clock, sleep=sleep)
+    holder.prime()  # best-effort warmup; failure is logged inside prime() and non-fatal
+    last_activity = clock()
+    try:
+        listener.settimeout(STREAM_KEEPALIVE_SECONDS)  # accept() times out -> keepalive + idle-exit
+        while not stopping["now"]:
+            try:
+                conn, _ = listener.accept()
+            except socket.timeout:
+                if clock() - last_activity >= STREAM_HOLDER_IDLE_EXIT:
+                    log("stream holder idle — exiting (the next streaming turn respawns)")
+                    break
+                holder.keepalive_if_due()
+                continue
+            except OSError:
+                break  # the listener died (shutdown) — stop
+            last_activity = clock()
+            try:
+                _serve_stream_connection(conn, holder, s, clock=clock)
+            finally:
+                try:
+                    conn.close()
+                except OSError:
+                    pass
+                last_activity = clock()
+    finally:
+        holder.close()
+        try:
+            listener.close()
+        except OSError:
+            pass
+        _remove_socket_file(_STREAM_HOLDER_SOCK)
+        _clear_stream_holder_pid()
+    return 0
+
+
+def run_holder_main(digest: str) -> int:
+    """The holder process entry: load config, refuse fast when streaming is off / the provider has
+    no variant / there is no key, fold speed into voice_settings, and run the loop."""
+    cfg_path = os.environ.get(
+        "VOICE_LOOP_CONFIG",
+        os.path.join(os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")), "voice-loop/config.json"),
+    )
+    s = resolve_settings(load_config(cfg_path), platform.system())
+    if not s["streaming"]:
+        return 1
+    entry = resolve_tts_provider(s["provider"])
+    if entry.streaming is None:
+        return 1
+    key = read_key(s["key_file"], s["key_env"], os.environ)
+    if not key:
+        log("stream holder: no key — exiting")
+        return 1
+    # fold speed into voice_settings so the BOS carries it on the held socket's first frame
+    s["voice_settings"] = {**(s["voice_settings"] or {}), "speed": s["speed"]}
+    return run_holder(s, entry, key, digest)
 
 
 def main() -> int:
@@ -1670,6 +2183,11 @@ def entry() -> int:
     default-off install run the whole page path on every tool call, and the no-op eager promises
     covers this file, not just main().
     """
+    # The holder daemon is this same script under a different argv (the speak-path mirror of #99's
+    # stream-worker): when invoked as `speak.py stream-holder <digest>` it runs the resident socket
+    # loop instead of the hook, and the contour check below does not apply to it.
+    if len(sys.argv) > 1 and sys.argv[1] == STREAM_HOLDER_ARG:
+        return run_holder_main(sys.argv[2] if len(sys.argv) > 2 else "")
     rc = main()
     cfg_path = os.environ.get(
         "VOICE_LOOP_CONFIG",
