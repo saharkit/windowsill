@@ -26,6 +26,53 @@ Then install what you want — this one is typed **inside a session**, not in yo
 /plugin install <plugin>@windowsill
 ```
 
+## Tester ritual
+
+On a fresh machine, the complete marketplace check is:
+
+```sh
+claude plugin marketplace add saharkit/windowsill
+claude plugin list --available --json
+```
+
+The second command lists what the marketplace makes available. `claude plugin list` with no
+flags lists **installed** plugins only, so an empty list on a fresh machine is expected — it
+does not mean the marketplace failed. Install the plugin from inside a Claude Code session,
+then inspect the installed metadata:
+
+```text
+/plugin install voice-loop@windowsill
+```
+
+Back in the shell:
+
+```sh
+claude plugin details voice-loop
+```
+
+`claude plugin marketplace info` is not a command. There is also no details lookup for an
+uninstalled `voice-loop@windowsill`; before installation, clone the shelf and use the local
+path workaround instead:
+
+```sh
+git clone https://github.com/saharkit/windowsill
+claude plugin details --plugin-dir ./windowsill/plugins/voice-loop
+```
+
+The in-repository relative sources are pinned by the shelf clone itself. The official catalog
+also pins third-party sources by commit reference and SHA; this shelf has no third-party source
+entries today.
+
+For the machine-checkable half of the conformance pass, run the seeded eval cases after cloning:
+
+```sh
+claude plugin eval ./windowsill/plugins/voice-loop
+```
+
+They complement the human checklist in [`plugins/voice-loop/CONFORMANCE.md`](plugins/voice-loop/CONFORMANCE.md)
+and the directory-readiness work tracked in [#56](https://github.com/saharkit/windowsill/issues/56)
+and [#20](https://github.com/saharkit/windowsill/issues/20).
+
 ## Running on Windows
 
 The recommended route is **WSL2 with WSLg** on Windows 11 — and honesty first: nobody has run
