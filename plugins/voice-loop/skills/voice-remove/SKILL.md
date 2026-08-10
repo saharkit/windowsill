@@ -66,6 +66,7 @@ crontab -l 2>/dev/null | grep -n 'contour-poll'; \
 echo "== hotkey"; gsettings get org.gnome.settings-daemon.plugins.media-keys custom-keybindings 2>/dev/null; \
 grep -n 'dictate-toggle' "$HOME/.config/skhd/skhdrc" 2>/dev/null; \
 echo "== convention"; grep -n 'spoken summary' "$HOME/.claude/CLAUDE.md" ./CLAUDE.md 2>/dev/null; \
+echo "== pipewire aec"; ls -l ~/.config/pipewire/pipewire.conf.d/voice-loop-echo-cancel.conf 2>/dev/null; \
 echo "== root-installed (left alone, reported only)"; systemctl is-active ydotoold 2>/dev/null
 ```
 
@@ -183,6 +184,22 @@ genuinely empty — a kept key leaves the directory standing, which is the hones
 ```sh
 rm -f "$CFG/config.json" "$CFG/stress.json"; rmdir "$CFG" 2>/dev/null
 ```
+
+### Step 3b — PipeWire echo-cancel config (Linux only, no root)
+
+If Step 0's probe found `~/.config/pipewire/pipewire.conf.d/voice-loop-echo-cancel.conf` (or if
+`speak.sink` / `dictate.source` are set in config pointing at the echo-cancel nodes), this
+step removes the PipeWire module config that setup wrote.
+
+```sh
+rm -f ~/.config/pipewire/pipewire.conf.d/voice-loop-echo-cancel.conf
+# The directory is shared with other PipeWire config — only rmdir if empty:
+rmdir ~/.config/pipewire/pipewire.conf.d 2>/dev/null || true
+```
+
+Tell the user the module is still loaded in the running PipeWire session — it stays active until the
+next restart (`systemctl --user restart pipewire`), and no running dictation is affected. The config
+is gone; the next PipeWire restart is a clean default-mic setup.
 
 ## Step 4 — model caches (list sizes, ask per cache)
 

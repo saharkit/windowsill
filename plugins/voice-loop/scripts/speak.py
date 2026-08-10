@@ -168,6 +168,7 @@ import os
 import platform
 import re
 import shlex
+import shutil
 import signal
 import socket
 import subprocess
@@ -308,6 +309,8 @@ _LOCK_PATH = os.path.join(_STATE_DIR, "speaking.lock")
 # child. dictate.py's echo guard reads THIS file to stop in-flight playback before recording
 # (its pkill fallback only fires when the file is absent), and both takeover paths verify each
 # pid via /proc/<pid>/cmdline before signalling (PID-reuse guard).
+# The belt-and-suspenders half (windowsill#101): last-spoken is written here and read by
+# dictate.py after transcription — a transcript matching it is dropped.
 _PID_PATH = os.path.join(_STATE_DIR, "playing.pid")
 
 # The heartbeat: epoch seconds of the last hook INVOCATION, rewritten on every one — even a firing
@@ -461,6 +464,9 @@ def resolve_settings(config: dict, system: str) -> dict:
         "eager": cfg(config, "speak.eager", False) not in (False, "false"),
         "marker": str(cfg(config, "speak.marker", "🔊")),
         "player": str(cfg(config, "speak.player", "afplay" if system == "Darwin" else "aplay -q")),
+        # PipeWire sink to route TTS audio into for echo cancellation — when set, the player targets
+        # this sink (via pw-play --target or aplay -D pipewire:<sink>) instead of the default device.
+        "sink": str(cfg(config, "speak.sink", "")),
         "max_chars": int(cfg(config, "speak.max_chars", 600)),
         "timeout": float(cfg(config, "speak.timeout", 60)),
         "backend": str(cfg(config, "tts.backend", "lan")),
@@ -1363,6 +1369,15 @@ def _play_stream(audio_iter, s: dict, t0: float) -> tuple[int, int, int, int | N
     Returns (chunks_played, total_bytes, first_audio_ms, last_rc), where first_audio_ms is
     t0 -> the spawn of the first player process, and -1 when nothing ever played."""
     player_argv = shlex.split(s["player"])
+    # Acoustic echo cancellation: when speak.sink names a PipeWire sink, route audio into it so the
+    # echo canceller can subtract it from the mic signal. pw-play --target does this natively; aplay
+    # reaches it via the pipewire ALSA plugin with -D pipewire:<node>.
+    _player_env: dict | None = None
+    if s.get("sink"):
+        if shutil.which("pw-play"):
+            player_argv = ["pw-play", "--target=" + s["sink"]]
+        else:
+            player_argv = player_argv + ["-D", "pipewire:" + s["sink"]]
     proc: subprocess.Popen | None = None
     proc_wav: str | None = None
     played = 0

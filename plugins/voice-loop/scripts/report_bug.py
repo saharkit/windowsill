@@ -485,6 +485,9 @@ LOG_RULES: tuple[tuple[str, str | None], ...] = (
     ("toggle ignored — key repeat (", None),
     ("toggle ignored — previous dictation still finishing (transcription/paste in progress)", None),
     ("pidfile already claimed", None),
+    # the belt-and-suspenders echo guard (windowsill#101): the transcript is dropped, so the log
+    # states the fact and the dropped character count — the text itself is never written
+    ("echo guard: transcript matches the last spoken line — dropped", None),
     ("dictate.paste_target is not a known value (", ") — using"),
     ("focus probe failed (", None),
     ("focus probe returned ", " — focus"),

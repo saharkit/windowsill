@@ -70,6 +70,7 @@ def test_defaults_with_empty_config_linux():
     assert s["paste_key"] == "ctrl+shift+v"
     assert s["auto_paste"] is False
     assert s["recorder"] == "auto"
+    assert s["source"] == ""  # no echo-cancel source by default
     assert s["clipboard"] == "auto"
     assert s["player"] == "aplay -q"
     assert s["backend"] == "lan"
@@ -198,6 +199,70 @@ def test_ffmpeg_argv_selects_the_platform_capture_device():
 
 def test_unknown_recorder_builds_no_argv():
     assert dictate.recorder_argv("parec", "Linux", "w.wav") == []
+
+
+def test_pw_record_targets_echo_cancel_source_when_configured():
+    """L2: pw-record --target routes capture to the AEC source; without it the gap is an echo leak."""
+    argv = dictate.recorder_argv("pw-record", "Linux", "/tmp/w.wav", source="Echo-Cancel Source")
+    assert argv == ["pw-record", "--rate", "16000", "--channels", "1", "--target", "Echo-Cancel Source", "/tmp/w.wav"]
+
+
+def test_pw_record_no_target_when_source_is_empty():
+    """L2: an empty source must produce the exact argv the pre-AEC code produced — no regression."""
+    argv = dictate.recorder_argv("pw-record", "Linux", "/tmp/w.wav", source="")
+    assert argv == ["pw-record", "--rate", "16000", "--channels", "1", "/tmp/w.wav"]
+
+
+def test_source_is_only_applied_to_pw_record():
+    """L2: arecord and ffmpeg must not pick up the source — --target is pw-record-only."""
+    assert dictate.recorder_argv("arecord", "Linux", "w.wav", source="Echo-Cancel Source") == [
+        "arecord", "-q", "-f", "S16_LE", "-r", "16000", "-c", "1", "w.wav"
+    ]
+    # ffmpeg should be unchanged
+    linux = dictate.recorder_argv("ffmpeg", "Linux", "w.wav", source="Echo-Cancel Source")
+    assert "--target" not in linux
+
+
+# --- the belt-and-suspenders echo guard (windowsill#101) ----------------------------------------
+
+
+def test_echo_normalization_collapses_whitespace_and_case_and_punctuation():
+    """L2: the recognizer varies these axes; normalization must erase that variance."""
+    assert dictate._normalize_for_echo_check("Hello, World!") == "hello world"
+    assert dictate._normalize_for_echo_check("  Привет…  мир  ") == "привет мир"
+    assert dictate._normalize_for_echo_check("") == ""
+
+
+def test_exact_match_is_detected_as_echo():
+    """L2: verbatim capture of the spoken line (the staged experiment, confidence 0.98)."""
+    assert dictate._is_echo_of_last_spoken("Hello world", "Hello world") is True
+    # Normalization erases case and punctuation differences
+    assert dictate._is_echo_of_last_spoken("Hello, World!", "hello world") is True
+
+
+def test_spoken_line_contained_in_longer_transcript_is_echo():
+    """L2: the production incident — the assistant's full sentence leaked into a real dictation."""
+    spoken = "Ключник — это привратник с грамотой, а не сейф с ключом"
+    transcript = f"я думаю что {spoken} наверное"
+    assert dictate._is_echo_of_last_spoken(transcript, spoken) is True
+
+
+def test_short_spoken_text_is_not_contained_checked():
+    """L2: the length floor keeps short words from muting every dictation that contains them."""
+    assert dictate._is_echo_of_last_spoken("the cat sat", "the") is False
+    assert dictate._is_echo_of_last_spoken("yes", "yes") is True  # exact match still catches short
+
+
+def test_normal_speech_that_differs_is_not_echo():
+    """L2: non-echo speech must reach the prompt — a false positive here mutes the user."""
+    assert dictate._is_echo_of_last_spoken("какая сегодня погода", "ключник это привратник") is False
+    assert dictate._is_echo_of_last_spoken("hello world", "goodbye") is False
+
+
+def test_empty_inputs_are_never_echo():
+    assert dictate._is_echo_of_last_spoken("", "something") is False
+    assert dictate._is_echo_of_last_spoken("something", "") is False
+    assert dictate._is_echo_of_last_spoken("", "") is False
 
 
 # --- the min-clip guard: byte math and the threshold --------------------------------------------

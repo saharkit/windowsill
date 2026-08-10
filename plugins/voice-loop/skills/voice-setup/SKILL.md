@@ -387,6 +387,79 @@ voice as their Linux machines.
 python3 "${CLAUDE_PLUGIN_ROOT}/scripts/install_ledger.py" step-done step-3-install-deps
 ```
 
+### Step 3b — acoustic echo cancellation (Linux / PipeWire, no root)
+
+On a full-duplex dictation loop the assistant's TTS leaks speaker→mic into the transcript verbatim —
+the raw mic has no echo protection, so the assistant's own replies are dictated back into the prompt.
+The fix is local: PipeWire's `libpipewire-module-echo-cancel` (WebRTC AEC).
+
+This step is **Linux-only** and **idempotent** — running it over an existing config leaves the right
+thing. Probe first: if `pw-cli` is not on PATH, PipeWire is not the audio system (or `pipewire-utils`
+is not installed). In that case skip to Step 4. Otherwise:
+
+```sh
+# Write the module config fragment — idempotent, one file.
+mkdir -p ~/.config/pipewire/pipewire.conf.d
+cat > ~/.config/pipewire/pipewire.conf.d/voice-loop-echo-cancel.conf <<'PIPEWIRE_EOF'
+# voice-loop: acoustic echo cancellation — subtract the assistant's TTS from the mic signal.
+# Loaded live by PipeWire on restart; creates Echo-Cancel Sink and Echo-Cancel Source nodes
+# auto-linked to the default sink and mic.  The speak hook routes TTS into the sink; dictation
+# records from the source.  Remove this file and restart PipeWire to disable.
+context.modules = [
+    {   name = libpipewire-module-echo-cancel
+        args = {
+            aec.method = "webrtc"
+            source.props = {
+                node.name = "Echo-Cancel Source"
+                node.description = "voice-loop Echo-Cancel Source (AEC)"
+            }
+            sink.props = {
+                node.name = "Echo-Cancel Sink"
+                node.description = "voice-loop Echo-Cancel Sink (AEC)"
+            }
+        }
+    }
+]
+PIPEWIRE_EOF
+```
+
+Verify the module loads (does not require a PipeWire restart — `pw-cli -m load-module` loads it
+live, but the persistent config above takes effect on the next restart):
+
+```sh
+pw-cli -m load-module libpipewire-module-echo-cancel 2>&1 || true
+```
+
+A "No such module" or "File not found" is an old PipeWire or a distro that ships the module
+separately (`pipewire-audio-client-libraries` on some apt distros). Say what was missing and that
+the config file is already written — it takes effect when the module becomes available.
+
+If the load succeeds, verify the nodes appeared:
+
+```sh
+pw-cli list-objects 2>/dev/null | grep -A5 'Echo-Cancel'
+```
+
+Then set the config keys that route the hooks into the cancel path:
+
+```jsonc
+// Add to ~/.config/voice-loop/config.json:
+"speak": { "sink": "Echo-Cancel Sink" },
+"dictate": { "source": "Echo-Cancel Source" }
+```
+
+Use `jq` to merge these keys into the existing config file rather than overwriting it — the config
+may already exist at this point (a re-run, a repair). If Step 4 has not yet written the file, write
+these keys into the config that Step 4 will produce instead.
+
+The degrade paths are all built in: `pw-record --target` on a missing node falls back to the default
+source (the AEC module absent does not block dictation), and the speak hook's sink routing degrades
+to the default device when the named sink is not present.
+
+Tell the user in one line: *Echo cancellation is configured. Restart PipeWire to activate it
+(`systemctl --user restart pipewire`), or just reboot — the config loads on every start.*  The live
+module load above is temporary and resets on restart; the config file makes it permanent.
+
 ## Step 4 — write the config
 
 **Begin step** — writing config is a side effect (the file is the product). Mark it in flight:

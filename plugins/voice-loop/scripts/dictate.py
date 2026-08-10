@@ -30,6 +30,12 @@ Deliberate behaviours, found by live debugging — do not "simplify" them away:
   never records our own speakers (windowsill#3). Primary path: read speak.py's playing.pid and
   SIGTERM exactly the recorded chain (identity-checked against /proc); the historical
   pkill -f "voice-loop-speak" pattern-kill is only the fallback when no pidfile exists.
+  The belt-and-suspenders half runs AFTER transcription: a transcript that matches what the
+  assistant just spoke (read from the state store) is dropped before it reaches the prompt
+  (windowsill#101). AEC alone can degrade — this is load-bearing, not optional.
+* echo cancel source — when ``dictate.source`` names a PipeWire source (the Echo-Cancel Source
+  created by the AEC module), ``pw-record --target`` captures from it instead of the default mic.
+  If the module is absent pw-record falls back to the default source — degrade, never block.
 * recorder table — auto picks pw-record -> arecord -> ffmpeg on Linux, sox(rec) -> ffmpeg on
   macOS; every recorder is pinned to 16 kHz mono S16 (what STT wants, and what the clip-length
   guard's byte math assumes).
@@ -184,6 +190,10 @@ _LOG_PATH = os.path.join(_STATE_DIR, "dictate.log")
 _PID_PATH = os.path.join(_STATE_DIR, "dictate.pid")
 _WAV_PATH = os.path.join(_STATE_DIR, "dictate.wav")
 _LAST_WAV_PATH = os.path.join(_STATE_DIR, "dictate-last.wav")
+# CROSS-SCRIPT CONTRACT (keep in sync with speak.py's _LAST_PATH): the last text the assistant spoke
+# out loud — the belt-and-suspenders echo guard reads this after transcription and drops a transcript
+# that matches it (AEC alone can degrade; the state-store comparison is load-bearing).
+_LAST_SPOKEN_PATH = os.path.join(_STATE_DIR, "last-spoken")
 # When the previous toggle happened — the whole state the key-repeat guard keeps. Separate from the
 # pidfile on purpose: the pidfile says whether a recorder is running, this says how long ago the
 # hotkey was last acted on, and the guard has to answer before either branch is chosen.
@@ -213,6 +223,8 @@ _PREVIEW_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "prev
 # child. The echo guard below reads THIS file to stop in-flight playback before recording, and
 # verifies each pid via /proc/<pid>/cmdline before signalling (PID-reuse guard), exactly like
 # speak.py's own take_over does.
+# The belt-and-suspenders half (windowsill#101) reads last-spoken — the text speak.py just voiced —
+# and drops any transcript that matches it after transcription.
 _SPEAK_PID_PATH = os.path.join(_STATE_DIR, "playing.pid")
 
 # When the macOS Accessibility permission for osascript keystroke injection was declined, this
@@ -337,6 +349,11 @@ def resolve_settings(config: dict, system: str) -> dict:
         # where auto-paste is allowed to land: "any" (the default power behaviour) or "same-window"
         "paste_target": resolve_paste_target(cfg(config, "dictate.paste_target", "any")),
         "recorder": str(cfg(config, "dictate.recorder", "auto")),
+        # PipeWire source to record from for echo cancellation — when set, pw-record adds --target
+        # to capture from this source (the Echo-Cancel Source) instead of the default mic.
+        # If the module is absent the pw-record invocation degrades: --target on an unknown node
+        # makes pw-record fall back to the default source, so dictation never blocks.
+        "source": str(cfg(config, "dictate.source", "")),
         # milliseconds in the config (what a human reasons about for a keypress), seconds inside
         "debounce_ms": resolve_debounce_ms(cfg(config, "dictate.debounce_ms", DEBOUNCE_SECONDS * 1000)),
         "clipboard": str(cfg(config, "dictate.clipboard", "auto")),
@@ -409,18 +426,62 @@ def resolve_recorder(recorder: str, system: str, have) -> str:
     return ""
 
 
-def recorder_argv(recorder: str, system: str, wav: str) -> list[str]:
-    """The exact device/format flags the shell used: 16 kHz, mono, S16 — [] for an unknown name."""
+def recorder_argv(recorder: str, system: str, wav: str, *, source: str = "") -> list[str]:
+    """The exact device/format flags the shell used: 16 kHz, mono, S16 — [] for an unknown name.
+
+    ``source`` is the PipeWire source name to target (e.g. "Echo-Cancel Source") — when set and the
+    recorder is pw-record, --target routes the capture to that source. If the named source does not
+    exist (the AEC module is absent), pw-record falls back to the default source — dictate never
+    blocks on echo cancellation."""
     if recorder == "pw-record":
-        return ["pw-record", "--rate", str(RECORD_RATE), "--channels", "1", wav]
+        argv = ["pw-record", "--rate", str(RECORD_RATE), "--channels", "1"]
+        if source:
+            argv.extend(["--target", source])
+        argv.append(wav)
+        return argv
     if recorder == "arecord":
         return ["arecord", "-q", "-f", "S16_LE", "-r", str(RECORD_RATE), "-c", "1", wav]
     if recorder == "sox":
         return ["rec", "-q", "-r", str(RECORD_RATE), "-c", "1", "-b", "16", wav]
     if recorder == "ffmpeg":
-        source = ["-f", "avfoundation", "-i", ":default"] if system == "Darwin" else ["-f", "alsa", "-i", "default"]
-        return ["ffmpeg", "-hide_banner", "-loglevel", "error", *source, "-ar", str(RECORD_RATE), "-ac", "1", "-y", wav]
+        src = ["-f", "avfoundation", "-i", ":default"] if system == "Darwin" else ["-f", "alsa", "-i", "default"]
+        return ["ffmpeg", "-hide_banner", "-loglevel", "error", *src, "-ar", str(RECORD_RATE), "-ac", "1", "-y", wav]
     return []
+
+
+# --- belt-and-suspenders echo guard -------------------------------------------------------------
+# AEC alone can degrade (misconfigured module, a PipeWire restart that drops the loaded module,
+# an amp turned up loud enough to saturate the canceller). The state-store comparison is the
+# second belt: a transcript that matches what the assistant just spoke out loud is dropped before
+# it reaches the prompt — load-bearing, not optional (windowsill#101 comment 1).
+
+
+def _normalize_for_echo_check(text: str) -> str:
+    """Collapse whitespace, lowercase, strip punctuation — the axes along which the same phrase
+    varies between the TTS speaker and the STT recognizer."""
+    text = re.sub(r"[^\w\s]", "", text.lower())
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _is_echo_of_last_spoken(transcript: str, last_spoken: str) -> bool:
+    """True when the transcript looks like an echo of what the assistant just spoke.
+
+    Two shapes, both caught in the live reproduction:
+    - Exact match: the spoken line was captured verbatim (the staged experiment, confidence 0.98).
+    - Contained match: the whole spoken line appears inside a longer transcript (the assistant's
+      full sentence leaked into a real dictation — the production incident in the tracker).
+    """
+    t = _normalize_for_echo_check(transcript)
+    s = _normalize_for_echo_check(last_spoken)
+    if not t or not s:
+        return False
+    if t == s:
+        return True
+    # The assistant spoke a substantial line and the whole thing was captured inside a longer
+    # transcript. The length floor keeps "the" from muting every dictation.
+    if len(s) >= 30 and s in t:
+        return True
+    return False
 
 
 def clip_seconds(size_bytes: int) -> float:
@@ -1588,7 +1649,7 @@ def start_recording(s: dict, system: str, pidfile_fd: int) -> int:
     stop_speak_playback()
 
     recorder = resolve_recorder(s["recorder"], system, shutil.which)
-    argv = recorder_argv(recorder, system, _WAV_PATH)
+    argv = recorder_argv(recorder, system, _WAV_PATH, source=s.get("source", ""))
     if not argv:
         note("no recorder found — install pw-record/arecord (Linux) or sox/ffmpeg (macOS)", system)
         log("no recorder available")
@@ -1708,6 +1769,26 @@ def stop_and_transcribe(s: dict, system: str, mode: str, recorder_pid: int) -> i
         # for beyond the finals the drain already collected.
         text = streamed
         via = "stream"
+
+    # Belt-and-suspenders echo guard (windowsill#101): AEC alone can degrade — a misconfigured
+    # module, a PipeWire restart that drops it, an amp saturated past the canceller's range.
+    # The state-store comparison catches what the signal path misses: a transcript that matches
+    # what the assistant just spoke is dropped before it reaches the prompt.
+    #
+    # Read AFTER transcription so the read cost is only paid for speech someone heard.
+    if text:
+        try:
+            with open(_LAST_SPOKEN_PATH, encoding="utf-8") as fh:
+                last_spoken = fh.read().strip()
+        except OSError:
+            last_spoken = ""
+        if last_spoken and _is_echo_of_last_spoken(text, last_spoken):
+            log(f"echo guard: transcript matches the last spoken line — dropped ({len(text)} chars)")
+            try:
+                os.replace(_WAV_PATH, _LAST_WAV_PATH)
+            except OSError:
+                pass
+            return 0
 
     def latency(landed: str) -> None:
         """The number windowsill#99 is judged on: end of speech -> the text being where it goes."""
