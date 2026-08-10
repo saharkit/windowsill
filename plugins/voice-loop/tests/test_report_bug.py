@@ -456,13 +456,28 @@ class TestHostRedaction:
         assert report_bug.redact("Start time: 12:00") == "Start time: 12:00"
         assert report_bug.redact("14:30:45") == "14:30:45"
 
-    def test_a_single_label_host_is_deliberately_left_alone(self):
-        """The grammar that catches `voicebox:8355` also catches `code:1006` and `pid:4321`. The
-        alternative was dropped: a dotless service name is the cheaper loss, and this pins that the
-        loss is a decision rather than a gap that gets 'fixed' back into the over-match."""
+    def test_a_known_single_label_host_is_redacted(self):
+        """`voicebox` is in the known set — a dotless LAN service name, caught and redacted.
+        `code:1006` and `pid:4321` are not in the set, so they survive (pinned below)."""
         assert report_bug.redact("Connection refused to voicebox:8355") == (
-            "Connection refused to voicebox:8355"
+            "Connection refused to <host>:8355"
         )
+
+    def test_an_unknown_single_label_with_a_port_is_left_alone(self):
+        """A `word:digits` token whose label is not in the known set is left alone — these are
+        the report's diagnostic value (close codes, pids, task ids, config keys)."""
+        assert report_bug.redact("websocket closed code:1006") == "websocket closed code:1006"
+        assert report_bug.redact("worker pid:4321 task:42") == "worker pid:4321 task:42"
+        assert report_bug.redact("item1:8080 is ready") == "item1:8080 is ready"
+
+    def test_every_single_label_loopback_name_matches_the_bare_regex(self):
+        """A loopback name added to `_LOOPBACK_HOSTS` must be matched by the bare-host regex
+        so it is recognised as a host. The regex is built from the loopback set by construction —
+        this test pins that the derivation holds after any edit."""
+        for name in report_bug._LOOPBACK_NAMES:
+            assert report_bug._BARE_HOST_PORT_RE.search(f"Connection refused to {name}:8355"), (
+                f"{name!r} is in _LOOPBACK_HOSTS but _BARE_HOST_PORT_RE does not match it"
+            )
 
     def test_the_port_grammar_is_the_same_for_every_host_shape(self):
         """One port fragment, so a one-digit port is not a host on one shape and prose on another."""
@@ -474,12 +489,16 @@ class TestHostRedaction:
         )
 
     def test_inline_credentials_leave_with_the_host_they_name(self):
-        """`user:pass@host` is a password in a URL; the host rule owns it, in both spellings."""
+        """`user:pass@host` is a password in a URL; the host rule owns it, in all spellings."""
         assert report_bug.redact("http://user:pw@voicebox.lan:8355/tts") == (
             "http://<user>@<host>:8355/tts"
         )
         assert report_bug.redact("Connection refused to user:pw@deepgram.corp.internal:443") == (
             "Connection refused to <user>@<host>:443"
+        )
+        # Known single-label hosts carry credentials too.
+        assert report_bug.redact("Connection refused to user:pw@voicebox:8355") == (
+            "Connection refused to <user>@<host>:8355"
         )
 
 

@@ -164,13 +164,16 @@ _HOST_BRACKETED_IPV6 = rf"\[{_IPV6}{_ZONE_IN_BRACKETS}\]"
 # and allowing it would reach for false matches that cost more than the rare true one.)
 _HOST_BARE_IPV6 = rf"(?<![0-9A-Za-z._%\-])(?<![0-9A-Fa-f]:){_IPV6}{_ZONE_BARE}"
 # A NAME is recognisable as a host only by its shape: dotted labels ending in a TLD-ish label of
-# two or more letters. A SINGLE-label host (`voicebox:8355`) is deliberately not matched at all —
-# every grammar that catches it also eats `code:1006`, `pid:4321` and `task:42`, and a close code
-# missing from a bug report costs more than a dotless service name kept. Labels are unicode (`\w`
-# is unicode for a str pattern): a host typed in its native script (`café.example.com`, `тест.рф`)
-# is a host on the same terms as its ASCII punycode form, so neither spelling leaks. The last label
-# is letters-only — `[^\W\d_-]` is a word char that is not a digit, underscore or hyphen — matching
-# a TLD of two or more letters in any script (and still excluding `dictate.debounce_ms`).
+# two or more letters, OR a single label in the known set below. That set stays deliberately small
+# — every `word:digits` pattern it catches also matches `code:1006`, `pid:4321` and `task:42` if it
+# grows too broad, and a close code missing from a bug report costs more than a dotless service name
+# kept. The loopback names are derived from `_LOOPBACK_HOSTS` below, so a name added there
+# automatically appears here.
+# The DOTTED shape below carries the labels themselves: they are unicode (`\w` is unicode for a str
+# pattern), so a host typed in its native script (`café.example.com`, `тест.рф`) is a host on the
+# same terms as its ASCII punycode form and neither spelling leaks. The last label is letters-only —
+# `[^\W\d_-]` is a word char that is not a digit, underscore or hyphen — matching a TLD of two or
+# more letters in any script (and still excluding `dictate.debounce_ms`).
 _HOST_DOTTED_NAME = r"(?:[\w-]+\.)+[^\W\d_-]{2,24}"
 # Credentials ride in front of a host as `user:pass@`; they leave with the host they name. Bounded
 # like everything else here: this fragment sits in front of every alternative, so an unbounded run
@@ -178,6 +181,29 @@ _HOST_DOTTED_NAME = r"(?:[\w-]+\.)+[^\W\d_-]{2,24}"
 _USERINFO = r"(?:[^\s/@\"'<>]{1,128}@)?"
 # One port grammar for every alternative in both passes.
 _PORT = r"\d{1,5}(?!\d)"
+
+# The ONE loopback set. Every spelling lives here and nowhere else — `_is_loopback` normalises
+# before asking, so brackets, a zone id and letter case are not separate entries.
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", "0:0:0:0:0:0:0:1", "0.0.0.0"})
+
+# Single-label hostnames from the loopback set — name-shaped entries (no dots, colons, or digits)
+# that must appear in the bare-host regex so the regex and the loopback set stay in agreement.
+# Currently only "localhost"; all other loopback entries are IP addresses matched by other rules.
+_LOOPBACK_NAMES = frozenset(
+    {h for h in _LOOPBACK_HOSTS if re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]*", h)}
+)
+
+# Single-label hostnames known to be LAN service names in diagnostic prose. Each one here also
+# matches `word:digits` — the shape of `code:1006`, `pid:4321` and every other label:number
+# token in the logs — so the set stays deliberately small. A name here is redacted like any
+# other non-loopback host.
+_KNOWN_SINGLE_LABEL_HOSTS: frozenset[str] = frozenset({"voicebox"})
+
+# The named-host alternatives in the bare-host regex: loopback names (so a name added to
+# `_LOOPBACK_HOSTS` is recognised as a host automatically) plus known single-label service
+# names. Sorted longest-first so the regex engine tries the longest match first.
+_NAMED_HOSTS = tuple(sorted(_LOOPBACK_NAMES | _KNOWN_SINGLE_LABEL_HOSTS, key=len, reverse=True))
+_NAMED_HOSTS_RE = "|".join(re.escape(h) for h in _NAMED_HOSTS)
 
 # The scheme'd form. The port is optional (`https://api.example.com/v1` has none) and so is the
 # userinfo. After a scheme, ANY run up to the path is a host — a name needs no dot to be one there,
@@ -204,7 +230,9 @@ _URL_RE = re.compile(
 _BARE_HOST_PORT_RE = re.compile(
     rf"(?P<ipuser>{_USERINFO})(?P<ip>{_HOST_BRACKETED_IPV6}|{_HOST_BARE_IPV6})"
     rf"(?::(?P<ipport>{_PORT}))?"
-    rf"|(?P<nameuser>{_USERINFO})\b(?P<name>{_HOST_DOTTED_NAME}|localhost)\.?\s*:\s*(?P<nameport>{_PORT})"
+    rf"|(?P<nameuser>{_USERINFO})\b(?P<name>{_HOST_DOTTED_NAME}"
+    + (f"|{_NAMED_HOSTS_RE}" if _NAMED_HOSTS_RE else "") +
+    rf")\.?\s*:\s*(?P<nameport>{_PORT})"
 )
 # `\.?\s*:\s*` (not a bare `:`) so a name still reads as a host when its port is spelled other than
 # `:port`: with a DNS root dot (`deepgram.corp.internal.:443` — `host.` is a fully-qualified name)
@@ -216,10 +244,6 @@ _BARE_HOST_PORT_RE = re.compile(
 # number has three components, not four); a bare *hostname* in prose is not, and is left to the two
 # rules above.
 _IPV4_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
-
-# The ONE loopback set. Every spelling lives here and nowhere else — `_is_loopback` normalises
-# before asking, so brackets, a zone id and letter case are not separate entries.
-_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", "0:0:0:0:0:0:0:1", "0.0.0.0"})
 
 # `session.py:117` and `File app.py:42` are source locations and `spoken.ledger:3` is a state file
 # — a bug report exists to carry them, and the host grammar above cannot tell them from
