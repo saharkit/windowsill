@@ -167,6 +167,37 @@ Turning it on for a provider that has no streaming variant changes nothing and s
 `stt.model` and `stt.language` are the same axes as the batch call. See
 [`PROVIDERS.md`](PROVIDERS.md) for which providers stream and what the billing difference is.
 
+### Streaming synthesis — first sound in ~200 ms on a held socket
+
+The voice-back counterpart. A batch cloud line pays the TLS+websocket dial on every turn —
+~300-420 ms, more than the synthesis itself. Where the provider's registry entry has a **streaming
+variant** (today: `elevenlabs`), one setting routes synthesis through a **resident holder** that
+keeps one stream-input socket open *across turns*, so the dial is paid once per session and a held
+socket renders at first-sound ≈ 200-250 ms:
+
+```json
+{ "tts": { "backend": "cloud", "cloud": { "provider": "elevenlabs", "streaming": true,
+           "voice_id": "your-voice", "model": "eleven_flash_v2_5",
+           "voice_settings": { "speed": 0.9 } } } }
+```
+
+It is **off by default** — a held socket is a second failure surface, and you should ask for it.
+What does not change when you do:
+
+- the **voice, model and output format are the same axes** as the batch call. One addition:
+  `tts.cloud.voice_settings.speed` (ElevenLabs accepts ~0.7-1.2; default 1.0). A voice_settings edit
+  is a **reconnect trigger** — the holder respawns with the new settings;
+- the streaming path asks for `pcm_22050` (raw s16le, **no decoder**); the holder wraps each fragment
+  in a WAV so the player queue plays it unchanged. Use `eleven_flash_v2_5` (32 languages) —
+  `eleven_flash_v2` without the `.5` is **English-only**;
+- **budget is the real constraint, not latency** — Flash is ~0.25 credits/char. On a **401/quota**
+  the line degrades to the local Silero path (or `tts.command`), never silence;
+- **any** failure — no key, a socket that will not open, a server that hangs up mid-line — degrades
+  the line to the batch blob path for that one turn; the next turn tries the held socket again.
+
+The holder self-exits after a few idle minutes, so a session that ended leaves nothing running.
+See [`PROVIDERS.md`](PROVIDERS.md) for which providers stream.
+
 ### Degrade — what happens when the cloud is down
 
 When the cloud backend fails — a network error, an expired key, a quota limit — dictation does
@@ -421,7 +452,7 @@ plugins/voice-loop/
   scripts/dictate-toggle.sh   push-to-talk launcher (stable hotkey entry point)
   scripts/dictate.py          the toggle: record -> transcribe -> clipboard/paste-into-prompt
   scripts/providers.py        the speech provider registry: one entry per provider, per direction
-  scripts/wsclient.py         a minimal stdlib RFC 6455 client — what streaming dictation talks over
+  scripts/wsclient.py         a minimal stdlib RFC 6455 client — what streaming dictation and the streaming synthesis holder talk over
   scripts/selftest.sh         hardware-free loopback proof (TTS -> STT -> compare)
   scripts/report-bug.sh       bug-report launcher (stable entry point for /report-bug)
   scripts/report_bug.py       the collector: diagnostics -> redaction -> one bundle -> a transport

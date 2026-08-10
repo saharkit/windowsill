@@ -74,6 +74,39 @@ paths are compared on your own machine rather than on a claim in this table.
 asymmetry is the reason the two directions are configured independently — `stt.cloud.provider:
 "deepgram"` beside `tts.cloud.provider: "elevenlabs"` is a perfectly ordinary config.
 
+### Streaming text-to-speech — `tts.cloud.streaming`
+
+A batch cloud line pays the TLS+websocket dial on every turn — ~300-420 ms, more than the synthesis
+itself (the live probe measured ~170 ms warm). A provider whose entry carries a **streaming
+variant** is reached over a websocket a **resident holder keeps open across turns**, so the dial is
+paid once per session, not once per line, and a held socket renders at first-sound ≈ 200-250 ms. It
+is the voice-back counterpart of streaming dictation, and closes the loop it opened: sub-second
+both ways.
+
+| provider | streaming variant | what turning it on does |
+|---|---|---|
+| `openai` (TTS) | — | nothing: the setting is ignored |
+| `elevenlabs` (TTS) | **yes** — the live `/v1/text-to-speech/{voice}/stream-input` websocket, `eleven_flash_v2_5`, `pcm_22050` out | a resident holder holds one socket across turns (whitespace keepalive every ≤15 s against the vendor's ~20 s idle close, a throwaway priming frame on connect); the hook streams each line's audio as it is synthesized, and the local server/`tts.command` remains the fallback chain |
+| `deepgram` (TTS) | — | nothing: Aura has no stream-input variant here |
+
+```json
+{ "tts": { "backend": "cloud", "cloud": { "provider": "elevenlabs", "streaming": true, "voice_id": "your-voice", "model": "eleven_flash_v2_5", "voice_settings": { "speed": 0.9 } } } }
+```
+
+Everything else is unchanged, and deliberately so:
+
+- the **voice, model and output format are the same axes** as the batch call (`tts.cloud.voice_id`,
+  `tts.cloud.model`), with one addition: `tts.cloud.voice_settings.speed` (ElevenLabs accepts
+  ~0.7-1.2; default 1.0). A voice_settings edit is a **reconnect trigger** — the holder respawns
+  with the new settings, because a change on a held socket may need a fresh stream;
+- the streaming path asks for `pcm_22050` (raw s16le) — **no decoder in the critical path**, the
+  holder wraps each fragment in a WAV header so the player queue plays it unchanged. `eleven_flash_v2`
+  (no `.5`) is **English-only** — use `eleven_flash_v2_5` for the 32-language model;
+- **budget is the real constraint, not latency** — Flash is ~0.25 credits/char on this account. On a
+  **401/quota** the line degrades to the local Silero path (or `tts.command`), never silence;
+- any failure — no key, a socket that will not open, a server that hangs up mid-line — degrades the
+  line to the blob path for that one turn; the next turn tries the held socket again.
+
 ## The audio container, and why your player matters
 
 `tts.cloud.output_format` means something different to each provider, because each vendor spells it

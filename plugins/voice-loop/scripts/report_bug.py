@@ -385,6 +385,19 @@ LOG_RULES: tuple[tuple[str, str | None], ...] = (
     # a provider name the registry does not know is the user's own typo — cut like paste_target's
     ("tts.cloud.provider is not a known provider — using ", "instead of "),
     ("stream died before its first chunk", None),
+    # the resident ElevenLabs streaming holder (windowsill#113): lifecycle and degrade lines. None
+    # carries a word of the turn's text (that travels over the holder's socket, not the log); the
+    # {err} is a WebSocketError/TtsStreamClosed reason — host/status at most, never the key (the
+    # websocket client's refusals are status-only by construction).
+    ("cloud stream degraded before the first chunk", None),
+    ("cloud stream: could not reach the holder", None),
+    ("stream holder priming failed", None),
+    ("stream holder did not start", None),
+    ("stream holder did not bind its socket in time", None),
+    ("stream holder could not bind its socket", None),
+    ("stream holder idle — exiting", None),
+    ("stream holder: a line failed after", None),
+    ("stream holder: no key — exiting", None),
     ("played rc=", None),
     ("nothing played via=", None),
     # the contour check (#40): the count is metadata, but the alert text names the operator's

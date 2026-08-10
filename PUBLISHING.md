@@ -45,7 +45,7 @@ marketplace. To list windowsill's reach here, submit each plugin individually.
 | description | Two-way voice for Claude Code with pluggable speech providers: a config registry picks OpenAI, ElevenLabs or Deepgram per direction, or keeps every clip local/self-hosted (faster-whisper STT; Silero, XTTS-v2 or Ukrainian TTS on the bundled server) — switching backends is a config entry, never a code change. A Stop hook speaks the lines Claude marks, a push-to-talk hotkey dictates into your prompt, and /voice-setup installs it all. |
 | license | MIT |
 | author | Sahar |
-| version | 0.7.0 |
+| version | 0.8.0 |
 | validation | `claude plugin validate ./plugins/voice-loop` must pass before submission |
 | keywords | voice, speech, tts, stt, dictation, provider-registry, deepgram, elevenlabs, openai, whisper, silero, self-hosted, accessibility |
 
