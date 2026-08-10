@@ -13,7 +13,8 @@ directory and nothing else at the top level.
 Root-level, and this is the whole list (every tracked entry): `README.md` (the catalog),
 `ACHIEVEMENTS.md` (the milestone ledger), `.claude-plugin/marketplace.json` (what `marketplace add`
 reads), `.github/` (shared CI), `plugins/` (one directory per plugin), `tales/` (story content, not
-a plugin), `LICENSE`, `.gitignore`, `.claude/`, this file.
+a plugin — the told tales, the `canon/` core of universe-model laws and the entity registry, and
+`CONTRIBUTING.md` for tales), `LICENSE`, `.gitignore`, `.claude/`, this file.
 
 A plugin's **version lives in `plugins/<name>/.claude-plugin/plugin.json`** — that is the source.
 It is recorded in **three** places in all: that manifest, its mirror in
@@ -93,9 +94,11 @@ linear-segmentation rewrite in the history).
 ## Public-repo hygiene
 
 - **English is the prose language** — code, comments, docs, commit messages, issues. `tales/` is the
-  one deliberate prose exception (Russian by design). Language *data* is whatever the feature
-  speaks and is not covered by this rule: the STT hallucination blocklist, the loopback job's
-  Russian test phrase, stress dictionaries, examples.
+  one deliberate prose exception (Russian by design) — the **told tales** themselves; the canon
+  reference docs beside them (`canon/`, `CONTRIBUTING.md`) are English with Russian canon terms
+  inline, like `tales/README.md`. Language *data* is whatever the feature speaks and is not covered
+  by this rule: the STT hallucination blocklist, the loopback job's Russian test phrase, stress
+  dictionaries, examples.
 - **MIT.** Everything added here ships under it; do not vendor code that cannot.
 - **No secrets, keys, tokens, hostnames or personal endpoints — ever**, not even in an example.
   Configuration lives in the user's own config file or environment; nothing is baked into the code.
