@@ -44,9 +44,98 @@ def _plugin_root() -> Path:
     return Path(__file__).resolve().parent.parent
 
 
+def _parse_version(version_str: str) -> tuple[int, ...]:
+    """Parse a version string like ``'0.1.0'`` into a comparable tuple.
+
+    Returns an empty tuple for unparseable strings so they sort lowest.
+    """
+    try:
+        return tuple(int(part) for part in version_str.split("."))
+    except (ValueError, TypeError):
+        return ()
+
+
+def _is_version_like(name: str) -> bool:
+    """True when *name* looks like a version directory (e.g. ``'0.1.0'``, ``'1.2'``)."""
+    parts = name.split(".")
+    if len(parts) < 2:
+        return False
+    return all(part.isdigit() for part in parts)
+
+
+def _resolve_version_dir(plugin_dir: Path) -> Path:
+    """Resolve the code directory inside a plugin directory.
+
+    In the cache layout, the version directory (e.g. ``'0.1.0'``) sits inside
+    the plugin directory and is what should go on ``sys.path``.  When several
+    versions are present, the highest one wins.
+
+    In the checkout layout, the plugin directory itself is the code root — no
+    version directory sits inside it.
+    """
+    try:
+        entries = list(plugin_dir.iterdir())
+    except OSError:
+        return plugin_dir
+
+    version_dirs = [
+        entry for entry in entries
+        if entry.is_dir() and _is_version_like(entry.name)
+    ]
+
+    if version_dirs:
+        return max(version_dirs, key=lambda d: _parse_version(d.name))
+
+    return plugin_dir
+
+
 def _sill_core_root() -> Path:
-    """The sill-core plugin root, alongside voice-loop."""
-    return _plugin_root().parent / "sill-core"
+    """The sill-core plugin root, alongside voice-loop.
+
+    Account for two layouts:
+
+    * **checkout** — ``plugins/voice-loop/`` and ``plugins/sill-core/``
+      sit side by side; no version directory separates them.
+    * **cache** — ``cache/<marketplace>/voice-loop/<ver>/`` and
+      ``cache/<marketplace>/sill-core/<ver>/``; the version directory
+      is one level down and must be resolved.
+
+    When multiple versions exist, the highest one wins.  Raises
+    :class:`FileNotFoundError` when sill-core is absent entirely.
+    """
+    our_parent = _plugin_root().parent  # marketplace / plugins/
+
+    # Try sibling first (checkout — both plugins under one directory).
+    candidates: list[Path] = [our_parent / "sill-core"]
+
+    # Also try one level above (cache — voice-loop/<ver>/ puts us one deeper
+    # than the marketplace level, while sill-core is at the marketplace level).
+    candidates.append(our_parent.parent / "sill-core")
+
+    for candidate in candidates:
+        if candidate.is_dir():
+            return _resolve_version_dir(candidate)
+
+    raise FileNotFoundError(
+        "sill-core plugin not found alongside voice-loop"
+        f" (checked {', '.join(str(c) for c in candidates)})"
+    )
+
+
+def _remove_incident_symlink() -> None:
+    """Delete the 2026-08-10 incident workaround symlink if it still exists.
+
+    Before the fix, :func:`_sill_core_root` pointed at
+    ``voice-loop/sill-core`` — one level too deep.  An incident symlink was
+    placed there to keep the doctor running.  It is now dead code and must
+    not survive a ``/plugin update``.
+    """
+    wrong_path = _plugin_root().parent / "sill-core"
+    try:
+        if wrong_path.is_symlink():
+            wrong_path.unlink()
+    except OSError:
+        pass  # best-effort — the fix itself does not depend on this succeeding
 
 
 def read_config(path: str) -> dict[str, Any]:
@@ -139,11 +228,77 @@ def main(argv: list[str] | None = None) -> int:
     root = _plugin_root()
     manifest = load_manifest(root)
 
-    core_root = str(_sill_core_root())
+    try:
+        core_root = str(_sill_core_root())
+    except FileNotFoundError:
+        # A diagnostic tool must never be unable to report itself.
+        # When sill-core is absent, emit the diagnosis rather than crashing.
+        output: dict[str, Any] = {
+            "config_present": bool(config),
+            "config_path": config_path,
+            "ledger_state": ledger.get("state", "none"),
+            "findings": [
+                {
+                    "bin": "real_anomaly",
+                    "key": "sill_core_missing",
+                    "title": "The diagnosis engine (sill-core) is not installed",
+                    "explanation": (
+                        "sill-core, the shared plugin that provides the diagnosis "
+                        "engine, was not found alongside voice-loop.  Without it, "
+                        "/doctor cannot run checks — the diagnosis tool itself "
+                        "cannot diagnose anything."
+                    ),
+                    "fix": (
+                        "Install sill-core alongside voice-loop: run "
+                        "`/plugin install sill-core@windowsill` in Claude Code, "
+                        "then run `/voice-loop:doctor` again."
+                    ),
+                    "offer_flip": False,
+                    "flip_path": "",
+                    "flip_value": None,
+                    "evidence": {},
+                }
+            ],
+        }
+        print(json.dumps(output, indent=2, ensure_ascii=False))
+        return 0
+
+    _remove_incident_symlink()
+
     if core_root not in sys.path:
         sys.path.insert(0, core_root)
 
-    from sill_core.diagnosis import Bin, diagnose  # noqa: E402
+    try:
+        from sill_core.diagnosis import Bin, diagnose  # noqa: E402
+    except ImportError:
+        output: dict[str, Any] = {
+            "config_present": bool(config),
+            "config_path": config_path,
+            "ledger_state": ledger.get("state", "none"),
+            "findings": [
+                {
+                    "bin": "real_anomaly",
+                    "key": "sill_core_import_failed",
+                    "title": "The diagnosis engine (sill-core) failed to import",
+                    "explanation": (
+                        "sill-core was found on disk, but its diagnosis module "
+                        "could not be imported — the plugin may be damaged or "
+                        "from an incompatible version."
+                    ),
+                    "fix": (
+                        "Reinstall sill-core: run "
+                        "`/plugin install sill-core@windowsill` in Claude Code, "
+                        "then run `/voice-loop:doctor` again."
+                    ),
+                    "offer_flip": False,
+                    "flip_path": "",
+                    "flip_value": None,
+                    "evidence": {},
+                }
+            ],
+        }
+        print(json.dumps(output, indent=2, ensure_ascii=False))
+        return 0
 
     findings = diagnose(manifest=manifest, config=config, ledger=ledger, logs=logs)
 

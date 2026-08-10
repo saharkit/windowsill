@@ -11,7 +11,9 @@ import base64
 import io
 import json
 
-import soundfile as sf
+import pytest
+
+sf = pytest.importorskip("soundfile")
 
 import voice_server
 from conftest import FakeSilero
