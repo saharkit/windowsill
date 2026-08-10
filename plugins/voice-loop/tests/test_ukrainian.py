@@ -251,7 +251,7 @@ def test_per_language_overrides_are_read_from_the_environment(monkeypatch):
     """The variable name is the language code uppercased, '-' to '_' — and the value is case-folded."""
     monkeypatch.setenv("VOICE_LOOP_TTS_ENGINE_UK", "Ukrainian")
     monkeypatch.setenv("VOICE_LOOP_TTS_ENGINE_ZH_CN", "xtts")
-    assert importlib.reload(voice_server).TTS_ENGINE_BY_LANGUAGE == {"uk": "ukrainian", "zh-cn": "xtts"}
+    assert importlib.reload(voice_server).TTS_ENGINE_BY_LANGUAGE == {"tr": "xtts", "uk": "ukrainian", "zh-cn": "xtts"}
 
     monkeypatch.delenv("VOICE_LOOP_TTS_ENGINE_UK")
     monkeypatch.delenv("VOICE_LOOP_TTS_ENGINE_ZH_CN")

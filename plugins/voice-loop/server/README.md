@@ -126,6 +126,7 @@ Three caps keep any single request from monopolizing an executor:
 | `VOICE_LOOP_TTS_SPEAKER` | per language | override the default speaker |
 | `VOICE_LOOP_XTTS_REFERENCE` | — | wav of the voice to clone — the `xtts` engine refuses requests without it |
 | `VOICE_LOOP_XTTS_MODEL_DIR` | coqui's cache | load XTTS-v2 from a local directory instead of downloading |
+| `VOICE_LOOP_XTTS_MIN_FREE_VRAM_BYTES` | `3221225472` (3 GiB) | minimum free VRAM before XTTS moves to CPU, preserving whisper/RVC GPU tenants |
 | `VOICE_LOOP_STRESS_FILE` | `~/.config/voice-loop/stress.json` | your stress overrides |
 | `VOICE_LOOP_HOOK_STAMP_FILE` | `~/.local/state/voice-loop/hook-last-fired` | the hook's heartbeat stamp — `/health` reports its age as `hook_last_fired_age_s`; see [the troubleshooting entry](../docs/troubleshooting.md#the-voice-stops-entirely-mid-session-but-everything-works-by-hand) |
 | `VOICE_LOOP_ACCENT` | `1` | set `0` to skip automatic accentuation |
@@ -159,8 +160,12 @@ state dir.
 | `de` | `v3_de` | `eva_k` | — |
 | `es` | `v3_es` | `es_0` | — |
 | `fr` | `v3_fr` | `fr_0` | — |
+| `tr` | XTTS-v2 (`VOICE_LOOP_TTS_ENGINE=xtts`) | cloned reference voice | XTTS prosody |
 
-Recognition works for every language whisper supports. A `/tts` request for a language not in the
+Recognition works for every language whisper supports. Turkish is routed to XTTS-v2 by default when
+its optional dependency and reference voice are configured; on a GPU-less machine configure the cloud
+pair `stt.cloud.provider: "deepgram"` and `tts.cloud.provider: "elevenlabs"` instead. A `/tts` request
+for a language not in the
 table returns `400` with the supported list — use a cloud TTS backend for those, or add the model to
 `SILERO_VOICES` in `voice_server.py`. `uk` also has an optional **dedicated engine** with its own
 trained voices (the Silero `v4_ua` voice reads Ukrainian with a noticeably Russian accent) — see

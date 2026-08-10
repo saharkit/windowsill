@@ -162,12 +162,13 @@ python3 "${CLAUDE_PLUGIN_ROOT}/scripts/install_ledger.py" step-done step-0-probe
 Derive the default from `$LC_ALL` / `$LANG` (`ru_RU.UTF-8` → `ru`), falling back to `en`. Ask **one**
 confirm-style question:
 
-> Voice language: **Russian**? (confirm, or pick another: ru, uk, en, de, es, fr — recognition also
+> Voice language: **Russian**? (confirm, or pick another: ru, uk, tr, en, de, es, fr — recognition also
 > works for many more languages than local synthesis does)
 
-Local synthesis (Silero) currently covers `ru, uk, en, de, es, fr`; recognition (whisper) is
-multilingual. If the user names a language outside the synthesis list, say so plainly and offer: cloud
-TTS, or the macOS built-in `say` voice, or recognition-only (dictation without speak-back).
+Local synthesis (Silero) currently covers `ru, uk, en, de, es, fr`; Turkish uses the local XTTS-v2
+cloned-voice engine when configured. Recognition (whisper) is multilingual. If the user names a
+language outside the synthesis list, say so plainly and offer: cloud TTS, or the macOS built-in `say`
+voice, or recognition-only (dictation without speak-back).
 
 *Advanced, mention only if asked or if the user hints at it:* dictation and speak-back may use
 different languages — that is just `stt.language` / `tts.language` next to the top-level `language`.

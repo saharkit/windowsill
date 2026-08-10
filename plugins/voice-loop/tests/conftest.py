@@ -168,6 +168,8 @@ def clean_state(monkeypatch, tmp_path):
         monkeypatch.setattr(voice_server, "TTS_MODEL_OVERRIDE", "")
         monkeypatch.setattr(voice_server, "TTS_SPEAKER_OVERRIDE", "")
         monkeypatch.setattr(voice_server, "TTS_ENGINE", "silero")
+        # Tests opt into language routing explicitly; production defaults route Turkish to XTTS.
+        monkeypatch.setattr(voice_server, "TTS_ENGINE_BY_LANGUAGE", {})
         monkeypatch.setattr(voice_server, "TTS_FALLBACK_ENGINE", "none")  # opt-in per test, never ambient
         monkeypatch.setattr(voice_server, "XTTS_REFERENCE", "")
         monkeypatch.setattr(voice_server, "XTTS_MODEL_DIR", "")
