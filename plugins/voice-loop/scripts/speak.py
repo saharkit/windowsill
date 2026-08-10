@@ -239,6 +239,52 @@ HEALTH_TIMEOUT = 5.0
 
 _SENTENCE_END = re.compile(r"(?<=[.!?…])\s+")
 
+# Latin → Cyrillic character mapping for ru/uk Silero voices. An alert composed in English (the
+# contour poller's messages are all English) has no Cyrillic characters, so a Russian or Ukrainian
+# voice cannot synthesize it — the server returns 400 "no speakable characters". This table maps
+# each Latin letter to a visually/auditorily similar Cyrillic letter, producing text the voice CAN
+# pronounce. The mapping is character-level (not phonetic): the result reads with an accent, which
+# is exactly what makes the alert audible rather than silent.
+_LATIN_TO_CYRILLIC: dict[str, str] = {
+    "A": "А", "a": "а",
+    "B": "Б", "b": "б",
+    "C": "К", "c": "к",
+    "D": "Д", "d": "д",
+    "E": "Е", "e": "е",
+    "F": "Ф", "f": "ф",
+    "G": "Г", "g": "г",
+    "H": "Х", "h": "х",
+    "I": "И", "i": "и",
+    "J": "Й", "j": "й",
+    "K": "К", "k": "к",
+    "L": "Л", "l": "л",
+    "M": "М", "m": "м",
+    "N": "Н", "n": "н",
+    "O": "О", "o": "о",
+    "P": "П", "p": "п",
+    "Q": "К", "q": "к",
+    "R": "Р", "r": "р",
+    "S": "С", "s": "с",
+    "T": "Т", "t": "т",
+    "U": "У", "u": "у",
+    "V": "В", "v": "в",
+    "W": "В", "w": "в",
+    "X": "Кс", "x": "кс",
+    "Y": "Ы", "y": "ы",
+    "Z": "З", "z": "з",
+}
+
+
+def _transliterate_to_cyrillic(text: str) -> str:
+    """Transliterate Latin letters to Cyrillic so ru/uk Silero voices can pronounce the text.
+
+    Non-Latin characters (Cyrillic already present, digits, punctuation) pass through unchanged.
+    The mapping is character-by-character: "Voice contour" becomes "Воисе контур", which reads
+    with an accent but is fully synthesizable by a Russian or Ukrainian voice.
+    """
+    return "".join(_LATIN_TO_CYRILLIC.get(ch, ch) for ch in text)
+
+
 _STATE_DIR = os.path.join(os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state")), "voice-loop")
 _LOG_PATH = os.path.join(_STATE_DIR, "speak.log")
 _LAST_PATH = os.path.join(_STATE_DIR, "last-spoken")
@@ -1170,6 +1216,11 @@ def contour_check(config: dict, t0: float, event: str = "Stop") -> None:
                 log(f"contour: already announced — nothing to voice ({len(alerts)} alert(s) still active)")
             return
         text = f"Voice contour: {'; '.join(alert['message'] for alert in fresh)}"
+        # A non-Latin voice cannot synthesize an all-Latin alert: the server returns 400
+        # "no speakable characters". Transliterate to Cyrillic so the page is audible on
+        # ru/uk deployments — a silent page is a monitor with no output path.
+        if s["language"] in ("ru", "uk"):
+            text = _transliterate_to_cyrillic(text)
         log(f"contour: voicing {len(fresh)} alert(s): {text[:80]}")
         signal.signal(signal.SIGTERM, _on_sigterm)
         if not s["eager"]:
