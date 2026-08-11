@@ -1331,13 +1331,36 @@ def _default_opener():
 def post_wav(url: str, wav: bytes, timeout: float, opener=None) -> bytes:
     """POST one WAV to the recolor service and read its answer back. Blocking, and BOUNDED twice.
 
-    The wall clock is mandatory (a converter that hangs must not hang the voice with it) and the
-    read stops one byte past MAX_UPLOAD_BYTES — the same ceiling /stt puts on audio arriving from
-    the network, applied here for the same reason: a peer's answer is not a promise about its size.
+    The wall clock is mandatory: a converter that hangs — or one that drips a byte every few seconds
+    so the per-operation socket timeout never trips — must not hang the voice with it. So connect,
+    send and the bounded read run on a worker joined at ``timeout``; a breach raises and the caller
+    degrades to the base voice. The read still stops one byte past MAX_UPLOAD_BYTES — the same ceiling
+    /stt puts on audio arriving from the network, for the same reason: a peer's answer is not a
+    promise about its size.
     """
     request = urllib.request.Request(url, data=wav, headers={"Content-Type": "audio/wav"}, method="POST")
-    with (opener or _default_opener()).open(request, timeout=timeout) as response:
-        return response.read(MAX_UPLOAD_BYTES + 1)
+    # `timeout` handed to the opener bounds each blocking socket operation, not the exchange as a
+    # whole — a slow drip that keeps every recv under it never trips it. The wall clock is enforced
+    # here instead: the open + bounded read run on a worker joined at `timeout`, so a slow peer
+    # cannot hold the voice past the budget. The socket timeout stays set too, so a worker orphaned
+    # by a breach unblocks on its own once its current recv elapses, rather than wedging a socket.
+    exchange: dict[str, object] = {}
+
+    def _exchange() -> None:
+        try:
+            with (opener or _default_opener()).open(request, timeout=timeout) as response:
+                exchange["body"] = response.read(MAX_UPLOAD_BYTES + 1)
+        except BaseException as exc:  # urllib's whole error family, re-raised on the caller's thread
+            exchange["error"] = exc
+
+    worker = threading.Thread(target=_exchange, daemon=True)
+    worker.start()
+    worker.join(timeout)
+    if worker.is_alive():
+        raise TimeoutError("the RVC recolor stage exceeded its wall-clock budget")
+    if "error" in exchange:
+        raise exchange["error"]
+    return exchange["body"]
 
 
 def count_rvc(recolored: bool) -> None:
@@ -1374,7 +1397,7 @@ def recolor(wav: bytes) -> tuple[bytes, bool]:
         log.warning("the RVC recolor stage failed (%s) — sending the base voice through", type(exc).__name__)
         count_rvc(False)
         return wav, False
-    if len(recolored) > MAX_UPLOAD_BYTES or not recolored.startswith(b"RIFF"):
+    if len(recolored) > MAX_UPLOAD_BYTES or not recolored.startswith(b"RIFF") or recolored[8:12] != b"WAVE":
         log.warning(
             "the RVC recolor stage answered with %d bytes that are not a WAV — sending the base "
             "voice through",

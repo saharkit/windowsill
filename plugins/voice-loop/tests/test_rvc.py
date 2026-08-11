@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import base64
 import json
+import threading
 import urllib.error
 import urllib.request
 
@@ -108,6 +109,41 @@ def test_post_wav_reads_one_byte_past_the_upload_cap(monkeypatch):
     body = voice_server.post_wav("http://127.0.0.1:7865/convert", b"RIFFbase", 1.0, opener=converter)
 
     assert body == b"RIFF" + b"x" * 5  # 8 + 1, and no more
+
+
+def test_a_converter_that_breaches_the_wall_clock_budget_raises_timeout():
+    """The breach arm of the deadline: a converter still mid-exchange when the budget elapses makes
+    `post_wav` raise TimeoutError.
+
+    Every other test drives an instant fake, so the worker has always finished by the time `join`
+    returns — the `worker.is_alive()` True arc and the raise itself never ran. Here the fake hangs
+    past the budget. The hang is gated by a threading.Event, not a bare sleep, so the worker it
+    orphans unblocks the moment the test releases it (no thread parked for the rest of the session),
+    and a wait-backstop caps it even if that release somehow never ran. The worker can never finish
+    on its own, so `is_alive()` is True at the deadline on every runner — the raise is deterministic,
+    not a race against the clock.
+    """
+    release = threading.Event()
+    completed = threading.Event()
+
+    class HangingConverter(FakeConverter):
+        def open(self, request, timeout=None):
+            release.wait(5.0)  # bounded backstop — never parks the worker indefinitely
+            response = super().open(request, timeout)
+            completed.set()  # the orphaned worker ran to completion — nothing left parked
+            return response
+
+    converter = HangingConverter()
+    try:
+        with pytest.raises(TimeoutError):
+            voice_server.post_wav(
+                "http://127.0.0.1:7865/convert", b"RIFFbase", 0.1, opener=converter
+            )
+    finally:
+        release.set()
+
+    assert completed.wait(2.0)  # the worker we breached on unblocked and finished
+    assert len(converter.posts) == 1
 
 
 # --- degrade, never silence -------------------------------------------------------------------------
