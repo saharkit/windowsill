@@ -182,12 +182,19 @@ from collections.abc import Callable, Iterator
 from datetime import datetime, timezone
 
 # The one module in scripts/ this file imports: the provider registry (see providers.py). It
-# resolves because sys.path[0] is this file's directory when speak.sh runs it; the tests, which
+# resolves because sys.path[0] is this file's directory when the hook calls it — the tests, which
 # load this file by spec_from_file_location, put scripts/ on sys.path themselves.
-import providers
-# The stdlib-only websocket client the streaming TTS holder needs (see wsclient.py). The launcher
-# checks for what it needs the same way it checks for providers.py and this file's own .py.
-import wsclient
+#
+# When the imports fail and this file is the process entry point (hooks.json calls python3
+# directly), exit silently: the same contract the bash launcher provided — a half-copied scripts/
+# directory is silence, not a traceback in the middle of a turn.
+try:
+    import providers
+    import wsclient
+except ImportError:
+    if __name__ == "__main__":
+        sys.exit(0)
+    raise
 
 try:
     import fcntl

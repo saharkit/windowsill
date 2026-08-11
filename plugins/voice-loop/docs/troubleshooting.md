@@ -162,7 +162,7 @@ hook by hand synthesizes and plays fine:
 
 ```sh
 printf '%s' '{"transcript_path": "/path/to/your/transcript.jsonl"}' \
-  | bash "${CLAUDE_PLUGIN_ROOT}/scripts/speak.sh"
+  | python3 "${CLAUDE_PLUGIN_ROOT}/scripts/speak.py"
 ```
 
 **Cause:** the harness itself has stopped invoking the Stop hook. That is above the plugin's pay
