@@ -485,6 +485,7 @@ plugins/voice-loop/
   server/                     the self-hostable speech server (FastAPI + faster-whisper + Silero), Dockerfile
   tests/                      the server's unit tests (no models, no network) — 100% gated in CI
   docs/                       architecture, troubleshooting, FAQ
+  rvc/                        RVC voice-conversion operator tooling (training pipeline + serving)
   pytest.ini, .coveragerc     this plugin's own test run (invoked from this directory)
   TESTING.md                  the human acceptance checklist
 ```
