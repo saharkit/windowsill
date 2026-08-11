@@ -583,7 +583,8 @@ def _convert_sync(data: bytes, p: dict):
             info = sf.info(in_path)
         except Exception as exc:
             _stats["errors"] += 1
-            return JSONResponse({"error": f"undecodable audio: {exc}"}, status_code=400)
+            log.warning("undecodable audio: %s", exc)
+            return JSONResponse({"error": "undecodable audio"}, status_code=400)
         if info.duration > MAX_INPUT_SECONDS:
             _stats["errors"] += 1
             return JSONResponse(
@@ -632,7 +633,7 @@ def _convert_sync(data: bytes, p: dict):
     except Exception as exc:
         _stats["errors"] += 1
         log.error("convert failed: %s", exc, exc_info=True)
-        return JSONResponse({"error": str(exc)}, status_code=500)
+        return JSONResponse({"error": "conversion failed"}, status_code=500)
     finally:
         _bump(-1)
         try:
