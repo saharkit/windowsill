@@ -159,16 +159,51 @@ python3 "${CLAUDE_PLUGIN_ROOT}/scripts/install_ledger.py" step-done step-0-probe
 
 ## Step 1 — language (ASK FIRST — it shapes every later option)
 
-Derive the default from `$LC_ALL` / `$LANG` (`ru_RU.UTF-8` → `ru`), falling back to `en`. Ask **one**
-confirm-style question:
+Derive the default from `$LC_ALL` / `$LANG` (`ru_RU.UTF-8` → `ru`), falling back to `en`.
 
-> Voice language: **Russian**? (confirm, or pick another: ru, uk, tr, en, de, es, fr — recognition also
-> works for many more languages than local synthesis does)
+Ask **two** questions in one batch — speech pattern FIRST (it changes what `stt.language` Step 4
+will write, so it must be known before the language picker; Step 2's backend then determines the
+value). State the speech-pattern options in the **user's** terms; do not name vendor tokens:
+
+**Q1 — Speech pattern:**
+
+> - **Single-language** — mostly one language, you stay in it.
+> - **Mixed: mostly LANG with English terms** — code, technical jargon, names, product names.
+>   Anyone who codes and does not speak English natively dictates in this register.
+
+**Q2 — Voice language:**
+
+> Voice language: **Russian**? (confirm, or pick another: ru, uk, tr, en, de, es, fr — recognition
+> also works for many more languages than local synthesis does)
+
+### What "mixed" actually writes (the per-backend translation)
+
+Step 1 runs BEFORE the backend is chosen, so the user states an **intent**; Step 4 translates it to
+`stt.language` per the backend Step 2 selected. The user never types a vendor token — the skill
+maps it. Honest about where the mapping is solid and where it is not:
+
+| Backend (Step 2) | Mixed-speech `stt.language` value | Verified how |
+|---|---|---|
+| **Local whisper** (`local` / `lan`) | `""` (empty) — the local server passes an empty `language` to faster-whisper, which then auto-detects per segment. For recurring jargon, set `VOICE_LOOP_STT_HINT` to a comma-separated list of names/terms; the server feeds it as whisper's `initial_prompt`. | **VERIFIED** — `server/voice_server.py` reads `VOICE_LOOP_LANGUAGE` and passes it to faster-whisper; an empty value is the documented auto-detect path; `VOICE_LOOP_STT_HINT` rides as `initial_prompt`. |
+| **ElevenLabs Scribe** (`cloud`) | `""` (empty) — Scribe's `language_code` form field is dropped, which asks Scribe to auto-detect. | **VERIFIED** — `scripts/providers.py` omits the field when `s["language"]` is falsy; `tests/test_providers.py::test_an_empty_language_leaves_scribe_to_auto_detect` asserts `language_code` is absent from the body. |
+| **Deepgram nova-3** (`cloud`) | `"multi"` — Deepgram's nova-3 multilingual code-switching mode. **Trade-off for Ukrainian:** nova-3 multilingual does NOT cover Ukrainian; Ukrainian needs `stt.model: "nova-2"`, which then loses mixed-speech support. State that plainly if the user is Ukrainian, and point at local whisper or ElevenLabs as alternatives. | **VERIFIED** — `PROVIDERS.md` documents the `"multi"` token and the `nova-2` Ukrainian fallback; the request builder sends whatever `stt.language` is as a query parameter. |
+| **OpenAI whisper-1** (`cloud`) | Keep `stt.language` as the dominant language (no special value). Whisper-1 with `language=ru` set is reasonably robust to occasional English terms, but **this plugin does not pass the OpenAI `prompt` parameter** — so the OpenAI API's documented jargon-priming lever is NOT wired in here. Occasional English terms may be transcribed wrong; reliability is best-effort, not guaranteed. | **UNVERIFIED in this codebase** — no code, no test, no doc passes the OpenAI `prompt` parameter. The lever exists in OpenAI's API; it is simply not implemented in this plugin. Do not promise it. |
+
+**Cost (say it in one sentence):** A multilingual model is usually slightly weaker on pure
+single-language speech than a pinned one. The choice is informed, not free — the plugin will write
+what you asked for, not what it guesses.
+
+### Recognition — the old line was misleading
+
+The previous Step 1 said *"Recognition (whisper) is multilingual."* That is true on the **local**
+whisper server (faster-whisper auto-detects when `stt.language` is empty) and **misleading on
+cloud** — every cloud provider here pins recognition to `stt.language`, so the choice matters
+more on the cloud path, and mixed speech needs saying so. The table above is the replacement.
 
 Local synthesis (Silero) currently covers `ru, uk, en, de, es, fr`; Turkish uses the local XTTS-v2
-cloned-voice engine when configured. Recognition (whisper) is multilingual. If the user names a
-language outside the synthesis list, say so plainly and offer: cloud TTS, or the macOS built-in `say`
-voice, or recognition-only (dictation without speak-back).
+cloned-voice engine when configured. Recognition still works for many more languages than synthesis
+does. If the user names a language outside the synthesis list, say so plainly and offer: cloud TTS,
+or the macOS built-in `say` voice, or recognition-only (dictation without speak-back).
 
 *Advanced, mention only if asked or if the user hints at it:* dictation and speak-back may use
 different languages — that is just `stt.language` / `tts.language` next to the top-level `language`.
@@ -568,6 +603,13 @@ Field notes worth telling the user:
     offer `tts.cloud.provider: "deepgram"` to a user whose `language` is `ru` or `uk`. Its
     *recognition* covers Russian (with `stt.language: "multi"`), and Ukrainian only on
     `stt.model: "nova-2"`.
+  - **`stt.language` for mixed speech (the Step 1 mapping).** If the user picked **mixed** in Step 1,
+    write `stt.language` per the table there — `""` (empty) for `local` / `lan` / ElevenLabs
+    Scribe; `"multi"` for Deepgram nova-3; the dominant language for OpenAI whisper-1 (no special
+    value — the OpenAI `prompt` parameter is the documented jargon-priming lever and this plugin
+    does NOT pass it). The top-level `language` (TTS voice selection) stays as the dominant
+    language either way. Say the value you wrote and why, in one line, so a user who later switches
+    backend knows to revisit this.
   - When the user already has an ElevenLabs key configured for TTS (`VOICE_LOOP_TTS_API_KEY`),
     offer `elevenlabs` for STT as the natural choice — the same key covers both directions with no
     extra setup. That shared-key rule is ElevenLabs' STT rule alone; every other provider needs its

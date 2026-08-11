@@ -1585,6 +1585,40 @@ def test_elevenlabs_scribe_posts_the_documented_shape(state, monkeypatch, opener
     assert b'name="file"; filename="dictate.wav"' in body
 
 
+def test_an_explicitly_empty_stt_language_reaches_scribe_with_no_language_code(state, monkeypatch, opener):
+    """windowsill#159: the skill writes ``stt.language: ""`` to ask Scribe to auto-detect mixed
+    speech. ``cfg`` used to collapse that empty value to the top-level ``language`` (``ru`` on the
+    operator's machine), so Scribe was handed ``language_code=ru`` — the opposite of auto-detect, and
+    exactly the pinned hint that drops the second tongue. ``test_an_empty_language_leaves_scribe_to_
+    auto_detect`` in test_providers.py proved the builder omits ``language_code`` for an empty value
+    but built ``s`` by hand, so it passed while the real path never produced that empty value. This
+    one goes through ``resolve_settings`` from an actual config dict, the path the unit test skipped."""
+    (state / "dictate.wav").write_bytes(b"RIFFfakewav")
+    fake = opener(b'{"text": "mixed speech"}')
+    monkeypatch.setenv("VOICE_LOOP_STT_API_KEY", "xi-secret")
+    s = dictate.resolve_settings(
+        {"language": "ru", "stt": {"backend": "cloud", "cloud": {"provider": "elevenlabs"}, "language": ""}},
+        "Linux",
+    )
+    assert s["language"] == ""  # the empty escape hatch reached settings, not the top-level "ru"
+    assert dictate.transcribe(s) == "mixed speech"
+    assert b"language_code" not in fake.requests[0][0].data  # no hint pinned — Scribe auto-detects
+
+
+def test_an_explicitly_empty_stt_language_reaches_the_local_server_unpinned(state, opener):
+    """windowsill#159, the local-whisper half: a pinned ``ru`` is exactly the configuration that
+    drops English words from a mixed sentence, so the empty escape hatch must reach the LAN request
+    as an empty ``?language=`` rather than the top-level ``ru``. The local server auto-detects when
+    no language is pinned; the bug would have produced ``?language=ru`` here."""
+    (state / "dictate.wav").write_bytes(b"RIFFfakewav")
+    fake = opener(b'{"text": "mixed speech"}')
+    s = dictate.resolve_settings({"language": "ru", "stt": {"language": ""}}, "Linux")
+    assert s["language"] == ""  # the empty escape hatch reached settings, not the top-level "ru"
+    assert dictate.transcribe(s) == "mixed speech"
+    # the bug collapsed "" to "ru" and pinned the recogniser; the fix leaves the query empty
+    assert fake.requests[0][0].full_url == "http://127.0.0.1:8355/stt?language="
+
+
 def test_elevenlabs_stt_falls_back_to_tts_key(state, monkeypatch, opener):
     """When VOICE_LOOP_STT_API_KEY is not set, ElevenLabs STT tries the TTS key —
     one credentials home, not a second one."""

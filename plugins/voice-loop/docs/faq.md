@@ -21,10 +21,12 @@ whole session, not your code. Keys are read from a file or a named environment v
 in `config.json`.
 
 **Which languages work?**
-Recognition is multilingual (whisper). Local synthesis ships English (`v3_en`), Russian (`v4_ru`),
-Ukrainian (`v4_ua`), German (`v3_de`), Spanish (`v3_es`), French (`v3_fr`). Russian and Ukrainian
-additionally get automatic stress marking, which is what keeps them from sounding drunk. Any other
-language: recognition still works, and for synthesis use a cloud voice or the macOS built-in `say`.
+Local whisper auto-detects languages. Cloud recognition is told one up front by `stt.language`, so
+that choice matters and mixed speech must be identified during setup. Local synthesis ships English
+(`v3_en`), Russian (`v4_ru`), Ukrainian (`v4_ua`), German (`v3_de`), Spanish (`v3_es`), French
+(`v3_fr`). Russian and Ukrainian additionally get automatic stress marking, which is what keeps them
+from sounding drunk. Any other language: recognition still works, and for synthesis use a cloud voice
+or the macOS built-in `say`.
 
 **Can I have my own voice?**
 `/voice-design` casts one: you describe the timbre you want, it auditions candidates, and the one you
