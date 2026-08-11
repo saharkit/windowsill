@@ -184,13 +184,23 @@ jobs:
           echo "::group::scripts coverage gate (ratcheting from 80%)"
           python -m coverage report --include='scripts/*' --fail-under=80
           echo "::endgroup::"
-          # Append to the shelf-level combined coverage total so a future report can sum
-          # across plugins. The combine runs from the repo root so its .coverage is the
-          # single shelf-level data file; --append preserves this plugin's own .coverage.
-          echo "::group::shelf coverage total"
-          cd "$GITHUB_WORKSPACE"
-          python -m coverage combine --append plugins/voice-loop/.coverage
-          echo "::endgroup::"
+
+      # The plugin's own .coverage is what gets uploaded — the same file pytest just wrote, with
+      # nothing in between touching it.  Previously this job also ran `coverage combine --append`
+      # to maintain a shelf-level .coverage at the repo root, on the assumption that "a future
+      # report can sum across plugins" — but the combined-coverage job below is that future: it
+      # downloads each plugin's per-runner artifact and combines them itself with the path remap,
+      # so the shelf-level file has had no consumer for several rounds and its `coverage combine`
+      # was deleting the very file this step uploads.  Removed.
+      - name: upload coverage for combined report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-voice-loop-${{ matrix.python }}
+          path: plugins/voice-loop/.coverage
+          # .coverage starts with a dot — v4 excludes hidden files by default, which is why
+          # `if-no-files-found: error` was firing even on a green matrix leg.
+          include-hidden-files: true
+          if-no-files-found: error
 
   sill-core-coverage:
     name: sill-core unit tests (${{ matrix.os }}, python ${{ matrix.python }})
@@ -211,6 +221,17 @@ jobs:
       - name: pytest with a hard 100% coverage gate
         working-directory: plugins/sill-core
         run: pytest --cov=sill_core --cov-report=term-missing --cov-fail-under=100
+
+      - name: upload coverage for combined report (ubuntu only)
+        if: matrix.os == 'ubuntu-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-sill-core-${{ matrix.python }}
+          path: plugins/sill-core/.coverage
+          # .coverage starts with a dot — v4 excludes hidden files by default, which is why
+          # `if-no-files-found: error` was firing on every ubuntu leg.
+          include-hidden-files: true
+          if-no-files-found: error
 
   loopback:
     name: loopback selftest (${{ matrix.os }}, ${{ matrix.language }})
@@ -1146,6 +1167,105 @@ jobs:
         if: failure()
         run: kill "$(cat /tmp/voice-loop.pid)" 2>/dev/null || true
 
+  combined-coverage:
+    name: combined coverage gate
+    runs-on: ubuntu-latest
+    needs: [coverage, sill-core-coverage]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: install coverage
+        run: python -m pip install coverage
+      - name: download voice-loop coverage
+        uses: actions/download-artifact@v4
+        with:
+          pattern: coverage-voice-loop-*
+          path: coverage-data/voice-loop
+      - name: download sill-core coverage
+        uses: actions/download-artifact@v4
+        with:
+          pattern: coverage-sill-core-*
+          path: coverage-data/sill-core
+      - name: combine all plugin data and enforce the shelf gate
+        run: |
+          set -euo pipefail
+          VOICE=$(find coverage-data/voice-loop -name '.coverage' 2>/dev/null | wc -l)
+          SILL=$(find coverage-data/sill-core -name '.coverage' 2>/dev/null | wc -l)
+          [ "$VOICE" -gt 0 ] || {
+            echo "FAIL: no voice-loop coverage artifacts ($VOICE found)"
+            echo "an artifact was not uploaded, or the upload step was skipped"
+            exit 1
+          }
+          [ "$SILL" -gt 0 ] || {
+            echo "FAIL: no sill-core coverage artifacts ($SILL found)"
+            echo "an artifact was not uploaded, or the upload step was skipped"
+            exit 1
+          }
+          echo "combining $VOICE voice-loop + $SILL sill-core coverage files"
+
+          # Path remapping: each runner's .coverage records absolute paths under
+          # $GITHUB_WORKSPACE.  This job checks out the same repo at the same
+          # path, so map runner paths → checkout paths so every source file
+          # appears once in the combined report.
+          cat > .coveragerc-combined <<'RCFILE'
+          [paths]
+          source =
+              /home/runner/work/windowsill/windowsill
+              .
+          [report]
+          show_missing = True
+          # Both plugins' own .coveragerc set the same single exclude — only
+          # "pragma: no cover".  The combined report replaces coverage.py's
+          # built-in excludes with an identical list, so the denominator the
+          # per-plugin gates measure is the same denominator the combined gate
+          # measures.  No hidden difference.
+          exclude_lines =
+              pragma: no cover
+          RCFILE
+          export COVERAGE_RCFILE="$PWD/.coveragerc-combined"
+
+          python -m coverage combine --keep \
+            coverage-data/voice-loop/*/.coverage \
+            coverage-data/sill-core/*/.coverage
+
+          # If the path remap above did NOT collapse the two runners' paths,
+          # each source file appears twice.  The combined percentage drops but
+          # can still clear 90 % — the gate passes while measuring the wrong
+          # thing.  Catch that here: fail loudly when any path is duplicated.
+          python -m coverage json -o - | python3 -c "
+          import json, sys
+          from collections import Counter
+          data = json.load(sys.stdin)
+          paths = sorted(data.get('files', {}).keys())
+
+          # Normalize to repo-relative by stripping known CI runner prefixes.
+          # After a working remap every path is already relative and passes
+          # through unchanged.  A failed remap leaves runner-absolute paths
+          # that normalise to the same relative stem — the duplicate lands here.
+          def norm(p):
+              for prefix in (
+                  '/home/runner/work/windowsill/windowsill/',
+                  '/Users/runner/work/windowsill/windowsill/',
+                  'D:/a/windowsill/windowsill/',
+              ):
+                  if p.startswith(prefix):
+                      return p[len(prefix):]
+              return p
+
+          normed = [norm(p) for p in paths]
+          dupes = {p: c for p, c in Counter(normed).items() if c > 1}
+          if dupes:
+              print('FAIL: path remap did not collapse runner paths — these files are duplicated:')
+              for p, c in sorted(dupes.items()):
+                  print(f'  {p} ({c}x)')
+              sys.exit(1)
+          print(f'OK: {len(normed)} unique source files, no duplicates')
+          "
+
+          python -m coverage report --fail-under=90
+
   # The ONE context the main-protection ruleset requires (infra#216, the night-wards #1538 pattern):
   # an aggregate that needs every real job and reports on EVERY run — `if: always()` means a failed or
   # skipped dependency still produces this check-run (as a failure), so the required context can never
@@ -1154,7 +1274,7 @@ jobs:
   gate:
     name: gate
     runs-on: ubuntu-latest
-    needs: [shellcheck, coverage, sill-core-coverage, loopback]
+    needs: [shellcheck, coverage, sill-core-coverage, loopback, combined-coverage]
     if: always()
     steps:
       - name: every needed job succeeded
