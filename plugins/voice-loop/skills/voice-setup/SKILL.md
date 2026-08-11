@@ -745,16 +745,21 @@ One rule before the per-desktop recipes: **on macOS, bind a physical chord, not 
 the macOS subsection below for why and for the question to ask. On Linux the F-row is a real key and
 `F9` remains the default.
 
-### No graphical session — skip the hotkey
+### No graphical session — skip the hotkey (Linux only)
 
-If the Step 0 probe printed `XDG_SESSION_TYPE=` (empty) and `XDG_CURRENT_DESKTOP=` (empty),
-the machine has no graphical session — a headless box, WSL without a desktop, an SSH shell,
-or a container.  A hotkey binding needs a desktop session to receive it, so **skip this step**
-with a stated reason rather than probing for a desktop that is not there:
+This check is **Linux only** — decide from the Step 0 `uname -s` line. macOS does not export
+`XDG_SESSION_TYPE` or `XDG_CURRENT_DESKTOP` even on a full Aqua desktop, so both are normally
+empty on a Mac that *does* have a graphical session. Empty XDG vars on macOS must not be read
+as headless — skip this section and use the macOS branch below.
 
-> `XDG_SESSION_TYPE` and `XDG_CURRENT_DESKTOP` are both empty — this machine has no graphical
-> session, so a desktop hotkey cannot be bound.  Dictation still works from the command line:
-> `voice-loop-dictate send` from any terminal.  Skip to Step 7.
+On Linux, if the Step 0 probe printed `XDG_SESSION_TYPE=` (empty) and `XDG_CURRENT_DESKTOP=`
+(empty), the machine has no graphical session — a headless box, WSL without a desktop, an SSH
+shell, or a container.  A hotkey binding needs a desktop session to receive it, so **skip this
+step** with a stated reason rather than probing for a desktop that is not there:
+
+> `XDG_SESSION_TYPE` and `XDG_CURRENT_DESKTOP` are both empty — this Linux machine has no
+> graphical session, so a desktop hotkey cannot be bound.  Dictation still works from the command
+> line: `voice-loop-dictate send` from any terminal.  Skip to Step 7.
 
 Leave the stable launcher in place (`~/.local/bin/voice-loop-dictate`) — it is harmless on a
 headless box and is ready if a desktop session is added later.
