@@ -852,12 +852,12 @@ def test_the_mailto_is_trimmed_harder_than_the_url():
     assert "truncated" in urllib.parse.unquote(url)
 
 
-def test_the_mailto_tier_reports_itself_unavailable_until_a_mailbox_exists(monkeypatch):
+def test_the_mailto_tier_is_available_by_default(monkeypatch):
     monkeypatch.delenv("VOICE_LOOP_REPORT_MAILBOX", raising=False)
     monkeypatch.setattr(report_bug.shutil, "which", lambda name: None)
     tiers = {row["name"]: row for row in report_bug.transports(runner_returning())}
-    assert tiers["mailto"]["available"] is False
-    assert "MX" in tiers["mailto"]["reason"]
+    assert tiers["mailto"]["available"] is True
+    assert "reports@saharkit.com" in tiers["mailto"]["destination"]
     assert tiers["url"]["available"] is True  # the tier that always works needs nothing installed
 
 
@@ -879,12 +879,13 @@ def test_every_transport_names_its_destination(monkeypatch):
 # --- the command line -------------------------------------------------------------------------------------
 
 
-def test_the_mailto_command_refuses_rather_than_inventing_an_address(monkeypatch, tmp_path, capsys):
+def test_the_mailto_command_sends_to_the_default_address(monkeypatch, tmp_path, capsys):
     monkeypatch.delenv("VOICE_LOOP_REPORT_MAILBOX", raising=False)
     bundle = tmp_path / "b.md"
     bundle.write_text("## bundle\n")
-    assert report_bug.main(["mailto", "--title", "t", "--bundle", str(bundle)]) == 1
-    assert "no service mailbox" in capsys.readouterr().err
+    assert report_bug.main(["mailto", "--title", "t", "--bundle", str(bundle)]) == 0
+    out = capsys.readouterr().out
+    assert "mailto:reports@saharkit.com" in urllib.parse.unquote(out)
 
 
 def test_the_gh_command_does_not_send_when_gh_is_not_ready(monkeypatch, capsys):

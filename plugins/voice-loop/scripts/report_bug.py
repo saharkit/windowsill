@@ -105,13 +105,11 @@ GH_TIMEOUT = 30.0
 ISSUE_URL_LIMIT = 8000
 MAILTO_LIMIT = 1800
 
-# The service mailbox for the no-GitHub tier. It is EMPTY on purpose: `saharkit.com` publishes no MX
-# record today, so a hardcoded address here would send a user's report into a black hole that looks
-# like success. The transport is built and tested; it reports itself unavailable until an operator
-# points this at a mailbox that exists (via the env var, or by this default gaining a value once the
-# conformance ticket for the mailbox closes).
+# The service mailbox for the no-GitHub tier. The address `reports@saharkit.com` (a Google Group)
+# receives reports; the `VOICE_LOOP_REPORT_MAILBOX` environment variable overrides it if set. This
+# tier composes a mailto: URL in the user's own mail client and sends nothing by itself.
 _MAILBOX_ENV = "VOICE_LOOP_REPORT_MAILBOX"
-_DEFAULT_MAILBOX = ""
+_DEFAULT_MAILBOX = "reports@saharkit.com"
 
 
 def _default_clock() -> datetime:
@@ -1060,14 +1058,9 @@ def transports(runner: Runner = _default_runner) -> list[dict[str, object]]:
         },
         {
             "name": "mailto",
-            "available": bool(mailbox),
-            "reason": (
-                f"addressed to {mailbox}"
-                if mailbox
-                else f"no service mailbox is configured (set ${_MAILBOX_ENV}); the project's domain "
-                "publishes no MX record yet, so this tier would silently drop the report"
-            ),
-            "destination": f"your mail client, addressed to {mailbox}" if mailbox else "(unavailable)",
+            "available": True,
+            "reason": f"addressed to {mailbox}",
+            "destination": f"your mail client, addressed to {mailbox}",
         },
     ]
 
@@ -1117,8 +1110,7 @@ def _cmd_mailto(args: argparse.Namespace) -> int:
     address = args.to or service_mailbox()
     if not address:
         print(
-            f"no service mailbox is configured: set ${_MAILBOX_ENV} or pass --to. "
-            "The project's domain publishes no MX record yet, so this tier is not live.",
+            f"no service mailbox is configured: set ${_MAILBOX_ENV} or pass --to.",
             file=sys.stderr,
         )
         return 1

@@ -287,11 +287,10 @@ print(issue_url('conformance: voice-loop v<version> (<date>)', body))
 Give the human the URL to open themselves. Say plainly: "nothing is sent until
 you press Submit."
 
-### mailto transport (unavailable — same reason as /report-bug)
+### mailto transport
 
-The project's domain publishes no MX record. Say so, and point at the URL
-transport instead. If the human has set `VOICE_LOOP_REPORT_MAILBOX`, use
-`report_bug.mailto_url` with that address.
+Available and addressed to `reports@saharkit.com` (a Google Group). If the human has set
+`VOICE_LOOP_REPORT_MAILBOX`, use `report_bug.mailto_url` with that address.
 
 ### Don't file
 
