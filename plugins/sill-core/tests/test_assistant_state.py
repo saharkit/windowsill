@@ -588,6 +588,7 @@ def _writer_worker_same_plugin(state_dir: str, worker_id: int) -> None:
 # kill -9 live process test
 # ---------------------------------------------------------------------------
 
+@pytest.mark.skipif(sys.platform == "win32", reason="SIGKILL is not supported on Windows")
 class TestKill9Live:
     """A real SIGKILL mid-write leaves the old state or new state intact.
 

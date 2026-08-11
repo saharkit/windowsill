@@ -21,14 +21,48 @@ Pattern bricks consulted:
 
 from __future__ import annotations
 
-import fcntl
 import json
 import os
+import sys
 import tempfile
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterator
+
+if sys.platform == "win32":          # pragma: no cover
+    import msvcrt as _flock
+
+    def _acquire_lock(lock_path: Path) -> int:
+        """Acquire a blocking exclusive advisory lock, returning an fd to release."""
+        fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR)
+        try:
+            _flock.locking(fd, _flock.LK_LOCK, 1)
+        except BaseException:
+            os.close(fd)
+            raise
+        return fd
+
+    def _release_lock(fd: int) -> None:
+        """Release the lock and close the fd."""
+        try:
+            _flock.locking(fd, _flock.LK_UNLCK, 1)
+        finally:
+            os.close(fd)
+
+else:                                # pragma: no cover
+    import fcntl as _flock
+
+    def _acquire_lock(lock_path: Path) -> object:
+        """Acquire a blocking exclusive advisory lock, returning a file object."""
+        lock_file = lock_path.open("a+")
+        _flock.flock(lock_file.fileno(), _flock.LOCK_EX)
+        return lock_file
+
+    def _release_lock(lock_handle: object) -> None:
+        """Release the lock and close the file."""
+        _flock.flock(lock_handle.fileno(), _flock.LOCK_UN)
+        lock_handle.close()
 
 CURRENT_SCHEMA = 1
 """The schema version stamped into every written state file.
@@ -101,12 +135,11 @@ class AssistantState:
         """Hold the per-plugin lock across a read-modify-write transaction."""
         self._state_dir.mkdir(parents=True, exist_ok=True)
         lock_path = self._state_dir / "assistant-state.lock"
-        with lock_path.open("a+") as lock_file:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
-            try:
-                yield
-            finally:
-                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+        lock_handle = _acquire_lock(lock_path)
+        try:
+            yield
+        finally:
+            _release_lock(lock_handle)
 
     def _read(self) -> dict[str, Any]:
         """Read the current state dict from disk.

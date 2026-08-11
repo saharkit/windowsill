@@ -193,12 +193,13 @@ jobs:
           echo "::endgroup::"
 
   sill-core-coverage:
-    name: sill-core unit tests (python ${{ matrix.python }})
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
+    name: sill-core unit tests (${{ matrix.os }}, python ${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
     strategy:
       fail-fast: false
       matrix:
+        os: [ubuntu-latest, windows-latest]
         python: ["3.10", "3.11", "3.12", "3.13"]
     steps:
       - uses: actions/checkout@v4
