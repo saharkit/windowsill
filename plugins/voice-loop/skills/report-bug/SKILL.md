@@ -97,21 +97,9 @@ Give them the URL to open themselves. The body is trimmed to fit a browser addre
 where it was cut; the full bundle is the file on disk. Nothing is sent until they submit the form —
 say that, it is what makes this tier easy to accept.
 
-**No GitHub at all** — a mailto: to the project's intake mailbox, which the maintainer forwards into
-an issue:
-
-```sh
-bash "${CLAUDE_PLUGIN_ROOT}/scripts/report-bug.sh" mailto \
-  --title "voice-loop: <short symptom>" --bundle "<bundle path>"
-```
-
-**This tier is not live yet** and `transports` will say so: the project's domain publishes no MX
-record, so there is no mailbox to receive it and a message sent there would vanish looking like
-success. Until that changes, the honest offer is: leave the bundle on disk and give them the
-pre-filled URL, or the repository's issue page to paste the bundle into by hand. An operator who
-does have a mailbox points the collector at it with `VOICE_LOOP_REPORT_MAILBOX=<address>`; a mailto
-body is trimmed harder than a URL one (2 KiB is the smallest handler limit), so the file stays on
-disk for them to attach.
+**No GitHub at all** — a mailto: to `reports@saharkit.com` (a Google Group). The bundle file stays
+on disk: mailto cannot attach, so the body carries the digest and the user attaches the file if they
+want the rest. Nothing is sent until they press Submit in their mail client.
 
 ## Rules
 

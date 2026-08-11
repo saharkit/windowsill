@@ -659,8 +659,7 @@ What the collector strips before you ever see it:
 
 Then you pick a transport: **`gh issue create`** if you have the CLI (issues are where the fixes
 live), a **pre-filled new-issue URL** you submit yourself if you have a GitHub account but no CLI, or
-a **mailto:** if you have neither — that last one waits on a project mailbox that does not exist yet,
-and `/report-bug` says so rather than sending mail into a void. The bundle file stays in
+a **mailto:** if you have neither — addressed to `reports@saharkit.com`. The bundle file stays in
 `~/.local/state/voice-loop/` either way; if you decline, it never leaves your machine.
 
 The collector runs standalone too, if you would rather read the bundle before Claude does:
