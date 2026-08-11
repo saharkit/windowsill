@@ -62,15 +62,24 @@ through) it is the **ear-check** — the agent speaks a line and you confirm you
 custom synthetic voice afterwards: `/voice-design`. To take the whole contour back off:
 [`/voice-remove`](#uninstall).
 
-Supported platforms: Linux and macOS. On Windows, WSL2 + WSLg is the recommended route (see
-the [shelf README](../../README.md#running-on-windows)) — still unverified on real hardware,
-tracked in [#41](https://github.com/saharkit/windowsill/issues/41). Two things that pass has
-to establish before we claim them: **audio** — WSLg routes sound through a PulseAudio server
-on the Windows side, and whether the default recorder/player chain (`pw-record` / `arecord` /
-`aplay`) picks that up unchanged is exactly the open question; and **`lan` topology** — a
-separate Linux box on the network is reached unchanged, but a server on the Windows host
-itself is not `localhost` from inside WSL (use the host's IP), and exposing a server running
-*inside* WSL to the LAN needs a port proxy or mirrored networking.
+Supported platforms: Linux and macOS. On Windows, use **WSL2 + WSLg on Windows 11**: install
+WSL2 with `wsl --install` from elevated PowerShell, then follow this page's Linux quickstart
+inside the distro. WSLg supplies the Linux GUI/audio integration for an attended Windows desktop;
+the WSL2 verification pass confirmed the marketplace install, the registered hook command,
+CI-style fake-recorder dictation, and a `lan` loopback against a remote server. It did **not**
+measure live Claude Code hook dispatch, speaker or microphone passthrough, `/voice-setup` end to
+end, or the bundled local server inside WSL, so those are not claims of this page. The pass used an explicit `--endpoint`
+because a fresh distro without `jq` ignored the valid config; the config-driven selftest remains
+an open prerequisite. See the [shelf Windows section](../../README.md#running-on-windows) and the
+[verification record](TESTING.md#8-wsl2-verification-record-2026-08-11).
+
+### Windows, WSL2 + WSLg
+
+WSL2's network path to a separate LAN server works as ordinary Linux networking. A server on the
+Windows host is not `localhost` from inside WSL; use the host's reachable IP. Exposing a server
+running inside WSL to the LAN needs port proxying or mirrored networking. The WSL2 pass did not
+exercise WSLg microphone capture or the local bundled server, so test those on an attended machine
+before choosing those contours.
 
 **On macOS, one trap is worth knowing about even though setup now handles it.** python.org-installer
 Python ships an **empty certificate store**, so until `/Applications/Python 3.x/Install

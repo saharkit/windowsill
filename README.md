@@ -21,12 +21,15 @@ claude plugin marketplace add saharkit/windowsill
 (or, from inside a running Claude Code session, the slash-command form: `/plugin marketplace add
 saharkit/windowsill`.)
 
-Then install what you want — this one is typed **inside a session**, not in your shell:
+Then install what you want from your shell:
 
-```text
-/plugin install voice-loop@windowsill   # voice-loop also needs sill-core — install both:
-/plugin install sill-core@windowsill
+```sh
+claude plugin install voice-loop@windowsill   # voice-loop also needs sill-core — install both:
+claude plugin install sill-core@windowsill
 ```
+
+If you are already in a Claude Code session, the equivalent slash commands are
+`/plugin install voice-loop@windowsill` and `/plugin install sill-core@windowsill`.
 
 ## Tester ritual
 
@@ -39,11 +42,11 @@ claude plugin list --available --json
 
 The second command lists what the marketplace makes available. `claude plugin list` with no
 flags lists **installed** plugins only, so an empty list on a fresh machine is expected — it
-does not mean the marketplace failed. Install the plugin from inside a Claude Code session,
-then inspect the installed metadata:
+does not mean the marketplace failed. Install the plugin from the shell (or use the equivalent
+slash command inside a session), then inspect the installed metadata:
 
-```text
-/plugin install voice-loop@windowsill
+```sh
+claude plugin install voice-loop@windowsill
 ```
 
 Back in the shell:
@@ -82,30 +85,32 @@ remind-once logic run on Windows with the same 100% branch-coverage gate as Linu
 kill-9 crash-consistency tests are skipped; `fcntl` advisory locking is replaced with
 `msvcrt.locking`). The rest of the shelf — voice-loop's server, hooks, hotkeys, audio
 capture and playback — still depends on POSIX facilities (process groups, `pkill`,
-`fcntl`) and has **not** been verified on native Windows.
-[#42](https://github.com/saharkit/windowsill/issues/42) tracks the remaining work.
+`fcntl`) and is not a native-Windows path. [#42](https://github.com/saharkit/windowsill/issues/42)
+tracks that work.
 
-The recommended route for **voice-loop** on a Windows machine is **WSL2 with WSLg** on
-Windows 11 — and honesty first: nobody has run voice-loop end to end on a real Windows
-machine yet (WSL or native).
-[#41](https://github.com/saharkit/windowsill/issues/41) tracks that verification pass;
-until it lands, this is the route we recommend, not a tested guarantee.
-
-From an elevated PowerShell:
+The documented Windows path for **voice-loop** is **WSL2 with WSLg on Windows 11**. From an
+elevated PowerShell, install WSL2 with:
 
 ```powershell
 wsl --install
 ```
 
-Restart when it asks; on first launch the distro prompts for a UNIX username and password. If
-the install fails with a virtualization error, enable virtualization in your UEFI/BIOS first.
-(Windows 10 21H2+ can also run WSLg via the Store WSL package, but Windows 11 is the route we
-intend to verify.)
+Restart if Windows asks, complete the distro setup, then open the WSL terminal. Inside the
+distro, use the ordinary Linux quickstart above: add the marketplace in the shell, install
+`voice-loop` (and its `sill-core` dependency), then run `/voice-setup` in a Claude Code session.
+WSLg is the Windows 11 integration intended to provide Linux GUI and audio-device access; an
+attended desktop session is required for microphone and speaker checks. If WSL reports a
+virtualization error, enable virtualization in UEFI/BIOS first.
 
-Inside the distro, **Add the marketplace** above works exactly as written — the marketplace
-add and the `/plugin install` both. A plugin's own setup may have platform-specific steps;
-its README is the place to check — for voice-loop's audio and server notes on WSL, see
-[its README](plugins/voice-loop/README.md).
+A real WSL2 pass on Windows 11 24H2 (Ubuntu 24.04, WSL 2.7.11, WSLg 1.0.73.2) verified the
+marketplace install, the registered hook command, dictation with the CI-style fake recorder,
+and a `lan` loopback against a remote speech server. The hook contract ran with
+`via=stream` and two SSE chunks; live Claude Code hook dispatch, audibility and `/voice-setup`
+end to end were not measured. The loopback passed with an explicit `--endpoint`; a fresh distro without `jq`
+did not pass the config-driven form. Microphone passthrough and the bundled local-server
+path inside WSL were not exercised, so this page claims neither. See the
+[voice-loop WSL2 verification record](plugins/voice-loop/TESTING.md#8-wsl2-verification-record-2026-08-11)
+and [its WSL notes](plugins/voice-loop/README.md#windows-wsl2--wslg).
 
 ## What is on the sill
 
