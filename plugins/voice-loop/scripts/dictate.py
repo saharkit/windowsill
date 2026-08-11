@@ -367,6 +367,25 @@ def resolve_stt_provider(name: str):
     return entry
 
 
+def resolve_stt_language(config: dict):
+    """The STT language, where an explicitly-empty ``stt.language`` survives and only a genuinely
+    absent key falls back to the top-level ``language``.
+
+    ``cfg`` treats empty as absent on purpose — bash-cfg parity, and the right rule for every other
+    setting (``test_empty_string_falls_back_to_default`` pins it for ``stt.endpoint``). This is the
+    one setting where that rule inverts: the voice-setup skill writes ``stt.language: ""`` to ask the
+    recogniser to auto-detect mixed speech, and a value that collapses to the top-level ``language``
+    is exactly the pinned hint that drops the second tongue (windowsill#159). So here an empty STRING
+    survives, a null still falls back the way it does everywhere else, and only a missing key
+    inherits the top-level ``language`` — which is the escape hatch the skill documents actually
+    reaching the providers (Scribe drops ``language_code`` on a falsy value; the local server
+    auto-detects)."""
+    stt = config.get("stt") if isinstance(config, dict) else None
+    if isinstance(stt, dict) and "language" in stt and stt["language"] is not None:
+        return stt["language"]
+    return cfg(config, "language", "en")
+
+
 def resolve_settings(config: dict, system: str) -> dict:
     """Every knob dictate-toggle.sh honoured, same names, same defaults, same precedence."""
     # the provider is an ENTRY, never a branch — every per-provider default below comes off it
@@ -398,9 +417,10 @@ def resolve_settings(config: dict, system: str) -> dict:
         "player": str(cfg(config, "speak.player", "afplay" if system == "Darwin" else "aplay -q")),
         "backend": str(cfg(config, "stt.backend", "lan")),
         "endpoint": str(cfg(config, "stt.endpoint", "http://127.0.0.1:8355")),
-        # top-level "language" is the one the user sets; ".stt.language" is the advanced escape
-        # for people who dictate in one language and listen in another.
-        "language": str(cfg(config, "stt.language", cfg(config, "language", "en"))),
+        # top-level "language" is the one the user sets; ".stt.language" is the advanced escape —
+        # and unlike every other setting an explicitly-empty ".stt.language" survives (it is how a
+        # user asks the recogniser to auto-detect mixed speech), so it has its own resolver.
+        "language": str(resolve_stt_language(config)),
         "stt_model": str(cfg(config, "stt.model", entry.default_model)),
         "stt_command": str(cfg(config, "stt.command", "")),
         "stt_provider": entry.name,
