@@ -423,6 +423,13 @@ def resolve_settings(config: dict, system: str) -> dict:
         "language": str(resolve_stt_language(config)),
         "stt_model": str(cfg(config, "stt.model", entry.default_model)),
         "stt_command": str(cfg(config, "stt.command", "")),
+        # stt.prompt: free-text jargon that biases the recogniser toward the user's recurring
+        # vocabulary. ONE key reaches two paths — the cloud OpenAI request (as the `prompt` form
+        # field) and the local server (as faster-whisper's initial_prompt, via _transcribe_lan's
+        # ?prompt= query) — so a local user sets it in config.json rather than hand-editing the
+        # server's systemd unit (VOICE_LOOP_STT_HINT). Trimmed here; the cloud builder truncates it
+        # to the API's token cap, the local path sends it whole.
+        "stt_prompt": str(cfg(config, "stt.prompt", "")).strip(),
         "stt_provider": entry.name,
         "cloud_endpoint": str(cfg(config, "stt.cloud.endpoint", "")),
         "key_env": str(cfg(config, "stt.cloud.api_key_env", cfg(config, "stt.api_key_env", "VOICE_LOOP_STT_API_KEY"))),
@@ -978,16 +985,25 @@ def transcribe(s: dict) -> str:
         log("cloud stt failed — falling back to local whisper")
         # The degrade always goes to the localhost server, not to the configured cloud
         # endpoint: a cloud user's ``stt.endpoint`` may point at a remote API.
-        return _transcribe_lan("http://127.0.0.1:8355", s["language"], wav_bytes, s["timeout"])
-    return _transcribe_lan(s["endpoint"], s["language"], wav_bytes, s["timeout"])
+        return _transcribe_lan("http://127.0.0.1:8355", s["language"], wav_bytes, s["timeout"], s["stt_prompt"])
+    return _transcribe_lan(s["endpoint"], s["language"], wav_bytes, s["timeout"], s["stt_prompt"])
 
 
-def _transcribe_lan(endpoint: str, language: str, wav_bytes: bytes, timeout: float) -> str:
+def _transcribe_lan(endpoint: str, language: str, wav_bytes: bytes, timeout: float, prompt: str = "") -> str:
     """POST the WAV to a voice-loop server's /stt endpoint — the LAN path and the
-    cloud-degrade target both use this."""
+    cloud-degrade target both use this.
+
+    ``prompt`` carries the configured jargon (``stt.prompt``) as a ``?prompt=`` query parameter so the
+    local server feeds it to faster-whisper as ``initial_prompt`` — the same key that primes the cloud
+    OpenAI request, reaching the local path without a systemd edit. Omitted when empty, so the server
+    falls back to its own ``VOICE_LOOP_STT_HINT`` default (an operator-wide hint) and the request
+    shape is unchanged for users who set nothing."""
     boundary = uuid.uuid4().hex
     body = multipart_form({}, "audio", "dictate.wav", wav_bytes, boundary)
-    url = f"{endpoint}/stt?language={urllib.parse.quote(language)}"
+    query = f"language={urllib.parse.quote(language)}"
+    if prompt:
+        query += f"&prompt={urllib.parse.quote(prompt)}"
+    url = f"{endpoint}/stt?{query}"
     raw = _post_multipart(url, {}, body, boundary, timeout)
     return transcript_from_response(raw)
 

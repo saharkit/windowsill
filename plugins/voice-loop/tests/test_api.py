@@ -145,6 +145,18 @@ def test_stt_passes_the_lexicon_hint_and_uses_vad(client, fake_whisper, monkeypa
     assert fake_whisper.calls[0]["vad_filter"] is True
 
 
+def test_stt_takes_the_prompt_from_the_query_and_it_wins_over_the_server_wide_hint(client, fake_whisper, monkeypatch):
+    """windowsill#162, server half — the unification. A client's ``stt.prompt`` arrives as ``?prompt=``
+    and feeds faster-whisper's initial_prompt, WINNING over the server-wide ``VOICE_LOOP_STT_HINT`` so a
+    local user's config key reaches the recogniser without editing the systemd unit. The other
+    direction (no query param -> the env default) is the test just above; together they two-way pin the
+    precedence. A regression that ignored ``?prompt=`` and always used ``STT_HINT`` would silently break
+    local prompting, and nothing existing would notice."""
+    monkeypatch.setattr(voice_server, "STT_HINT", "server-wide default")
+    client.post("/stt?prompt=kubectl%2C%20Acme", files={"audio": ("clip.wav", b"RIFFfake", "audio/wav")})
+    assert fake_whisper.calls[0]["initial_prompt"] == "kubectl, Acme"  # the request won, not the env
+
+
 # --- /tts ------------------------------------------------------------------------------------------
 
 

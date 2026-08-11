@@ -9,7 +9,9 @@ LAN or an ssh tunnel. Everything is configured through the environment — see R
     VOICE_LOOP_LANGUAGE      default language code       (default en; see SILERO_VOICES below)
     VOICE_LOOP_STT_MODEL     faster-whisper model size   (default small)
     VOICE_LOOP_COMPUTE_TYPE  auto | float16 | int8 | ... (default auto: float16 on cuda, int8 on cpu)
-    VOICE_LOOP_STT_HINT      optional lexicon hint biasing the recognizer toward your jargon
+    VOICE_LOOP_STT_HINT      optional lexicon hint biasing the recognizer toward your jargon (the
+                             SERVER-wide default; a per-request ?prompt= from a client's stt.prompt
+                             wins over it)
     VOICE_LOOP_TTS_ENGINE    silero | xtts | ukrainian   (default silero; xtts = XTTS-v2 voice cloning,
                              ukrainian = the dedicated robinhad/ukrainian-tts voices — speaks uk only)
     VOICE_LOOP_TTS_ENGINE_<LANG>  per-language engine override, e.g. VOICE_LOOP_TTS_ENGINE_UK=ukrainian
@@ -1663,14 +1665,22 @@ def bounded_segments(
         yield segment
 
 
-def transcribe_upload(data: bytes, language: str) -> tuple[str, object]:
-    """The blocking body of /stt — runs in the threadpool so the event loop stays responsive."""
+def transcribe_upload(data: bytes, language: str, prompt: str | None = None) -> tuple[str, object]:
+    """The blocking body of /stt — runs in the threadpool so the event loop stays responsive.
+
+    ``prompt`` is the per-request jargon hint a client's ``stt.prompt`` sends as ``?prompt=``; it
+    WINS over the server-wide ``VOICE_LOOP_STT_HINT`` so a local user's config key reaches
+    faster-whisper's ``initial_prompt`` without editing the systemd unit. ``None``/empty (the client
+    sent nothing) falls back to that operator default — backwards-compatible with every deployed
+    server, and the path every existing request still takes.
+    """
+    hint = prompt if prompt else STT_HINT
     with tempfile.NamedTemporaryFile(suffix=".wav") as handle:
         handle.write(data)
         handle.flush()
         with model_slot(resolve_device()):  # whisper is the one model that follows the GPU
             segments, info = whisper().transcribe(
-                handle.name, language=language, vad_filter=True, initial_prompt=STT_HINT
+                handle.name, language=language, vad_filter=True, initial_prompt=hint
             )
             text = " ".join(
                 segment.text.strip() for segment in bounded_segments(segments, STT_TIMEOUT)
@@ -1679,7 +1689,7 @@ def transcribe_upload(data: bytes, language: str) -> tuple[str, object]:
 
 
 @app.post("/stt")
-async def stt(request: Request, audio: UploadFile = File(...), language: str = "") -> JSONResponse:
+async def stt(request: Request, audio: UploadFile = File(...), language: str = "", prompt: str = "") -> JSONResponse:
     refusal = cross_site_error(request)
     if refusal is not None:
         return refusal
@@ -1703,7 +1713,7 @@ async def stt(request: Request, audio: UploadFile = File(...), language: str = "
             status_code=413,
         )
     try:
-        text, info = await run_in_threadpool(transcribe_upload, data, language)
+        text, info = await run_in_threadpool(transcribe_upload, data, language, prompt)
     except TranscriptionTimeout:
         # The slot went back with the failed call (model_slot releases on the way out), so the
         # queue behind it moves on immediately — which is the whole point of the bound.

@@ -29,6 +29,29 @@ the cloud rows below are the path that works today.
 | `elevenlabs` (STT) | `scribe_v1` | a second or two; accuracy-first rather than latency-first | ≈**$0.0067/min** (≈$0.40/hour) on the paid tiers | 99 languages, **Russian ✅ Ukrainian ✅ Turkish ✅**; `stt.language` rides as Scribe's `language_code` (the plugin defaults it to `en`), and an explicitly empty value asks it to auto-detect | audio leaves the machine; zero-retention is an account/enterprise setting |
 | `deepgram` (STT) | `nova-3` | the quickest of the three on short clips | ≈**$0.0043/min** pre-recorded; new accounts start with a **$200 credit** | **Russian ✅ Turkish ✅** via nova-3 multilingual (set `stt.language: "multi"`); **Ukrainian ⚠️** — nova-3 multilingual does not cover it, use `stt.model: "nova-2"` and check the vendor's model/language matrix | audio leaves the machine; a self-hosted deployment is offered, and `stt.cloud.endpoint` points at one |
 
+### Jargon priming — `stt.prompt`
+
+A free-text lexicon in `stt.prompt` biases the recogniser toward your recurring vocabulary — the
+technical terms, product names and jargon a bare model transcribes wrong. It is the documented fix
+for mixed speech (a Russian sentence carrying English terms): measured on real operator audio, a
+bare `whisper-1 ru` wrote *"… Sighted, 16-bit, Little, Indian."*; primed with the neighbouring terms
+it wrote *"… signed, 16-bit, little endian."* — **exact**. The priming even generalises: it recovered
+*signed* verbatim though that word was not in the prompt list.
+
+One key reaches two paths, and no provider gets a promise that was not measured:
+
+| path | `stt.prompt` | how |
+|---|---|---|
+| `openai` (STT) | ✅ sent as the API's `prompt` field | the measured win above; truncated to a conservative token-safe budget (see below) |
+| `local` / `lan` (whisper) | ✅ sent per request as faster-whisper's `initial_prompt` | the `?prompt=` query parameter **wins over** the server-wide `VOICE_LOOP_STT_HINT`, so a local user sets it in `config.json` rather than hand-editing the server's systemd unit |
+| `elevenlabs` (Scribe) | — not sent, **not needed** | measured: Scribe transcribed *"Signed sixteen bit little endian"* correctly with no lever at all |
+| `deepgram` (STT) | — not sent | Deepgram's keyterm prompting is model-specific and is **not wired here**; do not assume it |
+
+The OpenAI API caps `prompt` at 224 tokens; the plugin truncates to a conservative character budget
+on a term boundary (see `truncate_stt_prompt` in [`scripts/providers.py`](scripts/providers.py)) so
+the cap is never exceeded and the API never has to cut silently — no term is split, and the leading
+most-relevant terms are kept.
+
 ### Streaming speech-to-text — `stt.cloud.streaming`
 
 A batch dictation makes a long one pay twice: you speak for a minute, then wait at the end while

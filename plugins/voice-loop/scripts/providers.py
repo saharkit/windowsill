@@ -349,12 +349,51 @@ def multipart_form(fields: dict[str, str], file_field: str, filename: str, paylo
 # --- STT request builders ------------------------------------------------------------------------
 
 
+# OpenAI caps the transcription ``prompt`` at 224 tokens. ``scripts/`` is stdlib-only, so there is
+# no tokenizer here to count those exactly; this is a conservative CHARACTER budget sized against the
+# densest script the plugin supports — Cyrillic, ~2 chars/token at the dense end of whisper's BPE
+# (the real ratio is ~2.5-3.3, so this leaves margin). Sized to the dense end rather than a Latin
+# blend on purpose: under the cap does nothing, over it is the SILENT mid-prompt cut this exists to
+# prevent, and a Latin lexicon simply fits more under the same budget (the safe direction).
+STT_PROMPT_MAX_CHARS = 448
+
+
+def truncate_stt_prompt(text: str, limit: int = STT_PROMPT_MAX_CHARS) -> str:
+    """A lexicon prompt trimmed to ``limit`` characters on the last term boundary.
+
+    The 224-token cap is the constraint and a character budget is the stdlib-only proxy for it (see
+    ``STT_PROMPT_MAX_CHARS``). Truncation lands on the last comma or space at or before the limit so a
+    term is never split mid-word, and the LEADING terms are kept — a lexicon is ordered
+    most-relevant-first. ``limit`` is an argument so the one consumer (the OpenAI builder) and its
+    tests name the cap in one place; no other path truncates, because faster-whisper's
+    ``initial_prompt`` has no such cap.
+    """
+    text = text.strip()
+    if len(text) <= limit:
+        return text
+    head = text[:limit]
+    boundary = max(head.rfind(","), head.rfind(" "))
+    if boundary <= 0:  # no boundary to land on: a hard cut, trimmed
+        return head.rstrip()
+    return head[:boundary].rstrip(" ,")
+
+
 def _openai_stt(entry: SttProvider, s: dict, key: str, wav_bytes: bytes, boundary: str) -> SttRequest:
     """The OpenAI speech-to-text API (and anything that speaks its shape): multipart, the model and
-    the language as form fields, a bearer token."""
-    body = multipart_form(
-        {"model": s["stt_model"], "language": s["language"]}, "file", "dictate.wav", wav_bytes, boundary
-    )
+    the language as form fields, a bearer token.
+
+    ``prompt`` is the jargon-priming lever the API documents (measured on operator audio: priming with
+    neighbouring technical vocabulary recovered *signed* and *little endian* verbatim where the bare
+    model transcribed *Sighted* / *Little Indian*). It is omitted when ``stt.prompt`` is empty — an
+    empty field would be a no-op prompt, and omitting keeps the request shape stable for the users who
+    set none (the common case), mirroring how Scribe's ``language_code`` is omitted on an empty
+    language. The 224-token cap is honoured by ``truncate_stt_prompt``, not by the API silently.
+    """
+    fields: dict[str, str] = {"model": s["stt_model"], "language": s["language"]}
+    prompt = truncate_stt_prompt(str(s.get("stt_prompt", "")))
+    if prompt:
+        fields["prompt"] = prompt
+    body = multipart_form(fields, "file", "dictate.wav", wav_bytes, boundary)
     return SttRequest(
         f"{entry.endpoint(s)}/v1/audio/transcriptions",
         {"Authorization": f"Bearer {key}"},

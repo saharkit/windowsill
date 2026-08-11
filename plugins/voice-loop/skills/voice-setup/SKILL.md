@@ -184,14 +184,38 @@ maps it. Honest about where the mapping is solid and where it is not:
 
 | Backend (Step 2) | Mixed-speech `stt.language` value | Verified how |
 |---|---|---|
-| **Local whisper** (`local` / `lan`) | `""` (empty) — the local server passes an empty `language` to faster-whisper, which then auto-detects per segment. For recurring jargon, set `VOICE_LOOP_STT_HINT` to a comma-separated list of names/terms; the server feeds it as whisper's `initial_prompt`. | **VERIFIED** — `server/voice_server.py` reads `VOICE_LOOP_LANGUAGE` and passes it to faster-whisper; an empty value is the documented auto-detect path; `VOICE_LOOP_STT_HINT` rides as `initial_prompt`. |
+| **Local whisper** (`local` / `lan`) | `""` (empty) — the local server passes an empty `language` to faster-whisper, which then auto-detects per segment. For recurring jargon, set `stt.prompt` (see the seeding offer below) — the client sends it as `?prompt=`, which the server feeds to faster-whisper as `initial_prompt`; the server-wide `VOICE_LOOP_STT_HINT` is the fallback when a client sends none, so a local user sets it in `config.json` rather than editing a systemd unit. | **VERIFIED** — `server/voice_server.py` reads `VOICE_LOOP_LANGUAGE` and passes it to faster-whisper; an empty value is the documented auto-detect path; the `/stt` `?prompt=` query wins over `VOICE_LOOP_STT_HINT` as `initial_prompt` (`tests/test_api.py`). |
 | **ElevenLabs Scribe** (`cloud`) | `""` (empty) — Scribe's `language_code` form field is dropped, which asks Scribe to auto-detect. | **VERIFIED** — `scripts/providers.py` omits the field when `s["language"]` is falsy; `tests/test_providers.py::test_an_empty_language_leaves_scribe_to_auto_detect` asserts `language_code` is absent from the body. |
 | **Deepgram nova-3** (`cloud`) | `"multi"` — Deepgram's nova-3 multilingual code-switching mode. **Trade-off for Ukrainian:** nova-3 multilingual does NOT cover Ukrainian; Ukrainian needs `stt.model: "nova-2"`, which then loses mixed-speech support. State that plainly if the user is Ukrainian, and point at local whisper or ElevenLabs as alternatives. | **VERIFIED** — `PROVIDERS.md` documents the `"multi"` token and the `nova-2` Ukrainian fallback; the request builder sends whatever `stt.language` is as a query parameter. |
-| **OpenAI whisper-1** (`cloud`) | Keep `stt.language` as the dominant language (no special value). Whisper-1 with `language=ru` set is reasonably robust to occasional English terms, but **this plugin does not pass the OpenAI `prompt` parameter** — so the OpenAI API's documented jargon-priming lever is NOT wired in here. Occasional English terms may be transcribed wrong; reliability is best-effort, not guaranteed. | **UNVERIFIED in this codebase** — no code, no test, no doc passes the OpenAI `prompt` parameter. The lever exists in OpenAI's API; it is simply not implemented in this plugin. Do not promise it. |
+| **OpenAI whisper-1** (`cloud`) | Keep `stt.language` as the dominant language (no special value) AND seed `stt.prompt` with the user's English terms (see the seeding offer below). Whisper-1 with `language=ru` is reasonably robust to occasional English terms, and `stt.prompt` is the documented jargon-priming lever — now wired: priming with the neighbouring terms recovered *signed* and *little endian* verbatim where the bare model wrote *Sighted* / *Little Indian*. | **VERIFIED** — `scripts/providers.py::_openai_stt` sends `stt.prompt` as the `prompt` form field (omitted when empty, truncated to a token-safe budget); `tests/test_providers.py` pins the builder and `tests/test_dictate.py` pins it through `resolve_settings`. |
 
 **Cost (say it in one sentence):** A multilingual model is usually slightly weaker on pure
 single-language speech than a pinned one. The choice is informed, not free — the plugin will write
 what you asked for, not what it guesses.
+
+### Seeding `stt.prompt` (only when the user picked Mixed)
+
+The user just said "I mix in English terms" — that is the exact moment to ask which terms, in the
+**user's** register (not the vendor's):
+
+> You mentioned you mix in English terms. Want to list the ones you use most — product names,
+> commands, jargon — so recognition leans toward them? Optional; free text, comma-separated, and
+> you can edit it later.
+
+Write their answer to `stt.prompt`. One key reaches both paths, and no provider gets a promise that
+was not measured:
+
+- **OpenAI cloud** — rides as the API's `prompt` field (the measured jargon lever).
+- **Local / LAN whisper** — the client sends it as `?prompt=`, which the server feeds to
+  faster-whisper's `initial_prompt`. No systemd edit: `VOICE_LOOP_STT_HINT` is now the server-wide
+  *fallback*, not the only way in.
+- **ElevenLabs Scribe** — **not sent**; Scribe was measured to handle mixed speech correctly without
+  it, so do not promise an effect (the key is simply ignored on this backend).
+- **Deepgram** — **not sent**; keyterm prompting is model-specific and is not wired here.
+
+Keep it optional: an empty answer writes nothing (the key stays absent). Truncation to the OpenAI
+API's token cap is automatic — do not ask the user to count. Say in one line that the list lives in
+`config.json` under `stt.prompt` and can be edited any time.
 
 ### Recognition — the old line was misleading
 
@@ -606,10 +630,10 @@ Field notes worth telling the user:
   - **`stt.language` for mixed speech (the Step 1 mapping).** If the user picked **mixed** in Step 1,
     write `stt.language` per the table there — `""` (empty) for `local` / `lan` / ElevenLabs
     Scribe; `"multi"` for Deepgram nova-3; the dominant language for OpenAI whisper-1 (no special
-    value — the OpenAI `prompt` parameter is the documented jargon-priming lever and this plugin
-    does NOT pass it). The top-level `language` (TTS voice selection) stays as the dominant
-    language either way. Say the value you wrote and why, in one line, so a user who later switches
-    backend knows to revisit this.
+    value). Then write the user's terms to **`stt.prompt`** if they gave any (see the Step 1 seeding
+    offer) — one key primes OpenAI's `prompt` field and the local whisper `initial_prompt` alike.
+    The top-level `language` (TTS voice selection) stays as the dominant language either way. Say the
+    value you wrote and why, in one line, so a user who later switches backend knows to revisit this.
   - When the user already has an ElevenLabs key configured for TTS (`VOICE_LOOP_TTS_API_KEY`),
     offer `elevenlabs` for STT as the natural choice — the same key covers both directions with no
     extra setup. That shared-key rule is ElevenLabs' STT rule alone; every other provider needs its
