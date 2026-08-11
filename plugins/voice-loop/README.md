@@ -67,11 +67,11 @@ WSL2 with `wsl --install` from elevated PowerShell, then follow this page's Linu
 inside the distro. WSLg supplies the Linux GUI/audio integration for an attended Windows desktop;
 the WSL2 verification pass confirmed the marketplace install, the registered hook command,
 CI-style fake-recorder dictation, and a `lan` loopback against a remote server. It did **not**
-measure live Claude Code hook dispatch, speaker or microphone passthrough, or the bundled local
-server inside WSL, so those are not claims of this page. The pass used an explicit `--endpoint`
+measure live Claude Code hook dispatch, speaker or microphone passthrough, `/voice-setup` end to
+end, or the bundled local server inside WSL, so those are not claims of this page. The pass used an explicit `--endpoint`
 because a fresh distro without `jq` ignored the valid config; the config-driven selftest remains
 an open prerequisite. See the [shelf Windows section](../../README.md#running-on-windows) and the
-[verification record](TESTING.md#wsl2-verification-record-2026-08-11).
+[verification record](TESTING.md#8-wsl2-verification-record-2026-08-11).
 
 ### Windows, WSL2 + WSLg
 

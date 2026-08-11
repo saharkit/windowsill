@@ -401,6 +401,18 @@ end to end, `wsl --install` from a blank host, or the bundled local server insid
 remain unverified. The headless stand had no recorder, clipboard tools, `jq`, ffmpeg, or unzip;
 the real dictation path therefore failed closed with `no recorder available`, as expected.
 
+### Still to verify (attended Windows desktop required)
+
+These are the checks the 2026-08-11 pass did not reach; run them on a real Windows 11 + WSLg
+machine and fill the rows before claiming them anywhere.
+
+| # | check | expected | observed | pass |
+|---|---|---|---|---|
+| 8.6 | End a reply with a `🔊` line under live Claude Code hook dispatch | the Stop hook fires and the line is audible on the WINDOWS host's speakers — the row that decides the WSLg audio claim | | |
+| 8.7 | `scripts/dictate-toggle.sh` with a real microphone | the log states WHICH recorder `resolve_recorder` selected, and the recorded WAV is non-empty — the row that catches a present-but-daemonless `pw-record` winning the resolution order and then failing | | |
+| 8.8 | `/voice-setup` end to end inside the distro | the skill completes and ends with its proof (the green loopback selftest or the ear-check) | | |
+| 8.9 | `scripts/selftest.sh` in its config-driven form (no `--endpoint`) | green loopback with the endpoint read from config; the 2026-08-11 pass found a valid config ignored when `jq` was absent, so install `jq` first | | |
+
 ---
 
 **Sign-off**
