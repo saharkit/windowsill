@@ -20,9 +20,12 @@
 # SMOKE_DONE is printed only after every one of those checks has passed.
 set -e
 DIR=$HOME/voice/rvc/Applio/logs/scheherazade
+# shellcheck disable=SC2012
 IN=${1:-$(ls "$DIR"/sliced_audios/*.wav | head -1)}
 OUT=${2:-$HOME/voice/rvc/smoke_out.wav}
+# shellcheck disable=SC2012
 PTH=$(ls -t "$DIR"/scheherazade_*e_*s.pth 2>/dev/null | head -1)
+# shellcheck disable=SC2012
 IDX=$(ls -t "$DIR"/*.index 2>/dev/null | head -1)
 echo "input:   $IN"
 echo "weights: $PTH"

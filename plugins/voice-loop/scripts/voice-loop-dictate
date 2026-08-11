@@ -68,12 +68,21 @@ def _current_script() -> Path | None:
 def main() -> int:
     script = _current_script()
     if script is None:
-        return 0
+        print(
+            "voice-loop-dictate: cannot identify exactly one current voice-loop install — "
+            "the registry is missing, empty, or ambiguous",
+            file=sys.stderr,
+        )
+        return 1
     try:
         os.execv(str(script), [str(script), *sys.argv[1:]])
-    except OSError:
-        return 0
-    return 0
+    except OSError as err:
+        print(
+            f"voice-loop-dictate: exec failed: {err}",
+            file=sys.stderr,
+        )
+        return 1
+    return 1  # unreachable — execv replaces the process on success
 
 
 if __name__ == "__main__":

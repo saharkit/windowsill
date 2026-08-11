@@ -266,15 +266,20 @@ class TestScenarioRealAnomaly:
         assert f.evidence["match_count"] >= 1
 
     def test_player_failed_in_log(self) -> None:
+        # D3: the previous fixture invented a line speak.py never writes
+        # ("player failed: No such file or directory: 'aplay'").  The
+        # real failing-playback line is "played rc=1" — the player spawned
+        # but exited non-zero.  The old assertion tested the OSError-only
+        # path and missed the one the user actually hits.
         logs = {
             "speak.log": [
-                "2026-08-05T12:00:01 player failed: No such file or directory: 'aplay'",
+                "2026-08-05T12:00:01 played rc=1 bytes=232844 chunks=1 via=stream",
             ],
             "dictate.log": [],
         }
         findings = diagnose(MANIFEST, logs=logs)
 
-        f = _find_by_key(findings, "player_failed")
+        f = _find_by_key(findings, "player_nonzero_exit")
         assert f is not None, f"findings: {[x.key for x in findings]}"
         assert f.bin == Bin.REAL_ANOMALY
 

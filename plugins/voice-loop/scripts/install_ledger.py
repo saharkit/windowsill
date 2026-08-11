@@ -317,7 +317,10 @@ def finish_install(
 ) -> dict[str, Any]:
     """Mark the install as complete.  Idempotent.
 
-    Returns the updated state dict.  Exit 0 even if already complete.
+    Returns the updated state dict.  **Refuses** (returns an error dict
+    with ``"success": False`` and the list of incomplete steps) when any
+    step in ``step_order`` is not complete — the ground truth must not
+    call itself complete while a step is unfinished (D4).
     """
     if ledger_path is None:
         ledger_path = _default_ledger_path()
@@ -327,6 +330,25 @@ def finish_install(
     ledger = _require_ledger(ledger_path)
     if ledger.get("state") == "complete":
         return check_state(ledger_path)  # already complete — truly idempotent
+
+    steps: dict[str, Any] = ledger.get("steps", {})
+    step_order: list[str] = ledger.get("step_order", list(INSTALL_STEPS))
+    incomplete = [
+        sid
+        for sid in step_order
+        if steps.get(sid, {}).get("status") != "complete"
+    ]
+    if incomplete:
+        return {
+            "success": False,
+            "state": ledger.get("state", "in_progress"),
+            "incomplete_steps": incomplete,
+            "message": (
+                f"refusing to finish: {len(incomplete)} step(s) are not complete "
+                f"({', '.join(incomplete)})"
+            ),
+        }
+
     now_ts = _ts(clock)
     ledger["state"] = "complete"
     ledger["completed_at"] = now_ts
@@ -474,7 +496,8 @@ def main(argv: list[str] | None = None) -> int:
         elif cmd == "finish":
             result = finish_install(ledger_path or None)
             _print_json(result)
-            return 0
+            # D4: finish refuses when steps are incomplete — exit 2
+            return 2 if result.get("success") is False else 0
 
         elif cmd == "cancel":
             result = cancel_install(ledger_path or None)

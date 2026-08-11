@@ -362,6 +362,11 @@ class TestCompleteInstall:
         install_ledger.start_install(ledger_path, clock=clock)
         assert install_ledger.check_state(ledger_path)["started_at"] == "2026-08-05T12:00:00+00:00"
 
+        # D4: finish_install now requires all steps to be complete first —
+        # a "full lifecycle" MUST walk every step.
+        for sid in install_ledger.INSTALL_STEPS:
+            install_ledger.step_done(sid, ledger_path, clock=clock)
+
         clock.advance(30)
         install_ledger.finish_install(ledger_path, clock=clock)
         assert install_ledger.check_state(ledger_path)["completed_at"] == "2026-08-05T12:00:30+00:00"

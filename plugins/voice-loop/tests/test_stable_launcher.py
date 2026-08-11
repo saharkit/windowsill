@@ -52,16 +52,28 @@ def test_registry_resolution_follows_update_without_version_sorting(tmp_path, mo
     assert old.exists(), "the test models an update where the old cache may still linger"
 
 
-def test_missing_registry_fails_closed(tmp_path, monkeypatch):
-    """Gap: a missing registry must not silently guess a cache directory."""
+def test_missing_registry_fails_closed(tmp_path, monkeypatch, capsys):
+    """Gap: a missing registry must not silently guess a cache directory.
+
+    L1: the decision is made in main() — a non-zero exit and a stderr reason.
+    The existing test stopped at _current_script() and never verified main()
+    does anything with that None (D2).
+    """
     _install(tmp_path, "0.8.0")
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
 
-    assert _launcher._current_script() is None
+    assert _launcher.main() == 1
+    captured = capsys.readouterr()
+    assert "cannot identify exactly one current voice-loop install" in captured.err
 
 
-def test_ambiguous_registry_fails_closed(tmp_path, monkeypatch):
-    """Gap: two installed candidates must not send a hotkey to an arbitrary version."""
+def test_ambiguous_registry_fails_closed(tmp_path, monkeypatch, capsys):
+    """Gap: two installed candidates must not send a hotkey to an arbitrary version.
+
+    L1: the decision is made in main() — a non-zero exit and a stderr reason.
+    The existing test stopped at _current_script() and never verified main()
+    does anything with that None (D2).
+    """
     first = _install(tmp_path, "0.8.0")
     second = _install(tmp_path, "0.9.0")
     _write_registry(
@@ -70,10 +82,12 @@ def test_ambiguous_registry_fails_closed(tmp_path, monkeypatch):
     )
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
 
-    assert _launcher._current_script() is None
+    assert _launcher.main() == 1
+    captured = capsys.readouterr()
+    assert "cannot identify exactly one current voice-loop install" in captured.err
 
 
-def test_main_execs_current_script_with_hotkey_arguments(tmp_path, monkeypatch):
+def test_main_execs_current_script_with_hotkey_arguments(tmp_path, monkeypatch, capsys):
     """Gap: resolving the right file is insufficient if setup arguments are dropped."""
     current = _install(tmp_path, "0.8.0")
     _write_registry(tmp_path, [{"installPath": str(current)}])
@@ -87,5 +101,7 @@ def test_main_execs_current_script_with_hotkey_arguments(tmp_path, monkeypatch):
 
     monkeypatch.setattr(_launcher.os, "execv", fake_execv)
 
-    assert _launcher.main() == 0
+    assert _launcher.main() == 1  # D2: OSError in execv must return non-zero
+    captured = capsys.readouterr()
+    assert "exec failed" in captured.err
     assert calls == [(str(current / "scripts" / "dictate-toggle.sh"), [str(current / "scripts" / "dictate-toggle.sh"), "send"])]

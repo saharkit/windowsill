@@ -32,7 +32,8 @@ cd "$HOME/voice/rvc/Applio" || exit 1
 
 TARGET=$(grep -a "TRAIN_LAUNCH" "$LOG" 2>/dev/null | tail -1 | sed -n "s/.*epochs=\([0-9]*\).*/\1/p")
 FINAL_W=""
-[ -n "$TARGET" ] && FINAL_W=$(ls "$DIR"/scheherazade_${TARGET}e_*s.pth 2>/dev/null | tail -1)
+# shellcheck disable=SC2012
+[ -n "$TARGET" ] && FINAL_W=$(ls "$DIR"/scheherazade_"${TARGET}"e_*s.pth 2>/dev/null | tail -1)
 
 if [ -n "$FINAL_W" ] || grep -aq "Training has been successfully completed" "$LOG"; then
   HOW="completion marker present"
