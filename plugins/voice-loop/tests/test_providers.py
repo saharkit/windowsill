@@ -238,6 +238,98 @@ def test_an_empty_language_leaves_scribe_to_auto_detect():
     assert b"language_code" not in entry.request(s, "xi-secret", b"RIFFfakewav", "BOUND").body
 
 
+# --- stt.prompt: the jargon-priming lever (windowsill#162) ---------------------------------------
+#
+# One config key, two paths: on the cloud OpenAI request it is the API's `prompt` form field; on the
+# local server it is faster-whisper's initial_prompt (pinned in test_dictate.py / test_api.py). The
+# OpenAI builder is the ONLY path that truncates — the 224-token cap is an OpenAI-API constraint — so
+# the truncation decision and the include/omit decision are pinned HERE, at the request-build tier;
+# the wiring from a real config dict is pinned through resolve_settings in test_dictate.py.
+
+
+def test_a_prompt_under_the_budget_is_returned_trimmed_and_untouched():
+    """L2 GAP: a regression that always truncated (or skipped the trim) would still execute this
+    line for coverage and catch nothing. A short lexicon is passed through verbatim; surrounding
+    whitespace is trimmed because the value is a multipart form field, not free-form config prose."""
+    assert providers.truncate_stt_prompt("kubectl, Acme") == "kubectl, Acme"
+    assert providers.truncate_stt_prompt("  kubectl, Acme\n") == "kubectl, Acme"
+
+
+def test_a_prompt_over_the_budget_is_cut_after_the_last_whole_term():
+    """L2 GAP: a hard ``text[:limit]`` cut would split a term mid-word (and the API would cut again
+    at its own boundary). The mutant passes line coverage and survives every test that only checks
+    ``len <= limit``. This one proves the cut lands ON a comma boundary — the character right after
+    the kept text is the comma that began the dropped term — so no term is ever split, and the
+    leading (most-relevant) terms are kept because the cut text is a verbatim prefix."""
+    over = ", ".join(f"term{i}" for i in range(200))  # ~1300 chars, far over the 448 budget
+    cut = providers.truncate_stt_prompt(over)
+    assert len(cut) <= providers.STT_PROMPT_MAX_CHARS
+    assert over[: len(cut)] == cut, "the kept text must be a verbatim prefix (leading terms kept)"
+    assert over[len(cut)] == ",", "the cut must land on a term boundary, never mid-word"
+    assert cut, "truncation keeps the leading terms, it does not empty the prompt"
+
+
+def test_a_prompt_with_no_commas_lands_on_the_last_space():
+    """L2 GAP: the comma-first boundary has a space fallback for prose (or a lexicon a user wrote
+    with spaces). A mutant that handled commas only would hard-cut a comma-less string mid-word and
+    no comma-oriented test would notice."""
+    prose = " ".join(f"word{i}" for i in range(200))
+    cut = providers.truncate_stt_prompt(prose)
+    assert len(cut) <= providers.STT_PROMPT_MAX_CHARS
+    assert prose[: len(cut)] == cut
+    assert prose[len(cut)] == " ", "with no comma, the cut lands on the last space"
+
+
+def test_a_prompt_with_no_separator_at_all_is_hard_cut_to_the_limit():
+    """L2 GAP: the ``boundary <= 0`` guard. A string whose first ``limit`` chars hold NEITHER comma
+    nor space (one very long token) makes ``rfind`` return -1, and without this branch
+    ``head[:boundary]`` would slice to ``head[:-1]`` (dropping a char) — or to "" at a leading
+    separator, emptying the prompt. That mutant passes the comma and space tests above and survives;
+    only a separator-less input forces ``boundary`` negative and lands here."""
+    token = "x" * (providers.STT_PROMPT_MAX_CHARS + 50)
+    cut = providers.truncate_stt_prompt(token)
+    assert cut == "x" * providers.STT_PROMPT_MAX_CHARS  # a hard cut at the limit, nothing dropped past it
+
+
+def test_the_openai_builder_carries_a_set_prompt_as_a_form_field():
+    """L2 GAP: this is the bug the ticket fixes. A regression that dropped the `prompt` field from
+    the OpenAI body would transcribe English technical terms wrong again (Sighted, Little Indian) and
+    pass silently — the request would still be well-formed multipart. Without this assertion the
+    lever's presence is unverified."""
+    entry = providers.STT_PROVIDERS["openai"]
+    s = {"cloud_endpoint": "", "endpoint": "", "stt_model": "whisper-1", "language": "ru",
+         "stt_prompt": "kubectl, Acme"}
+    assert b'name="prompt"\r\n\r\nkubectl, Acme\r\n' in entry.request(
+        s, "sk-secret", b"RIFFfakewav", "BOUND"
+    ).body
+
+
+def test_the_openai_builder_omits_the_prompt_field_when_it_is_empty():
+    """L2 GAP: omit-when-empty (mirroring Scribe's language_code) keeps the request shape stable for
+    the users who set none. An always-send mutant would add an empty `prompt` part to EVERY OpenAI
+    request and break the `== 3` parts assertion in test_dictate's documented-shape test — but only
+    that one fragile test would notice. This pins the decision at the builder's own tier."""
+    entry = providers.STT_PROVIDERS["openai"]
+    s = {"cloud_endpoint": "", "endpoint": "", "stt_model": "whisper-1", "language": "en",
+         "stt_prompt": ""}
+    assert b'name="prompt"' not in entry.request(s, "sk-secret", b"RIFFfakewav", "BOUND").body
+
+
+def test_the_openai_builder_truncates_an_over_budget_prompt_before_sending():
+    """L2 GAP: the composition claim that the builder sends the prompt THROUGH truncate_stt_prompt,
+    not raw. A mutant `fields["prompt"] = s["stt_prompt"]` (skipping the call) passes the include
+    test above (short prompt) and the truncation tests in isolation (pure function) while shipping an
+    over-budget prompt for the API to cut. Only this test — an over-budget value end to end — kills it."""
+    entry = providers.STT_PROVIDERS["openai"]
+    over = ", ".join(f"term{i}" for i in range(200))
+    s = {"cloud_endpoint": "", "endpoint": "", "stt_model": "whisper-1", "language": "en",
+         "stt_prompt": over}
+    body = entry.request(s, "sk-secret", b"RIFFfakewav", "BOUND").body
+    sent = providers.truncate_stt_prompt(over)
+    assert f'name="prompt"\r\n\r\n{sent}\r\n'.encode() in body
+    assert over.encode() not in body, "the full over-budget string must not travel to the API"
+
+
 def test_the_deepgram_tts_request_asks_for_wav_because_aplay_cannot_play_mp3():
     entry = providers.TTS_PROVIDERS["deepgram"]
     s = {"endpoint": "", "cloud_model": "aura-2-thalia-en", "output_format": entry.default_output_format}

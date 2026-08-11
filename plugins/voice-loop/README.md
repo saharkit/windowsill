@@ -216,7 +216,17 @@ own feature with its own config schema, and it is not implemented — see the de
 ## Languages
 
 Local whisper auto-detects languages. A cloud recognizer is told one up front by `stt.language`, so
-that choice matters and mixed speech must be identified during setup. The contour ships the local
+that choice matters and mixed speech must be identified during setup.
+
+**For the English terms inside a non-English sentence, `stt.prompt` is the jargon lever.** It is free
+text — your recurring vocabulary, product names and technical terms — and one key reaches both the
+cloud OpenAI request (as the API's `prompt` field) and the local whisper server (as
+`initial_prompt`), so a `local`/`lan` user sets it in `config.json` rather than editing the server's
+`VOICE_LOOP_STT_HINT`. Per-provider support is honest: it ships for `openai` and `local`/`lan`;
+ElevenLabs Scribe was measured to need nothing; Deepgram's keyterm prompting is model-specific and is
+not wired — see [`PROVIDERS.md`](PROVIDERS.md#jargon-priming--sttprompt).
+
+The contour ships the local
 voices below; **English is a first-class language, not a fallback** — it has its own selftest phrase
 and its own CI loopback lane (the macOS one). Turkish uses XTTS-v2 locally for native cloned-voice
 synthesis, or the cloud pair Deepgram STT + ElevenLabs multilingual TTS on GPU-less machines.

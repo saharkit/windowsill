@@ -125,7 +125,7 @@ request waiting.
 | `VOICE_LOOP_LANGUAGE` | `en` | default language when a request does not name one |
 | `VOICE_LOOP_STT_MODEL` | `small` | `tiny` / `base` / `small` / `medium` / `large-v3-turbo` … |
 | `VOICE_LOOP_COMPUTE_TYPE` | `auto` | faster-whisper compute type |
-| `VOICE_LOOP_STT_HINT` | — | lexicon hint: a comma-separated list of names/jargon you want recognized |
+| `VOICE_LOOP_STT_HINT` | — | server-wide lexicon hint (comma-separated names/jargon) fed to faster-whisper as `initial_prompt`; a per-request `?prompt=` from a client's `stt.prompt` **wins over** this default |
 | `VOICE_LOOP_TTS_ENGINE` | `silero` | `silero`, `xtts` (XTTS-v2 voice cloning) or `ukrainian` (dedicated uk voices) — both optional dependencies |
 | `VOICE_LOOP_TTS_ENGINE_<LANG>` | — | per-language engine override: `VOICE_LOOP_TTS_ENGINE_UK=ukrainian` routes only `uk` requests, everything else stays on the global engine (`-` → `_`, so `zh-cn` is `VOICE_LOOP_TTS_ENGINE_ZH_CN`) |
 | `VOICE_LOOP_TTS_FALLBACK_ENGINE` | `silero` when any primary is not `silero`, else `none` | `silero` / `xtts` / `ukrainian` / `none` — engine a failed synthesis retries on, see [Engine fallback](#engine-fallback) |

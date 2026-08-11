@@ -1619,6 +1619,53 @@ def test_an_explicitly_empty_stt_language_reaches_the_local_server_unpinned(stat
     assert fake.requests[0][0].full_url == "http://127.0.0.1:8355/stt?language="
 
 
+def test_stt_prompt_in_config_reaches_the_openai_cloud_request(state, monkeypatch, opener):
+    """windowsill#162, and the #159 shape on purpose: the builder-level include is pinned in
+    test_providers.py (hand-built ``s``), but THIS test goes through ``resolve_settings`` from a real
+    config dict — the exact shortcut that let #159's defect (a resolver collapsing a key) survive its
+    own test. A resolver that drops ``stt_prompt`` would pass the builder test and fail here."""
+    (state / "dictate.wav").write_bytes(b"RIFFfakewav")
+    fake = opener(b'{"text": "ok"}')
+    monkeypatch.setenv("VOICE_LOOP_STT_API_KEY", "sk-secret")
+    s = dictate.resolve_settings(
+        {"stt": {"backend": "cloud", "endpoint": "https://api.example.com", "prompt": "kubectl, Acme"}},
+        "Linux",
+    )
+    assert s["stt_prompt"] == "kubectl, Acme"  # the resolver carried the key through
+    assert dictate.transcribe(s) == "ok"
+    assert b'name="prompt"\r\n\r\nkubectl, Acme\r\n' in fake.requests[0][0].data
+
+
+def test_stt_prompt_reaches_the_local_lan_request_as_a_query_parameter(state, opener):
+    """windowsill#162 — the unification deliverable: ONE config key reaches BOTH paths. On the local
+    path ``stt.prompt`` rides as a ``?prompt=`` query the server feeds to faster-whisper's
+    initial_prompt, so a ``local``/``lan`` user sets it in config.json instead of hand-editing the
+    server's systemd unit (``VOICE_LOOP_STT_HINT``). A resolver or ``_transcribe_lan`` wiring bug
+    would leave the lexicon unprimed and no unit test that builds ``s`` by hand would catch it."""
+    (state / "dictate.wav").write_bytes(b"RIFFfakewav")
+    fake = opener(b'{"text": "ok"}')
+    s = dictate.resolve_settings({"stt": {"prompt": "kubectl, Acme"}}, "Linux")
+    assert s["stt_prompt"] == "kubectl, Acme"
+    assert dictate.transcribe(s) == "ok"
+    assert fake.requests[0][0].full_url == (
+        "http://127.0.0.1:8355/stt?language=en&prompt=kubectl%2C%20Acme"
+    )
+
+
+def test_an_unset_stt_prompt_leaves_the_lan_url_unchanged(state, opener):
+    """L3 — two-way falsification of the omit-when-empty rule on the local path. The common user sets
+    no ``stt.prompt``; the LAN request must stay exactly ``?language=en`` (no stray ``&prompt=``),
+    and the server then falls back to its own ``VOICE_LOOP_STT_HINT``. An always-append mutant would
+    alter every LAN request and only the existing exact-URL assertion would notice — this pins the
+    decision at its own tier."""
+    (state / "dictate.wav").write_bytes(b"RIFFfakewav")
+    fake = opener(b'{"text": "ok"}')
+    s = dictate.resolve_settings({}, "Linux")
+    assert s["stt_prompt"] == ""
+    assert dictate.transcribe(s) == "ok"
+    assert fake.requests[0][0].full_url == "http://127.0.0.1:8355/stt?language=en"
+
+
 def test_elevenlabs_stt_falls_back_to_tts_key(state, monkeypatch, opener):
     """When VOICE_LOOP_STT_API_KEY is not set, ElevenLabs STT tries the TTS key —
     one credentials home, not a second one."""
