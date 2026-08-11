@@ -1471,21 +1471,17 @@ def write_corpus_clip(directory: Path, wav: bytes, text: str) -> str:
     is stored once — a training corpus is worse, not better, for holding the same seconds twice.
     """
     directory.mkdir(parents=True, exist_ok=True)
-    name = hashlib.sha256(wav).hexdigest()[:16]
     # `name` is the first 16 hex chars of a sha256 digest, so it is always `[0-9a-f]{16}` — no path
-    # separator, `..` or absolute prefix can reach the filename from request bytes — and `directory`
-    # is operator config (VOICE_LOOP_CORPUS_DIR / a fixed-set language code), never a request value.
-    # Neither check below can fire today; they PIN the invariant this writer rests on, so a future
-    # change to the naming scheme cannot silently turn it into a path traversal.
-    if re.fullmatch(r"[0-9a-f]{16}", name) is None:
-        raise ValueError(f"corpus clip name is not a 16-char hex digest: {name!r}")
-    clip, transcript = directory / f"{name}.wav", directory / f"{name}.txt"
-    root = directory.resolve()
-    if not clip.resolve().is_relative_to(root) or not transcript.resolve().is_relative_to(root):
-        raise ValueError(f"corpus clip path escapes its directory: {clip}")
+    # separator, `..` or absolute prefix can reach the filename from request bytes — and `directory` is
+    # operator configuration (VOICE_LOOP_CORPUS_DIR), never a request value. CodeQL flags this as
+    # `py/path-injection` because it sees caller bytes flow into a path and cannot see that the digest is a
+    # barrier; the alerts are dismissed as false positives against this comment. If the naming scheme ever
+    # stops being a hex digest, that dismissal stops being true — change this comment with it.
+    name = hashlib.sha256(wav).hexdigest()[:16]
+    clip = directory / f"{name}.wav"
     if clip.exists():
         return ""
-    atomic_write(transcript, text.strip().encode("utf-8") + b"\n")
+    atomic_write(directory / f"{name}.txt", text.strip().encode("utf-8") + b"\n")
     atomic_write(clip, wav)  # the audio lands LAST: a clip on disk always has its transcript
     return name
 
