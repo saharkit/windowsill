@@ -381,19 +381,25 @@ discipline as section 2: default mode, count the prompts.
 | 7.11 | `/voice-remove` on a machine with **nothing** installed | says there is nothing to remove and stops — no invented work, no errors | | |
 | 7.12 | After 7.1–7.9, start a fresh session and end a reply with a 🔊 line | nothing is spoken, no hook errors, no stray processes; `/plugin uninstall voice-loop@windowsill` then completes cleanly | | |
 
-## 8. WSL2 branch (run on Windows 11 + WSLg — the #41 verification pass)
+## 8. WSL2 verification record (2026-08-11)
 
-Same contract as the macOS branch: run on a real machine, fill the rows, claim nothing a row
-did not show. Until every row here carries an observed value, the shelf README's Windows
-section stays "recommended route, not a tested guarantee".
+The following pass ran on 2026-08-11 on Windows 11 24H2 (build 26100.8875), Ubuntu 24.04,
+WSL 2.7.11.0, kernel 6.18.33.2-2, and WSLg 1.0.73.2. It is a record of what was measured,
+not a claim about untested contours. The distro was a genuine WSL2 guest (`microsoft-standard-WSL2`,
+NAT `eth0`, and `wsl -l -v` reported version 2).
 
-| # | check | expected | observed | pass |
-|---|---|---|---|---|
-| 8.1 | `claude plugin marketplace add saharkit/windowsill` inside the distro | marketplace added, no error | | |
-| 8.2 | `/plugin install voice-loop@windowsill` | the plugin appears under `/plugin` | | |
-| 8.3 | End a reply with a `🔊` line | the Stop hook fires and the line is audible on the WINDOWS host's speakers — the row that decides the WSLg audio claim | | |
-| 8.4 | `scripts/selftest.sh` against a `lan` server | green loopback | | |
-| 8.5 | `scripts/dictate-toggle.sh` with a real mic | the log states WHICH recorder `resolve_recorder` selected, and the recorded WAV is non-empty — the row that catches a present-but-daemonless `pw-record` winning the resolution order and then failing | | |
+| # | check | observed result | verdict |
+|---|---|---|---|
+| 8.1 | `claude plugin marketplace add saharkit/windowsill` inside the distro | Completed in 7.1 s over HTTPS; no login required. | PASS |
+| 8.2 | Install `voice-loop` and `sill-core` | Shell verbs `claude plugin install voice-loop@windowsill` and `claude plugin install sill-core@windowsill` completed; both enabled. | PASS |
+| 8.3 | Registered hook command with a `🔊` payload | The command read from the installed `hooks/hooks.json` returned 0 and logged `played rc=0 ... chunks=2 via=stream`. This proves the registered command contract; live Claude Code dispatch and host audibility were not measured. | PASS (contract only) |
+| 8.4 | `scripts/selftest.sh` against a `lan` server | With `--endpoint`, a real remote server returned `OK: voice-loop round trip works`, similarity 1.00 against threshold 0.75, rc=0. A valid config was ignored when `jq` was absent, so the config-driven form is not yet green. | PASS (explicit endpoint) |
+| 8.5 | Dictation with the CI-style fake recorder | The fake `pw-record` and `wl-copy` pass completed all eight assertions: one recording cycle, held-key debounce, min-clip guard, STT text, transcript log, no error path, and clipboard delivery; `stop_to_paste_ms=1356`. | PASS |
+
+The pass did not exercise a real microphone, WSLg speaker/microphone passthrough, `/voice-setup`
+end to end, `wsl --install` from a blank host, or the bundled local server inside WSL. Those
+remain unverified. The headless stand had no recorder, clipboard tools, `jq`, ffmpeg, or unzip;
+the real dictation path therefore failed closed with `no recorder available`, as expected.
 
 ---
 
