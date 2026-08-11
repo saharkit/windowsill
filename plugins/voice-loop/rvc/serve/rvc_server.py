@@ -86,7 +86,24 @@ FORCE_DEVICE = os.environ.get("RVC_FORCE_DEVICE", "").strip().lower()
 CHUNK_SECONDS = 6.0
 CHUNK_SEARCH_SECONDS = 1.5  # how far back from a chunk edge to hunt for a quiet cut point
 CHUNK_FADE_MS = 5.0  # click-suppression fade at each join
-MAX_INPUT_SECONDS = 600.0  # absolute sanity bound; a longer body is a client bug, not a request
+
+# DECODED-SIZE bound (NOT a duration cap): the size that `sf.read(..., dtype="float32")` actually
+# allocates is `frames * channels * 4` bytes. The previous duration cap left the product
+# unbounded — a 600 s multichannel high-rate file expanded to multiple GiB on a single request.
+# 256 MiB = ~64 M float32 samples, which is a 600 s 22 kHz mono file or a 70 s 96 kHz 6-channel
+# file (the case the prior cap missed).
+MAX_DECODED_BYTES = 256 * 1024 * 1024
+
+# Wall-clock bound on a single conversion. CPU-lane RTF is ~5.5 (measured §6); GPU RTF 0.064.
+# A 600 s input on the CPU lane would otherwise hold _lock for ~55 minutes. The check fires at
+# chunk boundaries (worst case CHUNK_SECONDS beyond the budget) so the thread exits and the
+# next request can proceed.
+CONVERSION_TIMEOUT_S = 60.0
+
+# Admission bound. The pipeline serializes via _lock, so >1 in-flight means a queue. The previous
+# code happily grew that queue without bound; each queued body sat in memory while it waited.
+# 1 = refuse new requests until the current one returns, rather than park them.
+MAX_INFLIGHT = 1
 
 # Conversion defaults — RUNBOOK §8 verbatim. Per-request query params override them.
 DEFAULT_PITCH = 0
@@ -165,7 +182,7 @@ from starlette.datastructures import UploadFile  # noqa: E402
 TMP_DIR = "/dev/shm" if os.access("/dev/shm", os.W_OK) else tempfile.gettempdir()
 
 _vc = None  # primary VoiceConverter (cuda when the card allows)
-_vc_cpu = None  # lazy CPU overflow converter — built only if the primary ever OOMs
+_vc_cpu = None  # CPU overflow converter — pre-built at startup if primary lands on GPU
 _device = "unloaded"
 _lock = threading.Lock()  # the pipeline is not re-entrant: one conversion at a time
 _in_flight = 0
@@ -294,17 +311,22 @@ def load(device: str, restore: bool = False):
             cfg.device = previous
 
 
-def _cpu_overflow() -> object:
-    """Get (building on first need) the CPU converter used when the GPU cannot take a request.
+def _cpu_overflow() -> object | None:
+    """Get the CPU overflow converter (pre-built at startup if primary is GPU; None otherwise).
 
-    A SECOND resident copy, deliberately: the primary cuda converter is never downgraded, so one
-    oversized request can no longer leave the whole service 27x slower until someone restarts it.
-    Costs ~0.6 GiB of host RAM (31 GiB on this node), and only after the first overflow.
+    Returns None when no overflow is available — the caller MUST handle that case.
+
+    Earlier this function lazily built the converter; that was removed because:
+
+      (a) two concurrent first-overflows double-built the ~0.6 GiB converter, and
+      (b) the lazy build raced against itself on the upstream `rvc.configs.config.Config`
+          singleton. `load(..., restore=True)` snapshots cfg.device, sets it, builds, restores.
+          Two threads entering `load()` simultaneously interleave the snapshot/restore and the
+          second thread ends up restoring "cpu" instead of the primary's device — corrupting
+          cfg.device for the next load. The fix was either to serialise the build or to remove
+          the dependency; we removed the dependency by pre-building the converter at startup,
+          when no conversion can race.
     """
-    global _vc_cpu
-    if _vc_cpu is None:
-        log.warning("building CPU overflow converter (first overflow)")
-        _vc_cpu = load("cpu", restore=True)
     return _vc_cpu
 
 
@@ -332,8 +354,15 @@ def warmup():
 
 
 def load_with_fallback():
-    """Try the chosen device, fall back to cpu on any failure — serving slowly beats not serving."""
-    global _vc, _device
+    """Try the chosen device, fall back to cpu on any failure — serving slowly beats not serving.
+
+    When the primary lands on GPU, the CPU overflow is pre-built here so the OOM path is hot
+    AND the build race is impossible (no concurrent conversion can hold _lock at startup). Costs
+    ~0.6 GiB of host RAM (31 GiB on this node), paid up-front instead of on the first overflow.
+    When the primary lands on CPU, the overflow path is unreachable (no CUDA to OOM), so we
+    skip the pre-build.
+    """
+    global _vc, _device, _vc_cpu
     _install_warm_caches()
     device = pick_device()
     try:
@@ -344,6 +373,12 @@ def load_with_fallback():
         _release_cuda()
         _vc = load("cpu")
         _device = "cpu"
+    if _device == "cuda":
+        try:
+            _vc_cpu = load("cpu", restore=True)
+            log.info("CPU overflow pre-built (startup)")
+        except Exception as exc:
+            log.error("CPU overflow pre-build failed (%s) — OOMs will 503", exc, exc_info=True)
     try:
         warmup()
     except Exception as exc:
@@ -442,11 +477,19 @@ def _fade_join(pieces: list[np.ndarray], sr: int) -> np.ndarray:
     return np.concatenate(out)
 
 
-def _convert_bounded(vc, in_path: str, p: dict) -> tuple[np.ndarray, int, int]:
+class _DeadlineExceeded(Exception):
+    """Raised by `_convert_bounded` when `time.monotonic() > deadline` between chunks."""
+
+
+def _convert_bounded(vc, in_path: str, p: dict, deadline: float | None = None) -> tuple[np.ndarray, int, int]:
     """Convert a whole file, chunked so no single conversion exceeds CHUNK_SECONDS.
 
     Returns (audio, sample_rate, n_chunks). Holds _lock for the duration: the pipeline, the cuda
     context and the Config singleton are all shared, so conversions are strictly serialized.
+
+    If `deadline` is set, raises `_DeadlineExceeded` when `time.monotonic()` exceeds it. The check
+    fires at chunk boundaries — worst case CHUNK_SECONDS beyond the wall-clock budget — so the
+    thread exits promptly, releasing _lock so the next request can proceed.
     """
     x, sr = sf.read(in_path, dtype="float32", always_2d=False)
     if x.ndim > 1:
@@ -458,6 +501,10 @@ def _convert_bounded(vc, in_path: str, p: dict) -> tuple[np.ndarray, int, int]:
         tmp_paths = []
         try:
             for idx, (a, b) in enumerate(cuts):
+                if deadline is not None and time.monotonic() > deadline:
+                    raise _DeadlineExceeded(
+                        f"conversion exceeded {CONVERSION_TIMEOUT_S:.0f}s wall-clock budget"
+                    )
                 if len(cuts) == 1:
                     piece_in = in_path
                 else:
@@ -572,7 +619,18 @@ async def convert_endpoint(
 
 
 def _convert_sync(data: bytes, p: dict):
-    _bump(+1)
+    # Admission: refuse before we touch anything heavy when the pipeline is full. Atomic w.r.t.
+    # `_in_flight_lock`, so a flood of concurrent requests sees exactly MAX_INFLIGHT admits.
+    global _in_flight
+    with _in_flight_lock:
+        if _in_flight >= MAX_INFLIGHT:
+            _stats["errors"] += 1
+            return JSONResponse(
+                {"error": f"queue full ({_in_flight}/{MAX_INFLIGHT})"}, status_code=503
+            )
+        _in_flight += 1
+
+    deadline = time.monotonic() + CONVERSION_TIMEOUT_S
     t0 = time.monotonic()
     fd, in_path = tempfile.mkstemp(suffix=".wav", dir=TMP_DIR, prefix="rvc-in-")
     device_used = _device
@@ -585,14 +643,40 @@ def _convert_sync(data: bytes, p: dict):
             _stats["errors"] += 1
             log.warning("undecodable audio: %s", exc)
             return JSONResponse({"error": "undecodable audio"}, status_code=400)
-        if info.duration > MAX_INPUT_SECONDS:
+
+        # Size bound: cap the DECODED PCM product, not just the duration. `sf.read(..., dtype=
+        # "float32")` allocates `frames * channels * 4` bytes; a 600 s multichannel high-rate
+        # file decodes to multiple GiB. The duration check is gone — this subsumes it, since a
+        # longer file at the same rate uses more memory anyway.
+        if info.frames is None:
+            # Header lacks a frame count (some raw / streaming formats). We can't bound the
+            # decoded size, so we refuse rather than risk an unbounded sf.read downstream.
             _stats["errors"] += 1
             return JSONResponse(
-                {"error": f"input {info.duration:.1f}s exceeds max {MAX_INPUT_SECONDS:.0f}s"}, status_code=413
+                {"error": "cannot determine input length (header lacks frames); refused"},
+                status_code=413,
+            )
+        decoded_bytes = info.frames * info.channels * 4  # float32 sample width is fixed below
+        if decoded_bytes > MAX_DECODED_BYTES:
+            _stats["errors"] += 1
+            return JSONResponse(
+                {
+                    "error": (
+                        f"decoded size {decoded_bytes}B exceeds max {MAX_DECODED_BYTES}B "
+                        f"(frames={info.frames}, sr={info.samplerate}, ch={info.channels})"
+                    )
+                },
+                status_code=413,
             )
 
         try:
-            wav, sr, n_chunks = _convert_bounded(_vc, in_path, p)
+            wav, sr, n_chunks = _convert_bounded(_vc, in_path, p, deadline=deadline)
+        except _DeadlineExceeded as exc:
+            _stats["errors"] += 1
+            log.warning("conversion deadline exceeded (%s)", exc)
+            return JSONResponse(
+                {"error": f"conversion exceeded {CONVERSION_TIMEOUT_S:.0f}s budget"}, status_code=408
+            )
         except torch.cuda.OutOfMemoryError as exc:
             # Should be unreachable now that inputs are chunked — kept as the last line of defence.
             # The PRIMARY converter is deliberately NOT downgraded: this request overflows to a CPU
@@ -603,7 +687,13 @@ def _convert_sync(data: bytes, p: dict):
                 torch.cuda.empty_cache()
             except Exception:
                 pass
-            wav, sr, n_chunks = _convert_bounded(_cpu_overflow(), in_path, p)
+            overflow = _cpu_overflow()
+            if overflow is None:
+                _stats["errors"] += 1
+                return JSONResponse(
+                    {"error": "GPU OOM and no CPU overflow available"}, status_code=503
+                )
+            wav, sr, n_chunks = _convert_bounded(overflow, in_path, p, deadline=deadline)
             device_used = "cpu-overflow"
 
         buf = io.BytesIO()
