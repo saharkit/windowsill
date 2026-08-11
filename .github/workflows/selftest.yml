@@ -184,19 +184,22 @@ jobs:
           echo "::group::scripts coverage gate (ratcheting from 80%)"
           python -m coverage report --include='scripts/*' --fail-under=80
           echo "::endgroup::"
-          # Append to the shelf-level combined coverage total so a future report can sum
-          # across plugins. The combine runs from the repo root so its .coverage is the
-          # single shelf-level data file; --append preserves this plugin's own .coverage.
-          echo "::group::shelf coverage total"
-          cd "$GITHUB_WORKSPACE"
-          python -m coverage combine --append plugins/voice-loop/.coverage
-          echo "::endgroup::"
 
+      # The plugin's own .coverage is what gets uploaded — the same file pytest just wrote, with
+      # nothing in between touching it.  Previously this job also ran `coverage combine --append`
+      # to maintain a shelf-level .coverage at the repo root, on the assumption that "a future
+      # report can sum across plugins" — but the combined-coverage job below is that future: it
+      # downloads each plugin's per-runner artifact and combines them itself with the path remap,
+      # so the shelf-level file has had no consumer for several rounds and its `coverage combine`
+      # was deleting the very file this step uploads.  Removed.
       - name: upload coverage for combined report
         uses: actions/upload-artifact@v4
         with:
           name: coverage-voice-loop-${{ matrix.python }}
           path: plugins/voice-loop/.coverage
+          # .coverage starts with a dot — v4 excludes hidden files by default, which is why
+          # `if-no-files-found: error` was firing even on a green matrix leg.
+          include-hidden-files: true
           if-no-files-found: error
 
   sill-core-coverage:
@@ -225,6 +228,9 @@ jobs:
         with:
           name: coverage-sill-core-${{ matrix.python }}
           path: plugins/sill-core/.coverage
+          # .coverage starts with a dot — v4 excludes hidden files by default, which is why
+          # `if-no-files-found: error` was firing on every ubuntu leg.
+          include-hidden-files: true
           if-no-files-found: error
 
   loopback:
