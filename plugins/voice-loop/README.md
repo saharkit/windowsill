@@ -260,6 +260,16 @@ reference-wav contract are in
 [`server/README.md` — XTTS engine](server/README.md#xtts-engine-voice-cloning). Same ethics
 rule applies to the reference: your own voice, or one you have explicit rights to.
 
+**Steadier, once you have the data for it.** Zero-shot cloning drifts a little between renders and
+costs a full XTTS synthesis each time. The alternative is to *compose* the voice rather than clone
+it: synthesize with the fast local engine and send each piece through an **RVC recolor stage** on a
+GPU (`VOICE_LOOP_RVC_URL`), which repaints the timbre. A trained converter holds one voice where
+zero-shot cloning wanders — and it wants **10-30 minutes of the target voice** to train on, against
+XTTS-v2's six seconds. You do not have to record them: point `VOICE_LOOP_CORPUS_DIR` somewhere and
+the cloned voice writes down what it says as it speaks, until `scripts/rvc_corpus.py` reports there
+is enough to train. Both are opt-in, both live in
+[`server/README.md` — RVC recolor stage](server/README.md#rvc-recolor-stage-voice-conversion).
+
 ## Latency — speak-back streams
 
 The Stop hook does not synthesize the whole message before you hear anything. The marked text is
@@ -465,6 +475,7 @@ plugins/voice-loop/
   scripts/report_bug.py       the collector: diagnostics -> redaction -> one bundle -> a transport
   scripts/tls-probe.sh/.py    "do https certificates verify from this python?" — names the fix, --fix runs it
   scripts/contour-poll.sh/.py the contour poller: /health + VRAM -> the alert rules -> contour.json
+  scripts/rvc_corpus.py       "is there enough of the target voice yet?" — reads the RVC training corpus
   skills/voice-setup/         the agent installer
   skills/voice-design/        voice casting
   skills/voice-remove/        the symmetric uninstaller (service, hotkey, config, caches, convention)

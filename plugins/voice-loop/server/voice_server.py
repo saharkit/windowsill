@@ -23,6 +23,12 @@ LAN or an ssh tunnel. Everything is configured through the environment — see R
     VOICE_LOOP_XTTS_REFERENCE  wav of the voice to clone (the xtts engine refuses requests without it)
     VOICE_LOOP_XTTS_MODEL_DIR  local XTTS-v2 model dir   (optional; default: coqui's own download cache)
     VOICE_LOOP_XTTS_MIN_FREE_VRAM_BYTES  minimum free VRAM before XTTS uses CPU (default: 3 GiB)
+    VOICE_LOOP_RVC_URL       recolor every synthesized piece through an RVC voice-conversion service
+                             (default: unset — the stage is off; see "RVC recolor stage" in README.md)
+    VOICE_LOOP_RVC_TIMEOUT   per-piece budget for that call (default 10 seconds)
+    VOICE_LOOP_CORPUS_DIR    accumulate the xtts engine's own output here as an RVC TRAINING corpus
+                             (default: unset — nothing is recorded)
+    VOICE_LOOP_CORPUS_MAX_SECONDS  stop recording past this much audio (default 1800 — 30 minutes)
     VOICE_LOOP_STRESS_FILE   stress overrides            (default ~/.config/voice-loop/stress.json)
     VOICE_LOOP_HOOK_STAMP_FILE  the hook's heartbeat stamp (default
                              $XDG_STATE_HOME/voice-loop/hook-last-fired) — /health reports its age
@@ -50,6 +56,7 @@ Requires Python >= 3.10.
 from __future__ import annotations
 
 import base64
+import hashlib
 import io
 import json
 import logging
@@ -59,6 +66,7 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.request
 import wave
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -122,6 +130,16 @@ UKRAINIAN_STRESS = "dictionary"
 ENGINES = ("silero", "xtts", "ukrainian")
 ENGINE_HEADER = "X-Voice-Loop-Engine"  # every /tts response names the engine that actually spoke
 
+# The recolor stage speaks plain HTTP to a service that is NOT this process (RVC wants a GPU of its
+# own, and the whole point of the pipeline is that the base voice stays cheap). Only these two
+# schemes are ever opened: `urlopen` would just as happily read a `file://` path off this disk and
+# hand the bytes back as "audio", and VOICE_LOOP_RVC_URL is a string from the environment.
+RVC_SCHEMES = ("http", "https")
+# The corpus is laid out as <VOICE_LOOP_CORPUS_DIR>/<language>/<digest>.wav plus a <digest>.txt
+# transcript beside it — one directory per language, which is the shape RVC's own training tools
+# and scripts/rvc_corpus.py both read.
+CORPUS_CLIP_GLOB = "*/*.wav"
+
 # What each engine can actually speak, addressed by engine name — the tables above and nothing
 # else, so a refusal that points at another engine cannot drift from what that engine speaks.
 ENGINE_LANGUAGES: dict[str, set[str]] = {
@@ -168,6 +186,12 @@ XTTS_MODEL_DIR = os.environ.get("VOICE_LOOP_XTTS_MODEL_DIR", "")
 XTTS_MIN_FREE_VRAM_BYTES = int(
     os.environ.get("VOICE_LOOP_XTTS_MIN_FREE_VRAM_BYTES", str(3 * 1024**3))
 )
+# The recolor stage and the corpus that has to exist before it can be trained — see the section
+# "RVC recolor stage" further down. Both are OFF unless the operator sets them.
+RVC_URL = os.environ.get("VOICE_LOOP_RVC_URL", "").strip()
+RVC_TIMEOUT = float(os.environ.get("VOICE_LOOP_RVC_TIMEOUT", "10"))
+CORPUS_DIR = os.environ.get("VOICE_LOOP_CORPUS_DIR", "")
+CORPUS_MAX_SECONDS = float(os.environ.get("VOICE_LOOP_CORPUS_MAX_SECONDS", "1800"))
 USE_ACCENT = os.environ.get("VOICE_LOOP_ACCENT", "1") not in ("0", "false", "no")
 STRESS_FILE = Path(
     os.environ.get("VOICE_LOOP_STRESS_FILE", "")
@@ -226,6 +250,18 @@ _tts_fallbacks = 0
 # Its own lock rather than the model gate's `_in_flight_lock` below: this counter is bumped on the
 # request path from several threads, and it has nothing to do with how many model slots are held.
 _fallbacks_lock = threading.Lock()
+# The recolor stage's two outcomes, counted per process for /health. Same threading story as the
+# fallback counter above — /tts counts from a threadpool worker, the stream from the generator's
+# own thread — so the pair is bumped under a lock of its own.
+_rvc_recolored = 0
+_rvc_failures = 0
+_rvc_lock = threading.Lock()
+# How much of a training corpus is already on disk. `None` means "not counted yet": the directory
+# is scanned ONCE per process (see corpus_totals) and then kept in step by what this process writes,
+# because re-scanning it would put a stat of the whole corpus on the synthesis path.
+_corpus_clips: int | None = None
+_corpus_seconds = 0.0
+_corpus_lock = threading.Lock()
 
 
 def reset_caches() -> None:
@@ -236,6 +272,7 @@ def reset_caches() -> None:
     """
     global _whisper, _xtts, _xtts_device, _ukrainian, _stress, _hallucinations, _hallucinations_dropped
     global _hallucination_tails_stripped, _tts_fallbacks
+    global _rvc_recolored, _rvc_failures, _corpus_clips, _corpus_seconds
     _whisper = None
     _xtts = None
     _xtts_device = ""
@@ -245,6 +282,10 @@ def reset_caches() -> None:
     _hallucinations_dropped = 0
     _hallucination_tails_stripped = 0
     _tts_fallbacks = 0
+    _rvc_recolored = 0
+    _rvc_failures = 0
+    _corpus_clips = None  # the next reader scans the corpus directory again
+    _corpus_seconds = 0.0
     _hallucinations_by_pattern.clear()
     _tts.clear()
     _accent.clear()
@@ -1094,11 +1135,17 @@ def xtts_pieces(text: str, language: str):
     text are stripped instead of applied. The model's true streaming generator (inference_stream)
     lives below coqui's public api and needs the speaker latents plumbed by hand, so both engines
     stream at the same granularity: the sentence chunker.
+
+    This is also where the RVC training corpus is filled (capture_corpus, defined with the recolor
+    stage below): the cloned voice is the one worth recording, and a sentence chunk is the right
+    length of clip for it.
     """
     model = xtts()
     for part in chunk(strip_stress_markers(text)):
         wav = model.tts(text=part, speaker_wav=XTTS_REFERENCE, language=language)
-        yield torch.as_tensor(wav, dtype=torch.float32)
+        piece = torch.as_tensor(wav, dtype=torch.float32)
+        capture_corpus(piece, part, language)
+        yield piece
 
 
 def ukrainian_pieces(text: str, language: str, speaker: str = ""):
@@ -1202,9 +1249,11 @@ def count_fallback() -> None:
         _tts_fallbacks += 1
 
 
-def engine_label(engine: str, is_fallback: bool) -> str:
-    """How a response names the engine that actually spoke: "silero" or "silero (fallback)"."""
-    return f"{engine} (fallback)" if is_fallback else engine
+def engine_label(engine: str, is_fallback: bool, recolored: bool = False) -> str:
+    """How a response names the engine that actually spoke: "silero", "silero (fallback)", and
+    "silero + rvc" when the recolor stage carried every piece of that response (see below)."""
+    label = f"{engine} (fallback)" if is_fallback else engine
+    return f"{label} + rvc" if recolored else label
 
 
 def resolve_engine(text: str, language: str) -> tuple[str, bool, JSONResponse | None]:
@@ -1230,6 +1279,264 @@ def resolve_engine(text: str, language: str) -> tuple[str, bool, JSONResponse | 
     return engine, True, None
 
 
+# --- RVC recolor stage ------------------------------------------------------------------------------
+# A second way to get a chosen voice, composed instead of cloned: synthesize with the FAST base
+# engine and then hand each finished piece of audio to an RVC (retrieval-based voice conversion)
+# service, which repaints its timbre into the target voice. The trade against the xtts engine is
+# latency and steadiness for a training cost — RVC wants 10-30 minutes of the target voice, where
+# XTTS-v2 clones zero-shot from a 6-30 second reference.
+#
+# The converter is NOT in this process and never will be: it wants a GPU of its own, and keeping it
+# out is what lets the base voice stay cheap and the two scale separately. This side is the client —
+# one POST of a WAV, one WAV back — and the contract it speaks is written down in server/README.md
+# so any RVC deployment can sit behind it.
+#
+# It composes with everything above it because it works on ENCODED audio, after the model gate has
+# been released: /tts recolors the finished blob, /tts/stream recolors each chunk as it leaves, so
+# the stream stays a stream.
+
+
+def rvc_endpoint() -> str:
+    """The recolor service's URL, or "" when the stage is off — or configured with a URL we refuse.
+
+    Only http/https are ever opened (RVC_SCHEMES): `urlopen` reads `file://` just as happily, and
+    this string comes from the environment, so a typo must fail the stage rather than turn it into a
+    reader of local files whose bytes get played as audio.
+    """
+    if not RVC_URL:
+        return ""
+    try:
+        scheme = urlsplit(RVC_URL).scheme.lower()
+    except ValueError:  # a URL malformed enough that the parser itself gives up
+        scheme = ""
+    if scheme not in RVC_SCHEMES:
+        log.warning(
+            "VOICE_LOOP_RVC_URL is not an http(s) URL — the recolor stage stays off "
+            "(only %s are opened)",
+            "/".join(RVC_SCHEMES),
+        )
+        return ""
+    return RVC_URL
+
+
+def _default_opener():
+    """A urllib opener with proxies bypassed — the recolor service is a local or LAN peer, and a
+    system proxy has no business in the middle of it (parity with the plugin's own scripts).
+
+    A seam, so the tests exercise the real request-building and response-reading below against a
+    fake opener instead of a real socket."""
+    return urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+def post_wav(url: str, wav: bytes, timeout: float, opener=None) -> bytes:
+    """POST one WAV to the recolor service and read its answer back. Blocking, and BOUNDED twice.
+
+    The wall clock is mandatory: a converter that hangs — or one that drips a byte every few seconds
+    so the per-operation socket timeout never trips — must not hang the voice with it. So connect,
+    send and the bounded read run on a worker joined at ``timeout``; a breach raises and the caller
+    degrades to the base voice. The read still stops one byte past MAX_UPLOAD_BYTES — the same ceiling
+    /stt puts on audio arriving from the network, for the same reason: a peer's answer is not a
+    promise about its size.
+    """
+    request = urllib.request.Request(url, data=wav, headers={"Content-Type": "audio/wav"}, method="POST")
+    # `timeout` handed to the opener bounds each blocking socket operation, not the exchange as a
+    # whole — a slow drip that keeps every recv under it never trips it. The wall clock is enforced
+    # here instead: the open + bounded read run on a worker joined at `timeout`, so a slow peer
+    # cannot hold the voice past the budget. The socket timeout stays set too, so a worker orphaned
+    # by a breach unblocks on its own once its current recv elapses, rather than wedging a socket.
+    exchange: dict[str, object] = {}
+
+    def _exchange() -> None:
+        try:
+            with (opener or _default_opener()).open(request, timeout=timeout) as response:
+                exchange["body"] = response.read(MAX_UPLOAD_BYTES + 1)
+        except BaseException as exc:  # urllib's whole error family, re-raised on the caller's thread
+            exchange["error"] = exc
+
+    worker = threading.Thread(target=_exchange, daemon=True)
+    worker.start()
+    worker.join(timeout)
+    if worker.is_alive():
+        raise TimeoutError("the RVC recolor stage exceeded its wall-clock budget")
+    if "error" in exchange:
+        raise exchange["error"]
+    return exchange["body"]
+
+
+def count_rvc(recolored: bool) -> None:
+    """One more piece through the recolor stage — surfaced as /health `rvc_recolored` / `rvc_failures`."""
+    global _rvc_recolored, _rvc_failures
+    with _rvc_lock:
+        if recolored:
+            _rvc_recolored += 1
+        else:
+            _rvc_failures += 1
+
+
+def recolor(wav: bytes) -> tuple[bytes, bool]:
+    """Recolor one WAV through the RVC stage: (audio, whether the stage actually ran).
+
+    Never raises, and never silences the voice — the same rule the engine fallback follows. A
+    converter that is down, slow, or answers with something that is not a WAV hands the BASE audio
+    straight back, counted as a failure and logged; the caller says who spoke.
+
+    Deliberately NOT retried. The degrade path costs nothing and is already in hand, while a retry
+    would spend its backoff inside a request someone is waiting to HEAR — on the streaming path,
+    between two chunks of one sentence. `rvc_failures` on /health climbing request-for-request is
+    the signal to fix the converter, exactly as `tts_fallbacks` is for a broken engine.
+    """
+    url = rvc_endpoint()
+    if not url:
+        return wav, False
+    try:
+        recolored = post_wav(url, wav, RVC_TIMEOUT)
+    except Exception as exc:  # urllib raises a whole family, and none of them may reach the client
+        # The class name only, in the log: str(exc) on a URLError carries the endpoint and whatever
+        # the OS said about it (CodeQL: information exposure through an exception — the /tts/stream
+        # error event resolved the same rule the same way).
+        log.warning("the RVC recolor stage failed (%s) — sending the base voice through", type(exc).__name__)
+        count_rvc(False)
+        return wav, False
+    if len(recolored) > MAX_UPLOAD_BYTES or not recolored.startswith(b"RIFF") or recolored[8:12] != b"WAVE":
+        log.warning(
+            "the RVC recolor stage answered with %d bytes that are not a WAV — sending the base "
+            "voice through",
+            len(recolored),
+        )
+        count_rvc(False)
+        return wav, False
+    count_rvc(True)
+    return recolored, True
+
+
+# --- the training corpus ----------------------------------------------------------------------------
+# The recolor stage above cannot be trained out of thin air: RVC needs 10-30 minutes of the TARGET
+# voice, two orders of magnitude more than XTTS-v2's zero-shot reference. This is the bootstrap that
+# closes that gap — the cloned voice records its own training data as it speaks, so a machine that
+# has been running the xtts engine for a while has already produced the corpus that trains its
+# replacement. Off unless VOICE_LOOP_CORPUS_DIR is set, and it never breaks a synthesis: a clip that
+# cannot be written is logged and skipped.
+
+
+def scan_corpus(root: Path) -> tuple[int, float]:
+    """(clips, seconds) of the corpus already on disk — one pass over the WAV headers.
+
+    Unreadable and unparseable files are skipped rather than refused: this directory is the
+    operator's, and half a clip from a previous crash must not stop the corpus from growing.
+    """
+    clips, seconds = 0, 0.0
+    for path in sorted(root.glob(CORPUS_CLIP_GLOB)):
+        try:
+            duration = wav_duration_seconds(path.read_bytes())
+        except OSError:
+            duration = None
+        if duration is None:
+            continue
+        clips += 1
+        seconds += duration
+    return clips, seconds
+
+
+def corpus_totals() -> tuple[int, float]:
+    """(clips, seconds) in the corpus, counted once per process and kept in step from there."""
+    global _corpus_clips, _corpus_seconds
+    with _corpus_lock:
+        if _corpus_clips is None:
+            _corpus_clips, _corpus_seconds = scan_corpus(Path(CORPUS_DIR))
+        return _corpus_clips, _corpus_seconds
+
+
+def record_corpus_clip(seconds: float) -> None:
+    """Count one clip this process just wrote, and say so the once when that fills the corpus."""
+    global _corpus_clips, _corpus_seconds
+    with _corpus_lock:
+        _corpus_clips = (_corpus_clips or 0) + 1
+        _corpus_seconds += seconds
+        full = _corpus_seconds >= CORPUS_MAX_SECONDS
+    if full:
+        # Exactly once per process: capture_corpus() stops calling this the moment the cap is met.
+        log.info(
+            "the RVC training corpus in %s holds %.0f seconds — that is the "
+            "VOICE_LOOP_CORPUS_MAX_SECONDS cap, and nothing more will be recorded",
+            CORPUS_DIR,
+            _corpus_seconds,
+        )
+
+
+def atomic_write(path: Path, data: bytes) -> None:
+    """Write bytes to `path` atomically: temp sibling, fsync, os.replace.
+
+    The trainer reads this directory while the server writes it, so a crash mid-write must leave the
+    old content or the new — never a truncated clip a dataset loader would accept as valid audio.
+    Same shape as the install ledger's writer (`scripts/install_ledger.py`), bytes instead of text.
+    """
+    fd, tmp = tempfile.mkstemp(prefix=".voice-loop-corpus-", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        # Best-effort cleanup; the real file is untouched because os.replace has not run yet.
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def write_corpus_clip(directory: Path, wav: bytes, text: str) -> str:
+    """Store one clip and its transcript, named by the audio's own digest. "" if it was already here.
+
+    Content-addressed on purpose, and it buys two things at once: two syntheses running side by side
+    cannot collide on a name without needing a counter or a lock, and the same sentence spoken twice
+    is stored once — a training corpus is worse, not better, for holding the same seconds twice.
+    """
+    directory.mkdir(parents=True, exist_ok=True)
+    # `name` is the first 16 hex chars of a sha256 digest, so it is always `[0-9a-f]{16}` — no path
+    # separator, `..` or absolute prefix can reach the filename from request bytes — and `directory` is
+    # operator configuration (VOICE_LOOP_CORPUS_DIR), never a request value. CodeQL flags this as
+    # `py/path-injection` because it sees caller bytes flow into a path and cannot see that the digest is a
+    # barrier; the alerts are dismissed as false positives against this comment. If the naming scheme ever
+    # stops being a hex digest, that dismissal stops being true — change this comment with it.
+    name = hashlib.sha256(wav).hexdigest()[:16]
+    clip = directory / f"{name}.wav"
+    if clip.exists():
+        return ""
+    atomic_write(directory / f"{name}.txt", text.strip().encode("utf-8") + b"\n")
+    atomic_write(clip, wav)  # the audio lands LAST: a clip on disk always has its transcript
+    return name
+
+
+def capture_corpus(piece, text: str, language: str) -> None:
+    """Record one synthesized sentence into the RVC training corpus, if one is configured.
+
+    Called from the xtts engine and only from it — this is the voice being cloned, which is the one
+    a converter would be trained on; Silero's stock voices are not it. The piece is taken RAW: no
+    inter-chunk pause and no recolor, because a corpus is training data, not playback.
+
+    The cost is one WAV encode and one write while the model slot is held, paid only by an operator
+    who asked for a corpus, and small next to the XTTS synthesis that just produced the tensor.
+    """
+    if not CORPUS_DIR:
+        return
+    _clips, seconds = corpus_totals()
+    if seconds >= CORPUS_MAX_SECONDS:
+        return
+    try:
+        import soundfile as sf
+
+        out = io.BytesIO()
+        sf.write(out, piece.numpy(), XTTS_SR, format="WAV")
+        stored = write_corpus_clip(Path(CORPUS_DIR) / language, out.getvalue(), text)
+    except OSError as exc:
+        log.warning("could not record a corpus clip (%s) — the voice is unaffected", type(exc).__name__)
+        return
+    if stored:
+        record_corpus_clip(len(piece) / XTTS_SR)
+
+
 def _default_wall_clock() -> float:
     """Epoch seconds. Wall time is an INPUT here, injected so a test needs no real clock."""
     return time.time()
@@ -1253,6 +1560,9 @@ def hook_heartbeat(clock: Callable[[], float] = _default_wall_clock) -> tuple[st
 def health() -> dict[str, object]:
     queues = queue_depths()
     hook_fired_at, hook_fired_age = hook_heartbeat()
+    # Nulls rather than zeroes when no corpus is configured: "none is being recorded" and "one is
+    # being recorded and is still empty" are different answers, and only one of them is a problem.
+    corpus = corpus_totals() if CORPUS_DIR else None
     return {
         "ok": True,
         "version": SERVER_VERSION,
@@ -1271,6 +1581,14 @@ def health() -> dict[str, object]:
         "tts_engine_overrides": dict(TTS_ENGINE_BY_LANGUAGE),  # the per-language routing, if any
         "tts_fallback_engine": fallback_engine() or "none",  # the EFFECTIVE one behind the global engine
         "tts_fallbacks": _tts_fallbacks,
+        # The recolor stage: whether it is on (never the URL it points at — /health has no
+        # authentication and an endpoint is nobody else's business), and how it has been doing.
+        "rvc": bool(rvc_endpoint()),
+        "rvc_recolored": _rvc_recolored,
+        "rvc_failures": _rvc_failures,
+        # How far the bootstrap corpus has got. `null`/`null` when none is configured.
+        "corpus_clips": corpus[0] if corpus else None,
+        "corpus_seconds": round(corpus[1], 1) if corpus else None,
         "tts_languages": sorted(SILERO_VOICES),
         "accentuated_languages": sorted(ACCENTUATORS),
         "streaming": True,
@@ -1434,8 +1752,9 @@ async def tts_endpoint(request: Request, payload: dict) -> Response:
     """One WAV blob, and a header naming the engine that produced it.
 
     `X-Voice-Loop-Engine: <engine>` on every success — `<engine> (fallback)` when the primary was
-    broken and the configured fallback spoke instead. The failure itself stays in the server log:
-    a client that asked for speech gets speech, and can see who gave it.
+    broken and the configured fallback spoke instead, and `<engine> + rvc` when the recolor stage
+    repainted it. The failure itself stays in the server log: a client that asked for speech gets
+    speech, and can see who gave it.
     """
     refusal = cross_site_error(request)
     if refusal is not None:
@@ -1475,7 +1794,14 @@ async def tts_endpoint(request: Request, payload: dict) -> Response:
         count_fallback()
         wav = await run_in_threadpool(render_tts, text, language, speaker, alternative)
         engine, is_fallback = alternative, True
-    return Response(wav, media_type="audio/wav", headers={ENGINE_HEADER: engine_label(engine, is_fallback)})
+    # After the engine question is settled and the model slot is back: the stage recolors whichever
+    # voice ended up speaking, and a converter that is down leaves that voice untouched.
+    wav, recolored = await run_in_threadpool(recolor, wav)
+    return Response(
+        wav,
+        media_type="audio/wav",
+        headers={ENGINE_HEADER: engine_label(engine, is_fallback, recolored)},
+    )
 
 
 def gated_pieces(pieces, device: str = ""):
@@ -1529,6 +1855,12 @@ async def tts_stream_endpoint(request: Request, payload: dict) -> Response:
     every chunk after the FIRST carries that silence at its head. Leading (not trailing) silence
     keeps the first chunk's latency untouched and needs no lookahead — the audible result between
     two chunks is the same either way.
+
+    With the recolor stage on, each chunk is repainted on its way out and the `end` event carries a
+    `recolored` count. That count can be lower than `chunks`: unlike the engine fallback, which
+    refuses to change voices mid-stream, a converter that dies halfway leaves the REST of the stream
+    in the base voice — the alternative is silence from that chunk on, and this server degrades a
+    voice rather than losing it.
     """
     refusal = cross_site_error(request)
     if refusal is not None:
@@ -1556,7 +1888,7 @@ async def tts_stream_endpoint(request: Request, payload: dict) -> Response:
     def stream():
         import soundfile as sf
 
-        current, fell_back, sent = engine, is_fallback, 0
+        current, fell_back, sent, recolored = engine, is_fallback, 0, 0
         while True:
             sample_rate = engine_sample_rate(current)  # 48 kHz Silero / 24 kHz XTTS — per ENGINE
             device = synthesis_device(current)  # and the queue is per ENGINE too
@@ -1567,7 +1899,11 @@ async def tts_stream_endpoint(request: Request, payload: dict) -> Response:
                         piece = torch.cat([pause, piece])
                     out = io.BytesIO()
                     sf.write(out, piece.numpy(), sample_rate, format="WAV")
-                    audio = base64.b64encode(out.getvalue()).decode("ascii")
+                    # Outside the model slot (gated_pieces released it before it yielded) and per
+                    # chunk, so the stream stays a stream instead of waiting for a whole utterance.
+                    wav, was_recolored = recolor(out.getvalue())
+                    recolored += int(was_recolored)
+                    audio = base64.b64encode(wav).decode("ascii")
                     yield event("chunk", {"index": sent, "audio": audio})
                     sent += 1
             except Exception as exc:
@@ -1587,7 +1923,14 @@ async def tts_stream_endpoint(request: Request, payload: dict) -> Response:
                 log.exception("streaming synthesis failed after %d chunk(s)", sent)
                 yield event("error", {"error": f"synthesis failed ({type(exc).__name__})", "chunks": sent})
                 return
-            yield event("end", {"chunks": sent, "engine": engine_label(current, fell_back)})
+            whole = bool(recolored) and recolored == sent
+            ending: dict[str, object] = {"chunks": sent, "engine": engine_label(current, fell_back, whole)}
+            if rvc_endpoint():
+                # Only when the stage is configured, so a server without it emits byte-identical
+                # events to before. A count rather than a flag because the stage can fail PART of a
+                # stream, and that is exactly the case a client cannot hear its way to.
+                ending["recolored"] = recolored
+            yield event("end", ending)
             return
 
     return StreamingResponse(stream(), media_type="text/event-stream")

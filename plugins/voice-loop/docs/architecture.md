@@ -203,6 +203,22 @@ the server restarts a stream at most once and never after the first chunk, the c
 blob path at most once — so the composition terminates instead of looping; what it costs on a
 broken engine is latency, and the `tts_fallbacks` counter says how often it is being paid.
 
+**One optional stage sits after all of that, and outside the process.** With `VOICE_LOOP_RVC_URL`
+set, every finished piece of audio is POSTed to an RVC voice-conversion service, which repaints its
+timbre into a target voice and hands a WAV back
+([RVC recolor stage](../server/README.md#rvc-recolor-stage-voice-conversion)). It works on **encoded
+audio, after the model slot is released**, which is what lets it compose with everything above it
+without knowing about any of it: it recolors whichever engine ended up speaking, fallback included,
+and it recolors `/tts/stream` chunk by chunk so the stream stays a stream. A converter that is down
+hands the base audio through unchanged — the same degrade-never-silence rule the engine fallback
+follows — and `rvc_failures` on `/health` is how often that happened.
+
+Its prerequisite is data rather than code: RVC trains on 10-30 minutes of the target voice.
+`VOICE_LOOP_CORPUS_DIR` is the bootstrap — the `xtts` engine writes each sentence it synthesizes,
+plus its text, into `<corpus>/<language>/<digest>.wav`, so the cloned voice accumulates the corpus
+that trains its own replacement. `scripts/rvc_corpus.py` reads that directory and says whether there
+is enough yet.
+
 ## Where state lives
 
 | path | what |
@@ -213,8 +229,13 @@ broken engine is latency, and the `tts_fallbacks` counter says how often it is b
 | `~/.config/voice-loop/*.key` | optional cloud key files (mode 600) |
 | `~/.local/state/voice-loop/` | logs, the last spoken line, the recorder PID, the last WAV, the toggle and focus stamps, the hook heartbeat stamp, the contour poller's `contour.json` and its `contour-announced` ledger |
 | `~/.local/share/voice-loop/` | optional: the venv, models, voice previews |
+| `$VOICE_LOOP_CORPUS_DIR` (unset by default) | optional, and **on the server's machine**: the RVC training corpus the `xtts` engine records — one `<language>/<digest>.wav` plus its `.txt` per synthesized sentence |
 
 Nothing is written into the repo, and nothing outside these paths is touched. `/voice-remove` walks
 this same table in reverse — plus the model caches under `~/.cache/` that the server's own loaders
 (torch.hub, HuggingFace, coqui) fill, which are shared with other tools and so are removed entry by
 entry rather than wholesale.
+
+The corpus row is the one entry `/voice-remove` does **not** touch, and deliberately: it is a path
+the operator chose, on whichever machine runs the server, holding hours of work that is theirs. Every
+other row is state this plugin created without being asked where.
