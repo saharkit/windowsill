@@ -4,7 +4,7 @@
 
 **Owner:** Sahar (SRE role) · **Node:** `<gpu-host>` (user `<user>`, no sudo)
 **Endpoint:** `http://127.0.0.1:8358` (loopback only) · **Last verified:** 2026-08-02 07:0x UTC
-**Node clock is UTC.** Operator local time (Europe/Istanbul) = UTC+3.
+**Node clock is UTC.** Convert to your local time as needed.
 
 > **This is ops v0.** It exists to turn the 14.6 s cold `core.py infer` CLI call into a warm HTTP
 > call. It is deliberately small: one model, one endpoint, no auth, no metrics endpoint, no restart
@@ -31,44 +31,60 @@
 **Additive, and reversible in one command.** Everything new lives in `~/voice/rvc-serve/`. It writes
 nothing outside that directory except transient files under `/dev/shm` that it deletes. It does not
 modify Applio, the venv, the weights, the index or the corpus — all are opened read-only. Roll back
-with `~/voice/rvc-serve/stop.sh && rm -rf ~/voice/rvc-serve`.
+by stopping the process (see §1) and then `rm -rf ~/voice/rvc-serve`.
 
 ---
 
 ## 1. Start / stop / restart
 
+**The wrapper scripts (`start.sh`, `stop.sh`, `smoke.sh`) referenced throughout this runbook are
+operator-local helpers that ran on the source machine — they are NOT included in this tree.** Only
+`rvc/server/rvc_server.py` ships. The wrappers did: `start.sh` — `nohup setsid` + poll `/health`
+until ready; `stop.sh` — pidfile → socket → bracketed pgrep, reporting VRAM freed; `smoke.sh` —
+N real conversions with non-silence assertions.
+
+**To run the server directly:**
+
 ```sh
-~/voice/rvc-serve/start.sh     # detached (nohup setsid), waits for /health, prints it. Idempotent.
-~/voice/rvc-serve/stop.sh      # pidfile -> socket -> bracketed pgrep; prints the VRAM it returned
-~/voice/rvc-serve/stop.sh && ~/voice/rvc-serve/start.sh    # restart
+cd ~/voice/rvc/Applio
+PYTHONPATH=$HOME/voice/rvc/shims \
+~/voice/rvc/venv/bin/python ~/voice/rvc-serve/rvc_server.py \
+  >> ~/voice/rvc-serve/server.log 2>&1 &
 ```
+
+Or detached, matching what the wrapper did:
+
+```sh
+nohup setsid ~/voice/rvc/venv/bin/python ~/voice/rvc-serve/rvc_server.py \
+  >> ~/voice/rvc-serve/server.log 2>&1 < /dev/null &
+```
+
+To stop: `pkill -f rvc_server.py` (but see the warning below — use a bracketed pattern or the pid).
 
 - Log: `~/voice/rvc-serve/server.log` (append-only, `-u` unbuffered — unlike the training job's
   block-buffered log, this one does not lose its last lines; RUNBOOK §5 of the training runbook).
-- Pidfile: `~/voice/rvc-serve/server.pid`.
-- Startup is ~8-10 s (model + hubert load, then one synthetic warm-up conversion). `start.sh` polls
-  `/health` for up to 2 min and prints the log tail if the process dies.
-- **There is no supervision.** If the process dies, it stays dead until someone runs `start.sh`.
+- Startup is ~8-10 s (model + hubert load, then one synthetic warm-up conversion). Poll `/health`
+  until it responds.
+- **There is no supervision.** If the process dies, it stays dead until someone restarts it.
   That is a known v0 gap → windowsill#15.
 
 > **Never `pkill -f rvc_server.py` from an ssh command line.** `pkill -f` matches the remote shell's
 > own command line, so the shell kills itself and the server survives. This bit the training work
-> twice (training RUNBOOK §6a). `stop.sh` uses the pidfile first and a bracketed `[r]vc_server.py`
-> pattern last, for exactly this reason.
+> twice (training RUNBOOK §6a). Use a pidfile or the bracketed `[r]vc_server.py` pattern instead.
 
 ---
 
 ## 2. The dependency that will break it first: the pedalboard shim
 
 `PYTHONPATH=$HOME/voice/rvc/shims` — training RUNBOOK §8, **READ FIRST** section. This node is an
-Intel Xeon E5-1620 (Sandy Bridge, 2012) with AVX but **no AVX2/FMA**, and the `pedalboard` wheel's
+old 4-core CPU with AVX but **no AVX2/FMA**, and the `pedalboard` wheel's
 native extension is AVX2-only, so it **SIGILLs at import** — `Illegal instruction (core dumped)`,
 no traceback, empty log. `rvc/infer/infer.py:11` imports it at module level, so nothing can be
 imported without the shim.
 
 Two belts here, deliberately:
 
-1. `start.sh` exports `PYTHONPATH=$HOME/voice/rvc/shims`;
+1. the launcher (or your own invocation — see §1) exports `PYTHONPATH=$HOME/voice/rvc/shims`;
 2. `rvc_server.py` *also* puts that directory on `sys.path[0]` itself and then imports `pedalboard`
    explicitly, before anything else, logging which file it resolved to:
 
@@ -133,7 +149,7 @@ Response headers carry the per-request telemetry, so a client can log it without
 `X-RVC-Device`, `X-RVC-Chunks`, `X-RVC-Wall-S`, `X-RVC-Audio-S`, `X-RVC-RTF`.
 
 Error shapes: `400` empty body / undecodable audio / bad pitch, `413` body >128 MB or audio >600 s,
-`503` model not loaded, `500` conversion failure (with the exception text).
+`503` model not loaded, `500` conversion failure (returns `{"error": "conversion failed"}`, no exception text).
 
 ---
 
@@ -146,7 +162,7 @@ path is unchanged) and the hubert embedder across calls. Three things make that 
 1. **shim first** (§2);
 2. **cwd must be `Applio/`** — `infer.py`, `lib/utils.py` and `configs/config.py` all read
    `os.getcwd()` or relative paths (`rvc/configs/40000.json`, `rvc/models/predictors/rmvpe.pt`) **at
-   import time**. `start.sh` cds there and the module re-`chdir`s defensively;
+   import time**. The launcher cds there (see §1) and the module re-`chdir`s defensively;
 3. **two warm caches patched into `rvc.infer.pipeline`**, process-local, no file edits:
 
 | what upstream does per request | cost | what the server does |
@@ -207,13 +223,13 @@ that own this card. Verified:
 ```
 admission: card free 1161MiB < 1700MiB required -> CPU, holding no VRAM
 $ nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader
-1029504, 1824 MiB     <- :8355 whisper
-1247915, 2750 MiB     <- :8356 xtts
-                      <- :8358 absent. Not one MiB.
+<PID>, 1824 MiB     <- :8355 whisper
+<PID>, 2750 MiB     <- :8356 xtts
+                    <- :8358 absent. Not one MiB.
 ```
 
-Override for a deliberate measurement: `RVC_FORCE_DEVICE=cuda` (or `=cpu`) in the environment of
-`start.sh`. Forcing cuda on a full card is safe for the *incumbents* — a CUDA OOM hits the process
+Override for a deliberate measurement: `RVC_FORCE_DEVICE=cuda` (or `=cpu`) in the environment
+before launching. Forcing cuda on a full card is safe for the *incumbents* — a CUDA OOM hits the process
 that asks for memory, and this one catches it (§5c) — but it will be slow and noisy.
 
 ### 5c. The CPU overflow lane (last line of defence)
@@ -247,7 +263,7 @@ a live-contour action (training RUNBOOK §11(a)/§13 — the previous night's st
 operator-authorized). **This service will not take it.** Options, cheapest first:
 
 1. **Operator stops :8356** when RVC conversion matters more than XTTS cloning, then
-   `~/voice/rvc-serve/stop.sh && ~/voice/rvc-serve/start.sh` — the gate will admit CUDA.
+   restart the service — the gate will admit CUDA.
 2. Shrink the RVC footprint (hubert/net_g in fp16). Applio hardcodes `.float()`; this needs patched
    loading and a quality re-check. Not v0.
 3. A bigger card. Out of scope for this node.
@@ -271,11 +287,12 @@ Long inputs, chunked, on the CPU lane under CI load: 16.8 s in 30.3 s (3 chunks)
 (11 chunks) — both correct output (`dur` preserved to 0.2 s, rms 0.117-0.118, matching the
 single-chunk reference 0.118).
 
-Re-measure any time with the shipped smoke:
+Re-measure any time by calling `/convert` directly (the wrapper `smoke.sh` that did this is not
+included — it ran N conversions and asserted non-silence):
 
 ```sh
-~/voice/rvc-serve/smoke.sh                          # baya.wav, 3 runs, pitch 0
-~/voice/rvc-serve/smoke.sh /path/in.wav 5 12        # 5 runs, pitch +12
+curl -s -X POST -H 'Content-Type: audio/wav' --data-binary @baya.wav \
+  'http://127.0.0.1:8358/convert?pitch=0' -o out.wav
 ```
 
 > **The GPU row was measured on the same single-chunk code path**, before the admission gate demoted
@@ -286,7 +303,9 @@ Re-measure any time with the shipped smoke:
 > command that turns it into one:
 >
 > ```sh
-> ~/voice/rvc-serve/stop.sh && ~/voice/rvc-serve/start.sh && ~/voice/rvc-serve/smoke.sh
+> # restart the service (see §1), then:
+> curl -s -X POST -H 'Content-Type: audio/wav' --data-binary @baya.wav \
+>   'http://127.0.0.1:8358/convert?pitch=0' -o out.wav
 > ```
 >
 > Confirm `"device":"cuda"` in the HEALTH line it prints first; if it says `cpu`, read `"admission"`.
@@ -325,23 +344,28 @@ uptime; ps -eo pcpu,pid,args --sort=-pcpu | head -6      # who is eating the nod
 | conversion returns 200 but the wav is silence | treat as failure. Check `index_rate`/`protect` params, and confirm the weights file is the 70-epoch one, not a stale checkpoint |
 | everything is slow but `"device":"cuda"` | §7 — check the load average; CI is probably running. GPU path should not care, so also check `nvidia-smi` for a third process |
 | `Illegal instruction` in the log | §2, always |
-| `Could not initialize NNPACK! Reason: Unsupported hardware.` | **benign, CPU path only.** Same root cause as §2 — this 2012 Xeon lacks the instruction set NNPACK wants, so torch falls back to a generic conv kernel. It is part of why the CPU lane is slow. Not an error, do not chase it |
-| port 8358 in use by a stale process | `~/voice/rvc-serve/stop.sh` (it finds the pid by socket, not by pattern) |
+| `Could not initialize NNPACK! Reason: Unsupported hardware.` | **benign, CPU path only.** Same root cause as §2 — this older CPU lacks the instruction set NNPACK wants, so torch falls back to a generic conv kernel. It is part of why the CPU lane is slow. Not an error, do not chase it |
+| port 8358 in use by a stale process | kill the old process by pid (check with `ss -tlnp 'sport = 8358'`), then restart |
 
 ---
 
 ## 9. Files
 
+**Only `rvc_server.py` ships in this tree** (under `rvc/serve/`). The layout below shows the full
+deployment as it existed on the source machine, including the wrapper scripts that are NOT included:
+
 ```
 ~/voice/rvc-serve/
-├── rvc_server.py        # the service — config block at the top is the only thing to edit
-├── start.sh             # detached launch + /health wait (idempotent)
-├── stop.sh              # pidfile -> socket -> bracketed pgrep; reports VRAM returned
-├── smoke.sh             # real-invocation smoke: N conversions + non-silence assertions
+├── rvc_server.py        # the service — config block at the top is the only thing to edit (SHIPS)
+├── start.sh             # NOT INCLUDED — wrapper: detached launch + /health wait (idempotent)
+├── stop.sh              # NOT INCLUDED — wrapper: pidfile → socket → bracketed pgrep; reports VRAM returned
+├── smoke.sh             # NOT INCLUDED — wrapper: real-invocation smoke, N conversions + non-silence assertions
 ├── RUNBOOK-serve.md     # this file
 ├── server.log           # append-only, unbuffered
 └── server.pid
 ```
+
+See §1 for how to run `rvc_server.py` directly.
 
 Read-only dependencies, none of them modified: `~/voice/rvc/venv` (the training venv — `fastapi`,
 `uvicorn`, `python-multipart` were **already present**, nothing was installed), `~/voice/rvc/shims/`,

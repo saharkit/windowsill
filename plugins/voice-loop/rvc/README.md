@@ -46,7 +46,7 @@ so you can profile your own card before committing a night to it.
 ```
 rvc/
 ├── train/                  the training pipeline (12 bash scripts)
-│   ├── install.sh          creates the venv and clones Applio
+│   ├── install.sh          pip-installs torch and Applio deps into an already-present venv
 │   ├── prereq.sh           downloads pretrained weights
 │   ├── preprocess.sh       slices the corpus into training audio
 │   ├── extract.sh          extracts pitch and content features
@@ -63,9 +63,9 @@ rvc/
 ├── config/
 │   ├── training-config.example.json   hyper-parameters that produced a working voice
 │   └── model-info.example.json        corpus metadata (speaker name, language, description)
-├── docs/
-│   ├── rvc-training.md     RUNBOOK — the training pipeline, end to end
-│   └── rvc-serving.md      RUNBOOK — the conversion service, start to operate
+└── ../docs/                (runbooks live at the plugin level, not under rvc/)
+    ├── rvc-training.md     RUNBOOK — the training pipeline, end to end
+    └── rvc-serving.md      RUNBOOK — the conversion service, start to operate
 └── README.md               this file
 ```
 

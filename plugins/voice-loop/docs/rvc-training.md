@@ -4,7 +4,7 @@
 
 **Owner:** Sahar (SRE role) · **Node:** `<gpu-host>` (user `<user>`, no sudo)
 **Last verified:** 2026-08-02 (stood up and run on this date)
-**Node clock is UTC.** Operator local time (Europe/Istanbul) = UTC+3. All timestamps below are UTC unless marked.
+**Node clock is UTC.** All timestamps below are UTC; convert to your local time as needed.
 
 > ## STATUS 2026-08-02 06:30 UTC — **COMPLETE. All 70 epochs trained; model works; demo rendered.**
 >
@@ -59,7 +59,7 @@ never the live contour.
 | tool | **Applio 3.6.4**, commit `da174445ec98d15d006175ac99db3879bd3a73d1` | maintained RVC fork with a real headless CLI (`core.py preprocess/extract/train/index/infer`); **no fairseq**, so it installs on Python 3.12; its own installer targets `--python 3.12` and the `cu128` torch index, which is exactly this node |
 | license | **MIT** (source + model weights) + Applio's Terms of Use | see §11 |
 | python | 3.12.3 (`/usr/bin/python3.12`), venv at `~/voice/rvc/venv` | Applio's own `run-install.sh` uses 3.12; no 3.10 needed, none installed |
-| torch | **2.11.0+cu128** / torchaudio **2.11.0+cu128** | the node's driver is 570.86.15 = CUDA 12.8. Default PyPI torch ships cu130 and reports `cuda available: False` here. Installed from `--index-url https://download.pytorch.org/whl/cu128`. **This is the same trap XTTS hit** (`~/voice/xtts/RUNBOOK.md` §7.1) — root cause is the old driver, whose fix needs root. |
+| torch | **2.11.0+cu128** / torchaudio **2.11.0+cu128** | the node's driver supports CUDA 12.8 (not 13.0), so the default PyPI torch (cu130) reports `cuda available: False` here. Installed from `--index-url https://download.pytorch.org/whl/cu128`. **This is the same trap XTTS hit** (`~/voice/xtts/RUNBOOK.md` §7.1) — root cause is the old driver, whose fix needs root. |
 | pretrained | RVC **v2 HiFi-GAN 40k**, `f0G40k.pth` / `f0D40k.pth` | 40 kHz is the right size/quality trade for a 6 GiB card |
 | f0 | **rmvpe** (`rvc/models/predictors/rmvpe.pt`), GPU | Applio's and RVC's recommended default |
 | embedder | **contentvec** (`rvc/models/embedders/contentvec/`) | Applio default; loaded through `transformers`, not fairseq |
@@ -136,7 +136,7 @@ Dataset it trains on (built by `preprocess.sh` + `extract.sh`, both re-runnable)
 | batch 2, `--checkpointing True` **+ §11(b)** | **3:56** | 2502 MiB | 1409 MiB | **survived the epoch-10 save — this is the live config** |
 
 **The 6 h budget was never the binding constraint; VRAM at save time was.** Current run: started
-**01:18:42**, 70 epochs → **ETA ~05:55 UTC** (08:55 Istanbul), ~4h36m, plus 1–3 min for the index.
+**01:18:42**, 70 epochs → **ETA ~05:55 UTC** (08:55 local), ~4h36m, plus 1–3 min for the index.
 
 Loss evidence from the checkpointed run before it died (it *was* learning — this is not a
 "training didn't work" failure): `lowest_value` 15.952 → 14.4 → 13.699 → 13.139 → **12.954** over epochs
@@ -216,7 +216,7 @@ ssh <user>@<gpu-host> '~/voice/rvc/train-status.sh'
 | first token | means | evidence it uses |
 |---|---|---|
 | `RUNNING` | still training | `pgrep -f rvc/train/train.py` matches; also prints last epoch line + in-epoch % + VRAM |
-| `FINISHED` | done cleanly | trainer gone **and** `train.log` contains `Training has been successfully completed with …`; also prints the index path, the newest weights file, and the finisher's verdict |
+| `FINISHED` | done cleanly | trainer gone **and** the on-disk final-epoch weights file exists (primary); falls back to the log marker if the target epoch cannot be determined; also prints the index path, the newest weights file, and the finisher's verdict |
 | `DIED` | exited without completing | trainer gone, no completion marker; prints the last error / OOM lines |
 
 If you would rather have the raw one-liner than the script:
@@ -325,8 +325,7 @@ Expect ~1.5 GB of checkpoints for the full run; the disk has 136 GB free.
 > ## READ FIRST: `PYTHONPATH=$HOME/voice/rvc/shims` is MANDATORY for inference on this node.
 >
 > Without it, `core.py infer` dies instantly with **`Illegal instruction (core dumped)`, rc=132, and an
-> empty log** — no traceback, no message. Cause: this node is an **Intel Xeon E5-1620 (Sandy Bridge, 2012)
-> with AVX but no AVX2/FMA/F16C**, and the `pedalboard` 0.9.24 wheel's native extension is built for AVX2,
+> empty log** — no traceback, no message. Cause: this node is an **old 4-core CPU (no AVX2/FMA/F16C)**, and the `pedalboard` 0.9.24 wheel's native extension is built for AVX2,
 > so it SIGILLs at *import*. `rvc/infer/infer.py:11` imports it at module level, so inference cannot even
 > start. **Training is unaffected — it never imports pedalboard — which is why 70 epochs trained fine and
 > the very first inference crashed.**
@@ -347,7 +346,7 @@ PYTHONPATH=$HOME/voice/rvc/shims \
 ~/voice/rvc/venv/bin/python core.py infer \
   --input_path  /absolute/path/to/input.wav \
   --output_path /absolute/path/to/converted.wav \
-  --pth_path    ~/voice/rvc/Applio/logs/scheherazade/scheherazade_90e_41490s.pth \
+  --pth_path    ~/voice/rvc/Applio/logs/scheherazade/scheherazade_70e_32270s.pth \
   --index_path  ~/voice/rvc/Applio/logs/scheherazade/scheherazade.index \
   --f0_method rmvpe \
   --pitch 0 \
@@ -389,7 +388,7 @@ said success (same rule as the XTTS smoke).
 
 ## 9. Morning pipeline
 
-> **This is live again — a run is in flight, ETA ~05:55 UTC (08:55 Istanbul), and xtts is DOWN.**
+> **This is live again — a run is in flight, ETA ~05:55 UTC (08:55 local), and xtts is DOWN.**
 > If you are up before ~05:55 the run is still going: either let it finish or stop it at a save point
 > (§6a) — every 10 epochs from 01:58 there is a usable checkpoint, so stopping early costs at most ~39 min
 > of training, not the night.
@@ -397,7 +396,7 @@ said success (same rule as the XTTS smoke).
 Run in this order. Steps 1–2 are the ones that matter; 3 is verification.
 
 ```sh
-# 1. Stop training if it is still going (it should be done ~05:13 UTC / 08:13 Istanbul).
+# 1. Stop training if it is still going (it should be done ~05:13 UTC / 08:13 local).
 ssh <user>@<gpu-host> '~/voice/rvc/train-status.sh'
 #    RUNNING  -> ssh ... '~/voice/rvc/stop-train.sh'      (checkpoints are safe; resume later per §6b)
 #    FINISHED -> nothing to stop; check the index line is not MISSING
@@ -648,7 +647,7 @@ voice contour is a licensing question for the human, not a config change.
 
 ## 14. The demo (2026-08-02 06:16–06:25 UTC)
 
-One phrase — *«Доброе утро, Андрей. Ночь испекла мне новый голос — послушай и выбери.»* — in three voices,
+One phrase — *«Доброе утро, мой друг. Ночь испекла мне новый голос — послушай и выбери.»* — in three voices,
 in `~/voice/rvc/demo/` on the node and copied to the brain at
 `<path>/voice-demo/`:
 
