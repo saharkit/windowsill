@@ -188,9 +188,10 @@ the dedicated robinhad/ukrainian-tts voices for `uk` via `VOICE_LOOP_TTS_ENGINE_
 fakes — which is why the whole file is testable without a model on disk.
 
 Language is a **request field** (`?language=` / `{"language": ...}`), defaulting to the server's
-`VOICE_LOOP_LANGUAGE`. Recognition is multilingual; synthesis is limited to the languages the
-selected engine speaks, and an unsupported code returns `400` with the supported list rather than a
-stack trace.
+`VOICE_LOOP_LANGUAGE`. Local whisper auto-detects languages; a cloud recognizer receives
+`stt.language` up front, so the choice matters there and mixed speech must be configured as such.
+Synthesis is limited to the languages the selected engine speaks, and an unsupported code returns
+`400` with the supported list rather than a stack trace.
 
 **Two fallbacks compose, and neither knows about the other.** The client falls back from
 `/tts/stream` to the blob `/tts` when a stream dies before its first chunk (the speak path, step 4);

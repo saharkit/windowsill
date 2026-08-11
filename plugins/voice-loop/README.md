@@ -215,10 +215,11 @@ own feature with its own config schema, and it is not implemented — see the de
 
 ## Languages
 
-Recognition (whisper) is multilingual. The contour ships the local voices below; **English is a
-first-class language, not a fallback** — it has its own selftest phrase and its own CI loopback lane
-(the macOS one). Turkish uses XTTS-v2 locally for native cloned-voice synthesis, or the cloud pair
-Deepgram STT + ElevenLabs multilingual TTS on GPU-less machines.
+Local whisper auto-detects languages. A cloud recognizer is told one up front by `stt.language`, so
+that choice matters and mixed speech must be identified during setup. The contour ships the local
+voices below; **English is a first-class language, not a fallback** — it has its own selftest phrase
+and its own CI loopback lane (the macOS one). Turkish uses XTTS-v2 locally for native cloned-voice
+synthesis, or the cloud pair Deepgram STT + ElevenLabs multilingual TTS on GPU-less machines.
 
 | language | synthesis model | default speaker | automatic stress marking |
 |---|---|---|---|
