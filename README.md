@@ -75,10 +75,19 @@ and [#20](https://github.com/saharkit/windowsill/issues/20).
 
 ## Running on Windows
 
-The recommended route is **WSL2 with WSLg** on Windows 11 — and honesty first: nobody has run
-this end to end on a real Windows machine yet.
-[#41](https://github.com/saharkit/windowsill/issues/41) tracks that verification pass; until
-it lands, this is the route we recommend, not a tested guarantee.
+**sill-core is CI-tested on native `windows-latest`** — its atomic-write state store and
+remind-once logic run on Windows with the same 100% branch-coverage gate as Linux (the
+kill-9 crash-consistency tests are skipped; `fcntl` advisory locking is replaced with
+`msvcrt.locking`). The rest of the shelf — voice-loop's server, hooks, hotkeys, audio
+capture and playback — still depends on POSIX facilities (process groups, `pkill`,
+`fcntl`) and has **not** been verified on native Windows.
+[#42](https://github.com/saharkit/windowsill/issues/42) tracks the remaining work.
+
+The recommended route for **voice-loop** on a Windows machine is **WSL2 with WSLg** on
+Windows 11 — and honesty first: nobody has run voice-loop end to end on a real Windows
+machine yet (WSL or native).
+[#41](https://github.com/saharkit/windowsill/issues/41) tracks that verification pass;
+until it lands, this is the route we recommend, not a tested guarantee.
 
 From an elevated PowerShell:
 

@@ -21,14 +21,70 @@ Pattern bricks consulted:
 
 from __future__ import annotations
 
-import fcntl
 import json
 import os
+import sys
 import tempfile
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterator
+
+# Platform lock selection.  On Linux, ``fcntl.flock`` provides advisory
+# whole-file locking; on Windows, ``msvcrt.locking`` provides mandatory
+# byte-range locking.  That difference in kind — advisory vs. mandatory,
+# whole-file vs. byte-range — is not observable here: this store uses a
+# sidecar ``.lock`` file and only ever cooperates with itself, so both
+# mechanisms serialise the critical section identically.
+#
+# On Windows, ``msvcrt.locking(LK_LOCK)`` waits for up to ~10 s before raising
+# ``OSError``; on Linux, ``flock(LOCK_EX)`` waits indefinitely.  Both are fine
+# for the short read-modify-write section of this store — a ten-second hold
+# would never be reached under normal operation, and a pathological hold on
+# Linux hangs rather than raising, which is the safer failure mode for a file
+# that otherwise stays consistent.
+#
+# BOTH branches below carry ``# pragma: no cover``, and that is deliberate — do not "fix" it by
+# removing one.  ``sill-core-coverage`` runs ``--cov-fail-under=100`` on ubuntu AND windows, so a
+# branch left measurable is a branch that reports 0% on the platform that cannot execute it, and
+# reddens four legs.  The consequence is real and worth stating plainly: the gate does NOT measure
+# the lock helpers on either platform.  What covers them is the suite — ``test_two_writers_same_
+# plugin_file`` puts two workers on one file for 100 keys, which exercises the active acquire and
+# release under genuine contention.  Tests, not the percentage.
+
+if sys.platform == "win32":          # pragma: no cover
+    import msvcrt as _flock
+
+    def _acquire_lock(lock_path: Path) -> int:
+        """Acquire a blocking exclusive lock on Windows, returning an fd to release."""
+        fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR)
+        try:
+            _flock.locking(fd, _flock.LK_LOCK, 1)
+        except BaseException:
+            os.close(fd)
+            raise
+        return fd
+
+    def _release_lock(fd: int) -> None:
+        """Release the Windows lock and close the fd."""
+        try:
+            _flock.locking(fd, _flock.LK_UNLCK, 1)
+        finally:
+            os.close(fd)
+
+else:                                # pragma: no cover
+    import fcntl as _flock
+
+    def _acquire_lock(lock_path: Path) -> object:
+        """Acquire a blocking exclusive lock on POSIX, returning a file object."""
+        lock_file = lock_path.open("a+")
+        _flock.flock(lock_file.fileno(), _flock.LOCK_EX)
+        return lock_file
+
+    def _release_lock(lock_handle: object) -> None:
+        """Release the POSIX lock and close the file."""
+        _flock.flock(lock_handle.fileno(), _flock.LOCK_UN)
+        lock_handle.close()
 
 CURRENT_SCHEMA = 1
 """The schema version stamped into every written state file.
@@ -101,12 +157,11 @@ class AssistantState:
         """Hold the per-plugin lock across a read-modify-write transaction."""
         self._state_dir.mkdir(parents=True, exist_ok=True)
         lock_path = self._state_dir / "assistant-state.lock"
-        with lock_path.open("a+") as lock_file:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
-            try:
-                yield
-            finally:
-                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+        lock_handle = _acquire_lock(lock_path)
+        try:
+            yield
+        finally:
+            _release_lock(lock_handle)
 
     def _read(self) -> dict[str, Any]:
         """Read the current state dict from disk.
