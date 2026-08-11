@@ -645,7 +645,7 @@ def same_window_guard_on(s: dict) -> bool:
     return bool(s["auto_paste"]) and s["paste_target"] == "same-window"
 
 
-# --- paste denial: the macOS Accessibility permission, detected once per session --------------------
+# --- paste denial: an Accessibility marker persists until a re-probe clears it --------------------
 
 
 _ACCESSIBILITY_PROBE = [
