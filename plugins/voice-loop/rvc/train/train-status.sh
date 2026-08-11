@@ -28,14 +28,17 @@ DIR=$HOME/voice/rvc/Applio/logs/scheherazade
 LASTEP=$(tr "\r" "\n" < "$LOG" 2>/dev/null | grep -a "epoch=" | tail -1)
 TARGET=$(grep -a "TRAIN_LAUNCH" "$LOG" 2>/dev/null | tail -1 | sed -n "s/.*epochs=\([0-9]*\).*/\1/p")
 FINAL_W=""
-[ -n "$TARGET" ] && FINAL_W=$(ls "$DIR"/scheherazade_${TARGET}e_*s.pth 2>/dev/null | tail -1)
+# shellcheck disable=SC2012
+[ -n "$TARGET" ] && FINAL_W=$(ls "$DIR"/scheherazade_"${TARGET}"e_*s.pth 2>/dev/null | tail -1)
 
 if pgrep -f "rvc/train/train.py" > /dev/null; then
   PROG=$(tr "\r" "\n" < "$LOG" | grep -a "%|" | tail -1 | tr -s " ")
   VRAM=$(nvidia-smi --query-gpu=memory.used,memory.free --format=csv,noheader | tr "\n" " ")
   echo "RUNNING | ${LASTEP:-<no epoch finished yet>} | in-epoch:${PROG} | vram_used/free: ${VRAM}"
 elif [ -n "$FINAL_W" ] || grep -aq "Training has been successfully completed" "$LOG" 2>/dev/null; then
+  # shellcheck disable=SC2012
   IDX=$(ls "$DIR"/*.index 2>/dev/null | tail -1)
+  # shellcheck disable=SC2012
   ALLW=$(ls "$DIR"/scheherazade_*e_*s.pth 2>/dev/null | wc -l)
   HOW="completion marker present"
   [ -n "$FINAL_W" ] && HOW="final weights for the ${TARGET}-epoch target are on disk"

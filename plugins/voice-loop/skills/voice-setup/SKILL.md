@@ -308,7 +308,7 @@ python3 "${CLAUDE_PLUGIN_ROOT}/scripts/install_ledger.py" step-begin step-3-inst
 
 ```sh
 # packages the user may already have — list what is MISSING and ask once, printing the exact line:
-#   sudo apt install jq curl pipewire-utils alsa-utils wl-clipboard libsndfile1   # (or dnf/pacman)
+#   sudo apt install jq curl pipewire-bin alsa-utils wl-clipboard libsndfile1   # (or dnf/pacman)
 ```
 This is the one place a `sudo` line may appear — **printed for the user to run**, never executed by you.
 
@@ -454,7 +454,7 @@ the raw mic has no echo protection, so the assistant's own replies are dictated 
 The fix is local: PipeWire's `libpipewire-module-echo-cancel` (WebRTC AEC).
 
 This step is **Linux-only** and **idempotent** — running it over an existing config leaves the right
-thing. Probe first: if `pw-cli` is not on PATH, PipeWire is not the audio system (or `pipewire-utils`
+thing. Probe first: if `pw-cli` is not on PATH, PipeWire is not the audio system (or `pipewire-bin`
 is not installed). In that case skip to Step 4. Otherwise:
 
 ```sh
@@ -739,6 +739,23 @@ python3 "${CLAUDE_PLUGIN_ROOT}/scripts/install_ledger.py" step-begin step-6-hotk
 One rule before the per-desktop recipes: **on macOS, bind a physical chord, not an F-row key.** See
 the macOS subsection below for why and for the question to ask. On Linux the F-row is a real key and
 `F9` remains the default.
+
+### No graphical session — skip the hotkey
+
+If the Step 0 probe printed `XDG_SESSION_TYPE=` (empty) and `XDG_CURRENT_DESKTOP=` (empty),
+the machine has no graphical session — a headless box, WSL without a desktop, an SSH shell,
+or a container.  A hotkey binding needs a desktop session to receive it, so **skip this step**
+with a stated reason rather than probing for a desktop that is not there:
+
+> `XDG_SESSION_TYPE` and `XDG_CURRENT_DESKTOP` are both empty — this machine has no graphical
+> session, so a desktop hotkey cannot be bound.  Dictation still works from the command line:
+> `voice-loop-dictate send` from any terminal.  Skip to Step 7.
+
+Leave the stable launcher in place (`~/.local/bin/voice-loop-dictate`) — it is harmless on a
+headless box and is ready if a desktop session is added later.
+
+Do NOT use `gsettings` presence as evidence of a desktop — `libglib2.0-bin` includes it in
+the Ubuntu base image regardless of whether GNOME is actually running.
 
 ### GNOME (gsettings, no root)
 

@@ -273,6 +273,28 @@ CHECK_MANIFEST: list[dict] = [
     },
     {
         "bin": "real_anomaly",
+        "key": "player_nonzero_exit",
+        "title": "The audio player exited with an error",
+        "explanation": (
+            "The audio player ran but exited non-zero — the synthesis "
+            "succeeded and the player binary was found, but playback "
+            "failed (the audio device may be unavailable or busy)."
+        ),
+        "fix": (
+            "Check that the audio device is available: "
+            "`aplay -l` (Linux) to list devices, or check that the "
+            "macOS sound output is not muted.  The default player "
+            "is `aplay` (Linux) or `afplay` (macOS)."
+        ),
+        "offer_flip": False,
+        "check": {
+            "type": "log",
+            "source": "speak.log",
+            "pattern": "played rc=1",
+        },
+    },
+    {
+        "bin": "real_anomaly",
         "key": "recorder_failed",
         "title": "The audio recorder is failing",
         "explanation": (
@@ -353,7 +375,7 @@ CHECK_MANIFEST: list[dict] = [
         ),
         "fix": (
             "Install a recorder: on Linux with PipeWire, `sudo apt install "
-            "pipewire-utils` (or the equivalent for your distro); on "
+            "pipewire-bin` (or the equivalent for your distro); on "
             "ALSA, `alsa-utils`; on macOS, `brew install sox`."
         ),
         "offer_flip": False,

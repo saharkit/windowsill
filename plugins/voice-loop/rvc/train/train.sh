@@ -7,9 +7,9 @@ CLEANUP=${3:-False}
 SAVE_EVERY=${4:-10}
 CKPT=${5:-True}
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-cd $HOME/voice/rvc/Applio
+cd "$HOME"/voice/rvc/Applio || exit
 echo "=== TRAIN_LAUNCH batch=$BATCH epochs=$EPOCHS save_every=$SAVE_EVERY checkpointing=$CKPT cleanup=$CLEANUP alloc_conf=$PYTORCH_CUDA_ALLOC_CONF at $(date -Is) ==="
-$HOME/voice/rvc/venv/bin/python core.py train \
+"$HOME"/voice/rvc/venv/bin/python core.py train \
   --model_name scheherazade \
   --vocoder HiFi-GAN \
   --sample_rate 40000 \

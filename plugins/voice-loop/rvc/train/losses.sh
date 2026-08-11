@@ -1,6 +1,6 @@
 #!/bin/bash
 # Print the scalar loss curves Applio writes to TensorBoard for "scheherazade".
-$HOME/voice/rvc/venv/bin/python - <<"PY"
+"$HOME"/voice/rvc/venv/bin/python - <<"PY"
 import glob, os
 from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
 d = os.path.expanduser("~/voice/rvc/Applio/logs/scheherazade")
