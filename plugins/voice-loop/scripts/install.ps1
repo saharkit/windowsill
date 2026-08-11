@@ -68,10 +68,26 @@ function Test-Command {
 }
 
 # ---------------------------------------------------------------------------
+# Helper: is this a real Python interpreter (not a Windows Store App Execution
+# Alias stub)?  Runs the interpreter and checks its OUTPUT, never its presence
+# on PATH alone.  A real interpreter prints "Python X.Y.Z" on --version and
+# exits 0; a Store stub prints nothing (or exits 9009, or opens the Store).
+# ---------------------------------------------------------------------------
+function Test-RealPython {
+    param([string]$Name)
+    try {
+        $output = & $Name --version 2>&1 | Out-String
+        return $output -match 'Python \d+\.\d+'
+    } catch {
+        return $false
+    }
+}
+
+# ---------------------------------------------------------------------------
 # Step 1 — Python 3.12 (direct installer, no winget)
 # ---------------------------------------------------------------------------
 Invoke-Step "Python 3.12" {
-    if (Test-Command python) {
+    if (Test-RealPython python) {
         $ver = & python --version 2>&1
         Write-Host "    already installed: $ver"
         return
@@ -88,7 +104,7 @@ Invoke-Step "Python 3.12" {
     # REFRESH PATH for this session so the steps below see python.
     $env:Path = [System.Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path", "User")
 
-    if (Test-Command python) {
+    if (Test-RealPython python) {
         $ver = & python --version 2>&1
         Write-Host "    installed: $ver"
     } else {
@@ -106,7 +122,7 @@ Invoke-Step "Python 3.12" {
 # failure: it looks like the plugin misbehaving.
 # ---------------------------------------------------------------------------
 Invoke-Step "python3.exe alias" {
-    if (Test-Command python3) {
+    if (Test-RealPython python3) {
         $ver = & python3 --version 2>&1
         Write-Host "    python3 already resolves: $ver"
         return
@@ -131,7 +147,7 @@ Invoke-Step "python3.exe alias" {
 
     # Verify the copy resolves.
     $env:Path = "$pythonDir;$env:Path"
-    if (Test-Command python3) {
+    if (Test-RealPython python3) {
         $ver = & python3 --version 2>&1
         Write-Host "    python3 resolves: $ver"
     } else {
