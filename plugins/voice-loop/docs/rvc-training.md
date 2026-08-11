@@ -80,7 +80,7 @@ dependency that forced XTTS onto torch 2.8.0 does not apply. Verified by grep be
 │   ├── rvc/models/               # pretraineds, predictors (rmvpe), embedders (contentvec) — 1.9 GB
 │   └── logs/scheherazade/        # <<< the experiment: dataset, features, checkpoints, weights, index
 ├── venv/                         # python3.12 + torch 2.11.0+cu128
-├── install.sh  preprocess.sh  extract.sh      # the setup steps, re-runnable
+├── install.sh  prereq.sh  preprocess.sh  extract.sh      # the setup steps, in order, re-runnable (§2a)
 ├── train.sh                      # LAUNCHER: train.sh [BATCH] [EPOCHS] [CLEANUP] [SAVE_EVERY]
 ├── stop-train.sh                 # stop the run (§6a)
 ├── train-status.sh               # RUNNING / FINISHED / DIED (§4)
@@ -93,6 +93,40 @@ dependency that forced XTTS onto torch 2.8.0 does not apply. Verified by grep be
 
 Everything under `logs/scheherazade/` is regenerable from the corpus; nothing here is precious except the
 `.pth` weights and `.index` once you like a checkpoint.
+
+---
+
+## 2a. From a clean machine — the one-time setup
+
+§3 assumes all of this is already done. On a host that has never run this pipeline, do these steps in
+order, once. The pipeline scripts ship in this repo at `plugins/voice-loop/rvc/train/`; the runbook assumes
+they are deployed flat at `~/voice/rvc/` (the layout in §2), beside the venv and Applio they drive.
+
+```sh
+# 0. uv — install.sh invokes it; nothing else here installs it
+curl -LsSf https://astral.sh/uv/install.sh | sh          # uv lands in ~/.local/bin (install.sh adds it to PATH)
+
+# 1. the venv every script hard-codes ($HOME/voice/rvc/venv) — no step creates it otherwise
+python3.12 -m venv ~/voice/rvc/venv
+
+# 2. Applio at the pinned commit §1 documents — no script clones it
+git clone https://github.com/IAHispano/Applio.git ~/voice/rvc/Applio
+git -C ~/voice/rvc/Applio checkout da174445ec98d15d006175ac99db3879bd3a73d1
+
+# 3. headless clones have no assets/config.json (the GUI makes it on first launch); without this copy,
+#    training runs but silently skips writing the inference .pth at every save (see §10)
+cp ~/voice/rvc/Applio/assets/config_template.json ~/voice/rvc/Applio/assets/config.json
+
+# 4. the pipeline, in order — each script is re-runnable:
+#    install.sh (torch + Applio deps) -> prereq.sh (pretraineds, rmvpe, contentvec) ->
+#    preprocess.sh -> extract.sh   (then launch train.sh per §3 — a long job, run it detached)
+cd ~/voice/rvc && ./install.sh && ./prereq.sh && ./preprocess.sh && ./extract.sh
+```
+
+`prereq.sh` is the step the old §2 list omitted: it downloads the ~1.9 GB of pretraineds, the rmvpe f0
+predictor and the contentvec embedder into `Applio/rvc/models/`, all consumed by `extract.sh` and
+`train.sh`. `preprocess.sh` reads your corpus — point it at your own single-speaker audio (the example used
+`~/voice/corpus/eleven/`); under ~15 min of clean audio yields a weak model.
 
 ---
 
@@ -330,7 +364,9 @@ Expect ~1.5 GB of checkpoints for the full run; the disk has 136 GB free.
 > start. **Training is unaffected — it never imports pedalboard — which is why 70 epochs trained fine and
 > the very first inference crashed.**
 >
-> `~/voice/rvc/shims/pedalboard.py` provides the eleven imported names. Pedalboard is only used by
+> The shim **ships in this repo at `plugins/voice-loop/rvc/shims/pedalboard.py`** — copy it (or the whole
+> `shims/` dir) to `~/voice/rvc/shims/`; the `PYTHONPATH=$HOME/voice/rvc/shims` on the command below puts it
+> ahead of site-packages. It provides the eleven imported names. Pedalboard is only used by
 > `post_process_audio()`, reached solely when `post_process=True` (CLI default `False`), so nothing real is
 > lost; the shim's classes **raise** if instantiated, so enabling effects fails loudly rather than silently
 > skipping them. Nothing in site-packages was modified — remove the shim dir / drop `PYTHONPATH` to revert.
@@ -501,6 +537,10 @@ recoverable inside the night.
 the reversal command, and the VRAM trace proving the spike is gone.
 
 ### "An error occurred extracting the model: ... assets/config.json" — the silent one
+
+> Now a **setup step (§2a, step 3)** — a clean walkthrough copies `config_template.json` to `config.json`
+> before training, so this no longer happens by construction. What follows is the forensic record of the
+> one run that did hit it.
 
 Seen at the epoch-10 save on 2026-08-02, **fixed at 02:01**. It is the nastiest bug here because it does
 **not** stop training and does not appear in the status line:

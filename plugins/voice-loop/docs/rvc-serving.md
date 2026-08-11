@@ -76,11 +76,13 @@ To stop: `pkill -f rvc_server.py` (but see the warning below — use a bracketed
 
 ## 2. The dependency that will break it first: the pedalboard shim
 
-`PYTHONPATH=$HOME/voice/rvc/shims` — training RUNBOOK §8, **READ FIRST** section. This node is an
-old 4-core CPU with AVX but **no AVX2/FMA**, and the `pedalboard` wheel's
-native extension is AVX2-only, so it **SIGILLs at import** — `Illegal instruction (core dumped)`,
-no traceback, empty log. `rvc/infer/infer.py:11` imports it at module level, so nothing can be
-imported without the shim.
+`PYTHONPATH=$HOME/voice/rvc/shims` — training RUNBOOK §8, **READ FIRST** section. The shim **ships in
+the repo at `plugins/voice-loop/rvc/shims/pedalboard.py`**; copy it (or the whole `shims/` dir) to
+`~/voice/rvc/shims/` — the launcher in §1 already puts that directory on `PYTHONPATH`, and `rvc_server.py`
+puts it on `sys.path[0]` itself. This node is an old 4-core CPU with AVX but **no AVX2/FMA**, and the
+`pedalboard` wheel's native extension is AVX2-only, so it **SIGILLs at import** — `Illegal instruction
+(core dumped)`, no traceback, empty log. `rvc/infer/infer.py:11` imports it at module level, so nothing
+can be imported without the shim.
 
 Two belts here, deliberately:
 
