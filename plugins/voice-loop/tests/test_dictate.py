@@ -853,6 +853,12 @@ def test_run_paste_does_not_mark_denial_on_non_accessibility_error(state, monkey
 def test_run_paste_marks_denial_only_on_required_steps(state, monkeypatch):
     """The Enter-key step is best-effort (required=False); a denial-shaped error there must not
     create the marker — only the required paste-keystroke step counts."""
+    # Pin the plan shape this test depends on: with enter=True the osascript plan is exactly two
+    # steps — the required paste keystroke, then a best-effort Enter (required=False). Without this,
+    # the assertions below hold even if the Enter step vanished or became required, so the test would
+    # pass while testing nothing about the required=False path its name advertises.
+    plan = dictate.paste_plan("osascript", "cmd+v", enter=True)
+    assert [required for _, _, required in plan] == [True, False]
     denial_stderr = b"osascript is not allowed to send keystrokes. (1002)"
 
     class PasteOkEnterFailed:
