@@ -119,6 +119,11 @@ If any step fails and you cannot recover, **do not write its checkpoint**. The l
 last completed step, and the next run will pick up from there. Never write `step-done` for work
 that did not succeed — a false positive in the ledger is worse than redoing the step.
 
+A step the *machine* rules out is a different case: it succeeded, with nothing to do. Write its
+checkpoint with the reason stated (the headless hotkey skip in Step 6 is the one instance today).
+`finish` refuses while any step in `step_order` is incomplete, so a silently skipped step leaves
+the install unable to record itself as complete.
+
 ### Esc / Ctrl-C during a prompt
 
 If the user presses Esc (or Ctrl-C) during an interactive prompt (AskUserQuestion), the prompt's
@@ -753,6 +758,18 @@ with a stated reason rather than probing for a desktop that is not there:
 
 Leave the stable launcher in place (`~/.local/bin/voice-loop-dictate`) — it is harmless on a
 headless box and is ready if a desktop session is added later.
+
+**Checkpoint before skipping** — write the step's marker anyway. "No hotkey, because this machine
+has no desktop to receive one" is this step's *correct outcome*, not unfinished work, and `finish`
+in Step 8 refuses while any step in `step_order` is incomplete (it exits 2 and the install never
+records as complete):
+
+```sh
+python3 "${CLAUDE_PLUGIN_ROOT}/scripts/install_ledger.py" step-done step-6-hotkey
+```
+
+Then go to Step 7, and say in the closing report that the hotkey was skipped for want of a
+graphical session.
 
 Do NOT use `gsettings` presence as evidence of a desktop — `libglib2.0-bin` includes it in
 the Ubuntu base image regardless of whether GNOME is actually running.
