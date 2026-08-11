@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/scripts/speak.sh\"",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/speak.py\"",
             "async": true,
             "timeout": 90
           }
@@ -19,7 +19,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/scripts/speak.sh\"",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/speak.py\"",
             "async": true,
             "timeout": 90
           }

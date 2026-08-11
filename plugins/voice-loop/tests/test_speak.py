@@ -1900,6 +1900,78 @@ def test_the_mirrored_hook_timeout_is_the_one_the_manifest_declares():
     assert declared == {HOOK_TIMEOUT_S}
 
 
+def test_hook_commands_use_python3_not_bash():
+    """Mutation gap: changing ``python3`` back to ``bash`` in hooks.json would restore the
+    Windows-native failure — ``bash`` resolves to WSL's bash.exe which mangles Windows paths
+    and exits 127.  The hook must call the cross-platform interpreter, not a shell whose
+    resolution depends on the host."""
+    manifest = json.loads((Path(__file__).resolve().parents[1] / "hooks" / "hooks.json").read_text(encoding="utf-8"))
+    commands: list[str] = []
+    for registrations in manifest["hooks"].values():
+        for registration in registrations:
+            for entry in registration["hooks"]:
+                commands.append(entry["command"])
+    assert len(commands) >= 2, "expected at least two hook registrations (Stop + PostToolUse)"
+    for cmd in commands:
+        assert cmd.startswith("python3 "), (
+            f"hook command must use python3 (cross-platform), not a shell that differs per host; got: {cmd!r}"
+        )
+        assert "speak.py" in cmd, (
+            f"hook command must invoke speak.py (the Python entry point); got: {cmd!r}"
+        )
+
+
+def test_speak_py_exits_zero_when_sibling_modules_missing(tmp_path):
+    """Mutation gap: removing the try/except ImportError guard around ``import providers`` and
+    ``import wsclient`` in speak.py would cause an ImportError traceback (exit 1) instead of
+    the silent exit (0) when the sibling modules are absent.  That guard preserves the contract
+    the bash launcher provided — a half-copied scripts/ directory is silence, not a traceback
+    in the middle of a turn.
+
+    The test copies speak.py to a temp directory WITHOUT its siblings, then runs it as a
+    subprocess — the guard must exit 0 rather than raising."""
+    import shutil, subprocess, sys
+
+    dest = tmp_path / "speak.py"
+    shutil.copy2(str(_SPEAK_PATH), str(dest))
+    result = subprocess.run(
+        [sys.executable, str(dest)],
+        capture_output=True, timeout=15,
+        cwd=str(tmp_path),
+        env={**os.environ, "PYTHONPATH": str(tmp_path)},
+    )
+    assert result.returncode == 0, (
+        f"speak.py exited {result.returncode} without sibling modules;\n"
+        f"stdout: {result.stdout.decode(errors='replace')[:300]}\n"
+        f"stderr: {result.stderr.decode(errors='replace')[:500]}"
+    )
+
+
+def test_windows_install_recipe_exists_and_is_readable():
+    """Mutation gap: deleting or corrupting install.ps1 would leave the Windows-native install
+    path without its documented recipe — the control pass (#174) drives from this file and has
+    nothing to fall back on.  The test verifies the file is present, is valid UTF-8, and carries
+    the elevation check and the python3.exe copy — the two steps the manual pass had to discover
+    by hand."""
+    install_ps1 = Path(__file__).resolve().parents[1] / "scripts" / "install.ps1"
+    assert install_ps1.is_file(), f"install.ps1 not found at {install_ps1}"
+    text = install_ps1.read_text(encoding="utf-8")
+    # The elevation check must be present — a silent elevation assumption hangs on UAC.
+    assert "IsInRole" in text, "install.ps1 must detect elevation rather than assume it"
+    # The python3.exe copy must be present — python.org does not ship python3.exe.
+    assert "python3.exe" in text, "install.ps1 must create python3.exe from python.exe"
+    # The script must not invoke winget as a command (broken on the measured guest).
+    # A comment explaining WHY is fine; `winget install` / `winget source` is not.
+    assert "winget install" not in text.lower(), (
+        "install.ps1 must not invoke winget (broken on the measured guest)"
+    )
+    assert "winget source" not in text.lower(), (
+        "install.ps1 must not invoke winget (broken on the measured guest)"
+    )
+    # The script must use direct installers (curl.exe + Start-Process).
+    assert "curl.exe" in text.lower(), "install.ps1 must use curl.exe for downloads"
+
+
 class _FakeStat:
     """What os.stat gives wait_out_flush, and the only two fields it reads."""
 
