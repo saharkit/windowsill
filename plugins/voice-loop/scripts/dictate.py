@@ -488,10 +488,17 @@ def resolve_recorder(recorder: str, system: str, have) -> str:
 def recorder_argv(recorder: str, system: str, wav: str, *, source: str = "") -> list[str]:
     """The exact device/format flags the shell used: 16 kHz, mono, S16 — [] for an unknown name.
 
-    ``source`` is the PipeWire source name to target (e.g. "Echo-Cancel Source") — when set and the
-    recorder is pw-record, --target routes the capture to that source. If the named source does not
-    exist (the AEC module is absent), pw-record falls back to the default source — dictate never
-    blocks on echo cancellation."""
+    ``source`` is platform-specific:
+    * Linux + pw-record — the PipeWire source name (e.g. "Echo-Cancel Source"); when set, --target
+      routes capture to that source. An unknown source makes pw-record fall back to the default
+      source — dictate never blocks on echo cancellation.
+    * Windows + ffmpeg — the DirectShow device name (e.g. "Microphone (Realtek Audio)");
+      enumerated at start time when omitted (see _discover_dshow_mic). DirectShow demands the
+      explicit device, so an empty source on Windows produces [] — the dictation fails clean
+      rather than capturing from a non-existent input.
+
+    An empty source on Linux/macOS is the historic auto behaviour — a device ffmpeg picks itself.
+    Windows has no such default, which is why discovery is part of start_recording, not here."""
     if recorder == "pw-record":
         argv = ["pw-record", "--rate", str(RECORD_RATE), "--channels", "1"]
         if source:
@@ -503,9 +510,82 @@ def recorder_argv(recorder: str, system: str, wav: str, *, source: str = "") -> 
     if recorder == "sox":
         return ["rec", "-q", "-r", str(RECORD_RATE), "-c", "1", "-b", "16", wav]
     if recorder == "ffmpeg":
-        src = ["-f", "avfoundation", "-i", ":default"] if system == "Darwin" else ["-f", "alsa", "-i", "default"]
+        if system == "Darwin":
+            src = ["-f", "avfoundation", "-i", ":default"]
+        elif system == "Windows":
+            # DirectShow requires `audio=<device>`; no device name is a hard failure path —
+            # capture-from-nothing is the silent-mic bug class, so refuse the argv instead.
+            if not source:
+                return []
+            src = ["-f", "dshow", "-i", f"audio={source}"]
+        else:
+            src = ["-f", "alsa", "-i", "default"]
         return ["ffmpeg", "-hide_banner", "-loglevel", "error", *src, "-ar", str(RECORD_RATE), "-ac", "1", "-y", wav]
     return []
+
+
+# DirectShow enumeration (windowsill#177). Windows capture has no platform default for ffmpeg's
+# `-f dshow -i` device name the way ALSA's `default` and avfoundation's `:default` are defaults;
+# the device has to be named, and the right one varies with whatever hardware is plugged in. The
+# enumeration runs `ffmpeg -list_devices true -f dshow -i dummy` (the `dummy` trick: ffmpeg refuses
+# to open a real device in a list, but `dummy` is enough to make it print the catalogue to stderr)
+# and picks the first audio capture device. Override the pick with dictate.source when the user's
+# rig misnames it — the ticket calls that defect class an "implementer's guard", not a level-shift.
+_DSHOW_DISCOVERY_TIMEOUT = 5.0
+_DSHOW_DISCOVERY_ARGV = ["ffmpeg", "-list_devices", "true", "-f", "dshow", "-i", "dummy"]
+_DSHOW_AUDIO_HEADER = "DirectShow audio devices"
+_DSHOW_VIDEO_HEADER = "DirectShow video devices"
+# ffmpeg writes each device line as `[dshow @ ...]  "name"` — the dshow tag prefix is part of
+# every device row. Match the first quoted string on the line, ignoring the prefix and any
+# trailing text.
+_DSHOW_DEVICE_LINE = re.compile(r'"([^"]+)"')
+
+
+def _parse_dshow_audio_devices(stderr: str) -> str:
+    """The first audio capture device ffmpeg listed; '' when the catalog is empty.
+
+    ffmpeg's enumeration alternates 'DirectShow audio devices' and 'DirectShow video devices'
+    headers with `  "<device>"` rows under each. The first audio row is the most likely microphone;
+    on a multi-input rig (a USB interface, a virtual cable, stereo mix) this is the one an operator
+    overrides via dictate.source — picking the wrong one captures silence (#177)."""
+    in_audio = False
+    for line in stderr.splitlines():
+        if _DSHOW_AUDIO_HEADER in line:
+            in_audio = True
+            continue
+        if _DSHOW_VIDEO_HEADER in line:
+            in_audio = False
+            continue
+        if not in_audio:
+            continue
+        match = _DSHOW_DEVICE_LINE.search(line)
+        if match:
+            return match.group(1)
+    return ""
+
+
+def _discover_dshow_mic() -> str:
+    """The first DirectShow audio device on Windows; '' on any failure (non-Windows, no ffmpeg,
+    timed-out probe, empty catalog). Best-effort: a '' answer keeps dictate running — the next
+    step, recorder_argv's empty-source refusal, is what surfaces the missing device as a failed
+    start rather than a silent clip.
+
+    Tested via _parse_dshow_audio_devices and a fake subprocess.run — ffmpeg itself is a Windows
+    binary that doesn't run on the lane this is developed on, and a 5 s subprocess on each start
+    is the cost a hardware-locked enumeration pays anyway."""
+    try:
+        result = subprocess.run(
+            _DSHOW_DISCOVERY_ARGV,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=_DSHOW_DISCOVERY_TIMEOUT,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    if result.returncode != 0 and not result.stderr:
+        return ""
+    return _parse_dshow_audio_devices(result.stderr)
 
 
 # --- belt-and-suspenders echo guard -------------------------------------------------------------
@@ -550,17 +630,20 @@ def clip_seconds(size_bytes: int) -> float:
 
 def resolve_clipboard(clipboard: str, system: str, have, wayland: bool) -> str:
     """auto -> pbcopy (macOS), wl-copy (a live Wayland session), xclip, wl-copy (installed but no
-    $WAYLAND_DISPLAY — XWayland setups); an explicit name is taken as-is.
+    $WAYLAND_DISPLAY — XWayland setups), clip.exe (native Windows); an explicit name is taken as-is.
 
-    Only these three tools are ever candidates; a Windows ``clip.exe`` found on PATH through WSL
-    interop is NOT one of them — ``clipboard_commands`` has no entry for it, so no probe order can
-    select it. Under WSLg the session exports $WAYLAND_DISPLAY like any Wayland desktop, so the
-    first wl-copy tier already fires there; nothing WSL-specific is needed (#179 defect 3).
+    The WSL trap is closed by ``system`` alone: ``platform.system()`` returns 'Linux' inside WSL,
+    so the Windows branch only fires on NATIVE Windows — a binary search of PATH never enters
+    it on a Linux/WSL guest even when clip.exe is reachable through interop. Under WSLg the
+    session exports $WAYLAND_DISPLAY like any Wayland desktop, so the wl-copy branch already
+    fires there (#179 defect 3).
     """
     if clipboard != "auto":
         return clipboard
     if system == "Darwin":
         return "pbcopy"
+    if system == "Windows":
+        return "clip" if have("clip.exe") else ""
     if wayland and have("wl-copy"):
         return "wl-copy"
     if have("xclip"):
@@ -579,13 +662,27 @@ def clipboard_commands(tool: str) -> list[list[str]]:
         return [["wl-copy"], ["wl-copy", "--primary"]]
     if tool == "xclip":
         return [["xclip", "-selection", "clipboard"], ["xclip", "-selection", "primary"]]
+    if tool == "clip":
+        # Native Windows only — clip.exe is not a tier on Linux/WSL even when interop finds it,
+        # because resolve_clipboard gates on platform.system() == 'Windows' (WSL reports 'Linux').
+        return [["clip.exe"]]
     return []
 
 
 def pick_paste_tool(system: str, have, ydotool_socket_ok: bool, display: str) -> str:
-    """The platform table, in the shell's order: osascript / ydotool(+socket) / wtype / xdotool."""
+    """The platform table, in the shell's order: osascript / sendkeys / ydotool(+socket) / wtype / xdotool.
+
+    Native Windows uses ``SendKeys`` via the WSH COM object (a default Windows component, no
+    third-party install). The shim is a one-line PowerShell that creates a WScript.Shell and
+    calls SendKeys on it — the same automation surface AutoHotKey sits on, just the stdlib
+    shortcut. #46's paste-at-focus footgun carries over unchanged: the same-window guard is
+    the only thing standing between "I dictated into this app" and "I dictated into whatever
+    was focused when I let go of the key", and that ruling is platform-agnostic.
+    """
     if system == "Darwin":
         return "osascript" if have("osascript") else ""
+    if system == "Windows":
+        return "sendkeys" if have("powershell.exe") else ""
     if have("ydotool") and ydotool_socket_ok:
         return "ydotool"
     if have("wtype"):
@@ -593,6 +690,33 @@ def pick_paste_tool(system: str, have, ydotool_socket_ok: bool, display: str) ->
     if display and have("xdotool"):
         return "xdotool"
     return ""
+
+
+# Map the documented paste_key names to SendKeys syntax. SendKeys '^' is Ctrl, '+' is Shift,
+# '%' is Alt, and a key name in braces is the literal key — so `^+v` is Ctrl+Shift+V and
+# `+{Insert}` is Shift+Insert. Anything outside this map falls back to plain Ctrl+V, which is
+# what `rec` had no rule for and is the safe default for an unknown paste_key on Windows.
+_WIN_SENDKEYS_FOR_PASTE = {
+    "ctrl+shift+v": "^+v",
+    "ctrl+v": "^v",
+    "shift+insert": "+{Insert}",
+    "shift+ins": "+{Insert}",
+}
+
+
+def _win_sendkeys_argv(keys: str) -> list[str]:
+    """Build a PowerShell argv that calls WScript.Shell.SendKeys on the given key sequence.
+
+    The script is a single statement, -Command-compatible, and the keystrokes go through the
+    shared WSH COM object that every Windows automation tool (AutoHotKey, VBA, the GUI) sits
+    on, so no extra install is needed. The -NoProfile flag avoids hangs on user-land profiles
+    while a hotkey is being held."""
+    return [
+        "powershell.exe",
+        "-NoProfile",
+        "-Command",
+        f"(New-Object -ComObject WScript.Shell).SendKeys('{keys}')",
+    ]
 
 
 def paste_plan(tool: str, paste_key: str, enter: bool) -> list[tuple[float, list[str], bool]]:
@@ -608,6 +732,19 @@ def paste_plan(tool: str, paste_key: str, enter: bool) -> list[tuple[float, list
         steps.append((0.0, ["osascript", "-e", f'tell application "System Events" to keystroke "v" using {using}'], True))
         if enter:
             steps.append((0.25, ["osascript", "-e", 'tell application "System Events" to key code 36'], False))
+    elif tool == "sendkeys":
+        # SendKeys has no async-after delay (a race-free sequence against an open clipboard), and
+        # the same 250 ms settle as the other paste tools to give the focused app time to register
+        # the paste before the Enter arrives.
+        keys = _WIN_SENDKEYS_FOR_PASTE.get(paste_key, "^v")
+        steps.append((0.0, _win_sendkeys_argv(keys), True))
+        if enter:
+            # `{Enter}` — single braces, exactly like `+{Insert}` two lines up. PowerShell
+            # single-quoted strings are VERBATIM: there is no brace-doubling escape in them, so a
+            # doubled `{{Enter}}` reaches SendKeys as the literal `{{Enter}}`, SendKeys parses the
+            # token as `{Enter` and raises, and because this step is required=False the failure is
+            # silent — the default `send` mode pastes the transcript and never submits it.
+            steps.append((0.25, _win_sendkeys_argv("{Enter}"), False))
     elif tool == "ydotool":
         steps.append((0.15, ["ydotool", "key", paste_key], True))
         if enter:
@@ -1067,8 +1204,72 @@ def _transcribe_cloud(s: dict, wav_bytes: bytes, boundary: str) -> str | None:
 
 
 def _pid_alive(pid: int) -> bool:
+    """Is *pid* a live process? POSIX uses the signal-0 idiom; on Windows there IS no signal 0 —
+    os.kill maps straight to TerminateProcess, so the same call would TERMINATE the very process
+    it is probing. The Windows arm opens a kernel32 handle and polls it with a zero timeout — no
+    subprocess, because both callers ask this per poll iteration and a spawned tasklist.exe per
+    ask is a per-iteration process launch."""
     if pid <= 0:
         return False
+    if os.name == "nt":  # pragma: no cover — exercised on Windows; the lane runs Linux
+        import ctypes
+
+        try:
+            # use_last_error (not a bare windll): ctypes itself makes Win32 calls between our
+            # failing call and the error read, so kernel32.GetLastError() can report a stale
+            # code and misread access-denied as no-such-process. ctypes.get_last_error() is
+            # captured at the boundary and is the reliable read.
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # stdlib; Windows arm
+
+            # Without argtypes/restype ctypes truncates a 64-bit handle to a C int on 64-bit
+            # Python — exactly the class of defect that only shows up on the platform no lane
+            # runs. Declare every signature.
+            kernel32.OpenProcess.argtypes = (
+                ctypes.c_uint32,  # dwDesiredAccess
+                ctypes.c_int,  # bInheritHandle
+                ctypes.c_uint32,  # dwProcessId
+            )
+            kernel32.OpenProcess.restype = ctypes.c_void_p
+            kernel32.WaitForSingleObject.argtypes = (
+                ctypes.c_void_p,  # hHandle
+                ctypes.c_uint32,  # dwMilliseconds
+            )
+            kernel32.WaitForSingleObject.restype = ctypes.c_uint32
+            kernel32.CloseHandle.argtypes = (ctypes.c_void_p,)
+            kernel32.CloseHandle.restype = ctypes.c_int
+
+            # SYNCHRONIZE (0x00100000) lets us wait; PROCESS_QUERY_LIMITED_INFORMATION
+            # (0x1000) is the least-privilege right that still permits the wait below.
+            SYNCHRONIZE = 0x00100000
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            ERROR_ACCESS_DENIED = 5
+            ERROR_INVALID_PARAMETER = 87
+            WAIT_OBJECT_0 = 0
+            WAIT_TIMEOUT = 0x102
+
+            handle = kernel32.OpenProcess(
+                SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, False, pid
+            )
+            if not handle:
+                error = ctypes.get_last_error()
+                if error == ERROR_ACCESS_DENIED:
+                    # Exists but is not ours to open — the Windows twin of the POSIX arm's
+                    # PermissionError → True, kept answering the same way on both arms.
+                    return True
+                # ERROR_INVALID_PARAMETER (87) is "no such process"; any other failure we
+                # cannot ask: report dead rather than kill what we cannot see.
+                return False
+            try:
+                wait = kernel32.WaitForSingleObject(handle, 0)
+                if wait == WAIT_TIMEOUT:
+                    return True  # still running
+                if wait == WAIT_OBJECT_0:
+                    return False  # exited
+                return False  # WAIT_FAILED or anything else: cannot ask, report dead
+            finally:
+                kernel32.CloseHandle(handle)  # every path that opened it closes it
+        except (OSError, AttributeError):
+            return False  # kernel32 is not what we expect: report dead, do not fall back to spawn
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -1078,6 +1279,144 @@ def _pid_alive(pid: int) -> bool:
     except OSError:
         return False
     return True
+
+
+def _win_console_ctrl_c(pid: int) -> bool:  # pragma: no cover — exercised on Windows; the lane runs Linux
+    """Send CTRL_C_EVENT to the console *pid* lives in — True if the event went out.
+
+    This is the Windows equivalent of SIGINT, and the only graceful stop that reaches a process
+    we did not spawn: the start toggle that did spawn the recorder has exited by stop time, so
+    nobody still holds the recorder's stdin to write `q` into. Attaching to the target's console
+    and raising CTRL_C_EVENT takes the path ffmpeg's own console Ctrl+C handler runs — it
+    finalizes the output container — which TerminateProcess never does. Our own process ignores
+    the event for the duration (SetConsoleCtrlHandler NULL/True), because the event reaches every
+    process attached to that console, this one included."""
+    import ctypes
+
+    kernel32 = ctypes.windll.kernel32  # stdlib; this function is Windows-only by caller
+    was_attached = False
+    target_attached = False
+    handler_set = False
+    try:
+        # GetConsoleCP returns zero when this process has no console, unlike a window-handle
+        # probe which does not describe pseudoconsole attachment reliably.
+        was_attached = bool(kernel32.GetConsoleCP())
+        if was_attached:
+            kernel32.FreeConsole()
+        if not kernel32.AttachConsole(pid):
+            return False  # the process (or its console) is already gone
+        target_attached = True
+        kernel32.SetConsoleCtrlHandler(None, True)
+        handler_set = True
+        return bool(kernel32.GenerateConsoleCtrlEvent(0, 0))  # 0 = CTRL_C_EVENT, console-wide
+    except Exception:
+        return False
+    finally:
+        # Detach BEFORE restoring the handler, on EVERY exit path: SetConsoleCtrlHandler(None,
+        # False) re-arms this process's default Ctrl+C handler, and while we are still attached to
+        # the target console the CTRL_C_EVENT just raised can still reach us — killing the stop
+        # toggle before it transcribes the speech it stopped for. FreeConsole first, so the
+        # re-armed handler can never receive that event.
+        if target_attached:
+            try:
+                kernel32.FreeConsole()
+            except Exception:
+                pass
+        if handler_set:
+            try:
+                kernel32.SetConsoleCtrlHandler(None, False)
+            except Exception:
+                pass
+        if was_attached:
+            try:
+                kernel32.AttachConsole(-1)  # ATTACH_PARENT_PROCESS
+            except Exception:
+                pass
+
+
+def _win_pid_is_recorder(pid: int, recorder: str) -> bool:
+    """PID-reuse guard for the Windows stop path: is *pid* still OUR recorder?
+
+    The pidfile outlives its process and the kernel recycles PIDs, so the pid main() reads out of
+    dictate.pid can belong to somebody else by stop time — and _win_console_ctrl_c signals the WHOLE
+    console that pid is attached to, after which _stop_recorder TerminateProcess-es it. Before
+    either, confirm the process image is the recorder this recording would have spawned. The image
+    name is read through the handle _pid_alive already opens (PROCESS_QUERY_LIMITED_INFORMATION is
+    enough for QueryFullProcessImageNameW) — no subprocess, because the stop path must stay cheap.
+    """
+    if pid <= 0 or not recorder:
+        return False  # plain-Python guard, left under coverage: no Windows-only API before this
+    import ctypes  # pragma: no cover — exercised on Windows; the lane runs Linux
+
+    try:  # pragma: no cover — everything from here reaches kernel32
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # stdlib; Windows arm
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        kernel32.OpenProcess.argtypes = (
+            ctypes.c_uint32,  # dwDesiredAccess
+            ctypes.c_int,  # bInheritHandle
+            ctypes.c_uint32,  # dwProcessId
+        )
+        kernel32.OpenProcess.restype = ctypes.c_void_p
+        kernel32.QueryFullProcessImageNameW.argtypes = (
+            ctypes.c_void_p,  # hProcess
+            ctypes.c_uint32,  # dwFlags (0 = the Win32 path form)
+            ctypes.c_wchar_p,  # lpExeName
+            ctypes.POINTER(ctypes.c_uint32),  # lpdwSize (in TCHARs, in and out)
+        )
+        kernel32.QueryFullProcessImageNameW.restype = ctypes.c_int
+        kernel32.CloseHandle.argtypes = (ctypes.c_void_p,)
+        kernel32.CloseHandle.restype = ctypes.c_int
+
+        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not handle:
+            return False  # gone, or not ours to inspect — either way, not something to signal
+        try:
+            size = ctypes.c_uint32(32768)
+            buffer = ctypes.create_unicode_buffer(size.value)
+            if not kernel32.QueryFullProcessImageNameW(handle, 0, buffer, ctypes.byref(size)):
+                return False
+            image = os.path.basename(buffer.value).lower()
+            if image.endswith(".exe"):
+                image = image[: -len(".exe")]
+            # sox's front-end binary is `rec` (recorder_argv returns ["rec", ...]); every other
+            # recorder key IS the executable name.
+            expected = ("rec" if recorder == "sox" else recorder).lower()
+            return image == expected
+        finally:
+            kernel32.CloseHandle(handle)  # every path that opened it closes it
+    except (OSError, AttributeError):  # pragma: no cover — only the excluded Windows arm can raise these
+        return False  # kernel32 is not what we expect: cannot verify, do not signal
+
+
+def _stop_recorder(pid: int, system: str, recorder: str = "") -> None:
+    """Ask the recorder to finalize, then make it stop.
+
+    POSIX: SIGINT lets sox/ffmpeg write the WAV header and flush the tail; TERM is the fallback
+    for a recorder that ignores INT (pw-record/arecord). Windows: os.kill(pid, SIGINT) is an
+    unconditional TerminateProcess, which kills ffmpeg mid-write and leaves an unreadable WAV
+    with no finalized header — the stop toggle would then transcribe nothing, every time. The
+    Windows arm raises CTRL_C_EVENT in the recorder's console instead (see _win_console_ctrl_c)
+    so ffmpeg closes the container; TERM/TerminateProcess remains the fallback, exactly the
+    same INT-then-TERM shape as POSIX.
+
+    Windows first verifies the pid is still OUR recorder (see _win_pid_is_recorder): the pidfile
+    outlives its process and the kernel recycles PIDs, so a stale pid must not get a Ctrl+C in an
+    unrelated console group, nor the TerminateProcess that follows it."""
+    if system == "Windows":
+        if not _win_pid_is_recorder(pid, recorder):  # pragma: no cover — exercised on Windows
+            return  # pragma: no cover — a recycled pid: signal nobody, terminate nobody
+        _win_console_ctrl_c(pid)  # pragma: no cover — exercised on Windows; the lane runs Linux
+    else:
+        try:
+            os.kill(pid, signal.SIGINT)
+        except OSError:
+            pass
+    if not _wait_gone(pid):
+        try:
+            os.kill(pid, signal.SIGTERM)  # Windows: TerminateProcess — the fallback of last resort
+        except OSError:
+            pass
+        _wait_gone(pid)
 
 
 def _cmdline_of(pid: int) -> str | None:
@@ -1128,6 +1467,8 @@ def stop_speak_playback() -> None:
     except OSError:
         tokens = None
     if tokens is None:
+        if os.name == "nt":  # pkill and os.getuid are POSIX-only; Windows has no pattern fallback
+            return
         try:
             subprocess.run(
                 ["pkill", "-u", str(os.getuid()), "-f", "voice-loop-speak"],
@@ -1732,15 +2073,34 @@ def start_recording(s: dict, system: str, pidfile_fd: int) -> int:
     stop_speak_playback()
 
     recorder = resolve_recorder(s["recorder"], system, shutil.which)
-    argv = recorder_argv(recorder, system, _WAV_PATH, source=s.get("source", ""))
+    source = s.get("source", "")
+    # DirectShow on Windows demands an explicit device name; alsa / avfoundation default to one
+    # themselves, so the discovery is a Windows-only pre-step. Discovery races with hardware
+    # changes (a USB headset swapped mid-day) — the operator override is dictate.source.
+    if system == "Windows" and recorder == "ffmpeg" and not source:
+        source = _discover_dshow_mic()
+    argv = recorder_argv(recorder, system, _WAV_PATH, source=source)
     if not argv:
-        note("no recorder found — install pw-record/arecord (Linux) or sox/ffmpeg (macOS)", system)
-        log("no recorder available")
+        if system == "Windows" and recorder == "ffmpeg":
+            note(
+                "no dshow device found — run `ffmpeg -list_devices true -f dshow -i dummy` "
+                "and set dictate.source to the device name",
+                system,
+            )
+            log("dshow discovery returned no device — recorder not started")
+        else:
+            note("no recorder found — install pw-record/arecord (Linux) or sox/ffmpeg (macOS)", system)
+            log("no recorder available")
         _release_claim(pidfile_fd)
         return 1
     try:
         with open(_LOG_PATH, "a", encoding="utf-8") as errlog:
-            proc = subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=errlog)
+            popen_kwargs = {"stdout": subprocess.DEVNULL, "stderr": errlog}
+            if system == "Windows":
+                # Give CTRL_C_EVENT its own console: otherwise GenerateConsoleCtrlEvent(0, 0)
+                # reaches the user's shell and every other process sharing this terminal.
+                popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_CONSOLE", 0x00000010)
+            proc = subprocess.Popen(argv, **popen_kwargs)
     except OSError as err:
         note("recorder failed to start", system)
         log(f"recorder failed: {err}")
@@ -1755,7 +2115,14 @@ def start_recording(s: dict, system: str, pidfile_fd: int) -> int:
             os.close(pidfile_fd)
         except OSError:
             pass
-    log(f"recording via {recorder} pid={proc.pid}")
+    if system == "Windows" and recorder == "ffmpeg":
+        # The DirectShow device name is the operator's microphone label — often a person's name, a
+        # phone model or a company name. It is logged in full only locally; the report-bug collector
+        # cuts it at " device=" (see LOG_RULES). The pid sits BEFORE the device so that cut drops
+        # the name and nothing else.
+        log(f"ffmpeg -f dshow recording pid={proc.pid} device={source!r}")
+    else:
+        log(f"recording via {recorder} pid={proc.pid}")
     # The socket goes up FIRST of the two things that follow the recorder: opening it costs a
     # round trip, and every millisecond of that is speech the server never hears. The focus probe
     # below can spend up to FOCUS_PROBE_TIMEOUT and is deliberately behind it.
@@ -1803,17 +2170,12 @@ def stop_and_transcribe(s: dict, system: str, mode: str, recorder_pid: int) -> i
         os.unlink(_PID_PATH)
     except OSError:
         pass
-    # SIGINT lets sox/ffmpeg finalize the WAV header; TERM is the fallback for pw-record/arecord.
-    try:
-        os.kill(recorder_pid, signal.SIGINT)
-    except OSError:
-        pass
-    if not _wait_gone(recorder_pid):
-        try:
-            os.kill(recorder_pid, signal.SIGTERM)
-        except OSError:
-            pass
-        _wait_gone(recorder_pid)
+    # INT-then-TERM on POSIX; CTRL_C_EVENT-then-TerminateProcess on Windows (see _stop_recorder —
+    # the WAV header only gets finalized by a graceful stop, and os.kill on Windows is not one).
+    # On Windows the recorder name is re-derived so _stop_recorder can identity-check the pid before
+    # signalling (a recycled pid must not get a stranger's Ctrl+C — see _win_pid_is_recorder).
+    recorder = resolve_recorder(s["recorder"], system, shutil.which) if system == "Windows" else ""
+    _stop_recorder(recorder_pid, system, recorder)
     # the recorder flushes the tail of the file AFTER it stops accepting samples — this short
     # settle is the difference between a complete phrase and a truncated one
     time.sleep(0.2)
@@ -1905,8 +2267,15 @@ def stop_and_transcribe(s: dict, system: str, mode: str, recorder_pid: int) -> i
         return 1
     for argv in commands:
         try:
+            # clip.exe auto-detects Unicode only as UTF-16LE with a BOM; POSIX clipboard
+            # tools continue to receive UTF-8, including when running under WSL.
+            clipboard_input = text.encode("utf-16le")
+            if system == "Windows" and tool == "clip":
+                clipboard_input = b"\xff\xfe" + clipboard_input
+            else:
+                clipboard_input = text.encode("utf-8")
             with open(_LOG_PATH, "a", encoding="utf-8") as errlog:
-                subprocess.run(argv, input=text.encode("utf-8"), stdout=subprocess.DEVNULL, stderr=errlog, check=False)
+                subprocess.run(argv, input=clipboard_input, stdout=subprocess.DEVNULL, stderr=errlog, check=False)
         except OSError as err:
             _clear_preview()
             log(f"clipboard failed: {err}")

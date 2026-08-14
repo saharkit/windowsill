@@ -4,18 +4,37 @@
 Claude Code replaces versioned cache directories on plugin updates.  The desktop
 cannot expand ``CLAUDE_PLUGIN_ROOT``, so this launcher asks Claude Code's own
 installed-plugin registry for the current install path at every invocation.
+
+Cross-platform: Linux/macOS use ``os.execv`` (the original behaviour — replaces
+this process with the dict script so signal handling is shared); Windows uses
+``subprocess.run`` because ``os.execv`` raises ``OSError`` there. The two arms
+also resolve different launcher leaves — the ``.sh`` the POSIX desktop binds,
+and the ``.cmd`` shim CreateProcess can actually run (a ``.sh`` under
+CreateProcess is WinError 193, so a single hardcoded leaf fails one platform
+outright).
 """
 
 from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any
 
 _PLUGIN_KEY = "voice-loop@windowsill"
-_SCRIPT = Path("scripts/dictate-toggle.sh")
+
+
+def _script_leaf(platform: str = os.name) -> str:
+    """The launcher leaf for a platform: the ``.cmd`` shim on Windows, the ``.sh`` elsewhere.
+
+    ``subprocess.run`` reaches the child through CreateProcess, which does NOT consult shell file
+    associations — a ``.sh`` there is WinError 193 ("not a valid Win32 application") before bash is
+    ever asked, so every durable hotkey invocation on Windows would fail. The leaf is chosen per
+    call (a parameter, not a module constant) so ``_current_script`` can be driven for either
+    platform without patching the process-global ``os.name``."""
+    return "scripts/dictate-toggle.cmd" if platform == "nt" else "scripts/dictate-toggle.sh"
 
 
 def _config_dir() -> Path:
@@ -35,13 +54,18 @@ def _entries(raw: Any) -> list[dict[str, Any]]:
     return [entry for entry in value if isinstance(entry, dict)] if isinstance(value, list) else []
 
 
-def _current_script() -> Path | None:
+def _current_script(platform: str = os.name) -> Path | None:
     """Find the current plugin script from Claude Code's install registry.
 
     An ambiguous or malformed registry is a refusal, not an invitation to guess
     by sorting cache directory names. Claude Code refreshes this registry when
     the plugin is updated, which is the indirection the desktop binding needs.
+
+    ``platform`` selects the launcher leaf (see _script_leaf): the .cmd shim on
+    Windows, the .sh everywhere else. CreateProcess cannot run a .sh, so the
+    POSIX leaf would fail every Windows invocation outright (WinError 193).
     """
+    leaf = _script_leaf(platform)
     for registry in _registry_paths():
         try:
             raw = json.loads(registry.read_text(encoding="utf-8"))
@@ -52,7 +76,7 @@ def _current_script() -> Path | None:
             install_path = entry.get("installPath")
             if not isinstance(install_path, str) or not install_path:
                 continue
-            script = Path(install_path).expanduser() / _SCRIPT
+            script = Path(install_path).expanduser() / leaf
             if script.is_file():
                 candidates.append((script, entry))
         user_candidates = [script for script, entry in candidates if entry.get("scope") == "user"]
@@ -74,8 +98,23 @@ def main() -> int:
             file=sys.stderr,
         )
         return 1
+    argv = [str(script), *sys.argv[1:]]
+    if os.name == "nt":
+        # Windows: os.execv is not implemented, so chain through subprocess and propagate the
+        # child's exit code. The child is the same Python that would have been exec'd on POSIX,
+        # so the only behavioural difference is the parent waiting on the child rather than
+        # being replaced by it — irrelevant for a launcher.
+        try:
+            result = subprocess.run(argv, check=False)
+        except OSError as err:
+            print(
+                f"voice-loop-dictate: spawn failed: {err}",
+                file=sys.stderr,
+            )
+            return 1
+        return result.returncode
     try:
-        os.execv(str(script), [str(script), *sys.argv[1:]])
+        os.execv(str(script), argv)
     except OSError as err:
         print(
             f"voice-loop-dictate: exec failed: {err}",

@@ -38,7 +38,15 @@ def _install(tmp_path: Path, version: str) -> Path:
     scripts.mkdir(parents=True)
     script = scripts / "dictate-toggle.sh"
     script.write_text("#!/bin/sh\n", encoding="utf-8")
+    (scripts / "dictate-toggle.cmd").write_text("@echo off\r\n", encoding="utf-8")
     return root
+
+
+def _install_cmd(tmp_path: Path, version: str) -> Path:
+    """An install carrying BOTH launcher leaves — the real checkout ships the ``.cmd`` beside the
+    ``.sh``, so the leaf the resolver picks is a decision it makes, not an accident of which file
+    happens to exist."""
+    return _install(tmp_path, version)
 
 
 def test_registry_resolution_follows_update_without_version_sorting(tmp_path, monkeypatch):
@@ -105,3 +113,76 @@ def test_main_execs_current_script_with_hotkey_arguments(tmp_path, monkeypatch, 
     captured = capsys.readouterr()
     assert "exec failed" in captured.err
     assert calls == [(str(current / "scripts" / "dictate-toggle.sh"), [str(current / "scripts" / "dictate-toggle.sh"), "send"])]
+
+
+def test_main_on_windows_spawns_subprocess_and_returns_child_exit(tmp_path, monkeypatch):
+    """Gap: native Windows (`os.name == "nt"`) has no `os.execv`. The same launcher must reach the
+    child, propagate its exit code, and never re-enter the POSIX branch — without this branch, a
+    Windows hotkey fires the launcher and fails with `OSError: [Errno 22]` from `os.execv` every
+    time, the dictation equivalent of #151 (a path that broke while manual invocation kept
+    working, except here manual invocation never worked at all).
+
+    `_current_script` is mocked to a sentinel Path so the test never constructs ``Path()`` while
+    ``os.name`` is patched to ``"nt"`` — the stdlib `Path()` factory follows `os.name` and would
+    return WindowsPath, which `__init__` raises on Linux. The sentinel is the ``.cmd`` leaf because
+    the module-level ``_SCRIPT`` selects it under the same patch: ``subprocess.run`` reaches the
+    child through CreateProcess, which does not consult shell file associations, so a ``.sh`` leaf
+    is WinError 193 on every invocation — the hotkey that never once fires."""
+    fake_script = Path("/fake/install/scripts/dictate-toggle.cmd")
+    monkeypatch.setattr(_launcher, "_current_script", lambda: fake_script)
+    monkeypatch.setattr(_launcher.os, "name", "nt")
+    monkeypatch.setattr(_launcher.sys, "argv", ["launcher", "send"])
+    execv_calls: list[tuple[str, list[str]]] = []
+    monkeypatch.setattr(_launcher.os, "execv", lambda path, argv: execv_calls.append((path, argv)))
+
+    spawn_calls: list[list[str]] = []
+
+    class Done:
+        returncode = 7
+
+    def fake_run(argv, **kw):
+        spawn_calls.append(argv)
+        assert kw["check"] is False
+        return Done()
+
+    monkeypatch.setattr(_launcher.subprocess, "run", fake_run)
+
+    assert _launcher.main() == 7  # the child's exit code, surfaced to the caller
+    assert execv_calls == [], "Windows must not invoke os.execv (it raises OSError there)"
+    assert spawn_calls == [
+        [str(fake_script), "send"]
+    ], "argv reaches the child verbatim, including the user's hotkey arguments"
+
+
+def test_current_script_resolves_the_cmd_leaf_on_windows(tmp_path, monkeypatch):
+    """The registry candidate under Windows must be the ``.cmd`` shim, not the ``.sh``:
+    ``subprocess.run`` reaches the child through CreateProcess, which does not consult shell file
+    associations — a ``.sh`` candidate is WinError 193 before argv matters, so a hardcoded POSIX
+    leaf makes every durable Windows hotkey invocation fail. The platform is a parameter (not a
+    patched ``os.name``) because ``Path()`` itself follows ``os.name`` and cannot be constructed
+    as a WindowsPath on this Linux runner."""
+    root = _install_cmd(tmp_path, "0.8.0")
+    _write_registry(tmp_path, [{"installPath": str(root), "scope": "user"}])
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+
+    assert _launcher._current_script("nt") == root / "scripts" / "dictate-toggle.cmd"
+    assert _launcher._current_script("posix") == root / "scripts" / "dictate-toggle.sh"
+
+
+def test_main_on_windows_returns_nonzero_when_subprocess_spawn_fails(tmp_path, monkeypatch, capsys):
+    """A Windows-side spawn failure (file not found, permission denied) must surface as a
+    non-zero exit and an informative stderr message — the silent-launcher failure shape would
+    hide the broken hotkey behind a hotkey that appears to do nothing."""
+    fake_script = Path("/fake/install/scripts/dictate-toggle.cmd")
+    monkeypatch.setattr(_launcher, "_current_script", lambda: fake_script)
+    monkeypatch.setattr(_launcher.os, "name", "nt")
+    monkeypatch.setattr(_launcher.sys, "argv", ["launcher", "send"])
+
+    def fake_run(argv, **kw):
+        raise OSError("the script does not exist")
+
+    monkeypatch.setattr(_launcher.subprocess, "run", fake_run)
+
+    assert _launcher.main() == 1
+    captured = capsys.readouterr()
+    assert "spawn failed" in captured.err

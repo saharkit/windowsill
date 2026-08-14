@@ -395,6 +395,200 @@ def test_unknown_paste_tool_builds_no_plan():
     assert dictate.paste_plan("", "ctrl+shift+v", enter=True) == []
 
 
+# --- Windows native dictation (windowsill#177) ---------------------------------------------------
+#
+# Native Windows is a separate code path: dshow capture, clip.exe clipboard, SendKeys paste. Each
+# `if system == "Windows"` branch in the recorder/clipboard/paste decision tables is the seam the
+# acceptance criterion reads off `dictate.log`, so each branch gets its own test at the lowest
+# level that pins it. The dshow parser is a pure helper and gets full-coverage tests; the
+# discovery step is impure (subprocess) and is tested by faking that one call.
+
+
+def test_windows_ffmpeg_argv_uses_dshow_with_the_named_device():
+    """L2 gap: an `avfoundation` argv on Windows targets a macOS-only input and produces silence
+    on the user's mic — the failure shape is exactly the dictation that records but never hears.
+    The dshow branch must include ``-f dshow -i audio=<device>`` and pass the device name
+    through as a single argv element (spaces in the device name are part of the value, not a
+    word boundary)."""
+    argv = dictate.recorder_argv("ffmpeg", "Windows", "/tmp/w.wav", source="Microphone (Realtek Audio)")
+    assert ["-f", "dshow", "-i", "audio=Microphone (Realtek Audio)"] == argv[4:8]
+    assert argv[-1] == "/tmp/w.wav"
+
+
+def test_windows_ffmpeg_no_device_refuses_argv():
+    """L2 gap: an empty source on Windows must return [], not silently fall back to alsa. DirectShow
+    has no platform default like alsa's `default`, and an ffmpeg argv without -i would fail at the
+    `-f dshow` step the moment the recorder starts — the visible symptom being a recorder that
+    starts and captures nothing, exactly the failure shape dictation must refuse to ship."""
+    assert dictate.recorder_argv("ffmpeg", "Windows", "/tmp/w.wav") == []
+    assert dictate.recorder_argv("ffmpeg", "Windows", "/tmp/w.wav", source="") == []
+
+
+def test_windows_ffmpeg_source_is_not_misread_as_pw_record_target():
+    """L2 gap: `--target` is pw-record-only. Reusing `source` as the Windows device name must not
+    inject the pw-record flag on the ffmpeg branch — `-target` is a dshow option, not a flag."""
+    argv = dictate.recorder_argv("ffmpeg", "Windows", "/tmp/w.wav", source="Mic")
+    assert "--target" not in argv
+    assert "audio=Mic" in argv
+
+
+def test_parse_dshow_audio_devices_reads_first_device_under_audio_header():
+    """L2 gap: ffmpeg writes 'DirectShow audio devices' then `  "..."` lines under it; the parser
+    must skip non-device lines (headers, the camera section), capture the FIRST quoted device
+    name, and ignore every device name that appears later in the catalog."""
+    stderr = (
+        "ffmpeg version 6.0 Copyright (c) 2000-2024 the FFmpeg developers\n"
+        "[dshow @ 0x55c8b0a0c0] DirectShow audio devices\n"
+        '[dshow @ 0x55c8b0a0c0]  "Microphone (Realtek Audio)"\n'
+        '[dshow @ 0x55c8b0a0c0]  "Stereo Mix (Realtek Audio)"\n'
+        "[dshow @ 0x55c8b0a0c0] DirectShow video devices\n"
+        '[dshow @ 0x55c8b0a0c0]  "Integrated Camera"\n'
+        "dummy: Immediate exit requested\n"
+    )
+    assert dictate._parse_dshow_audio_devices(stderr) == "Microphone (Realtek Audio)"
+
+
+def test_parse_dshow_audio_devices_ignores_devices_under_video_header():
+    """L2 gap: without the audio/video header toggle, the first video device wins. A wrong device
+    captures a still image stream instead of audio — silent clip, exactly the failure class
+    dictation must reject."""
+    stderr = (
+        "[dshow @ 0x55c8b0a0c0] DirectShow video devices\n"
+        '[dshow @ 0x55c8b0a0c0]  "Integrated Camera"\n'
+    )
+    assert dictate._parse_dshow_audio_devices(stderr) == ""
+
+
+def test_parse_dshow_audio_devices_empty_or_unknown_stderr_returns_empty():
+    """L2 gap: a rig with no audio devices (or a missing ffmpeg) yields '' rather than crashing."""
+    assert dictate._parse_dshow_audio_devices("") == ""
+    assert dictate._parse_dshow_audio_devices("random ffmpeg noise") == ""
+
+
+def test_discover_dshow_mic_returns_empty_when_stderr_has_no_listing(monkeypatch):
+    """L2 gap: a non-zero exit with no stderr is the canonical 'ffmpeg not found' signal — must
+    return '', not raise."""
+    calls: list[dict[str, object]] = []
+
+    class Done:
+        returncode = 1
+        stderr = ""
+
+    def fake_run(argv, **kw):
+        calls.append({"argv": argv, "kw": kw})
+        return Done()
+
+    monkeypatch.setattr(dictate.subprocess, "run", fake_run)
+    assert dictate._discover_dshow_mic() == ""
+    assert len(calls) == 1
+    assert calls[0]["argv"] == dictate._DSHOW_DISCOVERY_ARGV
+    assert calls[0]["kw"]["timeout"] == dictate._DSHOW_DISCOVERY_TIMEOUT
+    assert calls[0]["kw"]["check"] is False
+
+
+def test_discover_dshow_mic_returns_parsed_first_device(monkeypatch):
+    """End-to-end: stderr arrives, the parser returns the first audio device, the helper
+    surfaces it as the chosen mic."""
+    expected_stderr = (
+        "[dshow @ 0x55c8b0a0c0] DirectShow audio devices\n"
+        '[dshow @ 0x55c8b0a0c0]  "Real Mic"\n'
+    )
+
+    class Done:
+        returncode = 0
+        stderr = expected_stderr
+
+    monkeypatch.setattr(dictate.subprocess, "run", lambda *a, **kw: Done())
+    assert dictate._discover_dshow_mic() == "Real Mic"
+
+
+def test_clipboard_native_windows_prefers_clip_when_present():
+    """L2 gap: a Windows tier must be present for native-Windows install. Without it the resolution
+    falls through to '' (the documented "no clipboard tool" diagnostic) — the recording completes,
+    but the user's clipboard is empty, which is the dictation-equivalent of #93 (an empty
+    transcript reachable via the success path)."""
+    assert dictate.resolve_clipboard("auto", "Windows", have("clip.exe"), wayland=False) == "clip"
+    assert dictate.resolve_clipboard("auto", "Windows", have_none, wayland=False) == ""
+
+
+def test_clipboard_native_windows_takes_explicit_clip_name():
+    """An explicit `clip` works without `clip.exe` on PATH (the user pre-confirmed the install)."""
+    assert dictate.resolve_clipboard("clip", "Windows", have_none, wayland=False) == "clip"
+
+
+def test_clipboard_native_windows_ignores_wayland_flag():
+    """The `wayland` parameter is Linux-only; on Windows the absence or presence of a Wayland
+    session is irrelevant. A branch that re-ordered on `wayland` would miss the Windows tier
+    when a runner had $WAYLAND_DISPLAY set."""
+    assert dictate.resolve_clipboard("auto", "Windows", have("clip.exe"), wayland=True) == "clip"
+
+
+def test_clipboard_commands_for_clip_returns_clip_exe_invocation():
+    """clip.exe is the only argv under the new tier; a single-element list matches the pbcopy
+    shape (one canonical command, no primary/clipboard split — Windows has no secondary
+    selection)."""
+    assert dictate.clipboard_commands("clip") == [["clip.exe"]]
+
+
+def test_paste_tool_pick_windows_uses_sendkeys():
+    """L2 gap: a Windows paste tool must be present. The Linux branches don't fire on Windows,
+    so without this branch `pick_paste_tool` returns '' and auto-paste silently falls back to
+    the clipboard tier — the dictation lands in the clipboard but never in the prompt."""
+    assert dictate.pick_paste_tool("Windows", have("powershell.exe"), False, "") == "sendkeys"
+    assert dictate.pick_paste_tool("Windows", have_none, False, "") == ""
+
+
+def test_sendkeys_argv_uses_noprofile_and_wscript_shell():
+    """L2 gap: -NoProfile avoids a PowerShell profile load on every paste (visible lag); the
+    COM-call shape is the auto-paste bug-free automation surface — every alternative (Add-Type
+    + SendKeys, start-process) has either a profile load or a longer cold path."""
+    argv = dictate._win_sendkeys_argv("^v")
+    assert argv[0] == "powershell.exe"
+    assert "-NoProfile" in argv
+    assert "-Command" in argv
+    assert argv[-1] == "(New-Object -ComObject WScript.Shell).SendKeys('^v')"
+
+
+def test_paste_plan_sendkeys_renders_ctrl_shift_v_as_caret_caret_v():
+    """L2 gap: `^+v` is simultaneous Ctrl+Shift+V. Dropping the `+` makes some apps fire Ctrl+V
+    twice (a paste, then a paste-while-pasting race). The `+` must precede the modifier it
+    applies to, and a separate modifier pair must surround the key for it to be a chord."""
+    steps = dictate.paste_plan("sendkeys", "ctrl+shift+v", enter=False)
+    assert len(steps) == 1
+    _, argv, required = steps[0]
+    assert required is True
+    assert argv[-1].endswith("SendKeys('^+v')")
+
+
+def test_paste_plan_sendkeys_renders_shift_insert_with_braces():
+    """L2 gap: '+Insert' (without braces) means Shift+I, n, s, e, r, t — six keys instead of one.
+    The braces tell SendKeys to look up the literal key name, not type the letters."""
+    steps = dictate.paste_plan("sendkeys", "shift+insert", enter=False)
+    assert steps[0][1][-1].endswith("SendKeys('+{Insert}')")
+
+
+def test_paste_plan_sendkeys_uses_single_braces_around_enter():
+    """L2 gap: PowerShell single-quoted strings are VERBATIM — there is no brace-doubling escape
+    in them. A doubled `{{Enter}}` reaches SendKeys as the literal `{{Enter}}`, which SendKeys
+    parses as the token `{Enter` and rejects; and because the Enter step is required=False, that
+    failure is silent — the default `send` mode pastes the transcript but never submits it. The
+    assertion matches the `+{Insert}` shape in the same table: single braces, the SendKeys
+    special-key name."""
+    steps = dictate.paste_plan("sendkeys", "ctrl+v", enter=True)
+    assert len(steps) == 2
+    delay, argv, required = steps[1]
+    assert delay == 0.25
+    assert argv[-1].endswith("SendKeys('{Enter}')")
+    assert required is False  # best-effort, like the other tools' Enter
+
+
+def test_paste_plan_sendkeys_falls_back_to_plain_ctrl_v_for_unknown_paste_key():
+    """An unknown paste_key maps to `^v` — the safe default that the Linux branches also end
+    up at via the .get(paste_key, default) pattern."""
+    steps = dictate.paste_plan("sendkeys", "garbage", enter=False)
+    assert steps[0][1][-1].endswith("SendKeys('^v')")
+
+
 # --- paste_target: the same-window guard --------------------------------------------------------
 
 
