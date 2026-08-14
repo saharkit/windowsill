@@ -151,6 +151,20 @@ def test_key_file_wins_over_env(tmp_path):
     assert dictate.read_key(str(key_file), "K_ENV", {"K_ENV": "sk-fromenv"}) == "sk-fromfile"
 
 
+def test_oversized_key_file_falls_back_without_reading_the_whole_file(tmp_path):
+    """L2: a hostile key file must not become an unbounded read or a credential candidate."""
+    key_file = tmp_path / "k"
+    key_file.write_bytes(b"x" * (dictate.MAX_KEY_BYTES + 1))
+    assert dictate.read_key(str(key_file), "K_ENV", {"K_ENV": "from-env"}) == "from-env"
+
+
+def test_oversized_config_is_ignored(tmp_path):
+    """L2: a malformed giant config must fail closed instead of consuming the hotkey process."""
+    config = tmp_path / "config.json"
+    config.write_bytes(b"{" + b"x" * dictate.MAX_CONFIG_BYTES)
+    assert dictate.load_config(str(config)) == {}
+
+
 def test_missing_key_file_falls_back_to_env(tmp_path):
     assert dictate.read_key(str(tmp_path / "absent"), "K_ENV", {"K_ENV": "sk-fromenv"}) == "sk-fromenv"
     assert dictate.read_key("", "K_ENV", {}) == ""
@@ -863,6 +877,42 @@ def test_multipart_form_with_no_fields_is_just_the_file_part():
 
 def test_transcript_from_response_reads_text_and_strips():
     assert dictate.transcript_from_response(b'{"text": " hello world \\n", "language": "en"}') == "hello world"
+
+
+def test_oversized_stt_response_is_rejected(state, monkeypatch, opener):
+    """L2: an endpoint cannot force dictation to buffer an unbounded response."""
+    (state / "dictate.wav").write_bytes(b"RIFFfakewav")
+    opener(b"x" * (dictate.MAX_RESPONSE_BYTES + 1))
+    s = dictate.resolve_settings({}, "Linux")
+    assert dictate.transcribe(s) == ""
+    assert "response rejected" in (state / "dictate.log").read_text(encoding="utf-8")
+
+
+def test_local_stt_command_is_argv_only_and_bounded(state, monkeypatch):
+    """L2: config text cannot become shell syntax, and a local engine gets a wall-clock bound."""
+    (state / "dictate.wav").write_bytes(b"RIFFfakewav")
+    calls = []
+
+    class Done:
+        returncode = 0
+        stdout = "local transcript"
+        stderr = ""
+
+    monkeypatch.setattr(dictate.subprocess, "run", lambda argv, **kw: calls.append((argv, kw)) or Done())
+    s = dictate.resolve_settings({"stt": {"command": "whisper-cli --model 'my model'"}}, "Linux")
+    assert dictate.transcribe(s) == "local transcript"
+    assert calls[0][0] == ["whisper-cli", "--model", "my model", str(state / "dictate.wav")]
+    assert calls[0][1]["timeout"] == 60.0
+    assert calls[0][1]["check"] is False
+    assert "shell" not in calls[0][1]
+
+
+def test_malformed_local_stt_command_fails_closed(state):
+    """L2: an unterminated quoted command must refuse execution rather than invoke a shell."""
+    (state / "dictate.wav").write_bytes(b"RIFFfakewav")
+    s = dictate.resolve_settings({"stt": {"command": "whisper-cli 'unterminated"}}, "Linux")
+    assert dictate.transcribe(s) == ""
+    assert "command rejected" in (state / "dictate.log").read_text(encoding="utf-8")
 
 
 def test_transcript_from_response_is_empty_on_anything_malformed():
@@ -1660,6 +1710,7 @@ def test_a_repeat_burst_through_main_produces_exactly_one_recording_cycle(state,
 def test_a_second_press_past_the_window_still_stops_the_recording(state, monkeypatch):
     """The guard must debounce autorepeat without breaking the toggle it protects."""
     monkeypatch.setattr(dictate.subprocess, "Popen", lambda argv, **kw: FakeProc())
+    monkeypatch.setattr(dictate, "_pid_looks_like_recorder", lambda pid, recorder, platform_id: True)
     monkeypatch.setattr(dictate, "stop_speak_playback", lambda: None)
     monkeypatch.setattr(dictate, "note", lambda message, system: None)
     monkeypatch.setattr(dictate, "_pid_alive", lambda pid: pid == FakeProc.pid)
@@ -1691,6 +1742,15 @@ def test_a_negative_debounce_ms_is_off_not_a_wedged_toggle(state):
     assert dictate.resolve_settings({"dictate": {"debounce_ms": -250}}, "Linux")["debounce_ms"] == 0.0
 
 
+def test_live_unrelated_pid_is_refused_before_signal(state, monkeypatch):
+    """L2: a recycled pid must not turn a toggle into a signal for an unrelated process."""
+    (state / "dictate.pid").write_text("4242", encoding="utf-8")
+    monkeypatch.setattr(dictate, "_pid_alive", lambda pid: True)
+    monkeypatch.setattr(dictate, "_pid_looks_like_recorder", lambda *args: False)
+    assert dictate.main(["dictate.py"]) == 1
+    assert "failed identity check" in (state / "dictate.log").read_text(encoding="utf-8")
+
+
 def test_debounce_ms_is_configurable_and_zero_disables_it(state, monkeypatch):
     assert dictate.resolve_settings({"dictate": {"debounce_ms": 150}}, "Linux")["debounce_ms"] == 150.0
     assert dictate.resolve_settings({"dictate": {"debounce_ms": 0}}, "Linux")["debounce_ms"] == 0.0
@@ -1700,6 +1760,7 @@ def test_debounce_ms_is_configurable_and_zero_disables_it(state, monkeypatch):
     monkeypatch.setattr(dictate, "stop_speak_playback", lambda: None)
     monkeypatch.setattr(dictate, "note", lambda message, system: None)
     monkeypatch.setattr(dictate, "_pid_alive", lambda pid: pid == FakeProc.pid)
+    monkeypatch.setattr(dictate, "_pid_looks_like_recorder", lambda pid, recorder, platform_id: True)
     stopped: list[int] = []
     monkeypatch.setattr(dictate, "stop_and_transcribe", lambda s, system, mode, pid: stopped.append(pid) or 0)
     _write_config(monkeypatch, state, {"dictate": {"recorder": "arecord", "debounce_ms": 0}})
