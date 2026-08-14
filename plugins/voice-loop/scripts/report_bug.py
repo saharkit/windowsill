@@ -514,6 +514,10 @@ LOG_RULES: tuple[tuple[str, str | None], ...] = (
     ("no recorder available", None),
     ("recorder failed: ", None),
     ("recording via ", None),
+    # Windows native dictation (windowsill#177): the dshow discovery call did not name a capture
+    # device. Same redaction shape as "no recorder available" — the line names the failure and
+    # nothing else.
+    ("dshow discovery returned no device", None),
     ("clip too short (", None),
     ("transcript: ", "transcript: "),
     ("empty transcription", None),

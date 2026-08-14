@@ -488,10 +488,17 @@ def resolve_recorder(recorder: str, system: str, have) -> str:
 def recorder_argv(recorder: str, system: str, wav: str, *, source: str = "") -> list[str]:
     """The exact device/format flags the shell used: 16 kHz, mono, S16 — [] for an unknown name.
 
-    ``source`` is the PipeWire source name to target (e.g. "Echo-Cancel Source") — when set and the
-    recorder is pw-record, --target routes the capture to that source. If the named source does not
-    exist (the AEC module is absent), pw-record falls back to the default source — dictate never
-    blocks on echo cancellation."""
+    ``source`` is platform-specific:
+    * Linux + pw-record — the PipeWire source name (e.g. "Echo-Cancel Source"); when set, --target
+      routes capture to that source. An unknown source makes pw-record fall back to the default
+      source — dictate never blocks on echo cancellation.
+    * Windows + ffmpeg — the DirectShow device name (e.g. "Microphone (Realtek Audio)");
+      enumerated at start time when omitted (see _discover_dshow_mic). DirectShow demands the
+      explicit device, so an empty source on Windows produces [] — the dictation fails clean
+      rather than capturing from a non-existent input.
+
+    An empty source on Linux/macOS is the historic auto behaviour — a device ffmpeg picks itself.
+    Windows has no such default, which is why discovery is part of start_recording, not here."""
     if recorder == "pw-record":
         argv = ["pw-record", "--rate", str(RECORD_RATE), "--channels", "1"]
         if source:
@@ -503,9 +510,82 @@ def recorder_argv(recorder: str, system: str, wav: str, *, source: str = "") -> 
     if recorder == "sox":
         return ["rec", "-q", "-r", str(RECORD_RATE), "-c", "1", "-b", "16", wav]
     if recorder == "ffmpeg":
-        src = ["-f", "avfoundation", "-i", ":default"] if system == "Darwin" else ["-f", "alsa", "-i", "default"]
+        if system == "Darwin":
+            src = ["-f", "avfoundation", "-i", ":default"]
+        elif system == "Windows":
+            # DirectShow requires `audio=<device>`; no device name is a hard failure path —
+            # capture-from-nothing is the silent-mic bug class, so refuse the argv instead.
+            if not source:
+                return []
+            src = ["-f", "dshow", "-i", f"audio={source}"]
+        else:
+            src = ["-f", "alsa", "-i", "default"]
         return ["ffmpeg", "-hide_banner", "-loglevel", "error", *src, "-ar", str(RECORD_RATE), "-ac", "1", "-y", wav]
     return []
+
+
+# DirectShow enumeration (windowsill#177). Windows capture has no platform default for ffmpeg's
+# `-f dshow -i` device name the way ALSA's `default` and avfoundation's `:default` are defaults;
+# the device has to be named, and the right one varies with whatever hardware is plugged in. The
+# enumeration runs `ffmpeg -list_devices true -f dshow -i dummy` (the `dummy` trick: ffmpeg refuses
+# to open a real device in a list, but `dummy` is enough to make it print the catalogue to stderr)
+# and picks the first audio capture device. Override the pick with dictate.source when the user's
+# rig misnames it — the ticket calls that defect class an "implementer's guard", not a level-shift.
+_DSHOW_DISCOVERY_TIMEOUT = 5.0
+_DSHOW_DISCOVERY_ARGV = ["ffmpeg", "-list_devices", "true", "-f", "dshow", "-i", "dummy"]
+_DSHOW_AUDIO_HEADER = "DirectShow audio devices"
+_DSHOW_VIDEO_HEADER = "DirectShow video devices"
+# ffmpeg writes each device line as `[dshow @ ...]  "name"` — the dshow tag prefix is part of
+# every device row. Match the first quoted string on the line, ignoring the prefix and any
+# trailing text.
+_DSHOW_DEVICE_LINE = re.compile(r'"([^"]+)"')
+
+
+def _parse_dshow_audio_devices(stderr: str) -> str:
+    """The first audio capture device ffmpeg listed; '' when the catalog is empty.
+
+    ffmpeg's enumeration alternates 'DirectShow audio devices' and 'DirectShow video devices'
+    headers with `  "<device>"` rows under each. The first audio row is the most likely microphone;
+    on a multi-input rig (a USB interface, a virtual cable, stereo mix) this is the one an operator
+    overrides via dictate.source — picking the wrong one captures silence (#177)."""
+    in_audio = False
+    for line in stderr.splitlines():
+        if _DSHOW_AUDIO_HEADER in line:
+            in_audio = True
+            continue
+        if _DSHOW_VIDEO_HEADER in line:
+            in_audio = False
+            continue
+        if not in_audio:
+            continue
+        match = _DSHOW_DEVICE_LINE.search(line)
+        if match:
+            return match.group(1)
+    return ""
+
+
+def _discover_dshow_mic() -> str:
+    """The first DirectShow audio device on Windows; '' on any failure (non-Windows, no ffmpeg,
+    timed-out probe, empty catalog). Best-effort: a '' answer keeps dictate running — the next
+    step, recorder_argv's empty-source refusal, is what surfaces the missing device as a failed
+    start rather than a silent clip.
+
+    Tested via _parse_dshow_audio_devices and a fake subprocess.run — ffmpeg itself is a Windows
+    binary that doesn't run on the lane this is developed on, and a 5 s subprocess on each start
+    is the cost a hardware-locked enumeration pays anyway."""
+    try:
+        result = subprocess.run(
+            _DSHOW_DISCOVERY_ARGV,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=_DSHOW_DISCOVERY_TIMEOUT,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    if result.returncode != 0 and not result.stderr:
+        return ""
+    return _parse_dshow_audio_devices(result.stderr)
 
 
 # --- belt-and-suspenders echo guard -------------------------------------------------------------
@@ -550,17 +630,20 @@ def clip_seconds(size_bytes: int) -> float:
 
 def resolve_clipboard(clipboard: str, system: str, have, wayland: bool) -> str:
     """auto -> pbcopy (macOS), wl-copy (a live Wayland session), xclip, wl-copy (installed but no
-    $WAYLAND_DISPLAY — XWayland setups); an explicit name is taken as-is.
+    $WAYLAND_DISPLAY — XWayland setups), clip.exe (native Windows); an explicit name is taken as-is.
 
-    Only these three tools are ever candidates; a Windows ``clip.exe`` found on PATH through WSL
-    interop is NOT one of them — ``clipboard_commands`` has no entry for it, so no probe order can
-    select it. Under WSLg the session exports $WAYLAND_DISPLAY like any Wayland desktop, so the
-    first wl-copy tier already fires there; nothing WSL-specific is needed (#179 defect 3).
+    The WSL trap is closed by ``system`` alone: ``platform.system()`` returns 'Linux' inside WSL,
+    so the Windows branch only fires on NATIVE Windows — a binary search of PATH never enters
+    it on a Linux/WSL guest even when clip.exe is reachable through interop. Under WSLg the
+    session exports $WAYLAND_DISPLAY like any Wayland desktop, so the wl-copy branch already
+    fires there (#179 defect 3).
     """
     if clipboard != "auto":
         return clipboard
     if system == "Darwin":
         return "pbcopy"
+    if system == "Windows":
+        return "clip" if have("clip.exe") else ""
     if wayland and have("wl-copy"):
         return "wl-copy"
     if have("xclip"):
@@ -579,13 +662,27 @@ def clipboard_commands(tool: str) -> list[list[str]]:
         return [["wl-copy"], ["wl-copy", "--primary"]]
     if tool == "xclip":
         return [["xclip", "-selection", "clipboard"], ["xclip", "-selection", "primary"]]
+    if tool == "clip":
+        # Native Windows only — clip.exe is not a tier on Linux/WSL even when interop finds it,
+        # because resolve_clipboard gates on platform.system() == 'Windows' (WSL reports 'Linux').
+        return [["clip.exe"]]
     return []
 
 
 def pick_paste_tool(system: str, have, ydotool_socket_ok: bool, display: str) -> str:
-    """The platform table, in the shell's order: osascript / ydotool(+socket) / wtype / xdotool."""
+    """The platform table, in the shell's order: osascript / sendkeys / ydotool(+socket) / wtype / xdotool.
+
+    Native Windows uses ``SendKeys`` via the WSH COM object (a default Windows component, no
+    third-party install). The shim is a one-line PowerShell that creates a WScript.Shell and
+    calls SendKeys on it — the same automation surface AutoHotKey sits on, just the stdlib
+    shortcut. #46's paste-at-focus footgun carries over unchanged: the same-window guard is
+    the only thing standing between "I dictated into this app" and "I dictated into whatever
+    was focused when I let go of the key", and that ruling is platform-agnostic.
+    """
     if system == "Darwin":
         return "osascript" if have("osascript") else ""
+    if system == "Windows":
+        return "sendkeys" if have("powershell.exe") else ""
     if have("ydotool") and ydotool_socket_ok:
         return "ydotool"
     if have("wtype"):
@@ -593,6 +690,33 @@ def pick_paste_tool(system: str, have, ydotool_socket_ok: bool, display: str) ->
     if display and have("xdotool"):
         return "xdotool"
     return ""
+
+
+# Map the documented paste_key names to SendKeys syntax. SendKeys '^' is Ctrl, '+' is Shift,
+# '%' is Alt, and a key name in braces is the literal key — so `^+v` is Ctrl+Shift+V and
+# `+{Insert}` is Shift+Insert. Anything outside this map falls back to plain Ctrl+V, which is
+# what `rec` had no rule for and is the safe default for an unknown paste_key on Windows.
+_WIN_SENDKEYS_FOR_PASTE = {
+    "ctrl+shift+v": "^+v",
+    "ctrl+v": "^v",
+    "shift+insert": "+{Insert}",
+    "shift+ins": "+{Insert}",
+}
+
+
+def _win_sendkeys_argv(keys: str) -> list[str]:
+    """Build a PowerShell argv that calls WScript.Shell.SendKeys on the given key sequence.
+
+    The script is a single statement, -Command-compatible, and the keystrokes go through the
+    shared WSH COM object that every Windows automation tool (AutoHotKey, VBA, the GUI) sits
+    on, so no extra install is needed. The -NoProfile flag avoids hangs on user-land profiles
+    while a hotkey is being held."""
+    return [
+        "powershell.exe",
+        "-NoProfile",
+        "-Command",
+        f"(New-Object -ComObject WScript.Shell).SendKeys('{keys}')",
+    ]
 
 
 def paste_plan(tool: str, paste_key: str, enter: bool) -> list[tuple[float, list[str], bool]]:
@@ -608,6 +732,17 @@ def paste_plan(tool: str, paste_key: str, enter: bool) -> list[tuple[float, list
         steps.append((0.0, ["osascript", "-e", f'tell application "System Events" to keystroke "v" using {using}'], True))
         if enter:
             steps.append((0.25, ["osascript", "-e", 'tell application "System Events" to key code 36'], False))
+    elif tool == "sendkeys":
+        # SendKeys has no async-after delay (a race-free sequence against an open clipboard), and
+        # the same 250 ms settle as the other paste tools to give the focused app time to register
+        # the paste before the Enter arrives.
+        keys = _WIN_SENDKEYS_FOR_PASTE.get(paste_key, "^v")
+        steps.append((0.0, _win_sendkeys_argv(keys), True))
+        if enter:
+            # {{Enter}} — braces are literal SendKeys escapes for a special key name. PowerShell
+            # escapes them by doubling inside the surrounding single quotes, which is why the
+            # string is `'{{Enter}}'` and not `'{Enter}'`.
+            steps.append((0.25, _win_sendkeys_argv("{{Enter}}"), False))
     elif tool == "ydotool":
         steps.append((0.15, ["ydotool", "key", paste_key], True))
         if enter:
@@ -1732,10 +1867,24 @@ def start_recording(s: dict, system: str, pidfile_fd: int) -> int:
     stop_speak_playback()
 
     recorder = resolve_recorder(s["recorder"], system, shutil.which)
-    argv = recorder_argv(recorder, system, _WAV_PATH, source=s.get("source", ""))
+    source = s.get("source", "")
+    # DirectShow on Windows demands an explicit device name; alsa / avfoundation default to one
+    # themselves, so the discovery is a Windows-only pre-step. Discovery races with hardware
+    # changes (a USB headset swapped mid-day) — the operator override is dictate.source.
+    if system == "Windows" and recorder == "ffmpeg" and not source:
+        source = _discover_dshow_mic()
+    argv = recorder_argv(recorder, system, _WAV_PATH, source=source)
     if not argv:
-        note("no recorder found — install pw-record/arecord (Linux) or sox/ffmpeg (macOS)", system)
-        log("no recorder available")
+        if system == "Windows" and recorder == "ffmpeg":
+            note(
+                "no dshow device found — run `ffmpeg -list_devices true -f dshow -i dummy` "
+                "and set dictate.source to the device name",
+                system,
+            )
+            log("dshow discovery returned no device — recorder not started")
+        else:
+            note("no recorder found — install pw-record/arecord (Linux) or sox/ffmpeg (macOS)", system)
+            log("no recorder available")
         _release_claim(pidfile_fd)
         return 1
     try:
@@ -1755,7 +1904,10 @@ def start_recording(s: dict, system: str, pidfile_fd: int) -> int:
             os.close(pidfile_fd)
         except OSError:
             pass
-    log(f"recording via {recorder} pid={proc.pid}")
+    if system == "Windows" and recorder == "ffmpeg":
+        log(f"recording via ffmpeg -f dshow device={source!r} pid={proc.pid}")
+    else:
+        log(f"recording via {recorder} pid={proc.pid}")
     # The socket goes up FIRST of the two things that follow the recorder: opening it costs a
     # round trip, and every millisecond of that is speech the server never hears. The focus probe
     # below can spend up to FOCUS_PROBE_TIMEOUT and is deliberately behind it.
