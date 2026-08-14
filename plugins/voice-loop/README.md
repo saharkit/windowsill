@@ -237,8 +237,12 @@ not wired — see [`PROVIDERS.md`](PROVIDERS.md#jargon-priming--sttprompt).
 
 The contour ships the local
 voices below; **English is a first-class language, not a fallback** — it has its own selftest phrase
-and its own CI loopback lane (the macOS one). Turkish uses XTTS-v2 locally for native cloned-voice
-synthesis, or the cloud pair Deepgram STT + ElevenLabs multilingual TTS on GPU-less machines.
+and its own CI loopback lane (the macOS one). Turkish is the one row in the table below that is **not
+turnkey**: its XTTS-v2 path is real and unit-tested, but `coqui-tts` is deliberately outside
+`server/requirements.txt`, `/voice-setup` does not install it, and XTTS refuses without a reference
+recording you supply in `VOICE_LOOP_XTTS_REFERENCE` — so a default install that selects `tr` falls through
+to a 400. Install the `[xtts]` extra and provide a reference wav, or use the cloud pair Deepgram STT +
+ElevenLabs multilingual TTS on GPU-less machines. The same applies to the other XTTS-only languages.
 
 | language | synthesis model | default speaker | automatic stress marking |
 |---|---|---|---|
