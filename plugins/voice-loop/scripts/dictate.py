@@ -1312,14 +1312,19 @@ def _win_console_ctrl_c(pid: int) -> bool:
     except Exception:
         return False
     finally:
-        if handler_set:
-            try:
-                kernel32.SetConsoleCtrlHandler(None, False)
-            except Exception:
-                pass
+        # Detach BEFORE restoring the handler, on EVERY exit path: SetConsoleCtrlHandler(None,
+        # False) re-arms this process's default Ctrl+C handler, and while we are still attached to
+        # the target console the CTRL_C_EVENT just raised can still reach us — killing the stop
+        # toggle before it transcribes the speech it stopped for. FreeConsole first, so the
+        # re-armed handler can never receive that event.
         if target_attached:
             try:
                 kernel32.FreeConsole()
+            except Exception:
+                pass
+        if handler_set:
+            try:
+                kernel32.SetConsoleCtrlHandler(None, False)
             except Exception:
                 pass
         if was_attached:
@@ -1329,7 +1334,61 @@ def _win_console_ctrl_c(pid: int) -> bool:
                 pass
 
 
-def _stop_recorder(pid: int, system: str) -> None:
+def _win_pid_is_recorder(pid: int, recorder: str) -> bool:
+    """PID-reuse guard for the Windows stop path: is *pid* still OUR recorder?
+
+    The pidfile outlives its process and the kernel recycles PIDs, so the pid main() reads out of
+    dictate.pid can belong to somebody else by stop time — and _win_console_ctrl_c signals the WHOLE
+    console that pid is attached to, after which _stop_recorder TerminateProcess-es it. Before
+    either, confirm the process image is the recorder this recording would have spawned. The image
+    name is read through the handle _pid_alive already opens (PROCESS_QUERY_LIMITED_INFORMATION is
+    enough for QueryFullProcessImageNameW) — no subprocess, because the stop path must stay cheap.
+    """
+    if pid <= 0 or not recorder:
+        return False
+    import ctypes
+
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # stdlib; Windows arm
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        kernel32.OpenProcess.argtypes = (
+            ctypes.c_uint32,  # dwDesiredAccess
+            ctypes.c_int,  # bInheritHandle
+            ctypes.c_uint32,  # dwProcessId
+        )
+        kernel32.OpenProcess.restype = ctypes.c_void_p
+        kernel32.QueryFullProcessImageNameW.argtypes = (
+            ctypes.c_void_p,  # hProcess
+            ctypes.c_uint32,  # dwFlags (0 = the Win32 path form)
+            ctypes.c_wchar_p,  # lpExeName
+            ctypes.POINTER(ctypes.c_uint32),  # lpdwSize (in TCHARs, in and out)
+        )
+        kernel32.QueryFullProcessImageNameW.restype = ctypes.c_int
+        kernel32.CloseHandle.argtypes = (ctypes.c_void_p,)
+        kernel32.CloseHandle.restype = ctypes.c_int
+
+        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not handle:
+            return False  # gone, or not ours to inspect — either way, not something to signal
+        try:
+            size = ctypes.c_uint32(32768)
+            buffer = ctypes.create_unicode_buffer(size.value)
+            if not kernel32.QueryFullProcessImageNameW(handle, 0, buffer, ctypes.byref(size)):
+                return False
+            image = os.path.basename(buffer.value).lower()
+            if image.endswith(".exe"):
+                image = image[: -len(".exe")]
+            # sox's front-end binary is `rec` (recorder_argv returns ["rec", ...]); every other
+            # recorder key IS the executable name.
+            expected = ("rec" if recorder == "sox" else recorder).lower()
+            return image == expected
+        finally:
+            kernel32.CloseHandle(handle)  # every path that opened it closes it
+    except (OSError, AttributeError):
+        return False  # kernel32 is not what we expect: cannot verify, do not signal
+
+
+def _stop_recorder(pid: int, system: str, recorder: str = "") -> None:
     """Ask the recorder to finalize, then make it stop.
 
     POSIX: SIGINT lets sox/ffmpeg write the WAV header and flush the tail; TERM is the fallback
@@ -1338,8 +1397,14 @@ def _stop_recorder(pid: int, system: str) -> None:
     with no finalized header — the stop toggle would then transcribe nothing, every time. The
     Windows arm raises CTRL_C_EVENT in the recorder's console instead (see _win_console_ctrl_c)
     so ffmpeg closes the container; TERM/TerminateProcess remains the fallback, exactly the
-    same INT-then-TERM shape as POSIX."""
+    same INT-then-TERM shape as POSIX.
+
+    Windows first verifies the pid is still OUR recorder (see _win_pid_is_recorder): the pidfile
+    outlives its process and the kernel recycles PIDs, so a stale pid must not get a Ctrl+C in an
+    unrelated console group, nor the TerminateProcess that follows it."""
     if system == "Windows":
+        if not _win_pid_is_recorder(pid, recorder):  # pragma: no cover — exercised on Windows
+            return  # pragma: no cover — a recycled pid: signal nobody, terminate nobody
         _win_console_ctrl_c(pid)  # pragma: no cover — exercised on Windows; the lane runs Linux
     else:
         try:
@@ -2051,7 +2116,11 @@ def start_recording(s: dict, system: str, pidfile_fd: int) -> int:
         except OSError:
             pass
     if system == "Windows" and recorder == "ffmpeg":
-        log(f"recording via ffmpeg -f dshow device={source!r} pid={proc.pid}")
+        # The DirectShow device name is the operator's microphone label — often a person's name, a
+        # phone model or a company name. It is logged in full only locally; the report-bug collector
+        # cuts it at " device=" (see LOG_RULES). The pid sits BEFORE the device so that cut drops
+        # the name and nothing else.
+        log(f"ffmpeg -f dshow recording pid={proc.pid} device={source!r}")
     else:
         log(f"recording via {recorder} pid={proc.pid}")
     # The socket goes up FIRST of the two things that follow the recorder: opening it costs a
@@ -2103,7 +2172,10 @@ def stop_and_transcribe(s: dict, system: str, mode: str, recorder_pid: int) -> i
         pass
     # INT-then-TERM on POSIX; CTRL_C_EVENT-then-TerminateProcess on Windows (see _stop_recorder —
     # the WAV header only gets finalized by a graceful stop, and os.kill on Windows is not one).
-    _stop_recorder(recorder_pid, system)
+    # On Windows the recorder name is re-derived so _stop_recorder can identity-check the pid before
+    # signalling (a recycled pid must not get a stranger's Ctrl+C — see _win_pid_is_recorder).
+    recorder = resolve_recorder(s["recorder"], system, shutil.which) if system == "Windows" else ""
+    _stop_recorder(recorder_pid, system, recorder)
     # the recorder flushes the tail of the file AFTER it stops accepting samples — this short
     # settle is the difference between a complete phrase and a truncated one
     time.sleep(0.2)

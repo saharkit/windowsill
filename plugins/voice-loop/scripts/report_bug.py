@@ -514,6 +514,11 @@ LOG_RULES: tuple[tuple[str, str | None], ...] = (
     ("no recorder available", None),
     ("recorder failed: ", None),
     ("recording via ", None),
+    # Windows native dictation (windowsill#177): the dshow recorder line carries the DirectShow
+    # device name — routinely a person's name, a phone model or a company name — so the name is
+    # cut at " device=". The pid stays: it is metadata, and it sits BEFORE the device so the cut
+    # drops the name and nothing else.
+    ("ffmpeg -f dshow recording pid=", " device="),
     # Windows native dictation (windowsill#177): the dshow discovery call did not name a capture
     # device. Same redaction shape as "no recorder available" — the line names the failure and
     # nothing else.
