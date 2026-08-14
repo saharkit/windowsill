@@ -107,8 +107,8 @@ marketplace install, the registered hook command, dictation with the CI-style fa
 and a `lan` loopback against a remote speech server. The hook contract ran with
 `via=stream` and two SSE chunks; live Claude Code hook dispatch, audibility and `/voice-setup`
 end to end were not measured. The loopback passed with an explicit `--endpoint`; a fresh distro without `jq`
-did not pass the config-driven form. Microphone passthrough and the bundled local-server
-path inside WSL were not exercised, so this page claims neither. See the
+did not pass the config-driven form. Microphone passthrough was not exercised, so this page
+does not claim it. See the
 [voice-loop WSL2 verification record](plugins/voice-loop/TESTING.md#8-wsl2-verification-record-2026-08-11)
 and [its WSL notes](plugins/voice-loop/README.md#windows-wsl2--wslg).
 
