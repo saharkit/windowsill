@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import subprocess
 import sys
 from pathlib import Path, PureWindowsPath
 from typing import Any, Callable
@@ -181,25 +182,107 @@ def _is_store_stub(path: str | None) -> bool:
     return PureWindowsPath(resolved).parent.name.lower() == "windowsapps"
 
 
+def _redact_windows_path(path: str) -> str:
+    """Hide the Windows account name while retaining the useful path shape."""
+    parts = PureWindowsPath(path).parts
+    try:
+        users_index = next(
+            index for index, part in enumerate(parts[:-1])
+            if part.lower() == "users"
+        )
+    except StopIteration:
+        return path
+    if users_index + 1 >= len(parts) - 1:
+        return path
+    redacted = list(parts)
+    redacted[users_index + 1] = "<user>"
+    return str(PureWindowsPath(*redacted))
+
+
+def _where_python3(
+    *,
+    platform: str = sys.platform,
+    run: Callable[..., Any] = subprocess.run,
+) -> list[str]:
+    """Return every ``python3`` resolution reported by Windows ``where.exe``."""
+    if platform != "win32":
+        return []
+    try:
+        result = run(
+            ["where.exe", "python3"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=2,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if result.returncode != 0:
+        return []
+    return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+
+
+def _wsl_boundary_finding(
+    *,
+    platform: str = sys.platform,
+    run: Callable[..., Any] = subprocess.run,
+) -> dict[str, Any] | None:
+    """Explain an empty Windows-side contour when WSL has a distro."""
+    if platform != "win32":
+        return None
+    try:
+        result = run(
+            ["wsl.exe", "-l", "-q"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=2,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    distros = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    if not distros:
+        return None
+    return {
+        "bin": "real_anomaly",
+        "key": "wsl_contour_not_visible_from_windows",
+        "title": "A WSL2 distro is present, but no voice-loop contour is visible on Windows",
+        "explanation": (
+            "This Windows-side `/doctor` found no config or install ledger, "
+            "but WSL reports at least one distro.  voice-loop installed inside "
+            "WSL stores its config and ledger in the distro filesystem, so this "
+            "answer cannot tell whether that contour is installed or working."
+        ),
+        "fix": "Run `/doctor` from inside the WSL2 distro where voice-loop is installed.",
+        "offer_flip": False,
+        "flip_path": "",
+        "flip_value": None,
+        "evidence": {"wsl_distro_present": True, "wsl_distro_count": len(distros)},
+    }
+
+
 def _check_python_interpreter(
     *,
     platform: str = sys.platform,
     which: Callable[[str], str | None] = shutil.which,
+    where: Callable[[], list[str]] | None = None,
 ) -> dict[str, Any] | None:
     """Return a Windows prerequisite finding for the Python interpreter.
 
-    Two distinct failure modes, two distinct findings:
+    Three Windows prerequisite outcomes produce findings or pass:
 
-    1. ``python3`` IS the Microsoft Store stub — fires when a
-       ``python3.exe`` is on PATH but resolves to the Store redirect.
-       A mere presence test answers YES on this trap; the launchers
+    1. A ``python3.exe`` under ``WindowsApps`` is on PATH — fires even when
+       a real interpreter currently wins, because PATH ordering can change.
+    2. ``python3`` resolves first to the Microsoft Store stub — the launchers
        all call ``python3`` and will silently fail.
-    2. No real Python interpreter at all — fires when NEITHER
-       ``python3`` NOR ``python`` resolves to a real interpreter
-       (either absent or another Store stub).
+    3. No real Python interpreter at all — fires when NEITHER ``python3`` NOR
+       ``python`` resolves to a real interpreter (either absent or another
+       Store stub).
 
-    Returns ``None`` on Linux/macOS (the check is inert) and when both
-    ``python3`` and ``python`` resolve to a real interpreter.
+    Returns ``None`` on Linux/macOS (the check is inert) and when no Store
+    stub is present and a real interpreter is available.
 
     The probe seams are keyword-only with production defaults
     (``sys.platform`` and ``shutil.which``), so the test can inject a
@@ -213,46 +296,69 @@ def _check_python_interpreter(
     python3_path = which("python3")
     python_path = which("python")
 
-    # Decision 1: python3 is the Store stub.  Fires first because the
-    # launchers all call ``python3``; a real ``python`` elsewhere does
-    # not save the launchers.
-    if python3_path is not None and _is_store_stub(python3_path):
-        # NOTE: the raw resolved path is NOT included in evidence.  The
-        # Store stub lives under
-        # ``C:\Users\<account>\AppData\Local\Microsoft\WindowsApps\``,
-        # so embedding the full path would carry the OS account name
-        # into the bundle, and /doctor's stdout is consumed by the
-        # /report-bug handoff which files a public GitHub issue.
-        # The diagnosis ("python3 IS the Store stub") is the whole
-        # signal the user needs; one boolean captures it without
-        # identity.
+    # ``which`` reports only the winner.  ``where.exe`` exposes every
+    # candidate, which matters because a Store stub later on PATH can win
+    # after a PATH reorder or a fresh shell.  Keep the injected seam useful
+    # to tests while using the real Windows probe in production.
+    python3_paths = list(where() if where is not None else _where_python3())
+    if python3_path is not None and python3_path not in python3_paths:
+        python3_paths.insert(0, python3_path)
+    elif python3_path is None and python3_paths:
+        python3_path = python3_paths[0]
+    stub_paths = [path for path in python3_paths if _is_store_stub(path)]
+
+    # Decision 1: any Store stub on PATH.  Fires even when a real interpreter
+    # currently wins, because that ordering is not a safe configuration.
+    if stub_paths:
+        first_path = _redact_windows_path(python3_path or python3_paths[0])
+        first_is_stub = _is_store_stub(python3_path)
+        if first_is_stub:
+            title = (
+                f"`python3` resolves first to `{first_path}`, the Microsoft "
+                "Store stub, not a real interpreter"
+            )
+            explanation = (
+                f"`python3` resolves first to `{first_path}`.  Every launcher "
+                "in voice-loop calls `python3`, but the python.org Windows "
+                "installer ships `python.exe` and NOT `python3.exe`.  This "
+                "`WindowsApps` executable is the Microsoft Store stub — a "
+                "real executable that opens the Store instead of running "
+                "Python."
+            )
+        else:
+            title = (
+                f"`python3` resolves first to `{first_path}`, but a "
+                "Microsoft Store stub is also on PATH"
+            )
+            explanation = (
+                f"`python3` currently resolves first to `{first_path}`, but "
+                "another `python3.exe` lives under `WindowsApps`.  PATH "
+                "ordering can change, so the Store stub may be selected by a "
+                "new shell and silently open the Store instead of running "
+                "voice-loop."
+            )
         return {
             "bin": "real_anomaly",
             "key": "python3_is_store_stub",
-            "title": (
-                "`python3` is the Microsoft Store stub, not a real interpreter"
-            ),
-            "explanation": (
-                "Every launcher in voice-loop calls `python3`, but the "
-                "python.org Windows installer ships `python.exe` and NOT "
-                "`python3.exe`.  When `python3` is on PATH but its file "
-                "lives under `WindowsApps`, it is the Microsoft Store "
-                "stub — a real executable that opens the Store instead "
-                "of running Python.  A presence test for `python3` would "
-                "ANSWER YES on this trap."
-            ),
+            "title": title,
+            "explanation": explanation,
             "fix": (
-                "Install Python from python.org "
-                "(https://www.python.org/downloads/windows/) and tick "
-                "'Add Python to PATH' during install.  If you also need "
-                "`python3.exe` to work, install the Python Launcher for "
-                "Windows (also at python.org) — it ships a real "
-                "`python.exe` and registers it on PATH."
+                "Remove or disable the Microsoft Store `python3.exe` App "
+                "Execution Alias in Windows Settings, or remove its "
+                "`WindowsApps` entry from PATH.  Ensure the real interpreter "
+                "you want is first, then open a new shell and run "
+                "`where.exe python3` to verify the ordering."
             ),
             "offer_flip": False,
             "flip_path": "",
             "flip_value": None,
-            "evidence": {"python3_is_stub": True},
+            "evidence": {
+                "python3_is_stub": first_is_stub,
+                "python3_first_path": first_path,
+                "python3_stub_paths": [
+                    _redact_windows_path(path) for path in stub_paths
+                ],
+            },
         }
 
     # Decision 2: no real interpreter.  "Real" means: present AND not
@@ -398,6 +504,14 @@ def main(argv: list[str] | None = None) -> int:
     config = read_config(config_path)
     ledger = read_ledger(state_home)
     logs = read_logs(state_home)
+
+    # A Windows-side empty contour may simply be the wrong side of the WSL2
+    # boundary.  Do not probe WSL on POSIX, and do not override a local config
+    # or ledger with a boundary warning.
+    if not config and ledger.get("state", "none") == "none":
+        wsl_finding = _wsl_boundary_finding()
+        if wsl_finding is not None:
+            platform_findings.append(wsl_finding)
 
     # Load the manifest and the engine.
     root = _plugin_root()
