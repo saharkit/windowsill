@@ -22,8 +22,14 @@ rem A node where no probe answers does nothing rather than half-recording — th
 rem fail-silent contract the bash launcher keeps.
 setlocal
 set "VLPY="
-py -3 -c "import sys" >nul 2>nul && set "VLPY=py -3"
-if not defined VLPY python -c "import sys" >nul 2>nul && set "VLPY=python"
-if not defined VLPY python3 -c "import sys" >nul 2>nul && set "VLPY=python3"
+if not defined VLPY (
+    py -3 -c "import sys" >nul 2>nul && set "VLPY=py -3"
+)
+if not defined VLPY (
+    python -c "import sys" >nul 2>nul && set "VLPY=python"
+)
+if not defined VLPY (
+    python3 -c "import sys" >nul 2>nul && set "VLPY=python3"
+)
 if not defined VLPY exit /b 0
 %VLPY% "%~dp0dictate.py" %*

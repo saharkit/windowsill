@@ -18,8 +18,14 @@ rem the shim probes in order (py -3, python, python3) and picks the first that a
 rem `import sys`, not the first name that merely resolves.
 setlocal
 set "VLPY="
-py -3 -c "import sys" >nul 2>nul && set "VLPY=py -3"
-if not defined VLPY python -c "import sys" >nul 2>nul && set "VLPY=python"
-if not defined VLPY python3 -c "import sys" >nul 2>nul && set "VLPY=python3"
+if not defined VLPY (
+    py -3 -c "import sys" >nul 2>nul && set "VLPY=py -3"
+)
+if not defined VLPY (
+    python -c "import sys" >nul 2>nul && set "VLPY=python"
+)
+if not defined VLPY (
+    python3 -c "import sys" >nul 2>nul && set "VLPY=python3"
+)
 if not defined VLPY exit /b 0
 %VLPY% "%~dp0voice-loop-dictate" %*

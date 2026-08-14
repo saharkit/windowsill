@@ -1250,20 +1250,39 @@ def _win_console_ctrl_c(pid: int) -> bool:
     import ctypes
 
     kernel32 = ctypes.windll.kernel32  # stdlib; this function is Windows-only by caller
+    was_attached = False
+    target_attached = False
+    handler_set = False
     try:
-        if not kernel32.FreeConsole():
-            pass  # not attached to a console of our own — fine, AttachConsole still works
+        # GetConsoleCP returns zero when this process has no console, unlike a window-handle
+        # probe which does not describe pseudoconsole attachment reliably.
+        was_attached = bool(kernel32.GetConsoleCP())
+        if was_attached:
+            kernel32.FreeConsole()
         if not kernel32.AttachConsole(pid):
             return False  # the process (or its console) is already gone
+        target_attached = True
         kernel32.SetConsoleCtrlHandler(None, True)
-        try:
-            sent = bool(kernel32.GenerateConsoleCtrlEvent(0, 0))  # 0 = CTRL_C_EVENT, console-wide
-        finally:
-            kernel32.SetConsoleCtrlHandler(None, False)
-            kernel32.FreeConsole()
-        return sent
+        handler_set = True
+        return bool(kernel32.GenerateConsoleCtrlEvent(0, 0))  # 0 = CTRL_C_EVENT, console-wide
     except Exception:
         return False
+    finally:
+        if handler_set:
+            try:
+                kernel32.SetConsoleCtrlHandler(None, False)
+            except Exception:
+                pass
+        if target_attached:
+            try:
+                kernel32.FreeConsole()
+            except Exception:
+                pass
+        if was_attached:
+            try:
+                kernel32.AttachConsole(-1)  # ATTACH_PARENT_PROCESS
+            except Exception:
+                pass
 
 
 def _stop_recorder(pid: int, system: str) -> None:
@@ -1339,6 +1358,8 @@ def stop_speak_playback() -> None:
     except OSError:
         tokens = None
     if tokens is None:
+        if os.name == "nt":  # pkill and os.getuid are POSIX-only; Windows has no pattern fallback
+            return
         try:
             subprocess.run(
                 ["pkill", "-u", str(os.getuid()), "-f", "voice-loop-speak"],
