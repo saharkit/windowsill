@@ -1432,19 +1432,27 @@ def _cmdline_of(pid: int) -> str | None:
 
 
 def pid_looks_like_speak(pid: int, read_cmdline=_cmdline_of, platform_id: str = sys.platform) -> bool:
-    """PID-reuse guard (duplicated helper — keep in sync with speak.py): a pidfile outlives its
-    process and the kernel recycles PIDs, so before SIGTERMing a recorded pid, confirm it still
-    looks like the voice-loop speaking chain: the player child's argv carries the
-    "voice-loop-speak-" temp-WAV prefix, the python half of the chain carries "speak.py".
-
-    Non-Linux has no /proc/<pid>/cmdline; rather than depend on parsing `ps` there, the check is
-    skipped and the historical raw-signal behaviour kept (the pidfile is same-user state, so the
-    blast radius of a stale pid is one same-user SIGTERM — unchanged from before). On Linux an
-    unreadable cmdline means the process is already gone (nothing to stop) or is not ours to
-    inspect (then not ours to signal either) — both mean: do not signal."""
-    if not platform_id.startswith("linux"):
-        return True
-    cmdline = read_cmdline(pid)
+    """PID-reuse guard (duplicated helper — keep in sync with speak.py)."""
+    if platform_id == "darwin":
+        if read_cmdline is _cmdline_of:
+            try:
+                result = subprocess.run(
+                    ["ps", "-p", str(pid), "-o", "command="],
+                    capture_output=True,
+                    check=False,
+                    timeout=1.0,
+                )
+            except (OSError, subprocess.TimeoutExpired):
+                return False
+            if result.returncode != 0:
+                return False
+            cmdline = result.stdout.decode("utf-8", "replace").strip() or None
+        else:
+            cmdline = read_cmdline(pid)
+    elif platform_id.startswith("linux"):
+        cmdline = read_cmdline(pid)
+    else:
+        return False
     if cmdline is None:
         return False
     return "voice-loop-speak" in cmdline or "speak.py" in cmdline

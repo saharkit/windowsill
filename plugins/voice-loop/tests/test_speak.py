@@ -46,6 +46,7 @@ def state(monkeypatch, tmp_path):
     monkeypatch.setattr(speak, "_LEDGER_PATH", str(tmp_path / "spoken.ledger"))
     monkeypatch.setattr(speak, "_LOCK_PATH", str(tmp_path / "speaking.lock"))
     monkeypatch.setattr(speak, "_STAMP_PATH", str(tmp_path / "hook-last-fired"))
+    monkeypatch.setattr(speak, "_pidfile_record", None)
 
     monkeypatch.setattr(speak, "_CONTOUR_PATH", str(tmp_path / "contour.json"))
     monkeypatch.setattr(speak, "_CONTOUR_ANNOUNCED_PATH", str(tmp_path / "contour-announced"))
@@ -466,6 +467,39 @@ def test_first_audio_ms_is_minus_one_when_nothing_ever_played(state, monkeypatch
     assert spawns == []
 
 
+def test_a_nonzero_player_exit_is_not_recorded_as_played(state, monkeypatch):
+    """L2 mutation gap: counting at spawn would report delivery even when the player rejects the
+    audio. Only a zero exit is a delivered chunk, so a failed player must leave the result empty."""
+
+    class FailedPlayer:
+        pid = 123
+        returncode = None
+
+        def wait(self):
+            self.returncode = 1
+            return self.returncode
+
+        def poll(self):
+            return self.returncode
+
+    monkeypatch.setattr(speak.subprocess, "Popen", lambda argv, **kwargs: FailedPlayer())
+    result = speak._play_stream(iter([WAV_A]), speak.resolve_settings({}, "Linux"), time.monotonic())
+    assert result[0] == 0
+    assert result[1] == 0
+    assert result[3] == 1
+
+
+def test_pidfile_write_is_atomic_and_stale_owner_cannot_clear_new_state(state, monkeypatch):
+    """L2 mutation gap: an in-place write can expose truncated tokens, and an old cleanup can erase
+    a replacement chain. Temp-then-replace plus the exact installed record protects both boundaries."""
+    speak._write_pidfile(111, 222)
+    monkeypatch.setattr(speak.os, "getpid", lambda: 111)
+    speak._atomic_write_text(str(state / "playing.pid"), "333 444", "replacement-")
+    speak._clear_pidfile()
+    assert (state / "playing.pid").read_text(encoding="utf-8") == "333 444"
+    assert not list(state.glob("voice-loop-playing-*"))
+
+
 # --- corrupt config / key files: ignored loudly, never a crash ----------------------------------
 
 
@@ -713,11 +747,17 @@ def test_pid_identity_rejects_a_reused_or_gone_pid_on_linux():
     assert speak.pid_looks_like_speak(9, read_cmdline=lambda pid: None, platform_id="linux") is False
 
 
-def test_pid_identity_check_is_skipped_off_linux():
-    def never(pid):
-        raise AssertionError("cmdline must not be read off Linux")
+def test_pid_identity_check_uses_the_macos_command_line_seam():
+    assert speak.pid_looks_like_speak(
+        9, read_cmdline=lambda pid: "python3 /repo/scripts/speak.py", platform_id="darwin"
+    ) is True
+    assert speak.pid_looks_like_speak(
+        9, read_cmdline=lambda pid: "ssh user@example", platform_id="darwin"
+    ) is False
 
-    assert speak.pid_looks_like_speak(9, read_cmdline=never, platform_id="darwin") is True
+
+def test_pid_identity_check_fails_closed_on_an_unsupported_platform():
+    assert speak.pid_looks_like_speak(9, read_cmdline=lambda pid: "speak.py", platform_id="win32") is False
 
 
 def test_cmdline_of_reads_our_own_process():
