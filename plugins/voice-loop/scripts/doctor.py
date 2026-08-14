@@ -265,44 +265,122 @@ def _where_python3(
     return [line.strip() for line in output.splitlines() if line.strip()]
 
 
+# Docker Desktop for Windows registers two WSL distros on every machine
+# that runs it.  Nothing is ever installed in them by hand, so they are not
+# evidence that a voice-loop contour could live in WSL.
+_WSL_DOCKER_DISTROS = frozenset({
+    "docker-desktop",
+    "docker-desktop-data",
+})
+
+# The registry key wsl.exe itself enumerates from: one GUID subkey per
+# registered distro, each carrying a ``DistributionName`` value.  Per-user
+# registrations sit under HKCU; all-users registrations (newer WSL) under
+# HKLM.  Reading it needs no privileges.
+_WSL_LXSS_SUBKEY = r"Software\Microsoft\Windows\CurrentVersion\Lxss"
+
+
+def _registered_wsl_distros() -> tuple[list[str], int]:
+    """Enumerate registered WSL distro names straight from the registry.
+
+    Returns ``(names, docker_excluded)`` where *names* excludes the Docker
+    Desktop distros.  This is the source of truth ``wsl.exe -l`` reports
+    from, read directly — which matters for two reasons:
+
+    * on some builds, ``wsl.exe -l -q`` prints the localized "no installed
+      distributions" banner to STDOUT with exit code 0, and one banner line
+      would otherwise count as one distro; the registry has no banner and
+      no localization to be wrong about;
+    * a STOPPED distro is registered exactly like a running one, so a
+      contour in a distro that is not running right now still counts —
+      the registration, not the running state, is the signal.
+
+    An unreadable or absent key means "no distros we can vouch for", which
+    suppresses the finding rather than risking a false positive.
+    """
+    try:
+        import winreg
+    except ImportError:
+        return [], 0
+
+    roots = (
+        (winreg.HKEY_CURRENT_USER, winreg.KEY_READ),
+        (winreg.HKEY_LOCAL_MACHINE, winreg.KEY_READ),
+    )
+    names: list[str] = []
+    docker_excluded = 0
+    for root, access in roots:
+        try:
+            lxss = winreg.OpenKey(root, _WSL_LXSS_SUBKEY, 0, access)
+        except OSError:
+            continue
+        with lxss:
+            index = 0
+            while True:
+                try:
+                    subkey_name = winreg.EnumKey(lxss, index)
+                except OSError:
+                    break
+                index += 1
+                try:
+                    with winreg.OpenKey(lxss, subkey_name, 0, access) as sub:
+                        name, _ = winreg.QueryValueEx(sub, "DistributionName")
+                except OSError:
+                    continue
+                if not isinstance(name, str) or not name:
+                    continue
+                if name.casefold() in _WSL_DOCKER_DISTROS:
+                    docker_excluded += 1
+                elif name not in names:
+                    names.append(name)
+    return names, docker_excluded
+
+
 def _wsl_boundary_finding(
     *,
     platform: str = sys.platform,
-    run: Callable[..., Any] = subprocess.run,
+    distros_probe: Callable[[], tuple[list[str], int]] = _registered_wsl_distros,
 ) -> dict[str, Any] | None:
-    """Explain an empty Windows-side contour when WSL has a distro."""
+    """Explain an empty Windows-side contour when WSL has a distro.
+
+    The probe knows only that a usable (non-Docker) WSL distro is
+    REGISTERED — not that a voice-loop contour lives in it — so the finding
+    is worded as a conditional, never as an assertion that the contour is
+    there.  A distro counts whether or not it is currently running.
+    """
     if platform != "win32":
         return None
-    try:
-        result = run(
-            ["wsl.exe", "-l", "-q"],
-            capture_output=True,
-            check=False,
-            timeout=2,
-        )
-    except (OSError, ValueError, subprocess.SubprocessError):
-        return None
-    if result.returncode != 0:
-        return None
-    output = _decode_windows_output(result.stdout)
-    distros = [line.strip() for line in output.splitlines() if line.strip()]
+    distros, docker_excluded = distros_probe()
     if not distros:
         return None
     return {
         "bin": "consequence_of_choice",
         "key": "wsl_contour_not_visible_from_windows",
-        "title": "A WSL2 distro is present, but no voice-loop contour is visible on Windows",
+        "title": (
+            "A WSL distro is registered, but no voice-loop contour is "
+            "visible on Windows"
+        ),
         "explanation": (
             "This Windows-side `/doctor` found no config or install ledger, "
-            "but WSL reports at least one distro.  voice-loop installed inside "
-            "WSL stores its config and ledger in the distro filesystem, so this "
-            "answer cannot tell whether that contour is installed or working."
+            "but WSL has at least one registered distro (a stopped distro "
+            "counts too).  This probe cannot see inside the distro, so it "
+            "cannot tell whether voice-loop is installed there — if it is, "
+            "its config and ledger live in the distro filesystem and are "
+            "invisible from Windows; if it is not, there is nothing there."
         ),
-        "fix": "Run `/doctor` from inside the WSL2 distro where voice-loop is installed.",
+        "fix": (
+            "If you installed voice-loop inside a WSL distro, run `/doctor` "
+            "from inside that distro.  If you never did, there is nothing in "
+            "WSL — continue with setup on the Windows side."
+        ),
         "offer_flip": False,
         "flip_path": "",
         "flip_value": None,
-        "evidence": {"wsl_distro_present": True, "wsl_distro_count": len(distros)},
+        "evidence": {
+            "wsl_distro_present": True,
+            "wsl_distro_count": len(distros),
+            "wsl_docker_distros_excluded": docker_excluded,
+        },
     }
 
 
