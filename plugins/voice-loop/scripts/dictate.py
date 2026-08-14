@@ -1206,22 +1206,26 @@ def _transcribe_cloud(s: dict, wav_bytes: bytes, boundary: str) -> str | None:
 def _pid_alive(pid: int) -> bool:
     """Is *pid* a live process? POSIX uses the signal-0 idiom; on Windows there IS no signal 0 —
     os.kill maps straight to TerminateProcess, so the same call would TERMINATE the very process
-    it is probing. The Windows arm asks the OS instead: tasklist's exit status answers "running"
-    without signalling anything."""
+    it is probing. The Windows arm parses tasklist's captured rows instead of trusting its exit
+    status: a successful query with no matching process still exits zero."""
     if pid <= 0:
         return False
     if os.name == "nt":  # pragma: no cover — exercised on Windows; the lane runs Linux
         try:
             result = subprocess.run(
-                ["tasklist.exe", "/FI", f"PID eq {pid}"],
-                stdout=subprocess.DEVNULL,
+                ["tasklist.exe", "/NH", "/FI", f"PID eq {pid}"],
+                stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
                 check=False,
                 timeout=5,
+                text=True,
             )
         except (OSError, subprocess.SubprocessError):
             return False  # cannot ask: report dead rather than kill what we cannot see
-        return result.returncode == 0
+        return any(
+            len(row := line.split()) >= 2 and row[1] == str(pid)
+            for line in result.stdout.splitlines()
+        )
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -1961,7 +1965,12 @@ def start_recording(s: dict, system: str, pidfile_fd: int) -> int:
         return 1
     try:
         with open(_LOG_PATH, "a", encoding="utf-8") as errlog:
-            proc = subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=errlog)
+            popen_kwargs = {"stdout": subprocess.DEVNULL, "stderr": errlog}
+            if system == "Windows":
+                # Give CTRL_C_EVENT its own console: otherwise GenerateConsoleCtrlEvent(0, 0)
+                # reaches the user's shell and every other process sharing this terminal.
+                popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_CONSOLE", 0x00000010)
+            proc = subprocess.Popen(argv, **popen_kwargs)
     except OSError as err:
         note("recorder failed to start", system)
         log(f"recorder failed: {err}")
@@ -2121,8 +2130,15 @@ def stop_and_transcribe(s: dict, system: str, mode: str, recorder_pid: int) -> i
         return 1
     for argv in commands:
         try:
+            # clip.exe auto-detects Unicode only as UTF-16LE with a BOM; POSIX clipboard
+            # tools continue to receive UTF-8, including when running under WSL.
+            clipboard_input = text.encode("utf-16le")
+            if system == "Windows" and tool == "clip":
+                clipboard_input = b"\xff\xfe" + clipboard_input
+            else:
+                clipboard_input = text.encode("utf-8")
             with open(_LOG_PATH, "a", encoding="utf-8") as errlog:
-                subprocess.run(argv, input=text.encode("utf-8"), stdout=subprocess.DEVNULL, stderr=errlog, check=False)
+                subprocess.run(argv, input=clipboard_input, stdout=subprocess.DEVNULL, stderr=errlog, check=False)
         except OSError as err:
             _clear_preview()
             log(f"clipboard failed: {err}")
