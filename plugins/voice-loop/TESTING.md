@@ -421,3 +421,52 @@ machine and fill the rows before claiming them anywhere.
 |---|---|---|---|
 | Tester | | | pass / fail |
 | Waived items (with reason) | | | |
+
+## 9. WSL2 local-server verification record (2026-08-14)
+
+A second pass on the same route as §8, three days later, on the WIN-TEST rig: Windows 11, Ubuntu 24.04
+under WSL2 with WSLg, Python 3.12.3, reached over RDP. Where §8 measured a `lan` loopback against a
+remote server, this pass measured the **bundled local server running inside the distro** — the contour
+§8 explicitly did not exercise. As with §8 this is a record of what was observed, not a claim about
+anything else.
+
+| # | check | observed result | verdict |
+|---|---|---|---|
+| 9.1 | Install the bundled server's dependencies in a WSL venv | torch **2.13.0+cpu** (CPU wheel, no CUDA payload), faster-whisper 1.2.1; all imports OK and `voice_server.py` compiles. Venv 2.2 GB. | PASS |
+| 9.2 | Run the server as `systemctl --user` inside WSL | `/health` returns `ok:true`, version 0.5.0, `device=cpu`, `stt_model=small`, `tts_engine=silero`, `streaming=true`, `ru` present in `tts_languages`. | PASS |
+| 9.3 | `scripts/selftest.sh` against the **local** backend | Round trip green: **similarity 1.00** against threshold 0.75, rc=0; TTS rendered 396 KB of WAV and STT transcribed it back verbatim. `/health` then reports `stt_loaded=True`, `tts_loaded=['ru']`. | PASS |
+| 9.4 | Audible playback through the configured player | `/tts` returned a 507 KB RIFF WAV over HTTP 200 and `aplay -q` played it, **rc=0** — out through WSLg to the Windows sound device (an RDP "Remote Audio" endpoint on this rig). | PASS |
+| 9.5 | The service survives a distro restart | After `wsl --terminate`, the server **rebound on its own in ~6 s** (fresh PID, no manual start). Requires `loginctl enable-linger`; without it root's `user@0.service` never starts on a WSL boot and the port stays dead while `is-active` still reports `active`. | PASS (with linger) |
+| 9.6 | Total disk cost of the local contour | **~2.7 GB**: venv 2.2 GB, HuggingFace cache 465 MB, torch cache 40 MB. | measured |
+
+**Two things the install script did not do, and the pass had to.** `/etc/asound.conf` must route ALSA
+through WSLg's PulseServer — without it `arecord`/`aplay` find no device at all. And
+`loginctl enable-linger` per row 9.5. Both are now known prerequisites of this contour, not incidents.
+
+### What this pass did NOT close
+
+* **A real microphone — and not for want of trying.** The rig's only capture endpoint is a "Line In"
+  with nothing attached; host audio is "Remote Audio", i.e. an RDP session with microphone redirection
+  off. WSLg's `RDPSource` therefore had nothing to forward and `parecord` produced a bare 44-byte
+  header. Microphone privacy for desktop apps was already `Allow`, so that is not the cause. **No
+  software choice makes dictation testable on a rig connected this way**; the fix is RDP microphone
+  redirection at the client. Row 8.7 stays open.
+* **Live Claude Code hook dispatch (row 8.6).** The session driving this pass ran on the *Windows*
+  side, where the hook cannot reach a server bound to `127.0.0.1` inside the distro — verified, not
+  assumed. Speak-back on this route requires Claude Code itself running inside WSL.
+* **`/voice-setup` end to end (row 8.8).** The skill completed steps 0–5 and stopped at step 6; the
+  ledger is left `in_progress` with `next_step: step-6-hotkey`, so a re-run resumes there rather than
+  repeating the 2.7 GB.
+
+### One structural limit, worth separating from the unmeasured ones
+
+**There is no hotkey host under WSLg.** WSLg runs individual applications, not a desktop session, so
+there is no `gsettings` (or equivalent) keybinding host to bind push-to-talk to. This is not a gap that
+further testing closes — on this route dictation is invoked as a command
+(`~/.local/bin/voice-loop-dictate`, which `/voice-setup` installs), not by a key. Any page describing
+the WSL2 route should say so rather than imply the hotkey step applies.
+
+**One incident worth recording because it cost the first run.** `scripts/selftest.sh` died immediately
+with `set: -: invalid option` and a run of `$'\r'` errors: the `.sh` files carried CRLF from a Windows
+checkout under system-level `core.autocrlf=true`. The pass ran from an LF copy and left the checkout
+untouched; the repository-side fix is a `.gitattributes` with `*.sh text eol=lf`.
