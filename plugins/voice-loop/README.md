@@ -122,7 +122,7 @@ reasonable mix.
 
 | | where it runs | cost | privacy | notes |
 |---|---|---|---|---|
-| `local` | your machine | free | audio never leaves it | whisper `small` ≈ 2 GB RAM, a second or two per phrase on a modern CPU; Silero TTS is near real time. First run downloads ~0.5–1.5 GB of models |
+| `local` | your machine | free | audio never leaves it | server holds both models at once: 3.56 GiB RSS after one round trip (whisper `small` + Silero, WSL2 — [§9.7](TESTING.md#9-wsl2-local-server-verification-record-2026-08-14)), not just whisper; a second or two per phrase on a modern CPU; Silero TTS is near real time. First run downloads ~0.5–1.5 GB of models |
 | `lan` | another box you own, over HTTP or an ssh tunnel | free | stays on your network | the honest sweet spot if you have a GPU machine — `server/` is that server |
 | `cloud` | a hosted speech API | per-use billing | **your audio and text leave your machine** | off by default; keys live in a file the config points at, never in the config |
 
