@@ -169,6 +169,39 @@ jobs:
         run: |
           claude plugin validate ./plugins/voice-loop
           claude plugin validate ./plugins/sill-core
+      # `claude plugin validate` checks each manifest's own structure; it does NOT compare the two
+      # copies of voice-loop's dependencies — the one in plugin.json and its mirror in the
+      # marketplace entry. A change that touches one and forgets the other passes both validations,
+      # and which copy then wins depends on how the user installed. Compare them here,
+      # order-insensitively, so drift is the gate's red, not a first-use crash.
+      #
+      # python3 rather than jq: this same runner image runs a bare `python3 -c` in the shellcheck
+      # job with no setup-python step, so python3 is already present; and the three-way absence
+      # logic (both-absent = agreement, one-absent = failure, present = sorted compare) reads more
+      # plainly in Python than in jq.
+      - name: dependencies agree across the two manifests
+        run: |
+          python3 - <<'PY'
+          import json, sys
+          plugin_path = "plugins/voice-loop/.claude-plugin/plugin.json"
+          market_path = ".claude-plugin/marketplace.json"
+          with open(plugin_path) as fh:
+              plugin_deps = json.load(fh).get("dependencies")
+          with open(market_path) as fh:
+              market = json.load(fh)
+          entry = next((p for p in market.get("plugins", []) if p.get("name") == "voice-loop"), None)
+          market_deps = entry.get("dependencies") if entry else None
+          # None stays None (field absent); a present list is sorted for an order-insensitive compare.
+          norm = lambda d: None if d is None else sorted(d)
+          if norm(plugin_deps) == norm(market_deps):
+              print(f"OK: voice-loop dependencies agree in both manifests: {sorted(plugin_deps or [])}")
+              sys.exit(0)
+          print("FAIL: voice-loop's dependencies field disagrees between the two manifests:")
+          print(f"  {plugin_path}: {plugin_deps!r}")
+          print(f"  {market_path}: {market_deps!r}")
+          print("Both must declare the same dependencies (compared order-insensitively).")
+          sys.exit(1)
+          PY
 
   coverage:
     name: unit tests (python ${{ matrix.python }})
