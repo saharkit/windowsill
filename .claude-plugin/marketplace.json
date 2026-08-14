@@ -31,6 +31,9 @@
         "self-hosted",
         "accessibility"
       ],
+      "dependencies": [
+        "sill-core"
+      ],
       "category": "productivity",
       "source": "./plugins/voice-loop"
     },

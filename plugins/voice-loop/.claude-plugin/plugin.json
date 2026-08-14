@@ -22,5 +22,8 @@
     "self-hosted",
     "accessibility"
   ],
+  "dependencies": [
+    "sill-core"
+  ],
   "category": "productivity"
 }

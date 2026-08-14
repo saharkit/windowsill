@@ -144,6 +144,32 @@ jobs:
           grep -q "contour_poll.py is missing" /tmp/contour-nopy2.txt \
             || { echo "the missing-script guard lost its diagnostic"; cat /tmp/contour-nopy2.txt; exit 1; }
 
+  # `claude plugin validate` is the local structural check the plugin directory's review pipeline
+  # runs on every submission: it verifies plugin.json, skill/agent/command frontmatter and
+  # hooks/hooks.json against the schema, with no auth and no model calls. Nothing here ran it, so a
+  # silent validate failure was invisible (windowsill submission readiness). The claude CLI is a
+  # public npm package, so this is obtainable in CI without any credential the repo does not hold.
+  # Intentionally NOT in gate.needs: required-check wiring lives in another repository (the branch
+  # protection config) and is not this change's to make, so the job reports but does not yet gate.
+  validate:
+    name: validate plugin manifests (claude plugin validate)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: install the claude CLI (public npm package, no credential needed)
+        run: npm install -g @anthropic-ai/claude-code
+      - name: validate both plugins
+        env:
+          # a local check (no auth, no model calls): suppress the CLI's update/telemetry network
+          # traffic so the gate is deterministic rather than dependent on external endpoints
+          CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
+        run: |
+          claude plugin validate ./plugins/voice-loop
+          claude plugin validate ./plugins/sill-core
+
   coverage:
     name: unit tests (python ${{ matrix.python }})
     runs-on: ubuntu-latest

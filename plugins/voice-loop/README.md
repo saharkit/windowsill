@@ -39,6 +39,15 @@ what is missing, writes your config, wires a hotkey, and proves the result with 
 
 ## Quickstart
 
+**voice-loop needs `sill-core` — install them together.** `sill-core` is a hard dependency, not
+optional: a voice-loop installed *without* it is broken on first use (`/doctor` and the hooks fail
+with `ModuleNotFoundError: sill_core`). Current Claude Code reads the `dependencies` field in the
+manifest and installs `sill-core` for you; if yours does not, the one command that fixes it is:
+
+```text
+/plugin install sill-core@windowsill
+```
+
 In your shell:
 
 ```sh
