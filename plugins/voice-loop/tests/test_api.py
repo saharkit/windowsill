@@ -498,6 +498,23 @@ def test_stt_abandons_a_transcription_that_outruns_its_budget(client, monkeypatc
     assert voice_server.queue_depths()["cpu"]["waiting"] == 0
 
 
+def test_stt_deadline_refuses_before_loading_or_transcribing(client, monkeypatch, one_slot_gate):
+    """L2 GAP: deleting this test lets a queued request load and invoke Whisper before its deadline.
+
+    The request bound owns both model loading and transcription, so neither may start after the gate
+    wait has already consumed the budget.
+    """
+    calls: list[str] = []
+    monkeypatch.setattr(voice_server, "STT_TIMEOUT", 0.01)
+    monkeypatch.setattr(voice_server, "resolve_device", lambda: "cpu")
+    monkeypatch.setattr(voice_server, "whisper", lambda: calls.append("load"))
+    clock_values = iter((100.0, 100.02))
+    with one_slot_gate:
+        with pytest.raises(voice_server.TranscriptionTimeout):
+            voice_server.transcribe_upload(b"RIFFfake", "ru", clock=lambda: next(clock_values))
+    assert calls == []
+
+
 def test_stt_timeout_default_is_the_documented_one(client, fake_whisper):
     assert voice_server.STT_TIMEOUT == 900.0
     response = client.post("/stt", files={"audio": ("clip.wav", b"RIFFfake", "audio/wav")})
