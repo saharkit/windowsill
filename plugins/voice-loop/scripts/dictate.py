@@ -1206,26 +1206,70 @@ def _transcribe_cloud(s: dict, wav_bytes: bytes, boundary: str) -> str | None:
 def _pid_alive(pid: int) -> bool:
     """Is *pid* a live process? POSIX uses the signal-0 idiom; on Windows there IS no signal 0 —
     os.kill maps straight to TerminateProcess, so the same call would TERMINATE the very process
-    it is probing. The Windows arm parses tasklist's captured rows instead of trusting its exit
-    status: a successful query with no matching process still exits zero."""
+    it is probing. The Windows arm opens a kernel32 handle and polls it with a zero timeout — no
+    subprocess, because both callers ask this per poll iteration and a spawned tasklist.exe per
+    ask is a per-iteration process launch."""
     if pid <= 0:
         return False
     if os.name == "nt":  # pragma: no cover — exercised on Windows; the lane runs Linux
+        import ctypes
+
         try:
-            result = subprocess.run(
-                ["tasklist.exe", "/NH", "/FI", f"PID eq {pid}"],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-                check=False,
-                timeout=5,
-                text=True,
+            # use_last_error (not a bare windll): ctypes itself makes Win32 calls between our
+            # failing call and the error read, so kernel32.GetLastError() can report a stale
+            # code and misread access-denied as no-such-process. ctypes.get_last_error() is
+            # captured at the boundary and is the reliable read.
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # stdlib; Windows arm
+
+            # Without argtypes/restype ctypes truncates a 64-bit handle to a C int on 64-bit
+            # Python — exactly the class of defect that only shows up on the platform no lane
+            # runs. Declare every signature.
+            kernel32.OpenProcess.argtypes = (
+                ctypes.c_uint32,  # dwDesiredAccess
+                ctypes.c_int,  # bInheritHandle
+                ctypes.c_uint32,  # dwProcessId
             )
-        except (OSError, subprocess.SubprocessError):
-            return False  # cannot ask: report dead rather than kill what we cannot see
-        return any(
-            len(row := line.split()) >= 2 and row[1] == str(pid)
-            for line in result.stdout.splitlines()
-        )
+            kernel32.OpenProcess.restype = ctypes.c_void_p
+            kernel32.WaitForSingleObject.argtypes = (
+                ctypes.c_void_p,  # hHandle
+                ctypes.c_uint32,  # dwMilliseconds
+            )
+            kernel32.WaitForSingleObject.restype = ctypes.c_uint32
+            kernel32.CloseHandle.argtypes = (ctypes.c_void_p,)
+            kernel32.CloseHandle.restype = ctypes.c_int
+
+            # SYNCHRONIZE (0x00100000) lets us wait; PROCESS_QUERY_LIMITED_INFORMATION
+            # (0x1000) is the least-privilege right that still permits the wait below.
+            SYNCHRONIZE = 0x00100000
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            ERROR_ACCESS_DENIED = 5
+            ERROR_INVALID_PARAMETER = 87
+            WAIT_OBJECT_0 = 0
+            WAIT_TIMEOUT = 0x102
+
+            handle = kernel32.OpenProcess(
+                SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, False, pid
+            )
+            if not handle:
+                error = ctypes.get_last_error()
+                if error == ERROR_ACCESS_DENIED:
+                    # Exists but is not ours to open — the Windows twin of the POSIX arm's
+                    # PermissionError → True, kept answering the same way on both arms.
+                    return True
+                # ERROR_INVALID_PARAMETER (87) is "no such process"; any other failure we
+                # cannot ask: report dead rather than kill what we cannot see.
+                return False
+            try:
+                wait = kernel32.WaitForSingleObject(handle, 0)
+                if wait == WAIT_TIMEOUT:
+                    return True  # still running
+                if wait == WAIT_OBJECT_0:
+                    return False  # exited
+                return False  # WAIT_FAILED or anything else: cannot ask, report dead
+            finally:
+                kernel32.CloseHandle(handle)  # every path that opened it closes it
+        except (OSError, AttributeError):
+            return False  # kernel32 is not what we expect: report dead, do not fall back to spawn
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
