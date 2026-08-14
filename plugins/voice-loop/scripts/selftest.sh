@@ -15,17 +15,42 @@ set -u
 
 CFG="${VOICE_LOOP_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/voice-loop/config.json}"
 
-cfg() { # cfg <jq-path> <default>
-  local v=""
-  if [ -f "$CFG" ] && command -v jq >/dev/null 2>&1; then
-    v=$(jq -r "$1 // empty" "$CFG" 2>/dev/null || true)
-  fi
-  if [ -n "$v" ] && [ "$v" != "null" ]; then printf '%s' "$v"; else printf '%s' "$2"; fi
+# A python3-backed JSON-path lookup that takes the place of the old `jq -r 'path'` call. python3 is
+# already a hard dep further below (the script refuses to run without one), and a fresh Ubuntu-24.04
+# distro — exactly the WSL2 lane the #41 loopback pass ran from — ships python3 but not jq. The old
+# jq path forced #179 to bypass the config entirely, which means the config path was the ONE path the
+# pass never exercised; this is its move (#179, defect 1).
+_cfg_get() {  # _cfg_get <dotted-json-path> -> string value, or empty on missing/invalid/none-json
+  local v
+  v=$(python3 - "$CFG" "$1" 2>/dev/null <<'PYCFG'
+import json, sys
+try:
+    with open(sys.argv[1], encoding="utf-8") as fh:
+        data = json.load(fh)
+except (OSError, ValueError):
+    sys.exit(0)
+node = data
+for part in sys.argv[2].lstrip(".").split("."):
+    if not isinstance(node, dict) or part not in node:
+        sys.exit(0)
+    node = node[part]
+if node is None or node == "":
+    sys.exit(0)
+if isinstance(node, (dict, list)):
+    sys.exit(0)
+print(node)
+PYCFG
+)
+  printf '%s' "$v"
 }
 
-if [ -f "$CFG" ] && ! command -v jq >/dev/null 2>&1; then
-  echo "note: jq not found -- config at $CFG is ignored" >&2
-fi
+cfg() { # cfg <dotted-json-path> <default>
+  local v=""
+  if [ -f "$CFG" ]; then
+    v=$(_cfg_get "$1")
+  fi
+  if [ -n "$v" ]; then printf '%s' "$v"; else printf '%s' "$2"; fi
+}
 
 TTS_EP=""; STT_EP=""; PHRASE=""; LANG_=""; SPEAKER=""; THRESHOLD="0.75"; KEEP="no"; STRICT="no"
 while [ $# -gt 0 ]; do

@@ -179,9 +179,11 @@ curl -s http://127.0.0.1:8355/health | python3 -c 'import json,sys; h=json.load(
 
 If `hook_last_fired_age_s` keeps **growing while you chat** — minutes old, then tens of minutes —
 the harness is no longer calling the hook, and no plugin-side setting will bring the voice back.
-Both fields are `null` when the server cannot see the stamp: the hook never fired on this machine,
-or the server runs on another one (the ssh-tunnel setup) and the client's state dir is not there
-to read.
+Both fields are `null` when the heartbeat is not observable: the hook never fired on this
+machine, the server runs on another (the ssh-tunnel setup) and the client's state dir is not
+there to read, or the server is bound to a non-loopback address (`VOICE_LOOP_HOST=0.0.0.0`,
+a LAN IP — the WSL2-into-LAN shape from #179) and the stamp this machine CAN read belongs to
+its OWN host, not the remote client.
 
 **Remedy:** restart the Claude Code session — hooks re-initialize on startup, and the voice comes
 back. Nothing else needs reinstalling or reconfiguring; the stamp and the logs survive the restart

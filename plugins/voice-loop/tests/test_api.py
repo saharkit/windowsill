@@ -117,6 +117,90 @@ def test_health_survives_an_unreadable_stamp(client, monkeypatch, tmp_path):
     assert body["hook_last_fired_age_s"] is None
 
 
+# --- /health: the heartbeat, when the bind address breaks the connection to the client's stamp --
+
+
+def test_health_reports_null_heartbeat_when_bound_to_a_non_loopback_address(
+    client, monkeypatch, tmp_path
+):
+    """L3 (two-way falsification): with HOST bound beyond loopback, the readable stamp is on the
+    SERVER's machine — not the client's hook. Reporting that stamp's age as the client's heartbeat
+    is the WSL2-into-LAN confabulation #179 retired; the server now says ``null`` instead.
+
+    The shape is the same as the unreadable-stamp cases above: null both fields. The reason
+    differs (non-loopback bind, vs no readable file) but the contract the client sees is one
+    shape — it cannot read the heartbeat it does not have.
+    """
+    stamp = tmp_path / "hook-last-fired"
+    stamp.write_text("1754157721.500\n", encoding="utf-8")
+    monkeypatch.setattr(voice_server, "HOOK_STAMP_FILE", stamp)
+    monkeypatch.setattr(voice_server.time, "time", lambda: 1754157721.5 + 90.0)
+    monkeypatch.setattr(voice_server, "HOST", "0.0.0.0")  # the wide bind — anyone on the LAN
+
+    body = client.get("/health").json()
+
+    assert body["hook_last_fired"] is None
+    assert body["hook_last_fired_age_s"] is None
+
+
+@pytest.mark.parametrize(
+    "host",
+    ["0.0.0.0", "192.168.1.42", "::", "::ffff:192.168.1.42"],
+)
+def test_health_null_heartbeat_for_any_non_loopback_bind(
+    client, monkeypatch, tmp_path, host
+):
+    """L2: cover the addresses a remote-bind configuration actually uses, not just ``0.0.0.0``.
+
+    The existence of a readable stamp on this server's state dir must never be reported as the
+    client's heartbeat — that stamp belongs to a hook on THIS machine, which is not necessarily
+    whose hook calls the server.
+    """
+    stamp = tmp_path / "hook-last-fired"
+    stamp.write_text("1754157721.500\n", encoding="utf-8")
+    monkeypatch.setattr(voice_server, "HOOK_STAMP_FILE", stamp)
+    monkeypatch.setattr(voice_server, "HOST", host)
+
+    body = client.get("/health").json()
+
+    assert body["hook_last_fired"] is None
+    assert body["hook_last_fired_age_s"] is None
+
+
+@pytest.mark.parametrize("host", ["127.0.0.1", "localhost", "127.0.0.42", "::1"])
+def test_health_keeps_the_heartbeat_on_loopback_binds(client, monkeypatch, tmp_path, host):
+    """L3 companion: the LAN carve-out (#179, defect 2) must NOT regress the loopback case.
+
+    A local server reading its local stamp is exactly what /health was designed for; the WSL2
+    fix narrowed the contract, it did not widen the loopback path to silence.
+    """
+    stamp = tmp_path / "hook-last-fired"
+    stamp.write_text("1754157721.500\n", encoding="utf-8")
+    monkeypatch.setattr(voice_server, "HOOK_STAMP_FILE", stamp)
+    monkeypatch.setattr(voice_server, "HOST", host)
+    monkeypatch.setattr(voice_server.time, "time", lambda: 1754157721.5 + 90.0)
+
+    body = client.get("/health").json()
+
+    assert body["hook_last_fired"] == "2025-08-02T18:02:01.500+00:00"
+    assert body["hook_last_fired_age_s"] == 90.0
+
+
+def test_is_loopback_bind_classifies_addresses_for_wsl2_carveout():
+    """L1: the classification helper is the answer the heartbeat will trust next to HOOK_STAMP_FILE.
+    Tests for its branches keep the carve-out exact — a typo in the prefix string would re-open
+    the LAN confabulation or silence every local install.
+    """
+    assert voice_server._is_loopback_bind("127.0.0.1") is True
+    assert voice_server._is_loopback_bind("localhost") is True
+    assert voice_server._is_loopback_bind("127.0.0.42") is True
+    assert voice_server._is_loopback_bind("::1") is True
+    assert voice_server._is_loopback_bind("0.0.0.0") is False
+    assert voice_server._is_loopback_bind("192.168.1.42") is False
+    assert voice_server._is_loopback_bind("::") is False
+    assert voice_server._is_loopback_bind("") is False
+
+
 # --- /stt ------------------------------------------------------------------------------------------
 
 
