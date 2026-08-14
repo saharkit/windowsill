@@ -403,15 +403,16 @@ the real dictation path therefore failed closed with `no recorder available`, as
 
 ### Still to verify (attended Windows desktop required)
 
-These are the checks the 2026-08-11 pass did not reach; run them on a real Windows 11 + WSLg
+These are the checks the 2026-08-11 pass did not reach (8.6 and 8.9 were reached on 2026-08-14; 8.7
+and 8.8 were not); run them on a real Windows 11 + WSLg
 machine and fill the rows before claiming them anywhere.
 
 | # | check | expected | observed | pass |
 |---|---|---|---|---|
-| 8.6 | End a reply with a `🔊` line under live Claude Code hook dispatch | the Stop hook fires and the line is audible on the WINDOWS host's speakers — the row that decides the WSLg audio claim | | |
+| 8.6 | End a reply with a `🔊` line under live Claude Code hook dispatch | the Stop hook fires and the line is audible on the WINDOWS host's speakers — the row that decides the WSLg audio claim | **Live dispatch confirmed (2nd attempt), 2026-08-14, WIN-TEST (Windows 11 + WSL2 Ubuntu-24.04 + WSLg, plugin 0.8.0, server 0.5.0).** Hook is registered by the PLUGIN, not user settings (`hooks/hooks.json` carries `Stop` + `PostToolUse`, `async`, timeout 90; `jq .hooks` on both `settings.json` files is `null`). `speak.log` grew 5 to 9 lines, 477 to 817 B, mtime advancing from 2026-08-11T20:07 to 2026-08-14T15:10:45; the delta is that turn's marker line with `played rc=0 bytes=387644 chunks=1 via=stream`, `extract_ms=10 first_audio_ms=1105 total_ms=5300`. **Audio reached the Windows endpoint, not just the renderer:** WASAPI `IAudioMeterInformation` on the default render device (state 1 = ACTIVE) read peak_max **0.73895**, 68 samples above noise over ~4.3 s, against a same-probe silence baseline of peak_max **0** over 64 samples. WSL leg corroborates (RDPSink SUSPENDED to RUNNING to IDLE bracketing the same playback, 15:10:41 to 15:10:45). Cross-checked with a direct `/tts` payload (952844 B, 9.93 s WAV): `aplay -q` rc=0, endpoint peak_max **0.9563**, audio 1.35 to 11.4 s, duration matching the WAV. **CAVEAT — not reliable as written:** the FIRST attempt fired and went silent, logging "nothing marked in the last assistant message". Cause: the final message had been written 195 ms before the hook read the transcript, but was not yet flushed to the `.jsonl`; because `assistant_texts()` skips pure tool-call messages, `scope[-1:]` fell back to an older marker-less message. A parsed-but-unmarked scope returns `''` rather than `None`, so the "'' means exit at once, never backoff" path skips `wait_out_flush` entirely and the flush race is misclassified as a decided "nothing to say". Attempt 2 passed only because a marker was also placed on the preceding message, which is a workaround, not a fix. | **pass** (with the reliability caveat above) |
 | 8.7 | `scripts/dictate-toggle.sh` with a real microphone | the log states WHICH recorder `resolve_recorder` selected, and the recorded WAV is non-empty — the row that catches a present-but-daemonless `pw-record` winning the resolution order and then failing | | |
 | 8.8 | `/voice-setup` end to end inside the distro | the skill completes and ends with its proof (the green loopback selftest or the ear-check) | | |
-| 8.9 | `scripts/selftest.sh` in its config-driven form (no `--endpoint`) | green loopback with the endpoint read from config; the 2026-08-11 pass found a valid config ignored when `jq` was absent, so install `jq` first | | |
+| 8.9 | `scripts/selftest.sh` in its config-driven form (no `--endpoint`) | green loopback with the endpoint read from config; the 2026-08-11 pass found a valid config ignored when `jq` was absent, so install `jq` first | Green in the config-driven form (no `--endpoint`), 2026-08-14, same rig. The only blocker was a missing `jq`; with `jq` installed the endpoint was read from config and the loopback passed. No similarity figure or timing was recorded for this run. | **pass** |
 
 ---
 
@@ -419,8 +420,8 @@ machine and fill the rows before claiming them anywhere.
 
 | | name | date | verdict |
 |---|---|---|---|
-| Tester | | | pass / fail |
-| Waived items (with reason) | | | |
+| Tester | Claude (Opus 5) in WSL2 Ubuntu-24.04 / Windows 11 WSLg, plugin 0.8.0, server 0.5.0 | 2026-08-14 | 8.6 pass (with the reliability caveat in the row) and 8.9 pass; 8.7 and 8.8 not reached |
+| Waived items (with reason) | 8.7 (real microphone) and 8.8 (/voice-setup end to end) | 2026-08-14 | not waived — genuinely unmeasured; no recorder was ever run on this rig (`dictate.log` does not exist) |
 
 ## 9. WSL2 local-server verification record (2026-08-14)
 
