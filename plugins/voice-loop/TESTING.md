@@ -438,6 +438,7 @@ anything else.
 | 9.4 | Audible playback through the configured player | `/tts` returned a 507 KB RIFF WAV over HTTP 200 and `aplay -q` played it, **rc=0** — out through WSLg to the Windows sound device (an RDP "Remote Audio" endpoint on this rig). | PASS |
 | 9.5 | The service survives a distro restart | After `wsl --terminate`, the server **rebound on its own in ~6 s** (fresh PID, no manual start). Requires `loginctl enable-linger`; without it root's `user@0.service` never starts on a WSL boot and the port stays dead while `is-active` still reports `active`. | PASS (with linger) |
 | 9.6 | Total disk cost of the local contour | **~2.7 GB**: venv 2.2 GB, HuggingFace cache 465 MB, torch cache 40 MB. | measured |
+| 9.7 | Peak memory of a full round trip (TTS then STT of the result), read two ways | **VmHWM 3 735 744 kB ≈ 3.56 GiB** (process RSS high-water — the honest "how much RAM does this want" figure). cgroup `MemoryPeak` 5 233 324 032 B ≈ 4.87 GiB, which **overstates** need: it includes reclaimable page cache attributable to the unit. Both models resident (`tts_engine=silero`, `stt_model=small`); freshly started, nothing loaded: VmHWM 107 444 kB ≈ 105 MiB, `MemoryPeak` 219 721 728 B ≈ 210 MiB. Host (7930 MB total) afterwards: used 4751, free 76, available 3178 MB. Models load lazily — a peak taken before a real request of each kind means nothing. | measured |
 
 **Two things the install script did not do, and the pass had to.** `/etc/asound.conf` must route ALSA
 through WSLg's PulseServer — without it `arecord`/`aplay` find no device at all. And
