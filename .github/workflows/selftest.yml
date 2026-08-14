@@ -144,6 +144,65 @@ jobs:
           grep -q "contour_poll.py is missing" /tmp/contour-nopy2.txt \
             || { echo "the missing-script guard lost its diagnostic"; cat /tmp/contour-nopy2.txt; exit 1; }
 
+  # `claude plugin validate` is the local structural check the plugin directory's review pipeline
+  # runs on every submission: it verifies plugin.json, skill/agent/command frontmatter and
+  # hooks/hooks.json against the schema, with no auth and no model calls. Nothing here ran it, so a
+  # silent validate failure was invisible (windowsill submission readiness). The claude CLI is a
+  # public npm package, so this is obtainable in CI without any credential the repo does not hold.
+  # Intentionally NOT in gate.needs: required-check wiring lives in another repository (the branch
+  # protection config) and is not this change's to make, so the job reports but does not yet gate.
+  validate:
+    name: validate plugin manifests (claude plugin validate)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: install the claude CLI (public npm package, no credential needed)
+        run: npm install -g @anthropic-ai/claude-code
+      - name: validate both plugins
+        env:
+          # a local check (no auth, no model calls): suppress the CLI's update/telemetry network
+          # traffic so the gate is deterministic rather than dependent on external endpoints
+          CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
+        run: |
+          claude plugin validate ./plugins/voice-loop
+          claude plugin validate ./plugins/sill-core
+      # `claude plugin validate` checks each manifest's own structure; it does NOT compare the two
+      # copies of voice-loop's dependencies — the one in plugin.json and its mirror in the
+      # marketplace entry. A change that touches one and forgets the other passes both validations,
+      # and which copy then wins depends on how the user installed. Compare them here,
+      # order-insensitively, so drift is the gate's red, not a first-use crash.
+      #
+      # python3 rather than jq: this same runner image runs a bare `python3 -c` in the shellcheck
+      # job with no setup-python step, so python3 is already present; and the three-way absence
+      # logic (both-absent = agreement, one-absent = failure, present = sorted compare) reads more
+      # plainly in Python than in jq.
+      - name: dependencies agree across the two manifests
+        run: |
+          python3 - <<'PY'
+          import json, sys
+          plugin_path = "plugins/voice-loop/.claude-plugin/plugin.json"
+          market_path = ".claude-plugin/marketplace.json"
+          with open(plugin_path) as fh:
+              plugin_deps = json.load(fh).get("dependencies")
+          with open(market_path) as fh:
+              market = json.load(fh)
+          entry = next((p for p in market.get("plugins", []) if p.get("name") == "voice-loop"), None)
+          market_deps = entry.get("dependencies") if entry else None
+          # None stays None (field absent); a present list is sorted for an order-insensitive compare.
+          norm = lambda d: None if d is None else sorted(d)
+          if norm(plugin_deps) == norm(market_deps):
+              print(f"OK: voice-loop dependencies agree in both manifests: {sorted(plugin_deps or [])}")
+              sys.exit(0)
+          print("FAIL: voice-loop's dependencies field disagrees between the two manifests:")
+          print(f"  {plugin_path}: {plugin_deps!r}")
+          print(f"  {market_path}: {market_deps!r}")
+          print("Both must declare the same dependencies (compared order-insensitively).")
+          sys.exit(1)
+          PY
+
   coverage:
     name: unit tests (python ${{ matrix.python }})
     runs-on: ubuntu-latest

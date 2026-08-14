@@ -39,6 +39,18 @@ what is missing, writes your config, wires a hotkey, and proves the result with 
 
 ## Quickstart
 
+**voice-loop needs `sill-core` — install them together.** `sill-core` is a hard dependency, not
+optional: a voice-loop installed *without* it is broken on first use (`/doctor` and the hooks fail
+with `ModuleNotFoundError: sill_core`). Install it explicitly with the command below:
+
+```text
+/plugin install sill-core@windowsill
+```
+
+If the client you install through honours the manifest's `dependencies` field, the command above is
+redundant — but we have not verified that any client does, so running it explicitly is the reliable
+path.
+
 In your shell:
 
 ```sh
