@@ -97,8 +97,8 @@ an open prerequisite. See the [shelf Windows section](../../README.md#running-on
 WSL2's network path to a separate LAN server works as ordinary Linux networking. A server on the
 Windows host is not `localhost` from inside WSL; use the host's reachable IP. Exposing a server
 running inside WSL to the LAN needs port proxying or mirrored networking. The WSL2 pass did not
-exercise WSLg microphone capture or the local bundled server, so test those on an attended machine
-before choosing those contours.
+exercise WSLg microphone capture, so test that on an attended machine
+before choosing that contour.
 
 **On macOS, one trap is worth knowing about even though setup now handles it.** python.org-installer
 Python ships an **empty certificate store**, so until `/Applications/Python 3.x/Install
