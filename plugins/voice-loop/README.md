@@ -78,7 +78,9 @@ Supported platforms: Linux and macOS. On Windows, use **WSL2 + WSLg on Windows 1
 WSL2 with `wsl --install` from elevated PowerShell, then follow this page's Linux quickstart
 inside the distro. WSLg supplies the Linux GUI/audio integration for an attended Windows desktop;
 the WSL2 verification pass confirmed the marketplace install, the registered hook command,
-CI-style fake-recorder dictation, and a `lan` loopback against a remote server. It did **not**
+CI-style fake-recorder dictation, and a `lan` loopback against a remote server. It ran on
+**Ubuntu 24.04**, and the distro version bounds the claim: a newer release is not covered, and the
+package names `/voice-setup` installs are not guaranteed to be the same there. It did **not**
 measure live Claude Code hook dispatch, speaker or microphone passthrough, `/voice-setup` end to
 end, or the bundled local server inside WSL, so those are not claims of this page. The pass used an explicit `--endpoint`
 because a fresh distro without `jq` ignored the valid config; the config-driven selftest remains
