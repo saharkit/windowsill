@@ -185,6 +185,27 @@ def _is_store_stub(path: str | None) -> bool:
 def _redact_windows_path(path: str) -> str:
     """Hide the Windows account name while retaining the useful path shape."""
     parts = PureWindowsPath(path).parts
+    profile = os.environ.get("USERPROFILE")
+    if not profile:
+        drive = os.environ.get("HOMEDRIVE", "")
+        home = os.environ.get("HOMEPATH", "")
+        profile = f"{drive}{home}" or None
+
+    if profile:
+        profile_parts = PureWindowsPath(profile).parts
+        profile_length = len(profile_parts)
+        for start in range(len(parts) - profile_length + 1):
+            candidate = parts[start:start + profile_length]
+            if all(
+                actual.casefold() == expected.casefold()
+                for actual, expected in zip(candidate, profile_parts)
+            ):
+                redacted = list(parts)
+                redacted[start + profile_length - 1] = "<user>"
+                return str(PureWindowsPath(*redacted))
+
+    # Keep the legacy shape as a fallback when the profile environment is not
+    # available (and for callers that provide a path from a different profile).
     try:
         users_index = next(
             index for index, part in enumerate(parts[:-1])
@@ -199,6 +220,28 @@ def _redact_windows_path(path: str) -> str:
     return str(PureWindowsPath(*redacted))
 
 
+def _decode_windows_output(output: Any) -> str:
+    """Decode bytes emitted by Windows tools without propagating decode errors."""
+    if isinstance(output, str):
+        return output
+    if not output:
+        return ""
+    if isinstance(output, bytes):
+        # wsl.exe commonly emits UTF-16LE to a pipe.  Only try that codec when
+        # a BOM or NUL bytes identify the stream as UTF-16; where.exe normally
+        # emits UTF-8/ANSI text without either marker.
+        if output.startswith((b"\xff\xfe", b"\xfe\xff")) or b"\x00" in output:
+            try:
+                return output.decode("utf-16le").lstrip("﻿")
+            except UnicodeDecodeError:
+                pass
+        try:
+            return output.decode("utf-8")
+        except UnicodeDecodeError:
+            return output.decode("utf-8", errors="replace")
+    return str(output)
+
+
 def _where_python3(
     *,
     platform: str = sys.platform,
@@ -211,15 +254,15 @@ def _where_python3(
         result = run(
             ["where.exe", "python3"],
             capture_output=True,
-            text=True,
             check=False,
             timeout=2,
         )
-    except (OSError, subprocess.SubprocessError):
+    except (OSError, ValueError, subprocess.SubprocessError):
         return []
     if result.returncode != 0:
         return []
-    return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    output = _decode_windows_output(result.stdout)
+    return [line.strip() for line in output.splitlines() if line.strip()]
 
 
 def _wsl_boundary_finding(
@@ -234,19 +277,19 @@ def _wsl_boundary_finding(
         result = run(
             ["wsl.exe", "-l", "-q"],
             capture_output=True,
-            text=True,
             check=False,
             timeout=2,
         )
-    except (OSError, subprocess.SubprocessError):
+    except (OSError, ValueError, subprocess.SubprocessError):
         return None
     if result.returncode != 0:
         return None
-    distros = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    output = _decode_windows_output(result.stdout)
+    distros = [line.strip() for line in output.splitlines() if line.strip()]
     if not distros:
         return None
     return {
-        "bin": "real_anomaly",
+        "bin": "consequence_of_choice",
         "key": "wsl_contour_not_visible_from_windows",
         "title": "A WSL2 distro is present, but no voice-loop contour is visible on Windows",
         "explanation": (
@@ -507,7 +550,10 @@ def main(argv: list[str] | None = None) -> int:
 
     # A Windows-side empty contour may simply be the wrong side of the WSL2
     # boundary.  Do not probe WSL on POSIX, and do not override a local config
-    # or ledger with a boundary warning.
+    # or ledger with a boundary warning.  When the boundary is present, the
+    # empty ledger is expected to belong to WSL, so suppress its misleading
+    # "run /voice-setup" findings below.
+    wsl_finding: dict[str, Any] | None = None
     if not config and ledger.get("state", "none") == "none":
         wsl_finding = _wsl_boundary_finding()
         if wsl_finding is not None:
@@ -592,6 +638,11 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     findings = diagnose(manifest=manifest, config=config, ledger=ledger, logs=logs)
+    if wsl_finding is not None:
+        findings = [
+            finding for finding in findings
+            if finding.bin.value != "unfinished_install"
+        ]
 
     # Emit structured JSON.
     output: dict[str, Any] = {
