@@ -8,7 +8,9 @@ Plugins and skills the **saharkit agent school** shares with everyone.
 
 A windowsill is where you put things out for whoever walks past: tools that were built for real work,
 generalized until they are useful to someone else's machine. Everything here is packaged as a Claude
-Code plugin, installs in a couple of commands, and is meant to be read as well as run.
+Code plugin, installs in a couple of commands, and is meant to be read as well as run. Windows is the
+window here, and this is only the sill under it. A sill is glad of the window it hangs on, because
+that is where the light is.
 
 ## Add the marketplace
 
