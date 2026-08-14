@@ -92,6 +92,26 @@ because a fresh distro without `jq` ignored the valid config; the config-driven 
 an open prerequisite. See the [shelf Windows section](../../README.md#running-on-windows) and the
 [verification record](TESTING.md#8-wsl2-verification-record-2026-08-11).
 
+## In-box Windows speech
+
+The platform story above routes Windows through WSL2, and one reason is worth recording plainly:
+the speech recognizer that ships **inside Windows itself** — the in-box `System.Speech` engine,
+no download, no WSL — recognizes a fixed, closed set of seventeen languages. These are all of
+them, and no others can ever be installed:
+
+    da-DK  de-DE  en-AU  en-CA  en-GB  en-IN  en-US  es-ES  es-MX
+    fr-CA  fr-FR  it-IT  ja-JP  pt-BR  zh-CN  zh-HK  zh-TW
+
+`ru-RU` is **permanently absent** from that list — not merely uninstalled. No download,
+capability install, or language pack will ever add Russian recognition to the in-box recognizer:
+the capability does not exist. `Get-WindowsCapability -Online -Name "*Speech*ru*"` returns
+exactly one row, `Language.TextToSpeech~~~ru-RU` — synthesis, the other direction, not
+recognition.
+
+This was measured on a Windows test rig on 2026-08-14 by enumerating `System.Speech`'s
+`InstalledRecognizers()` and the installable speech capabilities, so no future reader needs to
+re-derive it.
+
 ### Windows, WSL2 + WSLg
 
 WSL2's network path to a separate LAN server works as ordinary Linux networking. A server on the
