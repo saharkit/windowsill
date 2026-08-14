@@ -1281,7 +1281,7 @@ def _pid_alive(pid: int) -> bool:
     return True
 
 
-def _win_console_ctrl_c(pid: int) -> bool:
+def _win_console_ctrl_c(pid: int) -> bool:  # pragma: no cover — exercised on Windows; the lane runs Linux
     """Send CTRL_C_EVENT to the console *pid* lives in — True if the event went out.
 
     This is the Windows equivalent of SIGINT, and the only graceful stop that reaches a process
@@ -1345,10 +1345,10 @@ def _win_pid_is_recorder(pid: int, recorder: str) -> bool:
     enough for QueryFullProcessImageNameW) — no subprocess, because the stop path must stay cheap.
     """
     if pid <= 0 or not recorder:
-        return False
-    import ctypes
+        return False  # plain-Python guard, left under coverage: no Windows-only API before this
+    import ctypes  # pragma: no cover — exercised on Windows; the lane runs Linux
 
-    try:
+    try:  # pragma: no cover — everything from here reaches kernel32
         kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # stdlib; Windows arm
         PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
         kernel32.OpenProcess.argtypes = (
@@ -1384,7 +1384,7 @@ def _win_pid_is_recorder(pid: int, recorder: str) -> bool:
             return image == expected
         finally:
             kernel32.CloseHandle(handle)  # every path that opened it closes it
-    except (OSError, AttributeError):
+    except (OSError, AttributeError):  # pragma: no cover — only the excluded Windows arm can raise these
         return False  # kernel32 is not what we expect: cannot verify, do not signal
 
 
