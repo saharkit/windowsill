@@ -1544,12 +1544,29 @@ def _default_wall_clock() -> float:
     return time.time()
 
 
+def _is_loopback_bind(host: str) -> bool:
+    """True only for binds that point at the local machine — the one case where the stamp file
+    is the same file the hook on this machine writes. A non-loopback bind (``0.0.0.0``, a LAN IP,
+    anything reachable from another box) means the server can see its OWN state dir's stamp, not
+    the client's — and reporting an age in that case is a confabulation (#179, defect 2)."""
+    if not host:
+        return False
+    return host == "localhost" or host.startswith("127.") or host == "::1"
+
+
 def hook_heartbeat(clock: Callable[[], float] = _default_wall_clock) -> tuple[str | None, float | None]:
-    """(ISO-8601 UTC stamp, age in seconds) of the hook's last firing — (None, None) when there is
-    no readable stamp: the hook never fired on this machine, the stamp is corrupt, or the server
-    runs on another machine than the client (the ssh-tunnel deployment) and there is no state dir
-    here to read. The age is signed on purpose: a NEGATIVE age means the stamp is ahead of this
-    machine's clock, which is itself worth knowing before trusting the number."""
+    """(ISO-8601 UTC stamp, age in seconds) of the hook's last firing — (None, None) when there
+    is no observable heartbeat: the stamp file is unreadable here (corrupt, missing, on a
+    different machine the server cannot see — the ssh-tunnel setup), or this server is bound
+    to a non-loopback address and the stamp the server CAN read is the wrong machine's stamp
+    (#179, defect 2). The age is signed on purpose: a NEGATIVE age means the stamp is ahead of
+    this machine's clock, which is itself worth knowing before trusting the number."""
+    if not _is_loopback_bind(HOST):
+        # The heartbeat exists only as evidence "is the harness still calling the hook on THIS
+        # machine". A server bound to 0.0.0.0 (the recommended WSL2-into-LAN setup in #41) reads
+        # its own host's stamp, which is NOT the client's hook — answering "fresh" when the
+        # real client may be silent is exactly the wrong-shade-of-green the docs disclaimed.
+        return None, None
     try:
         fired = float(HOOK_STAMP_FILE.read_text(encoding="utf-8").strip())
         stamp = datetime.fromtimestamp(fired, timezone.utc).isoformat(timespec="milliseconds")
@@ -1601,8 +1618,11 @@ def health() -> dict[str, object]:
         "stt_hallucinations_dropped": _hallucinations_dropped,
         "stt_hallucination_tails_stripped": _hallucination_tails_stripped,
         "stt_hallucinations_by_pattern": dict(_hallucinations_by_pattern),
-        # The hook's heartbeat (see HOOK_STAMP_FILE): nulls when the stamp is not readable HERE,
-        # which includes the ssh-tunnel deployment where hook and server are on different machines.
+        # The hook's heartbeat (see HOOK_STAMP_FILE): nulls when there is no observable
+        # heartbeat HERE — the stamp file is unreadable (corrupt / not yet written / on a
+        # different machine the server cannot see — the ssh-tunnel setup), OR this server is
+        # bound to a non-loopback address and the stamp it CAN read is the wrong machine's
+        # stamp (#179, defect 2: the WSL2-into-LAN confabulation).
         "hook_last_fired": hook_fired_at,
         "hook_last_fired_age_s": hook_fired_age,
     }

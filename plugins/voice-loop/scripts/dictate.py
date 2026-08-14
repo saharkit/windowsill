@@ -550,7 +550,13 @@ def clip_seconds(size_bytes: int) -> float:
 
 def resolve_clipboard(clipboard: str, system: str, have, wayland: bool) -> str:
     """auto -> pbcopy (macOS), wl-copy (a live Wayland session), xclip, wl-copy (installed but no
-    $WAYLAND_DISPLAY — XWayland setups); an explicit name is taken as-is."""
+    $WAYLAND_DISPLAY — XWayland setups); an explicit name is taken as-is.
+
+    Only these three tools are ever candidates; a Windows ``clip.exe`` found on PATH through WSL
+    interop is NOT one of them — ``clipboard_commands`` has no entry for it, so no probe order can
+    select it. Under WSLg the session exports $WAYLAND_DISPLAY like any Wayland desktop, so the
+    first wl-copy tier already fires there; nothing WSL-specific is needed (#179 defect 3).
+    """
     if clipboard != "auto":
         return clipboard
     if system == "Darwin":
@@ -1890,6 +1896,7 @@ def stop_and_transcribe(s: dict, system: str, mode: str, recorder_pid: int) -> i
     tool = resolve_clipboard(
         s["clipboard"], system, shutil.which, bool(os.environ.get("WAYLAND_DISPLAY"))
     )
+    log(f"clipboard resolved: {tool or '<none>'}")
     commands = clipboard_commands(tool)
     if not commands:
         _clear_preview()

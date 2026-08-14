@@ -297,6 +297,35 @@ def test_clipboard_auto_order():
     assert dictate.resolve_clipboard("auto", "Linux", have_none, wayland=False) == ""
 
 
+def test_clipboard_wsl_clipexe_is_not_a_candidate():
+    """L3 (two-way falsification) for #179 defect 3, corrected: ``clip.exe`` is on PATH inside
+    WSL through Windows interop, but it was NEVER a candidate — the tiers are pbcopy/wl-copy/
+    xclip only, so no probe order can select it. What the WSL case must prove is that the
+    ordinary Linux order keeps holding there: a live Wayland session (WSLg exports
+    $WAYLAND_DISPLAY like any Wayland desktop) takes wl-copy, and a clip.exe-only PATH
+    resolves to "" rather than to the interop tool.
+
+    Without $WAYLAND_DISPLAY the wl-copy-beats-xclip swap the ticket described cannot be
+    right: an unset WAYLAND_DISPLAY means no Wayland socket to reach, and the xclip tier
+    (XWayland) is the honest answer there.
+    """
+    # WSLg session: $WAYLAND_DISPLAY set, wl-copy installed -> wl-copy, clip.exe on PATH
+    # notwithstanding (it is not a tier).
+    assert (
+        dictate.resolve_clipboard("auto", "Linux", have("wl-copy", "xclip", "clip.exe"), wayland=True)
+        == "wl-copy"
+    )
+    # WAYLAND_DISPLAY unset (XWayland setup): xclip wins — both inside and outside WSL, since
+    # the order is the same order.
+    assert (
+        dictate.resolve_clipboard("auto", "Linux", have("wl-copy", "xclip", "clip.exe"), wayland=False)
+        == "xclip"
+    )
+    # clip.exe alone on PATH: NOT a candidate — "" is the answer, the "no clipboard tool"
+    # diagnostic, not the interop passthrough.
+    assert dictate.resolve_clipboard("auto", "Linux", have("clip.exe"), wayland=False) == ""
+
+
 def test_clipboard_commands_fill_both_selections():
     assert dictate.clipboard_commands("pbcopy") == [["pbcopy"]]
     assert dictate.clipboard_commands("wl-copy") == [["wl-copy"], ["wl-copy", "--primary"]]

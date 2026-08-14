@@ -157,9 +157,11 @@ by comparing version strings.
 invocation. An age that keeps growing while the session continues means the harness has stopped
 calling the hook — see
 [the troubleshooting entry](../docs/troubleshooting.md#the-voice-stops-entirely-mid-session-but-everything-works-by-hand).
-Both are `null` when the stamp is not readable here — which includes a server running on a
-different machine than the client (the ssh-tunnel setup), since the stamp lives in the *client's*
-state dir.
+Both are `null` when the heartbeat is not observable here — the stamp file is unreadable
+(corrupt / not yet written / on a different machine the server cannot see — the ssh-tunnel
+setup), OR the server is bound to a non-loopback address (`VOICE_LOOP_HOST=0.0.0.0`, a LAN IP,
+etc.) and the stamp this machine CAN read is not the one the remote client's hook writes
+(#179, defect 2).
 
 ### Languages
 

@@ -519,6 +519,9 @@ LOG_RULES: tuple[tuple[str, str | None], ...] = (
     ("empty transcription", None),
     ("no clipboard tool (", None),
     ("clipboard failed: ", None),
+    # the resolved-tier name (#179, defect 3): tells the operator which tier was picked — the
+    # line is a tier name, NOT a payload, so no redaction
+    ("clipboard resolved: ", None),
     ("auto-pasted (", None),
     ("auto-paste unavailable", None),
     ("toggle ignored — key repeat (", None),
