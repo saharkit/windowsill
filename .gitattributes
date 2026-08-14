@@ -1,0 +1,9 @@
+# Shell scripts must arrive with LF, on every platform.
+#
+# The documented Windows route is: clone on Windows, run inside WSL2. Git for Windows sets
+# core.autocrlf=true at the SYSTEM level by default, so a Windows checkout writes CRLF into the
+# working tree while HEAD keeps LF. Bash inside WSL then refuses the file outright — measured
+# 2026-08-14 on a real rig: scripts/selftest.sh died with "set: -: invalid option" and a run of
+# $'\r' errors. The Stop hook is `bash scripts/speak.sh`, so under exactly the setup this project
+# recommends, speak-back would be silently dead. See issue #41.
+*.sh text eol=lf
