@@ -736,3 +736,209 @@ class TestDoctorMissingEngineDiagnosis:
         assert findings[0]["key"] == "sill_core_import_failed"
         assert findings[0]["bin"] == "real_anomaly"
         assert "reinstall sill-core" in findings[0]["fix"].lower()
+
+
+# ---------------------------------------------------------------------------
+# Windows prerequisites — /doctor names the three Windows traps by name
+# ---------------------------------------------------------------------------
+
+
+class TestWindowsPrerequisites:
+    """The doctor names all three Windows prerequisites specifically.
+
+    Ticket #174 was lost because a presence test for ``python3`` on PATH
+    answered YES on the Microsoft Store stub — a real ``.exe`` that
+    silently redirects to the Store instead of running Python.  A doctor
+    that only reported absent interpreters would pass on the exact trap
+    that hid the bug.  These tests pin the DECISION each check makes
+    (real interpreter vs. Store stub vs. absent), not the wording of
+    its message.
+
+    The probe seams follow the same shape the tree already uses for
+    ``_sill_core_root`` — keyword-only parameters with production
+    defaults, so the test injects a fixed platform and a fake ``which``
+    without monkeypatching the module.
+    """
+
+    def test_windows_python_check_decision(self) -> None:
+        """Each decision produces a distinct, expected key.
+
+        The check has two failure modes and two pass-throughs:
+
+        - Real ``python3`` (not under ``WindowsApps``) → no finding.
+        - ``python3`` resolves to the Store stub → fires
+          ``python3_is_store_stub``.
+        - No real interpreter on PATH (neither ``python3`` nor
+          ``python`` is real) → fires ``python_interpreter_missing``.
+        - Non-Windows platform → no finding (inert).
+
+        A check that only reported absences would answer the same
+        whether the user has the Store stub or a real interpreter:
+        both report "python3 is somehow on PATH".  The path check
+        distinguishes them — that is the load-bearing assertion.
+        """
+
+        def _which_with(python3: str | None, py: str | None):
+            """Build a fake ``which`` that answers the two lookups."""
+            def fake(name: str) -> str | None:
+                if name == "python3":
+                    return python3
+                if name == "python":
+                    return py
+                return None
+            return fake
+
+        # Decision 1: real python3 — no finding.
+        result = doctor._check_python_interpreter(
+            platform="win32",
+            which=_which_with(
+                python3="C:\\Python311\\python3.exe",
+                py=None,
+            ),
+        )
+        assert result is None, (
+            f"real python3 must not fire a finding: got {result}"
+        )
+
+        # Decision 2: python3 is the Store stub — fires
+        # ``python3_is_store_stub``.  This is the load-bearing check
+        # from ticket #174: a presence test answers YES on this trap.
+        stub = (
+            "C:\\Users\\me\\AppData\\Local\\Microsoft\\WindowsApps\\"
+            "python3.exe"
+        )
+        result = doctor._check_python_interpreter(
+            platform="win32",
+            which=_which_with(python3=stub, py=None),
+        )
+        assert result is not None, "Store stub must fire a finding"
+        assert result["key"] == "python3_is_store_stub", (
+            f"wrong key for Store stub: {result.get('key')!r}"
+        )
+        assert result["bin"] == "real_anomaly"
+
+        # Decision 3: no python3 AND no python on PATH — fires
+        # ``python_interpreter_missing``.
+        result = doctor._check_python_interpreter(
+            platform="win32",
+            which=_which_with(python3=None, py=None),
+        )
+        assert result is not None, (
+            "absent interpreter must fire a finding"
+        )
+        assert result["key"] == "python_interpreter_missing", (
+            f"wrong key for absent interpreter: {result.get('key')!r}"
+        )
+        assert result["bin"] == "real_anomaly"
+
+        # Decision 4: non-Windows is inert.  The launchers call
+        # ``python3``; on Linux/macOS the Store stub does not exist,
+        # so the check returns None and /doctor output is unchanged.
+        for platform_name in ("linux", "darwin"):
+            result = doctor._check_python_interpreter(
+                platform=platform_name,
+                which=_which_with(python3=None, py=None),
+            )
+            assert result is None, (
+                f"platform {platform_name!r} must be inert: got {result}"
+            )
+
+        # Sanity: the two failure-mode keys are distinct, not a single
+        # "FAIL" — the brief requires each prerequisite be named.
+        decision_stub = doctor._check_python_interpreter(
+            platform="win32",
+            which=_which_with(python3=stub, py=None),
+        )
+        decision_missing = doctor._check_python_interpreter(
+            platform="win32",
+            which=_which_with(python3=None, py=None),
+        )
+        assert decision_stub is not None
+        assert decision_missing is not None
+        assert decision_stub["key"] != decision_missing["key"]
+
+    def test_windows_findings_merged_into_main_output(
+        self, monkeypatch, capsys
+    ) -> None:
+        """When the platform check fires, its finding flows through main().
+
+        The brief requires ``/doctor`` to name all three prerequisites —
+        not for the unit function to behave correctly in isolation, but
+        for the final JSON to carry the finding the user reads.  This
+        pins the integration: a diagnostic tool that drops its own
+        broken state would defeat the engine.
+
+        The platform check's evidence is reviewed here: it MUST NOT carry
+        identity.  A real ``C:\\Users\\<account>\\...`` path embeds the
+        OS account name, and /doctor's stdout is consumed by the
+        /report-bug handoff which files a public GitHub issue — the
+        redactor's home-collapse is forward-slash-only and does not save
+        a Windows backslash path.  A fake account name shaped like a real
+        login is planted in the input path; the assertion below would
+        fail if the finding's evidence ever regressed to the raw path.
+        """
+        # Save the real function so the patch below can call it with
+        # controlled args — the seam is keyword-only ``platform`` and
+        # ``which``, so wrapping preserves production logic.
+        real_check = doctor._check_python_interpreter
+
+        # A login-shaped account name (≥3 chars, lowercase) that will
+        # surface in the path the fake `which` returns below.  Distinct
+        # enough that a substring search of the JSON output cannot
+        # accidentally hit it from anywhere else.
+        fake_account = "FakeAccountForDoctorTest"
+        fake_stub_path = (
+            f"C:\\Users\\{fake_account}\\AppData\\Local\\Microsoft\\"
+            "WindowsApps\\python3.exe"
+        )
+
+        def patched_check():
+            return real_check(
+                platform="win32",
+                which=lambda name: fake_stub_path if name == "python3" else None,
+            )
+
+        monkeypatch.setattr(doctor, "_check_python_interpreter", patched_check)
+        # Standard monkeypatches for the sill_core_missing branch.
+        monkeypatch.setattr(doctor, "read_config", lambda path: {})
+        monkeypatch.setattr(
+            doctor,
+            "read_ledger",
+            lambda state_home: {"state": "none", "completed_steps": []},
+        )
+        monkeypatch.setattr(
+            doctor, "read_logs", lambda state_home, tail_lines=60: {}
+        )
+        monkeypatch.setattr(doctor, "load_manifest", lambda root: [])
+        monkeypatch.setattr(
+            doctor,
+            "_sill_core_root",
+            lambda: (_ for _ in ()).throw(
+                FileNotFoundError("sill-core not found")
+            ),
+        )
+
+        rc = doctor.main([])
+        captured = capsys.readouterr()
+        output = json.loads(captured.out)
+
+        assert rc == 0
+        keys = [f["key"] for f in output["findings"]]
+        assert "python3_is_store_stub" in keys, (
+            f"missing platform finding in output: {keys}"
+        )
+        assert "sill_core_missing" in keys, (
+            f"missing sister finding in output: {keys}"
+        )
+
+        # The platform finding's evidence must not carry the account
+        # name planted in the input path.  A regression that
+        # re-introduced the raw resolved path into evidence would
+        # surface the fake account here.
+        platform_finding = next(
+            f for f in output["findings"] if f["key"] == "python3_is_store_stub"
+        )
+        evidence_blob = json.dumps(platform_finding["evidence"])
+        assert fake_account not in evidence_blob, (
+            f"account name leaked into platform evidence: {evidence_blob}"
+        )
