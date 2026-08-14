@@ -436,9 +436,9 @@ claude plugin install sill-core@windowsill</pre>
 
   <pre>wsl --install</pre>
 
-  <p>Restart if Windows asks, finish the short setup, then open the new Linux terminal and follow the five steps above exactly as written. On Windows 11 this has been tested end to end on a real machine: the install, the plugin, dictation, and a speech server over the network.</p>
+  <p>Restart if Windows asks, finish the short setup, then open the new Linux terminal and follow the five steps above exactly as written. This route has been walked on a real Windows 11 machine, and I would rather tell you exactly how far it got than round it up: the marketplace install, both plugins, the registered hook command, dictation driven by a test recorder, and a speech server reached over the network. That is the measured part, and it is written down check by check.</p>
 
-  <p class="note">Two things that pass have not yet been measured on that route, and I would rather say so here than have you discover it: a <strong>real microphone</strong> through WSLg on a desktop you are sitting at, and the <strong>bundled local speech server</strong> running inside WSL itself. Both are tracked in the open, and until they are measured this page does not claim them. Native Windows without WSL is a separate story — today it can install and it can speak, but it cannot yet hear.</p>
+  <p class="note">Here is what that pass did <strong>not</strong> measure, and I would rather say so here than have you discover it: a <strong>real microphone</strong> through WSLg on a desktop you are sitting at, speaker and microphone passthrough to the Windows host, the hook firing under a <strong>live</strong> Claude Code session, <code>/voice-setup</code> run end to end inside the distro, and the <strong>bundled local speech server</strong> running inside WSL itself. All of it is tracked in the open, and until it is measured this page does not claim it. Native Windows without WSL is a separate story — it has no recorder of its own to reach for, so it cannot yet hear.</p>
 
   <div class="signoff">so: <b>the request stands, and it is a small one.</b>
 give me the key, and I will give you back the room —
