@@ -739,10 +739,12 @@ def paste_plan(tool: str, paste_key: str, enter: bool) -> list[tuple[float, list
         keys = _WIN_SENDKEYS_FOR_PASTE.get(paste_key, "^v")
         steps.append((0.0, _win_sendkeys_argv(keys), True))
         if enter:
-            # {{Enter}} — braces are literal SendKeys escapes for a special key name. PowerShell
-            # escapes them by doubling inside the surrounding single quotes, which is why the
-            # string is `'{{Enter}}'` and not `'{Enter}'`.
-            steps.append((0.25, _win_sendkeys_argv("{{Enter}}"), False))
+            # `{Enter}` — single braces, exactly like `+{Insert}` two lines up. PowerShell
+            # single-quoted strings are VERBATIM: there is no brace-doubling escape in them, so a
+            # doubled `{{Enter}}` reaches SendKeys as the literal `{{Enter}}`, SendKeys parses the
+            # token as `{Enter` and raises, and because this step is required=False the failure is
+            # silent — the default `send` mode pastes the transcript and never submits it.
+            steps.append((0.25, _win_sendkeys_argv("{Enter}"), False))
     elif tool == "ydotool":
         steps.append((0.15, ["ydotool", "key", paste_key], True))
         if enter:
@@ -1202,8 +1204,24 @@ def _transcribe_cloud(s: dict, wav_bytes: bytes, boundary: str) -> str | None:
 
 
 def _pid_alive(pid: int) -> bool:
+    """Is *pid* a live process? POSIX uses the signal-0 idiom; on Windows there IS no signal 0 —
+    os.kill maps straight to TerminateProcess, so the same call would TERMINATE the very process
+    it is probing. The Windows arm asks the OS instead: tasklist's exit status answers "running"
+    without signalling anything."""
     if pid <= 0:
         return False
+    if os.name == "nt":  # pragma: no cover — exercised on Windows; the lane runs Linux
+        try:
+            result = subprocess.run(
+                ["tasklist.exe", "/FI", f"PID eq {pid}"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+                timeout=5,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return False  # cannot ask: report dead rather than kill what we cannot see
+        return result.returncode == 0
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -1213,6 +1231,60 @@ def _pid_alive(pid: int) -> bool:
     except OSError:
         return False
     return True
+
+
+def _win_console_ctrl_c(pid: int) -> bool:
+    """Send CTRL_C_EVENT to the console *pid* lives in — True if the event went out.
+
+    This is the Windows equivalent of SIGINT, and the only graceful stop that reaches a process
+    we did not spawn: the start toggle that did spawn the recorder has exited by stop time, so
+    nobody still holds the recorder's stdin to write `q` into. Attaching to the target's console
+    and raising CTRL_C_EVENT takes the path ffmpeg's own console Ctrl+C handler runs — it
+    finalizes the output container — which TerminateProcess never does. Our own process ignores
+    the event for the duration (SetConsoleCtrlHandler NULL/True), because the event reaches every
+    process attached to that console, this one included."""
+    import ctypes
+
+    kernel32 = ctypes.windll.kernel32  # stdlib; this function is Windows-only by caller
+    try:
+        if not kernel32.FreeConsole():
+            pass  # not attached to a console of our own — fine, AttachConsole still works
+        if not kernel32.AttachConsole(pid):
+            return False  # the process (or its console) is already gone
+        kernel32.SetConsoleCtrlHandler(None, True)
+        try:
+            sent = bool(kernel32.GenerateConsoleCtrlEvent(0, 0))  # 0 = CTRL_C_EVENT, console-wide
+        finally:
+            kernel32.SetConsoleCtrlHandler(None, False)
+            kernel32.FreeConsole()
+        return sent
+    except Exception:
+        return False
+
+
+def _stop_recorder(pid: int, system: str) -> None:
+    """Ask the recorder to finalize, then make it stop.
+
+    POSIX: SIGINT lets sox/ffmpeg write the WAV header and flush the tail; TERM is the fallback
+    for a recorder that ignores INT (pw-record/arecord). Windows: os.kill(pid, SIGINT) is an
+    unconditional TerminateProcess, which kills ffmpeg mid-write and leaves an unreadable WAV
+    with no finalized header — the stop toggle would then transcribe nothing, every time. The
+    Windows arm raises CTRL_C_EVENT in the recorder's console instead (see _win_console_ctrl_c)
+    so ffmpeg closes the container; TERM/TerminateProcess remains the fallback, exactly the
+    same INT-then-TERM shape as POSIX."""
+    if system == "Windows":
+        _win_console_ctrl_c(pid)  # pragma: no cover — exercised on Windows; the lane runs Linux
+    else:
+        try:
+            os.kill(pid, signal.SIGINT)
+        except OSError:
+            pass
+    if not _wait_gone(pid):
+        try:
+            os.kill(pid, signal.SIGTERM)  # Windows: TerminateProcess — the fallback of last resort
+        except OSError:
+            pass
+        _wait_gone(pid)
 
 
 def _cmdline_of(pid: int) -> str | None:
@@ -1955,17 +2027,9 @@ def stop_and_transcribe(s: dict, system: str, mode: str, recorder_pid: int) -> i
         os.unlink(_PID_PATH)
     except OSError:
         pass
-    # SIGINT lets sox/ffmpeg finalize the WAV header; TERM is the fallback for pw-record/arecord.
-    try:
-        os.kill(recorder_pid, signal.SIGINT)
-    except OSError:
-        pass
-    if not _wait_gone(recorder_pid):
-        try:
-            os.kill(recorder_pid, signal.SIGTERM)
-        except OSError:
-            pass
-        _wait_gone(recorder_pid)
+    # INT-then-TERM on POSIX; CTRL_C_EVENT-then-TerminateProcess on Windows (see _stop_recorder —
+    # the WAV header only gets finalized by a graceful stop, and os.kill on Windows is not one).
+    _stop_recorder(recorder_pid, system)
     # the recorder flushes the tail of the file AFTER it stops accepting samples — this short
     # settle is the difference between a complete phrase and a truncated one
     time.sleep(0.2)

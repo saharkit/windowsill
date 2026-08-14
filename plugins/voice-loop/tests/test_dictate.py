@@ -567,16 +567,18 @@ def test_paste_plan_sendkeys_renders_shift_insert_with_braces():
     assert steps[0][1][-1].endswith("SendKeys('+{Insert}')")
 
 
-def test_paste_plan_sendkeys_uses_double_braces_around_enter():
-    """L2 gap: in PowerShell `-Command`, single braces are interpolated by PowerShell's
-    variable expansion. The literal SendKeys escape `{Enter}` reaches PowerShell as
-    `{{Enter}}` inside the single-quoted string, and SendKeys sees the literal `{Enter}`. A
-    regression to `{Enter}` would have PowerShell fail to parse the command on every paste."""
+def test_paste_plan_sendkeys_uses_single_braces_around_enter():
+    """L2 gap: PowerShell single-quoted strings are VERBATIM — there is no brace-doubling escape
+    in them. A doubled `{{Enter}}` reaches SendKeys as the literal `{{Enter}}`, which SendKeys
+    parses as the token `{Enter` and rejects; and because the Enter step is required=False, that
+    failure is silent — the default `send` mode pastes the transcript but never submits it. The
+    assertion matches the `+{Insert}` shape in the same table: single braces, the SendKeys
+    special-key name."""
     steps = dictate.paste_plan("sendkeys", "ctrl+v", enter=True)
     assert len(steps) == 2
     delay, argv, required = steps[1]
     assert delay == 0.25
-    assert argv[-1].endswith("SendKeys('{{Enter}}')")
+    assert argv[-1].endswith("SendKeys('{Enter}')")
     assert required is False  # best-effort, like the other tools' Enter
 
 
