@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import subprocess
 import sys
 from pathlib import Path, PureWindowsPath
 from typing import Any, Callable
@@ -181,25 +182,228 @@ def _is_store_stub(path: str | None) -> bool:
     return PureWindowsPath(resolved).parent.name.lower() == "windowsapps"
 
 
+def _redact_windows_path(path: str) -> str:
+    """Hide the Windows account name while retaining the useful path shape."""
+    parts = PureWindowsPath(path).parts
+    profile = os.environ.get("USERPROFILE")
+    if not profile:
+        drive = os.environ.get("HOMEDRIVE", "")
+        home = os.environ.get("HOMEPATH", "")
+        profile = f"{drive}{home}" or None
+
+    if profile:
+        profile_parts = PureWindowsPath(profile).parts
+        profile_length = len(profile_parts)
+        for start in range(len(parts) - profile_length + 1):
+            candidate = parts[start:start + profile_length]
+            if all(
+                actual.casefold() == expected.casefold()
+                for actual, expected in zip(candidate, profile_parts)
+            ):
+                redacted = list(parts)
+                redacted[start + profile_length - 1] = "<user>"
+                return str(PureWindowsPath(*redacted))
+
+    # Keep the legacy shape as a fallback when the profile environment is not
+    # available (and for callers that provide a path from a different profile).
+    try:
+        users_index = next(
+            index for index, part in enumerate(parts[:-1])
+            if part.lower() == "users"
+        )
+    except StopIteration:
+        return path
+    if users_index + 1 >= len(parts) - 1:
+        return path
+    redacted = list(parts)
+    redacted[users_index + 1] = "<user>"
+    return str(PureWindowsPath(*redacted))
+
+
+def _decode_windows_output(output: Any) -> str:
+    """Decode bytes emitted by Windows tools without propagating decode errors."""
+    if isinstance(output, str):
+        return output
+    if not output:
+        return ""
+    if isinstance(output, bytes):
+        # wsl.exe commonly emits UTF-16LE to a pipe.  Only try that codec when
+        # a BOM or NUL bytes identify the stream as UTF-16; where.exe normally
+        # emits UTF-8/ANSI text without either marker.
+        if output.startswith((b"\xff\xfe", b"\xfe\xff")) or b"\x00" in output:
+            try:
+                return output.decode("utf-16le").lstrip("﻿")
+            except UnicodeDecodeError:
+                pass
+        try:
+            return output.decode("utf-8")
+        except UnicodeDecodeError:
+            return output.decode("utf-8", errors="replace")
+    return str(output)
+
+
+def _where_python3(
+    *,
+    platform: str = sys.platform,
+    run: Callable[..., Any] = subprocess.run,
+) -> list[str]:
+    """Return every ``python3`` resolution reported by Windows ``where.exe``."""
+    if platform != "win32":
+        return []
+    try:
+        result = run(
+            ["where.exe", "python3"],
+            capture_output=True,
+            check=False,
+            timeout=2,
+        )
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return []
+    if result.returncode != 0:
+        return []
+    output = _decode_windows_output(result.stdout)
+    return [line.strip() for line in output.splitlines() if line.strip()]
+
+
+# Docker Desktop for Windows registers two WSL distros on every machine
+# that runs it.  Nothing is ever installed in them by hand, so they are not
+# evidence that a voice-loop contour could live in WSL.
+_WSL_DOCKER_DISTROS = frozenset({
+    "docker-desktop",
+    "docker-desktop-data",
+})
+
+# The registry key wsl.exe itself enumerates from: one GUID subkey per
+# registered distro, each carrying a ``DistributionName`` value.  Per-user
+# registrations sit under HKCU; all-users registrations (newer WSL) under
+# HKLM.  Reading it needs no privileges.
+_WSL_LXSS_SUBKEY = r"Software\Microsoft\Windows\CurrentVersion\Lxss"
+
+
+def _registered_wsl_distros() -> tuple[list[str], int]:
+    """Enumerate registered WSL distro names straight from the registry.
+
+    Returns ``(names, docker_excluded)`` where *names* excludes the Docker
+    Desktop distros.  This is the source of truth ``wsl.exe -l`` reports
+    from, read directly — which matters for two reasons:
+
+    * on some builds, ``wsl.exe -l -q`` prints the localized "no installed
+      distributions" banner to STDOUT with exit code 0, and one banner line
+      would otherwise count as one distro; the registry has no banner and
+      no localization to be wrong about;
+    * a STOPPED distro is registered exactly like a running one, so a
+      contour in a distro that is not running right now still counts —
+      the registration, not the running state, is the signal.
+
+    An unreadable or absent key means "no distros we can vouch for", which
+    suppresses the finding rather than risking a false positive.
+    """
+    try:
+        import winreg
+    except ImportError:
+        return [], 0
+
+    roots = (
+        (winreg.HKEY_CURRENT_USER, winreg.KEY_READ),
+        (winreg.HKEY_LOCAL_MACHINE, winreg.KEY_READ),
+    )
+    names: list[str] = []
+    docker_excluded = 0
+    for root, access in roots:
+        try:
+            lxss = winreg.OpenKey(root, _WSL_LXSS_SUBKEY, 0, access)
+        except OSError:
+            continue
+        with lxss:
+            index = 0
+            while True:
+                try:
+                    subkey_name = winreg.EnumKey(lxss, index)
+                except OSError:
+                    break
+                index += 1
+                try:
+                    with winreg.OpenKey(lxss, subkey_name, 0, access) as sub:
+                        name, _ = winreg.QueryValueEx(sub, "DistributionName")
+                except OSError:
+                    continue
+                if not isinstance(name, str) or not name:
+                    continue
+                if name.casefold() in _WSL_DOCKER_DISTROS:
+                    docker_excluded += 1
+                elif name not in names:
+                    names.append(name)
+    return names, docker_excluded
+
+
+def _wsl_boundary_finding(
+    *,
+    platform: str = sys.platform,
+    distros_probe: Callable[[], tuple[list[str], int]] = _registered_wsl_distros,
+) -> dict[str, Any] | None:
+    """Explain an empty Windows-side contour when WSL has a distro.
+
+    The probe knows only that a usable (non-Docker) WSL distro is
+    REGISTERED — not that a voice-loop contour lives in it — so the finding
+    is worded as a conditional, never as an assertion that the contour is
+    there.  A distro counts whether or not it is currently running.
+    """
+    if platform != "win32":
+        return None
+    distros, docker_excluded = distros_probe()
+    if not distros:
+        return None
+    return {
+        "bin": "consequence_of_choice",
+        "key": "wsl_contour_not_visible_from_windows",
+        "title": (
+            "A WSL distro is registered, but no voice-loop contour is "
+            "visible on Windows"
+        ),
+        "explanation": (
+            "This Windows-side `/doctor` found no config or install ledger, "
+            "but WSL has at least one registered distro (a stopped distro "
+            "counts too).  This probe cannot see inside the distro, so it "
+            "cannot tell whether voice-loop is installed there — if it is, "
+            "its config and ledger live in the distro filesystem and are "
+            "invisible from Windows; if it is not, there is nothing there."
+        ),
+        "fix": (
+            "If you installed voice-loop inside a WSL distro, run `/doctor` "
+            "from inside that distro.  If you never did, there is nothing in "
+            "WSL — continue with setup on the Windows side."
+        ),
+        "offer_flip": False,
+        "flip_path": "",
+        "flip_value": None,
+        "evidence": {
+            "wsl_distro_present": True,
+            "wsl_distro_count": len(distros),
+            "wsl_docker_distros_excluded": docker_excluded,
+        },
+    }
+
+
 def _check_python_interpreter(
     *,
     platform: str = sys.platform,
     which: Callable[[str], str | None] = shutil.which,
+    where: Callable[[], list[str]] | None = None,
 ) -> dict[str, Any] | None:
     """Return a Windows prerequisite finding for the Python interpreter.
 
-    Two distinct failure modes, two distinct findings:
+    Three Windows prerequisite outcomes produce findings or pass:
 
-    1. ``python3`` IS the Microsoft Store stub — fires when a
-       ``python3.exe`` is on PATH but resolves to the Store redirect.
-       A mere presence test answers YES on this trap; the launchers
+    1. A ``python3.exe`` under ``WindowsApps`` is on PATH — fires even when
+       a real interpreter currently wins, because PATH ordering can change.
+    2. ``python3`` resolves first to the Microsoft Store stub — the launchers
        all call ``python3`` and will silently fail.
-    2. No real Python interpreter at all — fires when NEITHER
-       ``python3`` NOR ``python`` resolves to a real interpreter
-       (either absent or another Store stub).
+    3. No real Python interpreter at all — fires when NEITHER ``python3`` NOR
+       ``python`` resolves to a real interpreter (either absent or another
+       Store stub).
 
-    Returns ``None`` on Linux/macOS (the check is inert) and when both
-    ``python3`` and ``python`` resolve to a real interpreter.
+    Returns ``None`` on Linux/macOS (the check is inert) and when no Store
+    stub is present and a real interpreter is available.
 
     The probe seams are keyword-only with production defaults
     (``sys.platform`` and ``shutil.which``), so the test can inject a
@@ -213,46 +417,69 @@ def _check_python_interpreter(
     python3_path = which("python3")
     python_path = which("python")
 
-    # Decision 1: python3 is the Store stub.  Fires first because the
-    # launchers all call ``python3``; a real ``python`` elsewhere does
-    # not save the launchers.
-    if python3_path is not None and _is_store_stub(python3_path):
-        # NOTE: the raw resolved path is NOT included in evidence.  The
-        # Store stub lives under
-        # ``C:\Users\<account>\AppData\Local\Microsoft\WindowsApps\``,
-        # so embedding the full path would carry the OS account name
-        # into the bundle, and /doctor's stdout is consumed by the
-        # /report-bug handoff which files a public GitHub issue.
-        # The diagnosis ("python3 IS the Store stub") is the whole
-        # signal the user needs; one boolean captures it without
-        # identity.
+    # ``which`` reports only the winner.  ``where.exe`` exposes every
+    # candidate, which matters because a Store stub later on PATH can win
+    # after a PATH reorder or a fresh shell.  Keep the injected seam useful
+    # to tests while using the real Windows probe in production.
+    python3_paths = list(where() if where is not None else _where_python3())
+    if python3_path is not None and python3_path not in python3_paths:
+        python3_paths.insert(0, python3_path)
+    elif python3_path is None and python3_paths:
+        python3_path = python3_paths[0]
+    stub_paths = [path for path in python3_paths if _is_store_stub(path)]
+
+    # Decision 1: any Store stub on PATH.  Fires even when a real interpreter
+    # currently wins, because that ordering is not a safe configuration.
+    if stub_paths:
+        first_path = _redact_windows_path(python3_path or python3_paths[0])
+        first_is_stub = _is_store_stub(python3_path)
+        if first_is_stub:
+            title = (
+                f"`python3` resolves first to `{first_path}`, the Microsoft "
+                "Store stub, not a real interpreter"
+            )
+            explanation = (
+                f"`python3` resolves first to `{first_path}`.  Every launcher "
+                "in voice-loop calls `python3`, but the python.org Windows "
+                "installer ships `python.exe` and NOT `python3.exe`.  This "
+                "`WindowsApps` executable is the Microsoft Store stub — a "
+                "real executable that opens the Store instead of running "
+                "Python."
+            )
+        else:
+            title = (
+                f"`python3` resolves first to `{first_path}`, but a "
+                "Microsoft Store stub is also on PATH"
+            )
+            explanation = (
+                f"`python3` currently resolves first to `{first_path}`, but "
+                "another `python3.exe` lives under `WindowsApps`.  PATH "
+                "ordering can change, so the Store stub may be selected by a "
+                "new shell and silently open the Store instead of running "
+                "voice-loop."
+            )
         return {
             "bin": "real_anomaly",
             "key": "python3_is_store_stub",
-            "title": (
-                "`python3` is the Microsoft Store stub, not a real interpreter"
-            ),
-            "explanation": (
-                "Every launcher in voice-loop calls `python3`, but the "
-                "python.org Windows installer ships `python.exe` and NOT "
-                "`python3.exe`.  When `python3` is on PATH but its file "
-                "lives under `WindowsApps`, it is the Microsoft Store "
-                "stub — a real executable that opens the Store instead "
-                "of running Python.  A presence test for `python3` would "
-                "ANSWER YES on this trap."
-            ),
+            "title": title,
+            "explanation": explanation,
             "fix": (
-                "Install Python from python.org "
-                "(https://www.python.org/downloads/windows/) and tick "
-                "'Add Python to PATH' during install.  If you also need "
-                "`python3.exe` to work, install the Python Launcher for "
-                "Windows (also at python.org) — it ships a real "
-                "`python.exe` and registers it on PATH."
+                "Remove or disable the Microsoft Store `python3.exe` App "
+                "Execution Alias in Windows Settings, or remove its "
+                "`WindowsApps` entry from PATH.  Ensure the real interpreter "
+                "you want is first, then open a new shell and run "
+                "`where.exe python3` to verify the ordering."
             ),
             "offer_flip": False,
             "flip_path": "",
             "flip_value": None,
-            "evidence": {"python3_is_stub": True},
+            "evidence": {
+                "python3_is_stub": first_is_stub,
+                "python3_first_path": first_path,
+                "python3_stub_paths": [
+                    _redact_windows_path(path) for path in stub_paths
+                ],
+            },
         }
 
     # Decision 2: no real interpreter.  "Real" means: present AND not
@@ -399,6 +626,17 @@ def main(argv: list[str] | None = None) -> int:
     ledger = read_ledger(state_home)
     logs = read_logs(state_home)
 
+    # A Windows-side empty contour may simply be the wrong side of the WSL2
+    # boundary.  Do not probe WSL on POSIX, and do not override a local config
+    # or ledger with a boundary warning.  When the boundary is present, the
+    # empty ledger is expected to belong to WSL, so suppress its misleading
+    # "run /voice-setup" findings below.
+    wsl_finding: dict[str, Any] | None = None
+    if not config and ledger.get("state", "none") == "none":
+        wsl_finding = _wsl_boundary_finding()
+        if wsl_finding is not None:
+            platform_findings.append(wsl_finding)
+
     # Load the manifest and the engine.
     root = _plugin_root()
     manifest = load_manifest(root)
@@ -478,6 +716,11 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     findings = diagnose(manifest=manifest, config=config, ledger=ledger, logs=logs)
+    if wsl_finding is not None:
+        findings = [
+            finding for finding in findings
+            if finding.bin.value != "unfinished_install"
+        ]
 
     # Emit structured JSON.
     output: dict[str, Any] = {
