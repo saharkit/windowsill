@@ -21,7 +21,8 @@ tests so the interrupted-then-resume and interrupted-then-restart paths are cove
 
 Usage:
   python3 install_ledger.py check            — print JSON state; exit 0 if none/complete, 1 otherwise
-  python3 install_ledger.py start             — create a fresh ledger (idempotent: no-op if one exists)
+  python3 install_ledger.py start             — create a fresh ledger (idempotent: no-op if one exists;
+                                                 refuses a damaged one — reset is the only way onward)
   python3 install_ledger.py step-begin STEP   — mark a step as started (before side effects)
   python3 install_ledger.py step-done STEP    — mark a step as complete (after side effects succeeded)
   python3 install_ledger.py finish            — mark the whole install as complete
@@ -125,15 +126,25 @@ class LedgerData(dict):
         self.detail = detail
 
 
+# A real ledger is a few KiB (nine step entries plus timestamps).  Anything past this
+# bound is not a ledger that grew — it is damage or a wrong file — and it is classified
+# before being parsed, so no unbounded stream is ever handed to json.loads.
+LEDGER_MAX_BYTES = 1 * 1024 * 1024  # 1 MiB
+
+
 def read_ledger(ledger_path: str) -> LedgerData | None:
-    """Read the ledger while distinguishing missing, unreadable and malformed files."""
+    """Read the ledger while distinguishing missing, unreadable, oversized and malformed files."""
     try:
-        with open(ledger_path, encoding="utf-8") as fh:
-            loaded = json.load(fh)
+        with open(ledger_path, "rb") as fh:
+            raw = fh.read(LEDGER_MAX_BYTES + 1)
     except FileNotFoundError:
         return LedgerData({}, status="missing")
     except OSError as err:
         return LedgerData({}, status="unreadable", detail=f"{type(err).__name__}: {err}")
+    if len(raw) > LEDGER_MAX_BYTES:
+        return LedgerData({}, status="oversized", detail=f"ledger exceeds {LEDGER_MAX_BYTES} bytes (1 MiB limit)")
+    try:
+        loaded = json.loads(raw.decode("utf-8"))
     except (json.JSONDecodeError, UnicodeDecodeError) as err:
         return LedgerData({}, status="malformed", detail=f"{type(err).__name__}: {err}")
     if not isinstance(loaded, dict):
@@ -171,8 +182,8 @@ def check_state(
     """Return the current install state as a JSON-serialisable dict.
 
     The returned dict always has a ``state`` key: ``"none"``, ``"in_progress"``,
-    ``"complete"``, or ``"cancelled"``.  A present but unreadable or malformed
-    ledger is reported as ``state: "none"`` with ``read_status`` and
+    ``"complete"``, or ``"cancelled"``.  A present but unreadable, malformed or
+    oversized ledger is reported as ``state: "none"`` with ``read_status`` and
     ``read_detail`` fields, so the CLI contract remains closed while preserving
     the reason for recovery.  When the state is ``"in_progress"`` or
     ``"complete"``, ``completed_steps`` lists the step ids that finished.
@@ -234,7 +245,12 @@ def start_install(
 ) -> dict[str, Any]:
     """Create a fresh ledger if none exists. Idempotent: returns the existing one if present.
 
-    Returns the current state dict (``check_state`` format).
+    **Refuses** (raises RuntimeError naming ``read_status`` and ``read_detail``) when a
+    ledger exists but does not read ``ok`` — unreadable, malformed, or oversized.  A
+    reader that cannot tell damaged from absent must not let its writer overwrite: the
+    damaged ledger is the only evidence of what the interrupted install did, so explicit
+    ``reset`` is the sole way onward.  Returns the current state dict (``check_state``
+    format).
     """
     if ledger_path is None:
         ledger_path = _default_ledger_path()
@@ -253,6 +269,15 @@ def start_install(
             # in_progress or complete — return existing; the skill must
             # decide whether to resume, restart, or do nothing.
             return check_state(ledger_path)
+    elif existing is not None and existing.status != "missing":
+        # A ledger exists but cannot be trusted.  Overwriting it here would destroy
+        # the very evidence the recovery decision needs, so refuse and name the read
+        # verdict; only an explicit `reset` clears it.
+        raise RuntimeError(
+            f"refusing to overwrite install ledger at {ledger_path!r} "
+            f"(read_status={existing.status}, read_detail={existing.detail!r}) — "
+            f"run 'reset' to discard it explicitly, then 'start'"
+        )
 
     now_ts = _ts(clock)
     ledger: dict[str, Any] = {
@@ -465,7 +490,7 @@ usage: install_ledger.py <command> [<arg>]
 
 commands:
   check              print JSON state dict to stdout
-  start              create a fresh ledger (idempotent)
+  start              create a fresh ledger (idempotent; refuses a damaged one)
   step-begin STEP    mark a step as started
   step-done STEP     mark a step as complete
   finish             mark the install as complete

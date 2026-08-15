@@ -662,3 +662,121 @@ class TestRobustness:
         assert result["state"] == "none"
         assert result["read_status"] == "malformed"
         assert "invalid ledger state" in result["read_detail"]
+
+
+# ---------------------------------------------------------------------------
+# Size bound — a ledger past 1 MiB is classified, never parsed
+# ---------------------------------------------------------------------------
+
+
+class TestLedgerSizeBound:
+    """The read is bounded DURING reading: at most LEDGER_MAX_BYTES + 1 bytes are
+    ever pulled off disk, and a file past the bound gets a named status instead of
+    being handed to json.loads.
+    """
+
+    @staticmethod
+    def _write(path: str, payload: bytes) -> None:
+        with open(path, "wb") as fh:
+            fh.write(payload)
+
+    def test_oversized_ledger_is_classified_not_parsed(self, ledger_path):
+        # Valid JSON padded past the bound with trailing spaces (legal JSON
+        # whitespace).  Mutation gap: without the size check this file parses as a
+        # perfectly ok ledger, so `start` would overwrite it — the padding is what
+        # makes the bound observable.
+        payload = b'{"state": "in_progress", "steps": {}}'
+        payload += b" " * (install_ledger.LEDGER_MAX_BYTES + 1)
+        self._write(ledger_path, payload)
+        result = install_ledger.read_ledger(ledger_path)
+        assert result is not None
+        assert result.status == "oversized"
+        assert str(install_ledger.LEDGER_MAX_BYTES) in result.detail
+
+    def test_ledger_exactly_at_the_bound_still_reads(self, ledger_path):
+        # The bound is exclusive: a ledger of exactly LEDGER_MAX_BYTES bytes is a
+        # ledger.  Mutation gap: an off-by-one (`>=` instead of `>`) would classify
+        # this healthy file as oversized.
+        payload = b'{"state": "in_progress", "steps": {}}'
+        payload += b" " * (install_ledger.LEDGER_MAX_BYTES - len(payload))
+        assert len(payload) == install_ledger.LEDGER_MAX_BYTES
+        self._write(ledger_path, payload)
+        result = install_ledger.read_ledger(ledger_path)
+        assert result is not None
+        assert result.status == "ok"
+
+    def test_check_reports_oversized_as_none_with_read_status(self, ledger_path):
+        # Composition with the skill's entry flow: an oversized ledger keeps the
+        # closed CLI contract (state "none" + read_status), so `check` still exits 0
+        # and SKILL.md's guard branch keeps parsing it.
+        self._write(ledger_path, b"{\"state\": \"in_progress\", \"steps\": {}} " * 40_000)
+        result = install_ledger.check_state(ledger_path)
+        assert result["state"] == "none"
+        assert result["read_status"] == "oversized"
+        assert "read_detail" in result
+
+
+# ---------------------------------------------------------------------------
+# A damaged ledger is evidence — `start` must not overwrite it
+# ---------------------------------------------------------------------------
+
+
+class TestStartRefusesDamagedLedger:
+    """`start` is the one writer that used to fall through on any non-ok read status
+    and recreate the ledger, destroying the only record of what the interrupted
+    install did.  These tests pin the refusal (the CLI maps the RuntimeError to the
+    module's error shape and exit 2), the untouched file, and `reset` as the sole
+    way onward.
+    """
+
+    @staticmethod
+    def _damaged_payload(kind: str) -> bytes:
+        if kind == "oversized":
+            return b'{"state": "in_progress", "steps": {}}' + b" " * (
+                install_ledger.LEDGER_MAX_BYTES + 1
+            )
+        return b"{broken"
+
+    @pytest.mark.parametrize("kind", ["malformed", "oversized"])
+    def test_start_refuses_and_leaves_file_byte_identical(self, ledger_path, clock, kind):
+        payload = self._damaged_payload(kind)
+        with open(ledger_path, "wb") as fh:
+            fh.write(payload)
+        with pytest.raises(RuntimeError, match=f"read_status={kind}") as exc_info:
+            install_ledger.start_install(ledger_path, clock=clock)
+        assert "read_detail=" in str(exc_info.value)
+        assert "reset" in str(exc_info.value)
+        with open(ledger_path, "rb") as fh:
+            assert fh.read() == payload  # the evidence survived, byte for byte
+
+    def test_start_refuses_unreadable_ledger(self, ledger_path):
+        # A directory where the ledger should be forces the unreadable read status.
+        # Mutation gap: without the refusal the call raises a bare OSError from
+        # os.replace — the read_status=unreadable message is what distinguishes a
+        # deliberate refusal from an incidental write failure.
+        os.mkdir(ledger_path)
+        with pytest.raises(RuntimeError, match="read_status=unreadable"):
+            install_ledger.start_install(ledger_path)
+        assert os.path.isdir(ledger_path)  # nothing replaced it with a file
+
+    def test_recovery_is_explicit_reset_then_start(self, ledger_path, clock):
+        with open(ledger_path, "w") as fh:
+            fh.write("{broken")
+        with pytest.raises(RuntimeError):
+            install_ledger.start_install(ledger_path, clock=clock)
+        install_ledger.reset_install(ledger_path)
+        result = install_ledger.start_install(ledger_path, clock=clock)
+        assert result["state"] == "in_progress"
+
+    def test_cli_start_exits_2_with_error_shape(self, ledger_path, monkeypatch, capsys):
+        # Composition: the refusal reaches the operator through the module's existing
+        # error shape — one "error: ..." line on stderr naming the read verdict.
+        monkeypatch.setenv("VOICE_LOOP_INSTALL_LEDGER", ledger_path)
+        with open(ledger_path, "w") as fh:
+            fh.write("{broken")
+        rc = install_ledger.main(["install_ledger.py", "start"])
+        assert rc == 2
+        err = capsys.readouterr().err
+        assert err.startswith("error:")
+        assert "read_status=malformed" in err
+        assert "read_detail=" in err
