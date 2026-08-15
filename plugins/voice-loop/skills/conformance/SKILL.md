@@ -236,7 +236,7 @@ from report_bug import redact
 path = 'conformance-v<version>-<YYYYMMDD>.md'
 body = open(path).read()
 redacted = redact(body)
-open(path, 'w').write(redacted)
+open(path, 'w', newline='\n').write(redacted)
 "
 ```
 

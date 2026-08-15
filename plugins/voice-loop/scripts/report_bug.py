@@ -1050,7 +1050,7 @@ def write_bundle(path: str, text: str) -> str:
     os.makedirs(directory, exist_ok=True)
     fd, tmp = tempfile.mkstemp(prefix=".voice-loop-report-", dir=directory)
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as fh:
             fh.write(text)
             fh.flush()
             os.fsync(fh.fileno())
@@ -1093,6 +1093,7 @@ def create_issue(
     body_path: str,
     repo: str = REPO,
     runner: Runner = _default_runner,
+    label: str = "",
 ) -> tuple[bool, str]:
     """Send exactly the immutable artifact body through ``gh``.
 
@@ -1107,6 +1108,8 @@ def create_issue(
     else:
         title = redact(artifact)
     argv = ["gh", "issue", "create", "--repo", repo, "--title", title, "--body-file", body_path]
+    if label:
+        argv.extend(["--label", label])
     try:
         proc = runner(argv, GH_TIMEOUT)
     except subprocess.TimeoutExpired:
@@ -1280,7 +1283,7 @@ def _cmd_gh(args: argparse.Namespace) -> int:
         # Preserve the typed error from gh for a missing path; tests and callers that replace the
         # sender still get the same argv seam without inventing a second body source.
         artifact = redact(args.title)
-    ok, message = create_issue(artifact, args.bundle, args.repo)
+    ok, message = create_issue(artifact, args.bundle, args.repo, label=args.label)
     print(message, file=sys.stdout if ok else sys.stderr)
     return 0 if ok else 1
 
@@ -1319,6 +1322,7 @@ def build_parser() -> argparse.ArgumentParser:
     issue.add_argument("--title", required=True)
     issue.add_argument("--bundle", required=True)
     issue.add_argument("--repo", default=REPO)
+    issue.add_argument("--label", default="")
     issue.set_defaults(func=_cmd_gh)
     return parser
 
