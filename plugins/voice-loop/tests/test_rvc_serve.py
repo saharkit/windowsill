@@ -24,18 +24,33 @@ import pytest
 
 # Set up the home-directory structure that rvc_server.py expects on import (APPLIO_DIR is chdir'd
 # to at module load; SHIM_DIR is sys.path-inserted; the pedalboard shim is verified by realpath).
-# Pointing HOME at a temp tree means the suite never touches the operator's real ~/voice/.
+# Pointing the home env vars at a temp tree means the suite never touches the operator's real
+# ~/voice/ — and BOTH vars are needed: posix's expanduser reads HOME, but ntpath's reads
+# USERPROFILE first and never HOME, so setting only HOME left APPLIO_DIR pointing at the real
+# profile on Windows and the import-time os.chdir aborted pytest at COLLECTION on a stock machine
+# (no ~/voice tree exists there). rvc_server bakes the resolved paths in at import, so the vars
+# are restored right after — the redirection stays local to this import and leaks nowhere.
 _FAKE_HOME = Path(tempfile.mkdtemp(prefix="rvc-serve-tests-"))
 for sub in ("voice/rvc/Applio", "voice/rvc/shims"):
     (_FAKE_HOME / sub).mkdir(parents=True, exist_ok=True)
 (_FAKE_HOME / "voice/rvc/shims" / "pedalboard.py").write_text("# stub shim for tests\n")
+
+_home_env = {name: os.environ.get(name) for name in ("HOME", "USERPROFILE")}
 os.environ["HOME"] = str(_FAKE_HOME)
+os.environ["USERPROFILE"] = str(_FAKE_HOME)
 
 # `TMP_DIR` in rvc_server picks /dev/shm when writable, else tempfile.gettempdir() — that decision
 # happens at module import, so let the module choose (no override needed for these tests).
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "rvc" / "serve"))
-import rvc_server  # noqa: E402  — import-side-effects are load-bearing; see comment above
+try:
+    import rvc_server  # noqa: E402  — import-side-effects are load-bearing; see comment above
+finally:
+    for _name, _saved in _home_env.items():
+        if _saved is None:
+            os.environ.pop(_name, None)
+        else:
+            os.environ[_name] = _saved
 
 
 # --- helpers ---------------------------------------------------------------------------------------
