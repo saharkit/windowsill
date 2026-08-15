@@ -655,16 +655,19 @@ class TestDoctorMissingEngineDiagnosis:
     """When sill-core is absent, main() emits a diagnosis instead of crashing."""
 
     def test_missing_engine_emits_diagnosis_json(
-        self, monkeypatch, capsys
+        self, monkeypatch, capsys, tmp_path: Path
     ) -> None:
         """The JSON output carries a sill_core_missing finding, not a traceback.
 
         Gap: the incident showed that a missing sill-core crashed the doctor
         with ModuleNotFoundError — the diagnostic tool could not report its
         own broken state.  This test pins that it now emits structured JSON
-        with rc=0 instead, which the skill can present to the operator.
+        with rc=1 instead, which the skill can present to the operator.
         """
         # Prevent side effects from reaching the host filesystem.
+        real_read_ledger = doctor.read_ledger
+        real_read_logs = doctor.read_logs
+        real_load_manifest = doctor.load_manifest
         monkeypatch.setattr(doctor, "read_config", lambda path: {})
         monkeypatch.setattr(
             doctor, "read_ledger",
@@ -674,6 +677,15 @@ class TestDoctorMissingEngineDiagnosis:
             doctor, "read_logs", lambda state_home, tail_lines=60: {},
         )
         monkeypatch.setattr(doctor, "load_manifest", lambda root: [])
+        # An empty config and ledger are also the WSL-boundary precondition, and on a Windows
+        # host with a registered distro that finding appends a second row — environment noise,
+        # not part of what this test decides.
+        monkeypatch.setattr(
+            doctor, "_wsl_boundary_finding",
+            lambda **kwargs: None,
+        )
+        monkeypatch.setattr(doctor, "_default_state_home", lambda: str(tmp_path / "state"))
+        monkeypatch.setattr(doctor, "_default_config_path", lambda: str(tmp_path / "config.json"))
         monkeypatch.setattr(
             doctor, "_sill_core_root",
             lambda: (_ for _ in ()).throw(
@@ -684,13 +696,61 @@ class TestDoctorMissingEngineDiagnosis:
         rc = doctor.main([])
         captured = capsys.readouterr()
         output = json.loads(captured.out)
-
-        assert rc == 0
+        assert rc == 1
         findings = output["findings"]
-        assert len(findings) == 1
-        assert findings[0]["key"] == "sill_core_missing"
-        assert findings[0]["bin"] == "real_anomaly"
-        assert "install sill-core" in findings[0]["fix"].lower()
+        finding = next(item for item in findings if item["key"] == "sill_core_missing")
+        assert finding["bin"] == "real_anomaly"
+        assert "The diagnosis engine" in finding["title"]
+        assert "install sill-core" in finding["fix"].lower()
+
+        # Exercise the reader verdicts and neutral argument branches in the same diagnosis setup.
+        state_home = tmp_path / "state"
+        ledger_path = state_home / "voice-loop" / "install.ledger"
+        ledger_path.parent.mkdir(parents=True)
+        monkeypatch.setattr(doctor, "read_ledger", real_read_ledger)
+        monkeypatch.setattr(doctor, "read_logs", real_read_logs)
+        monkeypatch.setattr(doctor, "load_manifest", real_load_manifest)
+        assert doctor.read_ledger(str(state_home)).status == "missing"
+        ledger_path.write_text("[]", encoding="utf-8")
+        assert doctor.read_ledger(str(state_home)).status == "malformed"
+        ledger_path.write_text(json.dumps({"steps": []}), encoding="utf-8")
+        assert doctor.read_ledger(str(state_home)).status == "malformed"
+        ledger_path.write_text(json.dumps({"steps": {"probe": []}}), encoding="utf-8")
+        assert doctor.read_ledger(str(state_home)).status == "malformed"
+        ledger_path.write_text(json.dumps({"state": "in_progress", "steps": {
+            "done": {"status": "complete"}, "now": {"status": "in_progress"},
+        }}), encoding="utf-8")
+        parsed = doctor.read_ledger(str(state_home))
+        assert parsed["completed_steps"] == ["done"]
+        assert parsed["current_step"] == "now"
+        assert doctor.read_logs(str(tmp_path / "no-logs")).status == "degraded"
+        assert doctor.load_manifest(_plugin_root)
+
+        assert doctor.main(["doctor", "--help"]) == 0
+        assert doctor.main(["doctor", "--unknown"]) == 2
+
+        # With a real engine and a Windows-boundary finding, the unfinished-install finding is
+        # deliberately filtered and the structured output carries every field used by the skill.
+        ledger_path.write_text(json.dumps({"state": "none", "steps": {}}), encoding="utf-8")
+        monkeypatch.setattr(doctor, "_sill_core_root", lambda: _core_root)
+        monkeypatch.setattr(doctor, "_wsl_boundary_finding", lambda **kwargs: {
+            "bin": "consequence_of_choice", "key": "wsl", "title": "wsl",
+            "explanation": "wsl", "fix": "wsl", "offer_flip": False,
+            "flip_path": "", "flip_value": None, "evidence": {},
+        })
+        rc = doctor.main(["doctor", "--state-home", str(state_home), "--config-path", str(tmp_path / "config.json")])
+        rendered = json.loads(capsys.readouterr().out)
+        assert rc == 0
+        keys = [finding["key"] for finding in rendered["findings"]]
+        # What this asserts is the FILTER, not the exact roster: with a real engine and a
+        # Windows-boundary finding, unfinished_install is dropped and wsl survives. A host may
+        # legitimately contribute its own findings -- a Windows box resolves `python3` to the
+        # Store alias and correctly reports python3_is_store_stub -- so comparing the whole list
+        # couples this test to the machine it runs on, which is what made it red on the one
+        # platform this work is about.
+        assert "unfinished_install" not in keys
+        assert "wsl" in keys
+        assert rendered["ledger_status"] == "ok"
 
     def test_import_failed_emits_diagnosis_json(
         self, monkeypatch, capsys, tmp_path: Path
@@ -724,18 +784,24 @@ class TestDoctorMissingEngineDiagnosis:
             doctor, "read_logs", lambda state_home, tail_lines=60: {},
         )
         monkeypatch.setattr(doctor, "load_manifest", lambda root: [])
+        # Same as the missing-engine test above: the WSL-boundary finding is environment noise
+        # here, and on a Windows host with a registered distro it would add a second row.
+        monkeypatch.setattr(
+            doctor, "_wsl_boundary_finding",
+            lambda **kwargs: None,
+        )
         monkeypatch.setattr(doctor, "_sill_core_root", lambda: sill_root)
 
         rc = doctor.main([])
         captured = capsys.readouterr()
         output = json.loads(captured.out)
 
-        assert rc == 0
+        assert rc == 1
         findings = output["findings"]
-        assert len(findings) == 1
-        assert findings[0]["key"] == "sill_core_import_failed"
-        assert findings[0]["bin"] == "real_anomaly"
-        assert "reinstall sill-core" in findings[0]["fix"].lower()
+        finding = next(item for item in findings if item["key"] == "sill_core_import_failed")
+        assert finding["bin"] == "real_anomaly"
+        assert "The diagnosis engine" in finding["title"]
+        assert "reinstall sill-core" in finding["fix"].lower()
 
 
 # ---------------------------------------------------------------------------
@@ -760,7 +826,7 @@ class TestWindowsPrerequisites:
     without monkeypatching the module.
     """
 
-    def test_windows_python_check_decision(self) -> None:
+    def test_windows_python_check_decision(self, monkeypatch) -> None:
         """Each decision produces a distinct, expected key.
 
         The check has two failure modes and two pass-throughs:
@@ -788,13 +854,17 @@ class TestWindowsPrerequisites:
                 return None
             return fake
 
-        # Decision 1: real python3 — no finding.
+        # Decision 1: real python3 — no finding. ``where`` is injected because leaving it at
+        # its default runs ``where.exe python3`` against the HOST's PATH: on a Windows runner
+        # that answers the WindowsApps Store stub too, and the stub-anywhere rule (correctly)
+        # fires a finding this decision was not exercising.
         result = doctor._check_python_interpreter(
             platform="win32",
             which=_which_with(
                 python3="C:\\Python311\\python3.exe",
                 py=None,
             ),
+            where=lambda: ["C:\\Python311\\python3.exe"],
         )
         assert result is None, (
             f"real python3 must not fire a finding: got {result}"
@@ -857,6 +927,40 @@ class TestWindowsPrerequisites:
         assert decision_missing is not None
         assert decision_stub["key"] != decision_missing["key"]
 
+        # Exercise the platform-neutral seams with injected Windows-tool results; these are
+        # reachable on the Ubuntu measuring runner without pretending to run Windows itself.
+        assert doctor._is_store_stub(None) is False
+        assert doctor._decode_windows_output("already text") == "already text"
+        assert doctor._decode_windows_output(b"") == ""
+        assert doctor._decode_windows_output(b"plain") == "plain"
+        assert doctor._decode_windows_output(b"\xff") == "�"
+        assert doctor._decode_windows_output(42) == "42"
+        assert doctor._where_python3(platform="linux") == []
+        class FailedWhere:
+            returncode = 1
+            stdout = "unused"
+        assert doctor._where_python3(platform="win32", run=lambda *args, **kwargs: FailedWhere()) == []
+        class SuccessfulWhere:
+            returncode = 0
+            stdout = "C:\\Python311\\python3.exe\n"
+        assert doctor._where_python3(platform="win32", run=lambda *args, **kwargs: SuccessfulWhere()) == [
+            "C:\\Python311\\python3.exe"
+        ]
+        monkeypatch.delenv("USERPROFILE", raising=False)
+        monkeypatch.delenv("HOMEDRIVE", raising=False)
+        monkeypatch.delenv("HOMEPATH", raising=False)
+        assert doctor._redact_windows_path("C:\\temp\\python.exe") == "C:\\temp\\python.exe"
+        assert doctor._redact_windows_path("C:\\Users\\alice\\python.exe") == "C:\\Users\\<user>\\python.exe"
+        assert doctor._wsl_boundary_finding(platform="linux") is None
+        assert doctor._wsl_boundary_finding(
+            platform="win32", distros_probe=lambda: ([], 0)
+        ) is None
+        finding = doctor._wsl_boundary_finding(
+            platform="win32", distros_probe=lambda: (["Ubuntu"], 1)
+        )
+        assert finding is not None
+        assert finding["evidence"]["wsl_distro_count"] == 1
+
     def test_python3_alias_missing_fires_and_reaches_output(
         self, monkeypatch, capsys
     ) -> None:
@@ -908,7 +1012,7 @@ class TestWindowsPrerequisites:
         captured = capsys.readouterr()
         output = json.loads(captured.out)
 
-        assert rc == 0
+        assert rc == 1
         keys = [f["key"] for f in output["findings"]]
         assert "python3_alias_missing" in keys, (
             f"python3 alias finding missing from output: {keys}"
@@ -1004,7 +1108,7 @@ class TestWindowsPrerequisites:
         captured = capsys.readouterr()
         output = json.loads(captured.out)
 
-        assert rc == 0
+        assert rc == 1
         keys = [f["key"] for f in output["findings"]]
         assert "python3_is_store_stub" in keys, (
             f"missing platform finding in output: {keys}"

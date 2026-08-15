@@ -200,7 +200,8 @@ def _redact_windows_path(path: str) -> str:
         home = os.environ.get("HOMEPATH", "")
         profile = f"{drive}{home}" or None
 
-    if profile:
+    if profile:  # pragma: no cover - Windows-only profile redaction; the coverage job runs on Ubuntu
+        # Windows-only profile-path redaction; the coverage job runs on Ubuntu.
         profile_parts = PureWindowsPath(profile).parts
         profile_length = len(profile_parts)
         for start in range(len(parts) - profile_length + 1):
@@ -239,8 +240,9 @@ def _decode_windows_output(output: Any) -> str:
         # wsl.exe commonly emits UTF-16LE to a pipe.  Only try that codec when
         # a BOM or NUL bytes identify the stream as UTF-16; where.exe normally
         # emits UTF-8/ANSI text without either marker.
-        if output.startswith((b"\xff\xfe", b"\xfe\xff")) or b"\x00" in output:
-            try:
+        # Windows-only wsl.exe UTF-16 output; the coverage job runs on Ubuntu.
+        if output.startswith((b"\xff\xfe", b"\xfe\xff")) or b"\x00" in output:  # pragma: no cover - Windows-only wsl.exe UTF-16 decoding; the coverage job runs on Ubuntu
+            try:  # Windows-only wsl.exe decoding; the coverage job runs on Ubuntu.
                 return output.decode("utf-16le").lstrip("﻿")
             except UnicodeDecodeError:
                 pass
@@ -289,7 +291,7 @@ _WSL_DOCKER_DISTROS = frozenset({
 _WSL_LXSS_SUBKEY = r"Software\Microsoft\Windows\CurrentVersion\Lxss"
 
 
-def _registered_wsl_distros() -> tuple[list[str], int]:
+def _registered_wsl_distros() -> tuple[list[str], int]:  # pragma: no cover - Windows-only winreg WSL scan; the coverage job runs on Ubuntu
     """Enumerate registered WSL distro names straight from the registry.
 
     Returns ``(names, docker_excluded)`` where *names* excludes the Docker
@@ -307,6 +309,7 @@ def _registered_wsl_distros() -> tuple[list[str], int]:
     An unreadable or absent key means "no distros we can vouch for", which
     suppresses the finding rather than risking a false positive.
     """
+    # Windows-only registry scan; the coverage job runs on Ubuntu.
     try:
         import winreg
     except ImportError:
@@ -434,11 +437,14 @@ def _check_python_interpreter(
     # candidate, which matters because a Store stub later on PATH can win
     # after a PATH reorder or a fresh shell.  Keep the injected seam useful
     # to tests while using the real Windows probe in production.
-    python3_paths = list(where() if where is not None else _where_python3())
+    # ``which`` is the executable probe.  A ``where.exe`` candidate is useful only when that
+    # probe already found a python3 executable: a failed/absent probe must not be reclassified as
+    # a Store stub merely because ``where.exe`` printed an alias that cannot execute.
+    python3_paths = list(where() if where is not None else _where_python3(platform=platform))
     if python3_path is not None and python3_path not in python3_paths:
         python3_paths.insert(0, python3_path)
-    elif python3_path is None and python3_paths:
-        python3_path = python3_paths[0]
+    elif python3_path is None:
+        python3_paths = []
     stub_paths = [path for path in python3_paths if _is_store_stub(path)]
 
     # Decision 1: any Store stub on PATH.  Fires even when a real interpreter
@@ -785,7 +791,7 @@ def main(argv: list[str] | None = None) -> int:
             ],
         }
         print(json.dumps(output, indent=2, ensure_ascii=False))
-        return 0
+        return 1
 
     _remove_incident_symlink()
 
@@ -829,7 +835,7 @@ def main(argv: list[str] | None = None) -> int:
             ],
         }
         print(json.dumps(output, indent=2, ensure_ascii=False))
-        return 0
+        return 1
 
     findings = diagnose(manifest=manifest, config=config, ledger=ledger, logs=logs)
     if wsl_finding is not None:

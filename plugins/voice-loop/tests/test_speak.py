@@ -895,6 +895,7 @@ def test_take_over_never_signals_itself_or_without_a_pidfile(state, monkeypatch)
     speak.take_over()  # own pid and pid 0 are both skipped
 
 
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="the identity check reads /proc/<pid>/cmdline; Windows has no /proc to identify a child from")
 def test_take_over_sigterms_a_real_recorded_child(state):
     """Real-child integration: a long-sleeping child whose argv carries the voice-loop marker is
     recorded in the pidfile, then taken over — it must receive SIGTERM."""
@@ -999,6 +1000,7 @@ def test_playback_is_live_ignores_dead_pg_leaders(state, monkeypatch):
     assert speak.playback_is_live() is False
 
 
+@pytest.mark.skipif(not hasattr(os, "killpg"), reason="process-group signalling needs os.killpg, which Windows does not have")
 def test_on_sigterm_uses_killpg_when_pgid_is_set(monkeypatch):
     """When _live has a "pgid", _on_sigterm calls os.killpg on it — the process-group
     signalling that reaches the player inside the shell regardless of exec or wrapper depth."""
@@ -1023,11 +1025,12 @@ def test_on_sigterm_uses_killpg_when_pgid_is_set(monkeypatch):
         speak._live.pop("pgid", None)
 
 
+@pytest.mark.skipif(not hasattr(os, "killpg"), reason="process-group signalling needs os.killpg, which Windows does not have")
 def test_on_sigterm_skips_killpg_when_pgid_not_set(monkeypatch):
     """Without a pgid, _on_sigterm never calls killpg — the normal path is unchanged."""
     killpg_calls: list = []
     monkeypatch.setattr(speak.os, "killpg", lambda pgid, sig: killpg_calls.append(1))
-    monkeypatch.setattr(speak.os, "_exit", lambda code: None)
+    monkeypatch.setattr(speak.os, "_exit", lambda code: None)  # don't actually exit
 
     class _FakeProc:
         def poll(self):
@@ -1865,6 +1868,7 @@ def test_playback_is_live_only_for_a_pid_that_exists_and_is_the_chain(state, mon
     assert speak.playback_is_live() is False  # recycled pids: the file lies, the guard does not
 
 
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="the identity check reads /proc/<pid>/cmdline; Windows has no /proc to identify a child from")
 def test_a_pidfile_that_outlived_its_chain_is_not_waited_for(state):
     """Real-child integration, the negative half: a superseded chain leaves through _on_sigterm,
     which exits before the cleanup that would remove its pidfile — so the record routinely outlives
@@ -1956,7 +1960,13 @@ def test_a_line_written_while_the_previous_clip_plays_is_queued_not_dropped(stat
         if elapsed[0] >= PLAYBACK_SECONDS_IN_FLIGHT and child.poll() is None:
             _append_message(transcript, "🔊 the line that waited its turn")
             child.kill()
-            os.waitpid(child.pid, 0)  # reaped without routing through speak.time.sleep
+            # Reap with NO timeout, deliberately. os.waitpid() hangs on Windows, but a TIMED
+            # Popen.wait() busy-waits through time.sleep -- and this test patches
+            # speak.time.sleep, which IS the module-global time.sleep, so a timed wait recurses
+            # straight back into fake_sleep. An untimed wait() blocks in the kernel on both
+            # platforms (waitpid on POSIX, WaitForSingleObject on Windows) and touches no clock.
+            # Unbounded is safe here: the child was killed on the line above.
+            child.wait()
 
     try:
         payload = json.dumps({"transcript_path": str(transcript), "hook_event_name": "Stop"})
@@ -1966,7 +1976,7 @@ def test_a_line_written_while_the_previous_clip_plays_is_queued_not_dropped(stat
     finally:
         if child.poll() is None:
             child.kill()
-            child.wait(timeout=10)
+            child.wait()  # untimed for the same reason as above: no clock, no recursion
 
     assert spoken == ["the line that waited its turn"]  # voiced, not dropped
     assert elapsed[0] >= PLAYBACK_SECONDS_IN_FLIGHT  # and it really did outlast the clip
@@ -2082,11 +2092,37 @@ def test_the_mirrored_hook_timeout_is_the_one_the_manifest_declares():
     assert declared == {HOOK_TIMEOUT_S}
 
 
-def test_hook_commands_use_python3_not_bash():
-    """Mutation gap: changing ``python3`` back to ``bash`` in hooks.json would restore the
-    Windows-native failure — ``bash`` resolves to WSL's bash.exe which mangles Windows paths
-    and exits 127.  The hook must call the cross-platform interpreter, not a shell whose
-    resolution depends on the host."""
+def _hook_stub_interpreter(stub_dir: Path, name: str, log_path: Path, speak_exit: int) -> None:
+    """A ``name`` executable that logs its argv and stands in for a working interpreter.
+
+    Probe calls (``-c "import sys"``) succeed; running speak.py exits ``speak_exit`` — the
+    scenario dial for the fallthrough cases below."""
+    stub = stub_dir / name
+    stub.write_text(
+        "#!/bin/sh\n"
+        f'printf "%s\\n" "{name} $*" >> "{log_path}"\n'
+        f'case " $* " in *"speak.py"*) exit {speak_exit} ;; esac\n'
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    stub.chmod(0o755)
+
+
+def _speak_invocations(log_path: Path) -> list[str]:
+    return [line for line in log_path.read_text(encoding="utf-8").splitlines() if "speak.py" in line]
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX stub executables and shell grouping")
+def test_hook_commands_probe_a_real_interpreter_before_running_speak(tmp_path):
+    """Runs the hooks.json command under a real shell with stub interpreters on PATH, so the
+    short-circuit is EXECUTED, not string-matched.
+
+    Mutation gap this pins (#205): flattening the chain back to
+    ``probe && speak || probe && speak || probe && speak`` fires speak.py once per working
+    interpreter — invisible to a literal-string assert, caught here by counting recorded
+    speak.py invocations. Still caught structurally: removing the ``import sys`` probes
+    fails the probe-presence assert; a probeless command that leans on shell ``||`` alone
+    cannot tell a Store ``python3`` alias from a working interpreter."""
     manifest = json.loads((Path(__file__).resolve().parents[1] / "hooks" / "hooks.json").read_text(encoding="utf-8"))
     commands: list[str] = []
     for registrations in manifest["hooks"].values():
@@ -2094,12 +2130,57 @@ def test_hook_commands_use_python3_not_bash():
             for entry in registration["hooks"]:
                 commands.append(entry["command"])
     assert len(commands) >= 2, "expected at least two hook registrations (Stop + PostToolUse)"
-    for cmd in commands:
-        assert cmd.startswith("python3 "), (
-            f"hook command must use python3 (cross-platform), not a shell that differs per host; got: {cmd!r}"
+
+    plugin_root = tmp_path / "plugin"
+    (plugin_root / "scripts").mkdir(parents=True)
+    (plugin_root / "scripts" / "speak.py").write_text("# stub target; the interpreter stub logs the run\n")
+
+    def run_command(cmd: str, present: list[str], speak_exit: int = 0) -> tuple[int, list[str]]:
+        stub_dir = tmp_path / "stubs"
+        stub_dir.mkdir(exist_ok=True)
+        for stale in stub_dir.iterdir():
+            stale.unlink()  # each scenario names exactly the interpreters it wants present
+        log = tmp_path / "invocations.log"
+        log.write_text("", encoding="utf-8")
+        for name in present:
+            _hook_stub_interpreter(stub_dir, name, log, speak_exit)
+        result = subprocess.run(
+            cmd,
+            shell=True,
+            capture_output=True,
+            timeout=30,
+            env={**os.environ, "PATH": str(stub_dir), "CLAUDE_PLUGIN_ROOT": str(plugin_root)},
         )
-        assert "speak.py" in cmd, (
-            f"hook command must invoke speak.py (the Python entry point); got: {cmd!r}"
+        return result.returncode, _speak_invocations(log)
+
+    all_three = ["python3", "python", "py"]
+    for cmd in commands:
+        assert cmd.count("import sys") == cmd.count("speak.py"), (
+            "every speak.py run in the hook command must be guarded by its own interpreter probe; "
+            f"got: {cmd!r}"
+        )
+
+        # Short-circuit: with every interpreter working and speak.py succeeding, speak.py
+        # runs exactly once. The flattened chain runs it once per working interpreter.
+        code, spoke = run_command(cmd, all_three)
+        assert code == 0 and len(spoke) == 1, (
+            f"first working interpreter must short-circuit the chain: exit {code}, "
+            f"speak.py ran {len(spoke)} time(s); got: {cmd!r}"
+        )
+
+        # Fallthrough: the first interpreter absent, the second present — still exactly once.
+        code, spoke = run_command(cmd, ["python", "py"])
+        assert code == 0 and len(spoke) == 1, (
+            f"a missing python3 must fall through to the next interpreter, speaking once: "
+            f"exit {code}, speak.py ran {len(spoke)} time(s); got: {cmd!r}"
+        )
+
+        # Pinned as intended: a probe that succeeds but a speak.py that FAILS falls through
+        # to the next interpreter too — the next one may have the stdlib the first lacked.
+        code, spoke = run_command(cmd, all_three, speak_exit=3)
+        assert code == 3 and len(spoke) == 3, (
+            "a speak.py failure on one interpreter is retried on the next (and only) two, "
+            f"with the last exit code surfacing; got exit {code}, {len(spoke)} run(s): {cmd!r}"
         )
 
 
@@ -2830,6 +2911,7 @@ def test_with_eager_off_a_post_tool_use_firing_runs_no_contour_check(state, monk
     assert spoken == [_VOICED]
 
 
+@pytest.mark.skipif(speak.fcntl is None, reason="the contender is a real second flock; Windows has no flock to hold")
 def test_two_firings_in_one_assistant_block_cannot_both_page(state, monkeypatch):
     """Two tool calls in one assistant block are two concurrent hook processes. The eager-off page
     path took no lock at all, and the announced-ledger is a read-modify-write, so both read an

@@ -8,5 +8,9 @@
 # the distro, so the files arrive with LF — but a repository checkout made on Windows (a
 # contributor's path, or anyone running scripts/selftest.sh from such a clone) is. See issue #41.
 *.sh text eol=lf
+*.cmd text eol=crlf
+plugins/voice-loop/scripts/voice-loop-dictate text eol=lf
+plugins/voice-loop/scripts/speak text eol=lf
+
 # Keep the UTF-8 BOM in PowerShell recipes as ordinary content for Windows PowerShell 5.1.
 *.ps1 -text

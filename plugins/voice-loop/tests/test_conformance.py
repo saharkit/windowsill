@@ -11,6 +11,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -320,14 +321,16 @@ def test_skill_references_report_bug_transports():
 def _extract_inline_key_probe_code() -> str:
     """Extract the python code from the 1.11 inline-secret probe in SKILL.md.
 
-    The code lives inside a ``python3 -c "..."`` shell command.  This helper
-    finds the 1.11 anchor, locates the opening quote, and returns everything up
-    to the closing quote (a ``"`` on a line by itself).
+    The code lives inside a ``$VLPY -c "..."`` shell command, where ``$VLPY``
+    is whichever probed interpreter name answered ``import sys`` (a bare
+    ``python3`` is the Microsoft Store stub on Windows). This helper finds the
+    1.11 anchor, locates the opening quote, and returns everything up to the
+    closing quote (a ``"`` on a line by itself).
     """
     skill_text = _SKILL.read_text(encoding="utf-8")
     anchor = "# 1.11 — no inline secrets"
     pos = skill_text.index(anchor)
-    start_marker = 'python3 -c "'
+    start_marker = '$VLPY -c "'
     code_start = skill_text.index(start_marker, pos) + len(start_marker)
     rest = skill_text[code_start:]
     end_match = re.search(r'\n"', rest)
@@ -336,6 +339,29 @@ def _extract_inline_key_probe_code() -> str:
 
 
 _BASH_CONFIG_PATH = "${XDG_CONFIG_HOME:-$HOME/.config}/voice-loop/config.json"
+
+
+def _extract_inline_key_probe_runner() -> str:
+    """The shell line that hands the config path to the probe program.
+
+    The path must arrive as ``sys.argv[1]`` — a Windows config path carries
+    backslashes that cannot be interpolated into Python source — so this pins
+    the argument-passing shape the extracted program depends on. The line opens
+    with the program's closing quote, so the argument is everything after it.
+    """
+    skill_text = _SKILL.read_text(encoding="utf-8")
+    anchor = "# 1.11 — no inline secrets"
+    pos = skill_text.index(anchor)
+    end = skill_text.index("\n\n", pos)
+    block = skill_text[pos:end]
+    argument = f'"{_BASH_CONFIG_PATH}"'
+    arg_lines = [
+        line[len('" '):]
+        for line in block.splitlines()
+        if line.startswith('" ') and line.endswith(argument)
+    ]
+    assert arg_lines, "1.11 probe no longer passes the config path as an argument"
+    return arg_lines[-1]
 
 
 def test_inline_secret_probe_detects_keys(tmp_path):
@@ -352,16 +378,24 @@ def test_inline_secret_probe_detects_keys(tmp_path):
       runs and finds nothing.
     """
     code = _extract_inline_key_probe_code()
-    assert _BASH_CONFIG_PATH in code, (
-        "SKILL.md 1.11 probe no longer contains the expected config path — "
-        "the path-replacement fixture needs updating"
+    assert "sys.argv[1]" in code, (
+        "SKILL.md 1.11 probe no longer reads its config path from sys.argv[1] — "
+        "interpolating a Windows path into Python source is exactly the #205 defect"
+    )
+    assert _BASH_CONFIG_PATH not in code, (
+        "SKILL.md 1.11 probe interpolates the config path into the program body again"
+    )
+    # the shell half must hand the path over as an argument, or sys.argv[1] is empty
+    assert _extract_inline_key_probe_runner() == f'"{_BASH_CONFIG_PATH}"', (
+        "SKILL.md 1.11 probe does not pass the config path as the program's one argument"
     )
     cfg_file = tmp_path / "config.json"
 
     def _run() -> "subprocess.CompletedProcess[str]":
-        """Run the extracted probe code with the current config file."""
+        """Run the extracted probe code against the current config file, as the skill does:
+        the program on -c, the path as the argument the program reads from sys.argv[1]."""
         return subprocess.run(
-            ["python3", "-c", code.replace(_BASH_CONFIG_PATH, str(cfg_file))],
+            [sys.executable, "-c", code, str(cfg_file)],
             capture_output=True, text=True, timeout=10, check=False,
         )
 

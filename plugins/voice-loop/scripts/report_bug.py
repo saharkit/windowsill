@@ -449,7 +449,9 @@ LOG_RULES: tuple[tuple[str, str | None], ...] = (
     # the two quiet exits #106 made audible: neither carries a word of the turn's text
     ("stop: nothing marked in the last assistant message", None),
     ("stop: speech is switched off", None),
-    ("speaking lock is unsupported on this platform — speech skipped", None),
+    ("speaking lock is unsupported on this platform — proceeding unlocked", None),
+    # the lockfile's own path is state-dir metadata, not user speech
+    ("the lockfile ", None),
     ("stop: dropped a read identical to the last spoken line (dedup): ", "(dedup): "),
     ("text: ", "text: "),
     ("local command failed: ", None),
@@ -997,6 +999,9 @@ def write_bundle(path: str, text: str) -> str:
     """
     directory = os.path.dirname(os.path.abspath(path)) or "."
     os.makedirs(directory, exist_ok=True)
+    # mkstemp is the whole privacy story: POSIX creates it 0o600, and on Windows the file's
+    # ACL — inherited from the user's own temp/profile directory — is the boundary there.
+    # Calling os.fchmod would be dead on both (absent there, already-0o600 here).
     fd, tmp = tempfile.mkstemp(prefix=".voice-loop-report-", dir=directory)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:

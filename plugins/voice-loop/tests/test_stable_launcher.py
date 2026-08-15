@@ -9,6 +9,7 @@ from __future__ import annotations
 import importlib.machinery
 import importlib.util
 import json
+import os
 from pathlib import Path
 
 
@@ -50,13 +51,18 @@ def _install_cmd(tmp_path: Path, version: str) -> Path:
 
 
 def test_registry_resolution_follows_update_without_version_sorting(tmp_path, monkeypatch):
-    """Gap: a launcher that globbed cache directories would keep invoking version A."""
+    """Gap: a launcher that globbed cache directories would keep invoking version A.
+
+    The platform is named explicitly: ``_current_script()`` with no argument follows ``os.name``,
+    which picks the ``.cmd`` leaf on Windows — the leaf is a different test's subject
+    (``test_current_script_resolves_the_cmd_leaf_on_windows``), and pinning it here would make
+    this test fail on Windows for a reason that is not the registry resolution."""
     old = _install(tmp_path, "0.6.0")
     current = _install(tmp_path, "0.8.0")
     _write_registry(tmp_path, [{"installPath": str(current), "scope": "user"}])
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
 
-    assert _launcher._current_script() == current / "scripts" / "dictate-toggle.sh"
+    assert _launcher._current_script("posix") == current / "scripts" / "dictate-toggle.sh"
     assert old.exists(), "the test models an update where the old cache may still linger"
 
 
@@ -96,11 +102,17 @@ def test_ambiguous_registry_fails_closed(tmp_path, monkeypatch, capsys):
 
 
 def test_main_execs_current_script_with_hotkey_arguments(tmp_path, monkeypatch, capsys):
-    """Gap: resolving the right file is insufficient if setup arguments are dropped."""
+    """Gap: resolving the right file is insufficient if setup arguments are dropped.
+
+    ``os.name`` is pinned to "posix" so main() takes the execv branch it is testing — on a
+    Windows host the real ``os.name`` would send it down the subprocess branch, which never
+    calls the patched execv and whose spawn failure exits by a different route.
+    """
     current = _install(tmp_path, "0.8.0")
     _write_registry(tmp_path, [{"installPath": str(current)}])
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
     monkeypatch.setattr(_launcher.sys, "argv", ["launcher", "send"])
+    monkeypatch.setattr(_launcher.os, "name", "posix")
     calls: list[tuple[str, list[str]]] = []
 
     def fake_execv(path: str, argv: list[str]) -> None:
@@ -122,19 +134,36 @@ def test_main_on_windows_spawns_a_real_child_and_propagates_its_exit_code(tmp_pa
     executable that records its own argv and exits 7 proves both halves at once — argv reaches it
     verbatim and its exit code is propagated to the caller.
 
-    `os.name` is patched to "nt" so main() takes the subprocess branch; the child is a POSIX
-    executable with a shebang, which exec runs the same way CreateProcess runs a `.cmd` shim on
-    Windows — the platform difference this patch stands in for."""
+    `os.name` is patched to "nt" so main() takes the subprocess branch. The child must be
+    executable BY THE HOST for real: a POSIX shebang script only execs on POSIX, and on Windows
+    CreateProcess hands a `.cmd` to cmd.exe, which cannot read a shebang — so the child is
+    written in the host's own dialect (a shebang script here, a `py -3`-calling `.cmd` there)
+    rather than one dialect standing in for both."""
     record = tmp_path / "argv.json"
-    child = tmp_path / "dictate-toggle.cmd"
-    child.write_text(
-        "#!/usr/bin/env python3\n"
-        "import json, sys\n"
-        f"json.dump(sys.argv[1:], open({str(record)!r}, 'w'))\n"
-        "raise SystemExit(7)\n",
-        encoding="utf-8",
-    )
-    child.chmod(0o755)
+    if os.name == "nt":
+        # the same shape the plugin's own .cmd ships use: probe `py -3` first, `python` second
+        body = (
+            "import json, sys\n"
+            f"json.dump(sys.argv[1:], open({str(record)!r}, 'w'))\n"
+            "raise SystemExit(7)\n"
+        )
+        (tmp_path / "child_body.py").write_text(body, encoding="utf-8")
+        child = tmp_path / "dictate-toggle.cmd"
+        child.write_text(
+            "@echo off\r\n"
+            'python "%~dp0child_body.py" %*\r\n',
+            encoding="utf-8",
+        )
+    else:
+        child = tmp_path / "dictate-toggle.cmd"
+        child.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, sys\n"
+            f"json.dump(sys.argv[1:], open({str(record)!r}, 'w'))\n"
+            "raise SystemExit(7)\n",
+            encoding="utf-8",
+        )
+        child.chmod(0o755)
     monkeypatch.setattr(_launcher, "_current_script", lambda: child)
     monkeypatch.setattr(_launcher.os, "name", "nt")
     monkeypatch.setattr(_launcher.sys, "argv", ["launcher", "send"])

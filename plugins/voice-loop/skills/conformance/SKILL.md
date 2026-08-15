@@ -83,10 +83,19 @@ python3 -c "import json; d=json.load(open('${CLAUDE_PLUGIN_ROOT}/hooks/hooks.jso
 # 1.10 — config parses
 jq . "${XDG_CONFIG_HOME:-$HOME/.config}/voice-loop/config.json" >/dev/null 2>&1 && echo "config valid JSON" || echo "config invalid or absent"
 
-# 1.11 — no inline secrets
-python3 -c "
+# 1.11 — no inline secrets. The path travels as $1, never interpolated into the program: a
+# Windows config path carries backslashes, and \U/\C sequences are not holdable in Python source.
+# The interpreter is probed the way hooks.json and the .cmd shims probe it — on Windows a
+# `python3` that resolves may be the Microsoft Store stub, so the first name that actually runs
+# `import sys` is the one that gets the probe.
+VLPY=""
+for cand in python3 python "py -3"; do
+    $cand -c "import sys" >/dev/null 2>&1 && { VLPY="$cand"; break; }
+done
+[ -n "$VLPY" ] || { echo "FAIL: no Python interpreter found (tried python3, python, py -3)"; exit 1; }
+$VLPY -c "
 import json, sys
-cfg = json.load(open('${XDG_CONFIG_HOME:-$HOME/.config}/voice-loop/config.json'))
+cfg = json.load(open(sys.argv[1], encoding='utf-8'))
 def has_inline_key(node, path=''):
     if isinstance(node, dict):
         for k, v in node.items():
@@ -104,7 +113,7 @@ if found:
     print('FAIL: inline secrets found in config — fix before filing')
 else:
     print('PASS: no inline secrets')
-"
+" "${XDG_CONFIG_HOME:-$HOME/.config}/voice-loop/config.json"
 
 # 1.12 — selftest
 bash "${CLAUDE_PLUGIN_ROOT}/scripts/selftest.sh" 2>&1; echo "exit: $?"

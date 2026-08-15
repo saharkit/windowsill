@@ -8,6 +8,7 @@ boot and serve /stt no matter how broken the TTS configuration is.
 from __future__ import annotations
 
 import io
+from pathlib import Path
 
 import pytest
 sf = pytest.importorskip("soundfile")
@@ -241,7 +242,12 @@ def test_xtts_model_dir_override_loads_from_disk(monkeypatch, coqui_installed):
 
     model = voice_server.xtts()
 
-    assert model.kwargs == {"model_path": "/models/xtts-v2", "config_path": "/models/xtts-v2/config.json"}
+    # config_path is XTTS_MODEL_DIR joined with "config.json"; the separator is the platform's
+    # own (Path follows os.name), so assert the JOIN rather than one platform's spelling of it.
+    assert model.kwargs == {
+        "model_path": "/models/xtts-v2",
+        "config_path": str(Path("/models/xtts-v2") / "config.json"),
+    }
 
 
 def test_xtts_uses_cpu_when_free_vram_is_below_the_tenant_floor(monkeypatch, coqui_installed, caplog):

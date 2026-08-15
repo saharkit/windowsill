@@ -261,6 +261,24 @@ jobs:
           include-hidden-files: true
           if-no-files-found: error
 
+  voice-loop-windows:
+    name: voice-loop unit tests (windows, python 3.12)
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: install test dependencies
+        working-directory: plugins/voice-loop
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r tests/requirements.txt
+      - name: run the voice-loop unit suite on native Windows
+        working-directory: plugins/voice-loop
+        run: python -m pytest
+
   sill-core-coverage:
     name: sill-core unit tests (${{ matrix.os }}, python ${{ matrix.python }})
     runs-on: ${{ matrix.os }}
@@ -1358,7 +1376,7 @@ jobs:
   gate:
     name: gate
     runs-on: ubuntu-latest
-    needs: [shellcheck, coverage, sill-core-coverage, loopback, combined-coverage]
+    needs: [shellcheck, coverage, voice-loop-windows, sill-core-coverage, loopback, combined-coverage]
     if: always()
     steps:
       - name: every needed job succeeded

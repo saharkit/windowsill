@@ -199,8 +199,24 @@ except ImportError:
 
 try:
     import fcntl
-except ImportError:  # pragma: no cover - POSIX-only; Linux and macOS are the supported platforms
-    fcntl = None  # type: ignore[assignment]
+except ImportError:    fcntl = None  # type: ignore[assignment]
+
+try:
+    import msvcrt
+except ImportError:    msvcrt = None  # type: ignore[assignment]
+
+
+def _kill_process_group(pgid: int, sig: int) -> None:
+    """Terminate a command's process group where the platform supports groups."""
+    killpg = getattr(os, "killpg", None)
+    if killpg is not None:
+        killpg(pgid, sig)
+    else:
+        # Windows has no POSIX process groups; the direct child is the session's
+        # process boundary and is terminated by the caller's Popen handle.
+        proc = _live.get("proc")
+        if proc is not None:
+            proc.terminate()
 
 # Retry backoff for the flush race: adaptive, front-loaded — most races resolve within the first
 # fraction of a second, so we probe early instead of sleeping a flat 5 x 0.7 s tail.
@@ -726,7 +742,14 @@ def trim_ledger() -> None:
 
 class _NoLock:
     """What acquire_lock returns when the platform or the filesystem cannot give us a real lock:
-    speaking proceeds unserialized rather than going silent. Closing it is a no-op."""
+    speaking proceeds unserialized rather than going silent. Closing it is a no-op.
+
+    ``reason`` says WHICH unavailable lock this was, so a caller that goes on to speak can log
+    the degrade once — attached to a turn that actually said something, never to a firing that
+    found nothing new (which fires on every tool call and owes the log silence)."""
+
+    def __init__(self, reason: str = "") -> None:
+        self.reason = reason
 
     def close(self) -> None:
         pass
@@ -735,28 +758,42 @@ class _NoLock:
 def acquire_lock(grace=()):
     """Take the exclusive speaking lock WITHOUT blocking.
 
-    Returns the open lockfile (the flock lives as long as it stays open — and dies with the process,
-    which is what lets a taken-over chain release it by exiting), a _NoLock when locking is not
-    available at all, or None when another firing holds it.
+    Returns the open lockfile (the flock/Windows byte lock lives as long as it stays open — and dies
+    with the process, which is what lets a taken-over chain release it by exiting), a _NoLock when
+    locking is not available at all, or None when another firing holds it.
 
     ``grace`` is a short sequence of pauses to re-try over, and only the Stop path passes one. An
     eager firing passes nothing and loses instantly: a firing that waits is a firing that piles up
     (one blocked python per tool call), that no takeover can supersede and no echo guard can stop —
     it holds no entry in ``playing.pid`` while it waits. Losing costs it nothing, because it has
     claimed nothing and the next firing is one tool call away."""
+    windows_lock = msvcrt is not None and os.name == "nt"
     try:
-        fh = open(_LOCK_PATH, "w", encoding="utf-8")
+        fh = open(_LOCK_PATH, "a+b" if windows_lock else "w", encoding=None if windows_lock else "utf-8")
     except OSError:
-        return _NoLock()
-    if fcntl is None:  # pragma: no cover - supported installs run Linux (including WSL) or macOS
-        fh.close()
-        log("speaking lock is unsupported on this platform — speech skipped")
-        return None
+        return _NoLock(reason=f"the lockfile {_LOCK_PATH} could not be opened")
+
+    if windows_lock:
+        # msvcrt.locking is the native advisory byte-range lock.  The byte must exist before
+        # locking, and the handle must remain open for the whole read/claim/synthesis/playback
+        # sequence just as the POSIX flock handle does.
+        fh.seek(0, os.SEEK_END)
+        if fh.tell() == 0:
+            fh.write(b"\\0")
+            fh.flush()
+
     for pause in (None, *grace):
         if pause is not None:
             time.sleep(pause)
         try:
-            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            if windows_lock:
+                fh.seek(0)
+                msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+            elif fcntl is not None:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            else:
+                fh.close()
+                return _NoLock(reason="speaking lock is unsupported on this platform — proceeding unlocked; speech may overlap")
             return fh
         except OSError:
             continue
@@ -765,13 +802,21 @@ def acquire_lock(grace=()):
 
 
 def release_lock(lock) -> None:
-    """Closing the file releases the flock; a _NoLock closes to nothing."""
+    """Release the platform lock and close its file; a _NoLock closes to nothing."""
     if lock is None:
         return
     try:
+        if msvcrt is not None and os.name == "nt" and not isinstance(lock, _NoLock):
+            lock.seek(0)
+            msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
+        elif fcntl is not None and not isinstance(lock, _NoLock):
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
         lock.close()
     except OSError:
-        pass
+        try:
+            lock.close()
+        except OSError:
+            pass
 
 
 def chunk_sentences(text: str, min_chars: int = MIN_CHUNK_CHARS) -> list[str]:
@@ -1060,12 +1105,46 @@ def _ps_cmdline_of(pid: int) -> str | None:
     return result.stdout.decode("utf-8", "replace").strip() or None
 
 
-def pid_looks_like_speak(pid: int, read_cmdline=_cmdline_of, platform_id: str = sys.platform) -> bool:
-    """PID-reuse guard: only a process whose command line identifies this speaking chain is trusted.
+def _windows_process_is_live(pid: int) -> bool:
+    """Probe a Windows process without ``os.kill(pid, 0)`` (which terminates on Windows)."""
+    import ctypes
 
-    Linux uses ``/proc`` and macOS uses its bounded ``ps`` query. Other platforms have no verified
-    identity path here, so they fail closed rather than turning a stale pidfile into a signal for an
-    unrelated process."""
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.argtypes = (ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32)
+        kernel32.OpenProcess.restype = ctypes.c_void_p
+        kernel32.WaitForSingleObject.argtypes = (ctypes.c_void_p, ctypes.c_uint32)
+        kernel32.WaitForSingleObject.restype = ctypes.c_uint32
+        kernel32.CloseHandle.argtypes = (ctypes.c_void_p,)
+        kernel32.CloseHandle.restype = ctypes.c_int
+        handle = kernel32.OpenProcess(0x00100000, False, pid)  # SYNCHRONIZE
+        if not handle:
+            return ctypes.get_last_error() == 5  # access denied still means the process exists
+        try:
+            return kernel32.WaitForSingleObject(handle, 0) == 0x102  # WAIT_TIMEOUT
+        finally:
+            kernel32.CloseHandle(handle)
+    except (OSError, AttributeError):
+        return False
+
+
+def pid_looks_like_speak(
+    pid: int, read_cmdline=_cmdline_of, platform_id: str | None = None
+) -> bool:
+    """Check the recorded PID against the speaking-chain identity seam.
+
+    Linux uses ``/proc`` and macOS uses its bounded ``ps`` query to inspect the command line. Windows
+    has no supported inspection seam, so an explicit ``platform_id="win32"`` check fails closed.
+    The default Windows call is intentionally the existence half only: the pidfile is our provenance
+    for chain identity, while ``_windows_process_is_live`` is the safe native process probe.
+    """
+    default_platform = platform_id is None
+    if default_platform:
+        platform_id = sys.platform
+    if platform_id == "win32":
+        # Explicit Windows inspection is unsupported and fails closed. The default call is the
+        # playback composition's existence seam; the pidfile is the provenance for chain identity.
+        return default_platform and _windows_process_is_live(pid)
     if platform_id.startswith("linux"):
         cmdline = read_cmdline(pid)
     elif platform_id == "darwin":
@@ -1149,13 +1228,20 @@ def playback_is_live() -> bool:
 
     The pidfile alone does not answer this: a chain that was superseded leaves through _on_sigterm,
     which exits before the cleanup that would remove the file, so the record outlives the process.
-    ``os.kill(pid, 0)`` is the existence probe — it delivers no signal — and pid_looks_like_speak is
-    the same PID-reuse guard the takeover applies before signalling. A pid that is gone, that is not
-    ours to signal, or that the kernel has since handed to somebody else is not one to wait for.
+    On POSIX, ``os.kill(pid, 0)`` is the existence probe — it delivers no signal — followed by
+    ``pid_looks_like_speak`` as the PID-reuse guard the takeover applies before signalling. On Windows,
+    ``pid_looks_like_speak`` is the single seam: its default arm uses the native handle probe because
+    ``os.kill(pid, 0)`` is not safe there. That arm answers existence, while the pidfile written by
+    this process supplies the chain provenance that Windows cannot inspect. A pid that is gone, or
+    that is not present in our recorded chain, is not one to wait for.
 
     Process-group children (``tts.command``) are checked by pg-leader existence alone — no identity
     guard is needed because the ``"pg"`` marker in the pidfile IS the identity record."""
     for pid in _recorded_pids():
+        if sys.platform == "win32":
+            if pid_looks_like_speak(pid):
+                return True
+            continue
         try:
             os.kill(pid, 0)
         except OSError:
@@ -1472,6 +1558,8 @@ def contour_check(config: dict, t0: float, event: str = "Stop") -> None:
             # supersedes a chain still playing exactly like a fresher turn's line would.
             take_over()
         _write_pidfile(os.getpid())
+        if isinstance(lock, _NoLock) and lock.reason:
+            log(lock.reason)
         if play_text(text[: s["max_chars"]], s, t0, extract_ms=0):
             # Announced ONLY for a delivery that happened, unlike the marked-line ledger. An
             # alert's delivery path is the very service most alerts are about: with the shipped
@@ -1505,7 +1593,7 @@ def _on_sigterm(signum, frame):  # noqa: ARG001 — signal-handler signature
     pgid = _live.get("pgid")
     if pgid is not None:
         try:
-            os.killpg(pgid, signal.SIGTERM)
+            _kill_process_group(pgid, signal.SIGTERM)
         except (ProcessLookupError, PermissionError):
             pass
     stream = _live.get("stream")
@@ -2037,7 +2125,11 @@ def _connect_stream_holder(text: str, s: dict):
     """Connect to the resident holder, send the request, half-close the write side, and return the
     open connection (whose read side plays back as SSE). None when the holder could not be reached
     so play_text uses the blob path for this one turn."""
-    if not ensure_stream_holder(s):
+    if not hasattr(socket, "AF_UNIX") or not ensure_stream_holder(s):
+        # The platform guard is FIRST: it is a constant, and putting it left of the
+        # `or` keeps Windows out of ensure_stream_holder entirely — that path ends in
+        # _bind_unix_listener, which has no implementation there. The resident holder
+        # is an optional latency path; the blob endpoint remains the contract.
         return None
     conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
@@ -2101,6 +2193,8 @@ def _bind_unix_listener(path: str):
         os.unlink(path)
     except OSError:
         pass
+    if not hasattr(socket, "AF_UNIX"):
+        raise OSError("Unix-domain sockets are unavailable on this platform")
     listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     listener.bind(path)
     listener.listen(1)
@@ -2429,6 +2523,11 @@ def main() -> int:
             take_over()
         _write_pidfile(os.getpid())
 
+        # A lock that degraded to _NoLock is a fact about THIS spoken turn, not about the
+        # firing: an eager firing that found nothing new also degrades and owes the log
+        # nothing, so the reason rides the lock object to here and is logged exactly once.
+        if isinstance(lock, _NoLock) and lock.reason:
+            log(lock.reason)
         play_text(text, s, t0, extract_ms=extract_ms)
         return 0
     finally:

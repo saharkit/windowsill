@@ -124,8 +124,26 @@ import wsclient
 
 try:
     import fcntl
-except ImportError:  # pragma: no cover - POSIX-only; Linux and macOS are the supported platforms
+except ImportError:
     fcntl = None  # type: ignore[assignment]
+
+
+def _secure_chmod(fd: int, mode: int) -> None:
+    """Apply a private mode where the platform exposes descriptor chmod.
+
+    ``mkstemp`` already creates a private file on Windows, whose ACL-backed mode
+    bits cannot express POSIX group/other permissions.  Keep the POSIX hardening
+    and deliberately leave the Windows ACL alone rather than calling an absent
+    ``os.fchmod``.
+    """
+    chmod = getattr(os, "fchmod", None)
+    if chmod is not None:
+        chmod(fd, mode)
+
+
+def _hard_kill_signal() -> int:
+    """Return the strongest portable signal available to the worker cleanup."""
+    return getattr(signal, "SIGKILL", signal.SIGTERM)
 
 # Every recorder in the table records 16 kHz mono S16 — 32000 bytes of PCM per second. The clip
 # guard converts the WAV's size to seconds with this constant, so the two must move together.
@@ -1286,7 +1304,7 @@ def _pid_alive(pid: int) -> bool:
     ask is a per-iteration process launch."""
     if pid <= 0:
         return False
-    if os.name == "nt":  # pragma: no cover — exercised on Windows; the lane runs Linux
+    if os.name == "nt":
         import ctypes
 
         try:
@@ -1356,7 +1374,7 @@ def _pid_alive(pid: int) -> bool:
     return True
 
 
-def _win_console_ctrl_c(pid: int) -> bool:  # pragma: no cover — exercised on Windows; the lane runs Linux
+def _win_console_ctrl_c(pid: int) -> bool:
     """Send CTRL_C_EVENT to the console *pid* lives in — True if the event went out.
 
     This is the Windows equivalent of SIGINT, and the only graceful stop that reaches a process
@@ -1427,8 +1445,13 @@ def _pid_looks_like_recorder(pid: int, recorder: str, platform_id: str = sys.pla
         # the script path rather than the bare name. A bare-name match would refuse that legitimate
         # recorder and wedge the recording (the stop toggle would never signal it).
         return any(os.path.basename(token) == executable for token in cmdline.split())
-    if platform_id == "win32" or os.name == "nt":
+    if platform_id == "win32":
         return _win_pid_is_recorder(pid, recorder)
+    # darwin keeps the historical same-user process contract (no /proc, no handle check). An
+    # unknown non-Windows id keeps it too — the guard exists to REFUSE, not to demand a platform
+    # it was never taught. The host's os.name is deliberately not consulted here: platform_id is
+    # the caller's answer, and on a Windows host a darwin id would otherwise reach for kernel32
+    # while claiming to answer for macOS.
     return True
 
 
@@ -1444,9 +1467,8 @@ def _win_pid_is_recorder(pid: int, recorder: str) -> bool:
     """
     if pid <= 0 or not recorder:
         return False  # plain-Python guard, left under coverage: no Windows-only API before this
-    import ctypes  # pragma: no cover — exercised on Windows; the lane runs Linux
-
-    try:  # pragma: no cover — everything from here reaches kernel32
+    import ctypes
+    try:
         kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # stdlib; Windows arm
         PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
         kernel32.OpenProcess.argtypes = (
@@ -1482,7 +1504,7 @@ def _win_pid_is_recorder(pid: int, recorder: str) -> bool:
             return image == expected
         finally:
             kernel32.CloseHandle(handle)  # every path that opened it closes it
-    except (OSError, AttributeError):  # pragma: no cover — only the excluded Windows arm can raise these
+    except (OSError, AttributeError):
         return False  # kernel32 is not what we expect: cannot verify, do not signal
 
 
@@ -1501,9 +1523,9 @@ def _stop_recorder(pid: int, system: str, recorder: str = "") -> None:
     outlives its process and the kernel recycles PIDs, so a stale pid must not get a Ctrl+C in an
     unrelated console group, nor the TerminateProcess that follows it."""
     if system == "Windows":
-        if not _win_pid_is_recorder(pid, recorder):  # pragma: no cover — exercised on Windows
-            return  # pragma: no cover — a recycled pid: signal nobody, terminate nobody
-        _win_console_ctrl_c(pid)  # pragma: no cover — exercised on Windows; the lane runs Linux
+        if not _win_pid_is_recorder(pid, recorder):
+            return
+        _win_console_ctrl_c(pid)
     else:
         try:
             os.kill(pid, signal.SIGINT)
@@ -1655,7 +1677,7 @@ def _write_stream_result(result: dict) -> None:
     result_path = _stream_result_path(pid)
     try:
         fd, tmp = tempfile.mkstemp(prefix="voice-loop-stream-", dir=os.path.dirname(result_path))
-        os.fchmod(fd, 0o600)
+        _secure_chmod(fd, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             json.dump(result, fh)
         os.replace(tmp, result_path)
@@ -1748,7 +1770,7 @@ def _write_preview(data: dict, path: str) -> None:
     means the preview surface is silently off, which is the documented degrade."""
     try:
         fd, tmp = tempfile.mkstemp(prefix="voice-loop-preview-", dir=os.path.dirname(path))
-        os.fchmod(fd, 0o600)
+        _secure_chmod(fd, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             json.dump(data, fh)
         os.replace(tmp, path)
@@ -1835,7 +1857,7 @@ def finish_stream_worker() -> str | None:
         log(f"stream worker did not finish within {STREAM_FINISH_TIMEOUT:.0f}s — using the recorded clip")
         if pid_looks_like_stream_worker(pid):
             try:
-                os.kill(pid, signal.SIGKILL)  # not merely abandoned: it holds a metered socket
+                os.kill(pid, _hard_kill_signal())  # not merely abandoned: it holds a metered socket
             except OSError:
                 pass
         clear_stream_state(stop_survivor=False)
