@@ -788,7 +788,7 @@ def main(argv: list[str] | None = None) -> int:
             ],
         }
         print(json.dumps(output, indent=2, ensure_ascii=False))
-        return 0
+        return 1
 
     _remove_incident_symlink()
 
@@ -832,7 +832,7 @@ def main(argv: list[str] | None = None) -> int:
             ],
         }
         print(json.dumps(output, indent=2, ensure_ascii=False))
-        return 0
+        return 1
 
     findings = diagnose(manifest=manifest, config=config, ledger=ledger, logs=logs)
     if wsl_finding is not None:

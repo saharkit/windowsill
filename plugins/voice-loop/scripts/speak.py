@@ -1105,12 +1105,37 @@ def _ps_cmdline_of(pid: int) -> str | None:
     return result.stdout.decode("utf-8", "replace").strip() or None
 
 
+def _windows_process_is_live(pid: int) -> bool:
+    """Probe a Windows process without ``os.kill(pid, 0)`` (which terminates on Windows)."""
+    import ctypes
+
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.argtypes = (ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32)
+        kernel32.OpenProcess.restype = ctypes.c_void_p
+        kernel32.WaitForSingleObject.argtypes = (ctypes.c_void_p, ctypes.c_uint32)
+        kernel32.WaitForSingleObject.restype = ctypes.c_uint32
+        kernel32.CloseHandle.argtypes = (ctypes.c_void_p,)
+        kernel32.CloseHandle.restype = ctypes.c_int
+        handle = kernel32.OpenProcess(0x00100000, False, pid)  # SYNCHRONIZE
+        if not handle:
+            return ctypes.get_last_error() == 5  # access denied still means the process exists
+        try:
+            return kernel32.WaitForSingleObject(handle, 0) == 0x102  # WAIT_TIMEOUT
+        finally:
+            kernel32.CloseHandle(handle)
+    except (OSError, AttributeError):
+        return False
+
+
 def pid_looks_like_speak(pid: int, read_cmdline=_cmdline_of, platform_id: str = sys.platform) -> bool:
     """PID-reuse guard: only a process whose command line identifies this speaking chain is trusted.
 
-    Linux uses ``/proc`` and macOS uses its bounded ``ps`` query. Other platforms have no verified
-    identity path here, so they fail closed rather than turning a stale pidfile into a signal for an
-    unrelated process."""
+    Linux uses ``/proc`` and macOS uses its bounded ``ps`` query. Windows has no cheap command-line
+    seam in the standard library; its pidfile is written by this process immediately before
+    playback, so the native handle probe is the least-privilege identity available there."""
+    if platform_id == "win32":
+        return _windows_process_is_live(pid)
     if platform_id.startswith("linux"):
         cmdline = read_cmdline(pid)
     elif platform_id == "darwin":

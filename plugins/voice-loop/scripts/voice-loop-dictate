@@ -30,14 +30,17 @@ _PLUGIN_KEY = "voice-loop@windowsill"
 _OS_PATH = type(Path())
 
 
-def _script_leaf(platform: str = os.name) -> str:
+def _script_leaf(platform: str | None = None) -> str:
     """The launcher leaf for a platform: the ``.cmd`` shim on Windows, the ``.sh`` elsewhere.
 
     ``subprocess.run`` reaches the child through CreateProcess, which does NOT consult shell file
     associations — a ``.sh`` there is WinError 193 ("not a valid Win32 application") before bash is
     ever asked, so every durable hotkey invocation on Windows would fail. The leaf is chosen per
     call (a parameter, not a module constant) so ``_current_script`` can be driven for either
-    platform without patching the process-global ``os.name``."""
+    platform without patching the process-global ``os.name``.  Resolve the default at call time:
+    tests and embedders may temporarily select a platform after this module was imported."""
+    if platform is None:
+        platform = os.name
     return "scripts/dictate-toggle.cmd" if platform == "nt" else "scripts/dictate-toggle.sh"
 
 
@@ -58,7 +61,7 @@ def _entries(raw: Any) -> list[dict[str, Any]]:
     return [entry for entry in value if isinstance(entry, dict)] if isinstance(value, list) else []
 
 
-def _current_script(platform: str = os.name) -> Path | None:
+def _current_script(platform: str | None = None) -> Path | None:
     """Find the current plugin script from Claude Code's install registry.
 
     An ambiguous or malformed registry is a refusal, not an invitation to guess
