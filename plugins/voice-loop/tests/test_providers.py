@@ -17,6 +17,7 @@ from pathlib import Path
 import pytest
 
 import providers
+import voice_server
 
 _SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
 _FIXTURES = Path(__file__).resolve().parent / "fixtures"
@@ -754,3 +755,121 @@ class TestTheTtsStreamingVariantIsDocumented:
         claimed = set(re.findall(r"`([a-z0-9-]+)` \(TTS\) \| \*\*yes\*\*", doc))
         streams = {name for name, entry in providers.TTS_PROVIDERS.items() if entry.streaming is not None}
         assert claimed == streams, f"PROVIDERS.md claims {sorted(claimed)} stream; the registry says {sorted(streams)}"
+
+
+# --- the endpoint-and-origin policy (windowsill #215) --------------------------------------------
+#
+# One decision — what counts as a local address, and what a credential may travel over — instead
+# of the five that used to disagree. These are the pure halves; where each script WIRES the guard
+# in is pinned in test_speak.py and test_dictate.py, and the server's own use of its mirror in
+# test_api.py.
+
+
+@pytest.mark.parametrize(
+    ("host", "expected"),
+    [
+        # local by spelling: the literal name, and literal addresses only
+        ("localhost", True),
+        ("127.0.0.1", True),
+        ("127.0.0.42", True),
+        ("127.213.78.9", True),  # the whole 127/8 block is loopback, not just 127.0.0.x
+        ("::1", True),
+        # not local: the spellings that used to be admitted by startswith("127.")
+        ("127.evil.com", False),
+        ("127.0.0.1.evil.com", False),
+        ("localhost.evil.com", False),
+        # not local: everything else
+        ("", False),
+        ("0.0.0.0", False),  # "every interface" is not "this machine"
+        ("192.168.1.42", False),
+        ("::", False),
+        ("example.com", False),
+    ],
+)
+def test_is_local_host_admits_only_literal_loopback(host, expected):
+    """L2: the old prefix test classified 127.evil.com — a DNS name a caller controls — as
+    loopback; nothing else in the suite would catch a regression back to prefix matching."""
+    assert providers.is_local_host(host) is expected
+
+
+def test_a_literal_host_never_reaches_the_resolver():
+    """The default endpoint (127.0.0.1) and the provider hosts must classify with zero lookups —
+    a lookup on those paths would be network I/O on every plain configuration."""
+    providers.is_local_host("127.0.0.1", resolve=lambda host: pytest.fail(f"looked up {host}"))
+    providers.is_local_host("localhost", resolve=lambda host: pytest.fail(f"looked up {host}"))
+    providers.is_local_host("192.168.1.42", resolve=lambda host: pytest.fail(f"looked up {host}"))
+
+
+@pytest.mark.parametrize(
+    ("addresses", "expected"),
+    [
+        (["127.0.0.1"], True),  # a name that resolves to loopback IS local — the ssh-tunnel-by-name case
+        (["192.0.2.1"], False),
+        ([], False),  # nothing resolved: not provably local
+        (["not-an-address"], False),  # a resolver handing back garbage: not provably local
+    ],
+)
+def test_a_name_is_local_only_where_it_resolves(addresses, expected):
+    """The policy's second half: locality of a NAME is a fact about where it resolves, decided by
+    the injected resolver — the module itself never does I/O. Fail-closed on every bad answer."""
+    assert providers.is_local_host("tunnel.internal", resolve=lambda host: addresses) is expected
+
+
+def test_a_name_without_a_resolver_is_not_local():
+    """No resolver means no claim of locality — the spelling of a name is not evidence (#215)."""
+    assert providers.is_local_host("tunnel.internal") is False
+
+
+@pytest.mark.parametrize(
+    ("url", "has_credential", "expected_fragment"),
+    [
+        # nothing to protect: TLS, or no credential riding
+        ("https://api.example.com/v1", True, None),
+        ("wss://api.example.com/v1", True, None),
+        ("http://192.168.1.100:8080", False, None),
+        # the local default must never be refused
+        ("http://127.0.0.1:8355", True, None),
+        ("ws://127.0.0.1:8355", True, None),
+        # clear text to a remote literal address: refused, naming the fix
+        ("http://192.168.1.100:8080", True, "https://"),
+        ("ws://192.168.1.100:8080", True, "wss://"),
+        # the exact shape from the tracker: a name that merely starts with "127."
+        ("http://127.evil.com:9000", True, "https://"),
+    ],
+)
+def test_clear_text_credential_error(url, has_credential, expected_fragment):
+    """L2: http:// AND ws:// are one rule — the websocket path carries the same key and audio in
+    the clear, so a check that only covers http leaves the leak on the other transport. The
+    127.evil.com row is the shape the old startswith admitted."""
+    error = providers.clear_text_credential_error(
+        url, has_credential=has_credential, resolve=lambda host: ["192.0.2.1"]
+    )
+    if expected_fragment is None:
+        assert error is None
+    else:
+        assert error is not None and expected_fragment in error
+        assert "in the clear" in error
+
+
+def test_the_server_and_client_loopback_classifiers_agree():
+    """L1's deliberate-duplication exception. voice_server._is_loopback_host and
+    providers.is_local_host are two implementations of ONE decision because the server and the
+    scripts share no import path (windowsill #215); the server half's own use is pinned in
+    test_api.py. This test is the composition claim that the mirrors never drift — without it,
+    either side could quietly re-widen to prefix matching while the other stays fixed, and the
+    origin guard and the endpoint guard would disagree about what "local" means."""
+    corpus = {
+        "localhost": True,
+        "127.0.0.1": True,
+        "127.0.0.42": True,
+        "127.evil.com": False,
+        "localhost.evil.com": False,
+        "0.0.0.0": False,
+        "192.168.1.42": False,
+        "::1": True,
+        "::": False,
+        "": False,
+    }
+    for host, expected in corpus.items():
+        assert providers.is_local_host(host) is expected, host
+        assert voice_server._is_loopback_host(host) is expected, host

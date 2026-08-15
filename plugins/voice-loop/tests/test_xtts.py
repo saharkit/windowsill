@@ -188,14 +188,22 @@ def test_tts_xtts_without_a_reference_is_a_clear_500(client, monkeypatch, coqui_
     assert "VOICE_LOOP_XTTS_REFERENCE" in response.json()["error"]
 
 
-def test_tts_xtts_with_a_missing_reference_file_is_a_clear_500(client, monkeypatch, coqui_installed, tmp_path):
+def test_tts_xtts_with_a_missing_reference_file_is_a_clear_500(client, monkeypatch, coqui_installed, tmp_path, caplog):
     monkeypatch.setattr(voice_server, "TTS_ENGINE", "xtts")
-    monkeypatch.setattr(voice_server, "XTTS_REFERENCE", str(tmp_path / "nowhere.wav"))
+    configured = str(tmp_path / "nowhere.wav")
+    monkeypatch.setattr(voice_server, "XTTS_REFERENCE", configured)
 
-    response = client.post("/tts", json={"text": "Привет."})
+    with caplog.at_level("WARNING"):
+        response = client.post("/tts", json={"text": "Привет."})
 
     assert response.status_code == 500
     assert "not found" in response.json()["error"]
+    # windowsill #215: /tts has no authentication, and the configured absolute path is information
+    # about this operator's filesystem — the same rule xtts_import_error applies to exception
+    # text. The body names the SETTING, the log keeps the path.
+    assert configured not in response.text
+    assert "VOICE_LOOP_XTTS_REFERENCE" in response.json()["error"]
+    assert any(configured in record.getMessage() for record in caplog.records)
 
 
 def test_tts_unknown_engine_is_a_clear_500(client, monkeypatch):

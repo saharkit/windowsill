@@ -926,10 +926,36 @@ def _open_stream(endpoint: str, payload: dict, timeout: float):
         return None
 
 
-def _is_loopback_host(host: str) -> bool:
-    """True only for addresses that point at the local machine — the one case where plaintext is
-    safe (the bundled server on 127.0.0.1 is the default and must never warn)."""
-    return host == "localhost" or host == "::1" or host.startswith("127.")
+def _host_addresses(host: str) -> list[str]:
+    """The ONE place this script turns a hostname into addresses (windowsill #215): one lookup,
+    at configuration time, from the endpoint guard below — never from a request path, where it
+    would be a blocking call on every synthesis."""
+    try:
+        return [info[4][0] for info in socket.getaddrinfo(host, None)]
+    except (OSError, UnicodeError):
+        return []
+
+
+def _clear_text_refusal(s: dict) -> str | None:
+    """The endpoint policy applied at CONFIGURATION time (windowsill #215): a clear-text scheme —
+    http:// and ws:// are one rule, the websocket carries the same key and audio in the clear —
+    may carry the API key only to a LOCAL endpoint, and local means the RESOLVED address, never
+    the spelling of a name (127.evil.com is a DNS name, not a loopback address). Called once per
+    process, before any request is built, so the doomed request never happens; the old behaviour
+    warned about it while sending it."""
+    if s["backend"] != "cloud":
+        return None
+    entry = resolve_tts_provider(s["provider"])
+    if not read_key(s["key_file"], s["key_env"], os.environ):
+        return None  # no credential configured — nothing rides the clear text
+    urls = [entry.endpoint(s)]
+    if cloud_streaming_wanted(s):
+        urls.append(entry.streaming.url(entry.streaming, entry, s))
+    for url in urls:
+        error = providers.clear_text_credential_error(url, has_credential=True, resolve=_host_addresses)
+        if error:
+            return f"cloud tts refused: {error}"
+    return None
 
 
 def synthesize(text: str, s: dict, key: str) -> bytes | None:
@@ -951,12 +977,6 @@ def synthesize(text: str, s: dict, key: str) -> bytes | None:
             log(f"cloud tts misconfigured: {err}")
             return None
         endpoint = entry.endpoint(s)  # for the error messages below, which name where it went
-        parsed = urllib.parse.urlsplit(request.url)
-        if parsed.scheme == "http" and parsed.hostname and not _is_loopback_host(parsed.hostname):
-            log(
-                f"cloud tts endpoint is http:// to {parsed.hostname} — "
-                "the API key and the text travel in the clear"
-            )
         body = _post(request.url, request.headers, request.payload, s["timeout"])
     else:
         endpoint = s["endpoint"] or providers.LOCAL_SPEECH_HOST
@@ -2182,6 +2202,12 @@ def run_holder_main(digest: str) -> int:
     if not key:
         log("stream holder: no key — exiting")
         return 1
+    # The holder is its own process with its own configuration moment — the endpoint policy
+    # (#215) applies here too, before the resident socket is dialed.
+    refusal = _clear_text_refusal(s)
+    if refusal:
+        log(refusal)
+        return 1
     # fold speed into voice_settings so the BOS carries it on the held socket's first frame
     s["voice_settings"] = {**(s["voice_settings"] or {}), "speed": s["speed"]}
     return run_holder(s, entry, key, digest)
@@ -2234,6 +2260,14 @@ def main() -> int:
         # Both shapes — a payload naming no transcript at all, and one naming a file that is not
         # there — end the turn's speech before a single line has been read. Neither was visible.
         log(f"no transcript to read: transcript_path={transcript!r}")
+        return 0
+
+    # The endpoint policy, at configuration time — before a single request is built. A refusal
+    # here ends the turn's speech with a diagnosis in the log (the same posture as "no key"):
+    # the hook itself must not fail the harness's turn over its own configuration.
+    refusal = _clear_text_refusal(s)
+    if refusal:
+        log(refusal)
         return 0
 
     # The ledger, the lock and the seeding are eager mode's machinery, and they exist ONLY when the

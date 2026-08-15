@@ -45,6 +45,7 @@ for humans in ``PROVIDERS.md`` next to this file.
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import urllib.parse
 from dataclasses import dataclass
@@ -326,6 +327,62 @@ def _deepgram_error(data: object) -> str:
 
 def _multipart_type(boundary: str) -> str:
     return f"multipart/form-data; boundary={boundary}"
+
+
+# --- the endpoint-and-origin policy (windowsill #215) --------------------------------------------
+#
+# What counts as a safe endpoint, and who may reach it — decided ONCE here rather than
+# independently at every place that binds, connects or admits. The scripts share this module; the
+# server cannot (server and scripts have no import path between them), so it mirrors the local-host
+# half in voice_server.py and a test asserts the two agree.
+
+
+def is_local_host(host: str, resolve: Callable[[str], list[str]] | None = None) -> bool:
+    """True only for an address that points at the local machine.
+
+    A LITERAL loopback address — anything in 127.0.0.0/8, or ``::1`` — or the literal name
+    ``localhost``. Nothing else is local by spelling: ``127.evil.com`` is a DNS name a caller
+    controls, not a loopback address, and the ``host.startswith("127.")`` this replaces admitted
+    exactly that shape (windowsill #215). Any other name is local only where it RESOLVES, so the
+    caller that owns the sockets passes ``resolve`` — once, at configuration time; this module
+    does no I/O. Without a resolver a name is not local: fail closed rather than trust a spelling.
+    """
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        pass
+    if resolve is None:
+        return False
+    try:
+        return any(ipaddress.ip_address(address).is_loopback for address in resolve(host))
+    except (TypeError, ValueError):
+        return False
+
+
+def clear_text_credential_error(
+    url: str, *, has_credential: bool, resolve: Callable[[str], list[str]] | None = None
+) -> str | None:
+    """Why this URL may not carry a credential, or None when it may.
+
+    ONE rule for both clear-text schemes: ``http://`` and ``ws://``, because the websocket
+    transport carries the same key and the same audio in the clear — refusing only http leaves
+    the leak on the other transport. A credential over either, to a host that is not local, is a
+    configuration error named here so the caller can refuse it at CONFIGURATION time, before the
+    request exists, instead of warning while sending it (windowsill #215).
+    """
+    parsed = urllib.parse.urlsplit(url)
+    if not has_credential or parsed.scheme not in ("http", "ws"):
+        return None
+    host = parsed.hostname or ""
+    if is_local_host(host, resolve):
+        return None
+    secure = "wss://" if parsed.scheme == "ws" else "https://"
+    return (
+        f"{parsed.scheme} endpoint {host or url!r} would carry the API key and the audio in the "
+        f"clear — point it at {secure}, or at this machine"
+    )
 
 
 def multipart_form(fields: dict[str, str], file_field: str, filename: str, payload: bytes, boundary: str) -> bytes:

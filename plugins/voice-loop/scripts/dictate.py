@@ -104,6 +104,7 @@ import re
 import shlex
 import shutil
 import signal
+import socket
 import stat
 import subprocess
 import sys
@@ -294,9 +295,37 @@ def log(message: str) -> None:
         pass
 
 
-def _is_loopback_host(host: str) -> bool:
-    """True only for addresses that point at the local machine — the one case where plaintext is safe."""
-    return host == "localhost" or host == "::1" or host.startswith("127.")
+def _host_addresses(host: str) -> list[str]:
+    """The ONE place this script turns a hostname into addresses (windowsill #215): one lookup,
+    at configuration time, from the endpoint guard below — never from a request path, where it
+    would be a blocking call on every transcription and every live socket."""
+    try:
+        return [info[4][0] for info in socket.getaddrinfo(host, None)]
+    except (OSError, UnicodeError):
+        return []
+
+
+def _clear_text_refusal(s: dict) -> str | None:
+    """The endpoint policy applied at CONFIGURATION time (windowsill #215): a clear-text scheme —
+    http:// and ws:// are one rule, the websocket carries the same key and audio in the clear —
+    may carry the API key only to a LOCAL endpoint, and local means the RESOLVED address, never
+    the spelling of a name (127.evil.com is a DNS name, not a loopback address). Called once per
+    process, before any request is built or socket dialed, so the doomed request never happens;
+    the old behaviour warned about it while sending it."""
+    if s["backend"] != "cloud":
+        return None
+    entry = resolve_stt_provider(s["stt_provider"])
+    key_envs = entry.key_envs(s["key_env"])
+    if not any(read_key(s["key_file"], env, os.environ) for env in key_envs):
+        return None  # no credential configured — the cloud path refuses keyless calls itself
+    urls = [entry.endpoint(s)]
+    if s["streaming"] and entry.streaming is not None:
+        urls.append(entry.streaming.url(entry.streaming, entry, s))
+    for url in urls:
+        error = providers.clear_text_credential_error(url, has_credential=True, resolve=_host_addresses)
+        if error:
+            return f"cloud stt refused: {error}"
+    return None
 
 
 def _read_bounded_text(path: str, limit: int, *, label: str) -> str | None:
@@ -1252,11 +1281,6 @@ def _transcribe_cloud(s: dict, wav_bytes: bytes, boundary: str) -> str | None:
             f"{entry.name} has no default host"
         )
         return None
-    if parsed.scheme == "http" and parsed.hostname and not _is_loopback_host(parsed.hostname):
-        log(
-            f"cloud stt endpoint is http:// to {parsed.hostname} — "
-            "the API key, audio and transcript travel in the clear"
-        )
     raw = _post_bytes(request.url, request.headers, request.body, request.content_type, s["timeout"])
     if raw is None:
         return None  # network error — already logged by _post_bytes
@@ -1928,12 +1952,6 @@ def run_stream_session(
         }
 
     url = streaming.url(streaming, entry, s)
-    parsed = urllib.parse.urlsplit(url)
-    if parsed.scheme == "ws" and parsed.hostname and not _is_loopback_host(parsed.hostname):
-        log(
-            f"streaming stt endpoint is ws:// to {parsed.hostname} — "
-            "the API key, audio and transcript travel in the clear"
-        )
     try:
         socket_ = connect(url, streaming.headers(key), timeout=STREAM_CONNECT_TIMEOUT)
     except wsclient.WebSocketError as err:
@@ -2486,6 +2504,13 @@ def main(argv: list[str]) -> int:
         os.path.join(os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")), "voice-loop/config.json"),
     )
     s = resolve_settings(load_config(cfg_path), system)
+
+    # The endpoint policy, at configuration time — before any request is built or socket dialed,
+    # and ahead of every path below (the toggle, the transcription, the streaming worker).
+    refusal = _clear_text_refusal(s)
+    if refusal:
+        log(refusal)
+        return 1
 
     # The streaming worker (windowsill#99) is this same script, spawned by its own START toggle —
     # never a hotkey invocation. It is dispatched here, ABOVE the debounce and the pidfile mutex,
