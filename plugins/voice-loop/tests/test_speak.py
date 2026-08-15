@@ -500,6 +500,55 @@ def test_pidfile_write_is_atomic_and_stale_owner_cannot_clear_new_state(state, m
     assert not list(state.glob("voice-loop-playing-*"))
 
 
+def test_atomic_write_removes_its_temp_file_when_the_replace_fails(state, monkeypatch):
+    def deny_replace(src, dst):
+        raise OSError("replace denied")
+
+    monkeypatch.setattr(speak.os, "replace", deny_replace)
+    speak._atomic_write_text(str(state / "playing.pid"), "111", "voice-loop-playing-")
+    assert not (state / "playing.pid").exists()
+    assert not list(state.glob("voice-loop-playing-*"))
+
+
+def test_atomic_write_swallows_a_failed_cleanup(state, monkeypatch):
+    def deny_replace(src, dst):
+        raise OSError("replace denied")
+
+    def deny_unlink(path):
+        raise OSError("unlink denied")
+
+    monkeypatch.setattr(speak.os, "replace", deny_replace)
+    monkeypatch.setattr(speak.os, "unlink", deny_unlink)
+    # the cleanup is best-effort: a failure to remove the temp file must not mask the original error
+    speak._atomic_write_text(str(state / "playing.pid"), "111", "voice-loop-playing-")
+
+
+def test_atomic_write_skips_cleanup_when_the_temp_file_is_never_created(state, monkeypatch):
+    def deny_mkstemp(**kwargs):
+        raise OSError("mkstemp denied")
+
+    monkeypatch.setattr(speak.tempfile, "mkstemp", deny_mkstemp)
+    speak._atomic_write_text(str(state / "playing.pid"), "111", "voice-loop-playing-")
+    assert not (state / "playing.pid").exists()
+
+
+def test_pidfile_ownership_is_false_when_the_record_cannot_be_read(state, monkeypatch):
+    monkeypatch.setattr(speak, "_pidfile_record", "111")
+    monkeypatch.setattr(speak, "_PID_PATH", str(state / "no-such-dir" / "playing.pid"))
+    assert speak._owns_pidfile() is False
+
+
+def test_pidfile_clear_swallows_a_failed_unlink(state, monkeypatch):
+    speak._write_pidfile(111)
+
+    def deny_unlink(path):
+        raise OSError("unlink denied")
+
+    monkeypatch.setattr(speak.os, "unlink", deny_unlink)
+    speak._clear_pidfile()
+    assert speak._pidfile_record is None  # the finally still released the record
+
+
 # --- corrupt config / key files: ignored loudly, never a crash ----------------------------------
 
 
@@ -758,6 +807,37 @@ def test_pid_identity_check_uses_the_macos_command_line_seam():
 
 def test_pid_identity_check_fails_closed_on_an_unsupported_platform():
     assert speak.pid_looks_like_speak(9, read_cmdline=lambda pid: "speak.py", platform_id="win32") is False
+
+
+def test_pid_identity_queries_ps_for_the_macos_command_line(monkeypatch):
+    calls = []
+
+    class PsResult:
+        returncode = 0
+        stdout = b"aplay -q /tmp/voice-loop-speak-abc"
+
+    def fake_run(argv, **kwargs):
+        calls.append(argv)
+        return PsResult()
+
+    monkeypatch.setattr(speak.subprocess, "run", fake_run)
+    assert speak.pid_looks_like_speak(9, platform_id="darwin") is True
+    assert calls == [["ps", "-p", "9", "-o", "command="]]
+
+
+def test_pid_identity_rejects_a_failed_or_unavailable_ps(monkeypatch):
+    class FailedPs:
+        returncode = 1
+        stdout = b""
+
+    monkeypatch.setattr(speak.subprocess, "run", lambda argv, **kwargs: FailedPs())
+    assert speak.pid_looks_like_speak(9, platform_id="darwin") is False
+
+    def no_ps(argv, **kwargs):
+        raise OSError("no ps binary")
+
+    monkeypatch.setattr(speak.subprocess, "run", no_ps)
+    assert speak.pid_looks_like_speak(9, platform_id="darwin") is False
 
 
 def test_cmdline_of_reads_our_own_process():
