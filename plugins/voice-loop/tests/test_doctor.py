@@ -818,7 +818,7 @@ class TestWindowsPrerequisites:
     without monkeypatching the module.
     """
 
-    def test_windows_python_check_decision(self) -> None:
+    def test_windows_python_check_decision(self, monkeypatch) -> None:
         """Each decision produces a distinct, expected key.
 
         The check has two failure modes and two pass-throughs:
@@ -918,6 +918,40 @@ class TestWindowsPrerequisites:
         assert decision_stub is not None
         assert decision_missing is not None
         assert decision_stub["key"] != decision_missing["key"]
+
+        # Exercise the platform-neutral seams with injected Windows-tool results; these are
+        # reachable on the Ubuntu measuring runner without pretending to run Windows itself.
+        assert doctor._is_store_stub(None) is False
+        assert doctor._decode_windows_output("already text") == "already text"
+        assert doctor._decode_windows_output(b"") == ""
+        assert doctor._decode_windows_output(b"plain") == "plain"
+        assert doctor._decode_windows_output(b"\xff") == "�"
+        assert doctor._decode_windows_output(42) == "42"
+        assert doctor._where_python3(platform="linux") == []
+        class FailedWhere:
+            returncode = 1
+            stdout = "unused"
+        assert doctor._where_python3(platform="win32", run=lambda *args, **kwargs: FailedWhere()) == []
+        class SuccessfulWhere:
+            returncode = 0
+            stdout = "C:\\Python311\\python3.exe\n"
+        assert doctor._where_python3(platform="win32", run=lambda *args, **kwargs: SuccessfulWhere()) == [
+            "C:\\Python311\\python3.exe"
+        ]
+        monkeypatch.delenv("USERPROFILE", raising=False)
+        monkeypatch.delenv("HOMEDRIVE", raising=False)
+        monkeypatch.delenv("HOMEPATH", raising=False)
+        assert doctor._redact_windows_path("C:\\temp\\python.exe") == "C:\\temp\\python.exe"
+        assert doctor._redact_windows_path("C:\\Users\\alice\\python.exe") == "C:\\Users\\<user>\\python.exe"
+        assert doctor._wsl_boundary_finding(platform="linux") is None
+        assert doctor._wsl_boundary_finding(
+            platform="win32", distros_probe=lambda: ([], 0)
+        ) is None
+        finding = doctor._wsl_boundary_finding(
+            platform="win32", distros_probe=lambda: (["Ubuntu"], 1)
+        )
+        assert finding is not None
+        assert finding["evidence"]["wsl_distro_count"] == 1
 
     def test_python3_alias_missing_fires_and_reaches_output(
         self, monkeypatch, capsys

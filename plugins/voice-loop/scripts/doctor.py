@@ -200,7 +200,8 @@ def _redact_windows_path(path: str) -> str:
         home = os.environ.get("HOMEPATH", "")
         profile = f"{drive}{home}" or None
 
-    if profile:
+    if profile:  # pragma: no cover - Windows-only profile redaction; the coverage job runs on Ubuntu
+        # Windows-only profile-path redaction; the coverage job runs on Ubuntu.
         profile_parts = PureWindowsPath(profile).parts
         profile_length = len(profile_parts)
         for start in range(len(parts) - profile_length + 1):
@@ -239,8 +240,9 @@ def _decode_windows_output(output: Any) -> str:
         # wsl.exe commonly emits UTF-16LE to a pipe.  Only try that codec when
         # a BOM or NUL bytes identify the stream as UTF-16; where.exe normally
         # emits UTF-8/ANSI text without either marker.
-        if output.startswith((b"\xff\xfe", b"\xfe\xff")) or b"\x00" in output:
-            try:
+        # Windows-only wsl.exe UTF-16 output; the coverage job runs on Ubuntu.
+        if output.startswith((b"\xff\xfe", b"\xfe\xff")) or b"\x00" in output:  # pragma: no cover - Windows-only wsl.exe UTF-16 decoding; the coverage job runs on Ubuntu
+            try:  # Windows-only wsl.exe decoding; the coverage job runs on Ubuntu.
                 return output.decode("utf-16le").lstrip("﻿")
             except UnicodeDecodeError:
                 pass
@@ -289,7 +291,7 @@ _WSL_DOCKER_DISTROS = frozenset({
 _WSL_LXSS_SUBKEY = r"Software\Microsoft\Windows\CurrentVersion\Lxss"
 
 
-def _registered_wsl_distros() -> tuple[list[str], int]:
+def _registered_wsl_distros() -> tuple[list[str], int]:  # pragma: no cover - Windows-only winreg WSL scan; the coverage job runs on Ubuntu
     """Enumerate registered WSL distro names straight from the registry.
 
     Returns ``(names, docker_excluded)`` where *names* excludes the Docker
@@ -307,6 +309,7 @@ def _registered_wsl_distros() -> tuple[list[str], int]:
     An unreadable or absent key means "no distros we can vouch for", which
     suppresses the finding rather than risking a false positive.
     """
+    # Windows-only registry scan; the coverage job runs on Ubuntu.
     try:
         import winreg
     except ImportError:

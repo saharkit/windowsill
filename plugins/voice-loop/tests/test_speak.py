@@ -1960,7 +1960,8 @@ def test_a_line_written_while_the_previous_clip_plays_is_queued_not_dropped(stat
         if elapsed[0] >= PLAYBACK_SECONDS_IN_FLIGHT and child.poll() is None:
             _append_message(transcript, "🔊 the line that waited its turn")
             child.kill()
-            os.waitpid(child.pid, 0)  # reaped without routing through speak.time.sleep
+            # Popen.wait() is the portable process-handle reap; os.waitpid() can hang on Windows.
+            child.wait(timeout=10)
 
     try:
         payload = json.dumps({"transcript_path": str(transcript), "hook_event_name": "Stop"})
