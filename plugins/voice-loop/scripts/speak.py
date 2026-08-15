@@ -2418,36 +2418,41 @@ def main() -> int:
         log(refusal)
         return 0
 
-    # The ledger and the seeding are eager mode's machinery, and they exist ONLY when the user has
-    # opted in. The lock is not part of this gate: every event path takes it below (eager without
-    # blocking, Stop with its grace and takeover), because with eager off there is no ledger to
-    # accidentally provide one.
+    # The ledger, the lock and the seeding are eager mode's machinery, and they exist ONLY when the
+    # user has opted in. With eager off there is one event path, no race to be idempotent against,
+    # and therefore nothing to gate on: everything below reduces to the pre-0.3.2 Stop hook.
+    #
+    # The lock MUST stay behind this gate.  An eager-off Stop that arrived while a previous line was
+    # still playing has to WAIT BESIDE the playing chain (#51: the ladder plus wait_out_playback
+    # reads playing.pid for as long as the clip is in the air), which an acquired lock forbids twice
+    # over — the grace ladder would either end the turn with the lock unheld, or take the lock by
+    # SIGTERming the very chain the wait below is about to wait on.  Takeover is not lost: an
+    # eager-off Stop that actually HAS a line supersedes the older chain at claim time, below.
     ledger_on = s["eager"]
 
     lock = None
     superseded = False  # a turn supersedes the chain before it exactly once, wherever it had to
     try:
-        # Every event path takes the speaking lock.  Eager remains non-blocking; Stop gets its short
-        # grace and takeover chance because it is the turn's last opportunity to speak.  The default
-        # path must be serialized too: without eager, no ledger exists to accidentally provide a lock.
-        if eager:
-            lock = acquire_lock()
-            if lock is None:
-                log("eager: another firing is speaking — line left unclaimed for the next firing")
-                return 0
-        else:
-            lock = acquire_lock(LOCK_GRACE)
-            if lock is None:
-                take_over()
-                superseded = True
-                lock = acquire_lock(LOCK_GRACE)
-            if lock is None:
-                log("stop: the speaking lock is still held — lines left unclaimed")
-                return 0
-
         if ledger_on:
             # Everything from reading the ledger to finishing playback happens under this lock, so a
             # line cannot be claimed twice or spoken over. The acquire never blocks for eager.
+            if eager:
+                lock = acquire_lock()
+                if lock is None:
+                    log("eager: another firing is speaking — line left unclaimed for the next firing")
+                    return 0
+            else:
+                # Stop: give the holder its beat, then supersede it — the SIGTERM releases that
+                # chain's flock with it — and take one more shot.
+                lock = acquire_lock(LOCK_GRACE)
+                if lock is None:
+                    take_over()
+                    superseded = True
+                    lock = acquire_lock(LOCK_GRACE)
+                if lock is None:
+                    log("stop: the speaking lock is still held — lines left unclaimed")
+                    return 0
+
             trim_ledger()
             # First run for this transcript: everything already in it is history. Write it off
             # without speaking it, so enabling eager mid-session cannot recite the session back.
