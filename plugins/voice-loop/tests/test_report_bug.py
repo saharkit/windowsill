@@ -808,6 +808,27 @@ def test_gh_is_available_when_authenticated(monkeypatch):
     assert argv == ["gh", "auth", "status"] and timeout > 0  # argv list, never a shell string
 
 
+def test_artifact_redacts_title_and_rejects_unknown_bundle_fields(install, offline):
+    """L2 gap: catches a new outbound field bypassing the single redaction/schema seam."""
+    bundle = bundle_for(install)
+    artifact = report_bug.make_artifact("account vasilisa at /home/vasilisa", bundle)
+    assert "vasilisa" not in artifact.title
+    with pytest.raises(ValueError, match="unknown field"):
+        report_bug.make_artifact("t", {**bundle, "new_field": "must not travel"})
+
+
+def test_transport_artifact_body_matches_the_bytes_it_sends(tmp_path):
+    """L2 gap: catches consent drift when a transport reads a different body than displayed."""
+    path = tmp_path / "bundle.md"
+    # CRLF on purpose: the reader must not re-normalise the file's bytes or the byte check below fails.
+    path.write_bytes(b"displayed bytes\r\n")
+    artifact = report_bug._load_artifact("private /home/vasilisa", str(path))
+    runner = runner_returning(stdout="https://github.com/saharkit/windowsill/issues/99\n")
+    ok, message = report_bug.create_issue(artifact, str(path), runner=runner)
+    assert ok and message.endswith("/99")
+    assert runner.calls[0][0][5:7] == ["--title", "private /home/<user>"]
+
+
 def test_creating_an_issue_passes_the_body_by_path_and_returns_the_url():
     runner = runner_returning(stdout="https://github.com/saharkit/windowsill/issues/99\n")
     ok, message = report_bug.create_issue("voice-loop: no sound", "/tmp/bundle.md", runner=runner)
