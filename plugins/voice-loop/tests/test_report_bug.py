@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import re
 import stat
 import subprocess
@@ -190,7 +191,11 @@ def test_secrets_named_by_their_config_key_are_dropped_but_pointers_are_kept(ins
     assert config["tts"]["cloud"]["api_key"] == "<redacted-key>"
     # the pointers to a secret are not the secret, and a report without them cannot diagnose "no key"
     assert config["stt"]["cloud"]["api_key_env"] == "VOICE_LOOP_STT_API_KEY"
-    assert config["stt"]["cloud"]["key_file"] == "~/.config/voice-loop/openai.key"
+    # The pointer survives redacted: home collapsed to ~, the file name still readable. The
+    # separator spelling is the platform's and is deliberately not asserted.
+    key_file = config["stt"]["cloud"]["key_file"]
+    assert key_file.startswith("~") and key_file.endswith("openai.key")
+    assert str(install["home"]) not in key_file
 
 
 def test_environment_reports_a_credential_variable_as_set_never_as_its_value(install, offline):
@@ -675,15 +680,19 @@ def test_log_rules_cover_every_log_call_in_the_scripts():
     known = {prefix for prefix, _ in report_bug.LOG_RULES}
     unclassified: list[str] = []
     matched: set[str] = set()
+    # A _NoLock reason reaches log() as a variable, so the regex above cannot see its literal.
+    # Collected separately so the table still covers every string that can be written.
+    reason = re.compile(r"""_NoLock\(\s*reason=f?(['"])(.+?)\1""", re.S)
     for name in ("speak.py", "dictate.py"):
         source = (_SCRIPTS / name).read_text(encoding="utf-8")
-        for _quote, literal in call.findall(source):
-            head = literal.split("{")[0]
-            rows = [prefix for prefix in known if head.startswith(prefix)]
-            if rows:
-                matched.add(max(rows, key=len))
-            else:
-                unclassified.append(f"{name}: {literal[:60]}")
+        for pattern in (call, reason):
+            for _quote, literal in pattern.findall(source):
+                head = literal.split("{")[0]
+                rows = [prefix for prefix in known if head.startswith(prefix)]
+                if rows:
+                    matched.add(max(rows, key=len))
+                else:
+                    unclassified.append(f"{name}: {literal[:60]}")
     assert not unclassified, "log calls with no LOG_RULES row: " + "; ".join(unclassified)
     # …and the other direction: a row nothing writes any more is a row nobody will notice is wrong.
     assert not known - matched, "LOG_RULES rows no script writes: " + "; ".join(sorted(known - matched))
@@ -746,8 +755,12 @@ def test_the_bundle_file_is_written_atomically_and_privately(tmp_path):
     path = tmp_path / "nested" / "bug-report.md"
     report_bug.write_bundle(str(path), "hello\n")
     assert path.read_text() == "hello\n"
-    assert stat.S_IMODE(path.stat().st_mode) == 0o600
     assert [p.name for p in path.parent.iterdir()] == ["bug-report.md"]  # no temp file left behind
+    # mkstemp is the privacy mechanism (write_bundle adds no chmod of its own): 0o600 is the
+    # POSIX creation mode. Windows has no group/other bits to read here — its boundary is the
+    # ACL on the user's own directories — so the mode assertion is a POSIX-only fact.
+    if os.name == "posix":
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
 
 
 def test_a_failed_write_leaves_no_temp_file(tmp_path, monkeypatch):
@@ -766,8 +779,10 @@ def test_collect_prints_byte_exactly_what_it_wrote(install, offline, tmp_path, c
 
 
 def test_the_default_bundle_path_is_timestamped_in_the_state_dir():
+    # Path-to-Path: the separator between the state dir and the file name is the platform's,
+    # and a str-to-str compare would pin this test to the POSIX spelling of it.
     path = report_bug.default_bundle_path("/state", clock_at())
-    assert path == "/state/bug-report-20260803T090000Z.md"
+    assert Path(path) == Path("/state") / "bug-report-20260803T090000Z.md"
 
 
 # --- the three transports --------------------------------------------------------------------------------

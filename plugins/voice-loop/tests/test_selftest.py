@@ -46,10 +46,14 @@ _TOOLS_FOR_SHELL = (
 
 
 def _build_jqless_bin(tmp_path: Path) -> str:
-    """A private /tmp bin directory whose symlinks point at the real tools but whose DIRECTORY
+    """A private /tmp bin directory whose links point at the real tools but whose DIRECTORY
     contains no ``jq`` binary. The test PATH is set to just this directory so the script's own
     interpreter/parser/toolchain is reachable while ``command -v jq`` — the very check the old
     selftest.sh used — answers no.
+
+    The links are COPIES on Windows and symlinks elsewhere: creating a symlink there needs a
+    privilege the runner does not grant, and a failed link reads as "tool absent" to the script's
+    ``command -v`` guard — an exit 1 that says nothing about the parse step under test.
     """
     bin_dir = tmp_path / "jqless-bin"
     bin_dir.mkdir()
@@ -59,11 +63,18 @@ def _build_jqless_bin(tmp_path: Path) -> str:
             continue
         target = bin_dir / name
         try:
-            target.symlink_to(resolved)
-        except FileExistsError:
-            pass
+            if os.name == "nt":
+                shutil.copy2(resolved, target)
+            else:
+                target.symlink_to(resolved)
+        except (FileExistsError, OSError):
+            continue
     if not (bin_dir / "bash").exists() or not (bin_dir / "python3").exists():
         pytest.skip("bash/python3 not findable on this host — cannot simulate a fresh WSL2 distro")
+    # curl is the other tool the script hard-requires before it can report its no-config exit;
+    # a host without it cannot reach the code under test, whichever platform that is.
+    if not (bin_dir / "curl").exists():
+        pytest.skip("curl not findable on this host — selftest.sh refuses to run before the parse step")
     return str(bin_dir)
 
 
@@ -120,8 +131,13 @@ def test_selftest_parses_config_via_python3_not_jq(tmp_path):
                     captured.append(tail)
                 break
     finally:
+        # stop the curl the script is about to hang on. Windows has no process groups, so there
+        # killpg does not exist and the direct kill is the only way to reach the child.
         try:
-            os.killpg(proc.pid, 9)
+            if hasattr(os, "killpg"):
+                os.killpg(proc.pid, 9)
+            else:
+                proc.kill()
         except (OSError, ProcessLookupError):
             pass
         try:

@@ -413,7 +413,9 @@ def test_an_absent_or_unreadable_config_is_an_empty_one_not_a_crash(tmp_path):
 
 
 def test_config_path_defaults_under_xdg_config_home():
-    assert tls_probe.config_path({"XDG_CONFIG_HOME": "/x"}) == "/x/voice-loop/config.json"
+    # Path-to-Path, not rendered-string-to-rendered-string: the join's separator is the platform's,
+    # and comparing str() forms would pin this test to one platform's choice.
+    assert Path(tls_probe.config_path({"XDG_CONFIG_HOME": "/x"})) == Path("/x") / "voice-loop" / "config.json"
 
 
 def test_with_no_url_flag_the_probe_goes_to_the_host_the_config_names(tmp_path, monkeypatch, capsys):

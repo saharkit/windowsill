@@ -1514,6 +1514,10 @@ def test_pid_identity_rejects_a_failed_or_unavailable_ps(monkeypatch):
 
 
 def test_cmdline_of_reads_its_own_process_and_returns_none_for_a_dead_pid():
+    # /proc/<pid>/cmdline exists only on Linux — the helper's own docstring says callers gate on
+    # the platform, and on Windows there is no file to read so BOTH asserts are meaningless.
+    if not sys.platform.startswith("linux"):
+        return
     own = dictate._cmdline_of(os.getpid())
     assert isinstance(own, str) and own
     assert dictate._cmdline_of(10**9) is None
@@ -1546,6 +1550,10 @@ def test_echo_guard_skips_unverified_pids_and_garbage_tokens(state, monkeypatch)
 
 
 def test_echo_guard_falls_back_to_pkill_only_without_a_pidfile(state, monkeypatch):
+    # pkill and os.getuid are POSIX-only; the Windows branch of stop_speak_playback has no
+    # pattern fallback at all, so there is no argv to compare against there.
+    if os.name != "posix":
+        return
     runs = []
     monkeypatch.setattr(dictate.subprocess, "run", lambda argv, **kw: runs.append(argv))
 
@@ -3172,7 +3180,10 @@ class TestFinishStreamWorker:
 
         assert dictate.finish_stream_worker() is None
         assert "did not finish within 5s" in _log_of(state)
-        assert killed == [dictate.signal.SIGTERM, dictate.signal.SIGKILL]  # asked, then made to
+        # "asked, then made to": the hard-kill signal is SIGKILL where the platform has it and
+        # SIGTERM where it does not (Windows), so assert the SECOND signal through the same seam
+        # the product uses rather than naming SIGKILL directly.
+        assert killed == [dictate.signal.SIGTERM, dictate._hard_kill_signal()]
         assert not (state / "dictate-stream.pid").exists()
 
     def test_a_recycled_pid_is_never_signalled_by_the_stop_toggle(self, state, monkeypatch):
@@ -3307,7 +3318,10 @@ class TestStreamWorkerState:
         dictate._write_stream_result({"status": "ok", "text": "round trip", "finals": 1, "messages": 1})
         assert dictate._read_stream_result()["text"] == "round trip"
         assert not list(state.glob("voice-loop-stream-*"))  # renamed over, never left half-written
-        assert oct(os.stat(state / f"dictate-stream.{os.getpid()}.json").st_mode)[-3:] == "600"
+        # mkstemp's creation mode is 0o600 on POSIX; Windows ACLs are the boundary there and the
+        # mode bits read as 0o666, so the privacy assertion is a POSIX-only fact.
+        if os.name == "posix":
+            assert oct(os.stat(state / f"dictate-stream.{os.getpid()}.json").st_mode)[-3:] == "600"
 
     def test_an_unwritable_state_dir_is_logged_and_never_raises(self, state, monkeypatch):
         monkeypatch.setattr(dictate, "_STREAM_RESULT_PATH", str(state / "nope" / "dictate-stream.json"))

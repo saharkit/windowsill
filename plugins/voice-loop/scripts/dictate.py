@@ -1445,8 +1445,13 @@ def _pid_looks_like_recorder(pid: int, recorder: str, platform_id: str = sys.pla
         # the script path rather than the bare name. A bare-name match would refuse that legitimate
         # recorder and wedge the recording (the stop toggle would never signal it).
         return any(os.path.basename(token) == executable for token in cmdline.split())
-    if platform_id == "win32" or os.name == "nt":
+    if platform_id == "win32":
         return _win_pid_is_recorder(pid, recorder)
+    # darwin keeps the historical same-user process contract (no /proc, no handle check). An
+    # unknown non-Windows id keeps it too — the guard exists to REFUSE, not to demand a platform
+    # it was never taught. The host's os.name is deliberately not consulted here: platform_id is
+    # the caller's answer, and on a Windows host a darwin id would otherwise reach for kernel32
+    # while claiming to answer for macOS.
     return True
 
 

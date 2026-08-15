@@ -738,7 +738,14 @@ def trim_ledger() -> None:
 
 class _NoLock:
     """What acquire_lock returns when the platform or the filesystem cannot give us a real lock:
-    speaking proceeds unserialized rather than going silent. Closing it is a no-op."""
+    speaking proceeds unserialized rather than going silent. Closing it is a no-op.
+
+    ``reason`` says WHICH unavailable lock this was, so a caller that goes on to speak can log
+    the degrade once — attached to a turn that actually said something, never to a firing that
+    found nothing new (which fires on every tool call and owes the log silence)."""
+
+    def __init__(self, reason: str = "") -> None:
+        self.reason = reason
 
     def close(self) -> None:
         pass
@@ -759,13 +766,13 @@ def acquire_lock(grace=()):
     try:
         fh = open(_LOCK_PATH, "w", encoding="utf-8")
     except OSError:
-        return _NoLock()
+        return _NoLock(reason=f"the lockfile {_LOCK_PATH} could not be opened")
     if fcntl is None:
-        # Windows lacks flock; do not mute speech solely for that unsupported
-        # advisory primitive. Speech proceeds without inter-process locking.
+        # Windows lacks flock; do not mute speech solely for that unsupported advisory
+        # primitive. Speech proceeds without inter-process locking, and two speakers can now
+        # overlap — a fact the turn that speaks owes the log, logged where it is spoken.
         fh.close()
-        log("speaking lock is unsupported on this platform — speech skipped")
-        return _NoLock()
+        return _NoLock(reason="speaking lock is unsupported on this platform — proceeding unlocked; speech may overlap")
     for pause in (None, *grace):
         if pause is not None:
             time.sleep(pause)
@@ -1486,6 +1493,8 @@ def contour_check(config: dict, t0: float, event: str = "Stop") -> None:
             # supersedes a chain still playing exactly like a fresher turn's line would.
             take_over()
         _write_pidfile(os.getpid())
+        if isinstance(lock, _NoLock) and lock.reason:
+            log(lock.reason)
         if play_text(text[: s["max_chars"]], s, t0, extract_ms=0):
             # Announced ONLY for a delivery that happened, unlike the marked-line ledger. An
             # alert's delivery path is the very service most alerts are about: with the shipped
@@ -2051,9 +2060,11 @@ def _connect_stream_holder(text: str, s: dict):
     """Connect to the resident holder, send the request, half-close the write side, and return the
     open connection (whose read side plays back as SSE). None when the holder could not be reached
     so play_text uses the blob path for this one turn."""
-    if not ensure_stream_holder(s) or not hasattr(socket, "AF_UNIX"):
-        # Windows has no Unix-domain socket API; the resident holder is an
-        # optional latency path and the blob endpoint remains the contract.
+    if not hasattr(socket, "AF_UNIX") or not ensure_stream_holder(s):
+        # The platform guard is FIRST: it is a constant, and putting it left of the
+        # `or` keeps Windows out of ensure_stream_holder entirely — that path ends in
+        # _bind_unix_listener, which has no implementation there. The resident holder
+        # is an optional latency path; the blob endpoint remains the contract.
         return None
     conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
@@ -2447,6 +2458,11 @@ def main() -> int:
             take_over()
         _write_pidfile(os.getpid())
 
+        # A lock that degraded to _NoLock is a fact about THIS spoken turn, not about the
+        # firing: an eager firing that found nothing new also degrades and owes the log
+        # nothing, so the reason rides the lock object to here and is logged exactly once.
+        if isinstance(lock, _NoLock) and lock.reason:
+            log(lock.reason)
         play_text(text, s, t0, extract_ms=extract_ms)
         return 0
     finally:

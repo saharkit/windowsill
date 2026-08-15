@@ -405,6 +405,7 @@ def test_run_holder_main_refuses_for_a_provider_without_a_variant(monkeypatch, t
 # --- the unix-socket plumbing --------------------------------------------------------------------
 
 
+@pytest.mark.skipif(not hasattr(socket, "AF_UNIX"), reason="the holder's socket is Unix-domain; Windows has no AF_UNIX to bind")
 def test_bind_unix_listener_creates_a_listener_and_drops_a_stale_file(tmp_path):
     """A leftover socket file from a crashed holder would make bind() fail; the bind removes any
     stale file first, so a respawn always succeeds."""
@@ -618,6 +619,7 @@ def test_synthesize_line_against_a_real_loopback_websocket():
     assert frags == [b"\x01\x02", b"\x03\x04"]
 
 
+@pytest.mark.skipif(not hasattr(socket, "AF_UNIX"), reason="the holder's socket is Unix-domain; Windows has no AF_UNIX to connect")
 def test_run_holder_serves_a_turn_and_self_exits_when_its_listener_closes(monkeypatch, tmp_path):
     """The daemon loop end to end: prime on the held socket, accept one per-turn connection, emit the
     SSE chunks, and exit cleanly when the listener goes (the shutdown path). Runs in the MAIN thread

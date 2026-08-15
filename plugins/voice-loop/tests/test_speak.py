@@ -895,6 +895,7 @@ def test_take_over_never_signals_itself_or_without_a_pidfile(state, monkeypatch)
     speak.take_over()  # own pid and pid 0 are both skipped
 
 
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="the identity check reads /proc/<pid>/cmdline; Windows has no /proc to identify a child from")
 def test_take_over_sigterms_a_real_recorded_child(state):
     """Real-child integration: a long-sleeping child whose argv carries the voice-loop marker is
     recorded in the pidfile, then taken over — it must receive SIGTERM."""
@@ -999,6 +1000,7 @@ def test_playback_is_live_ignores_dead_pg_leaders(state, monkeypatch):
     assert speak.playback_is_live() is False
 
 
+@pytest.mark.skipif(not hasattr(os, "killpg"), reason="process-group signalling needs os.killpg, which Windows does not have")
 def test_on_sigterm_uses_killpg_when_pgid_is_set(monkeypatch):
     """When _live has a "pgid", _on_sigterm calls os.killpg on it — the process-group
     signalling that reaches the player inside the shell regardless of exec or wrapper depth."""
@@ -1023,11 +1025,12 @@ def test_on_sigterm_uses_killpg_when_pgid_is_set(monkeypatch):
         speak._live.pop("pgid", None)
 
 
+@pytest.mark.skipif(not hasattr(os, "killpg"), reason="process-group signalling needs os.killpg, which Windows does not have")
 def test_on_sigterm_skips_killpg_when_pgid_not_set(monkeypatch):
     """Without a pgid, _on_sigterm never calls killpg — the normal path is unchanged."""
     killpg_calls: list = []
     monkeypatch.setattr(speak.os, "killpg", lambda pgid, sig: killpg_calls.append(1))
-    monkeypatch.setattr(speak.os, "_exit", lambda code: None)
+    monkeypatch.setattr(speak.os, "_exit", lambda code: None)  # don't actually exit
 
     class _FakeProc:
         def poll(self):
@@ -1865,6 +1868,7 @@ def test_playback_is_live_only_for_a_pid_that_exists_and_is_the_chain(state, mon
     assert speak.playback_is_live() is False  # recycled pids: the file lies, the guard does not
 
 
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="the identity check reads /proc/<pid>/cmdline; Windows has no /proc to identify a child from")
 def test_a_pidfile_that_outlived_its_chain_is_not_waited_for(state):
     """Real-child integration, the negative half: a superseded chain leaves through _on_sigterm,
     which exits before the cleanup that would remove its pidfile — so the record routinely outlives
@@ -2901,6 +2905,7 @@ def test_with_eager_off_a_post_tool_use_firing_runs_no_contour_check(state, monk
     assert spoken == [_VOICED]
 
 
+@pytest.mark.skipif(speak.fcntl is None, reason="the contender is a real second flock; Windows has no flock to hold")
 def test_two_firings_in_one_assistant_block_cannot_both_page(state, monkeypatch):
     """Two tool calls in one assistant block are two concurrent hook processes. The eager-off page
     path took no lock at all, and the announced-ledger is a read-modify-write, so both read an

@@ -674,6 +674,13 @@ class TestDoctorMissingEngineDiagnosis:
             doctor, "read_logs", lambda state_home, tail_lines=60: {},
         )
         monkeypatch.setattr(doctor, "load_manifest", lambda root: [])
+        # An empty config and ledger are also the WSL-boundary precondition, and on a Windows
+        # host with a registered distro that finding appends a second row — environment noise,
+        # not part of what this test decides.
+        monkeypatch.setattr(
+            doctor, "_wsl_boundary_finding",
+            lambda **kwargs: None,
+        )
         monkeypatch.setattr(
             doctor, "_sill_core_root",
             lambda: (_ for _ in ()).throw(
@@ -684,7 +691,6 @@ class TestDoctorMissingEngineDiagnosis:
         rc = doctor.main([])
         captured = capsys.readouterr()
         output = json.loads(captured.out)
-
         assert rc == 0
         findings = output["findings"]
         assert len(findings) == 1
@@ -724,6 +730,12 @@ class TestDoctorMissingEngineDiagnosis:
             doctor, "read_logs", lambda state_home, tail_lines=60: {},
         )
         monkeypatch.setattr(doctor, "load_manifest", lambda root: [])
+        # Same as the missing-engine test above: the WSL-boundary finding is environment noise
+        # here, and on a Windows host with a registered distro it would add a second row.
+        monkeypatch.setattr(
+            doctor, "_wsl_boundary_finding",
+            lambda **kwargs: None,
+        )
         monkeypatch.setattr(doctor, "_sill_core_root", lambda: sill_root)
 
         rc = doctor.main([])
@@ -788,13 +800,17 @@ class TestWindowsPrerequisites:
                 return None
             return fake
 
-        # Decision 1: real python3 — no finding.
+        # Decision 1: real python3 — no finding. ``where`` is injected because leaving it at
+        # its default runs ``where.exe python3`` against the HOST's PATH: on a Windows runner
+        # that answers the WindowsApps Store stub too, and the stub-anywhere rule (correctly)
+        # fires a finding this decision was not exercising.
         result = doctor._check_python_interpreter(
             platform="win32",
             which=_which_with(
                 python3="C:\\Python311\\python3.exe",
                 py=None,
             ),
+            where=lambda: ["C:\\Python311\\python3.exe"],
         )
         assert result is None, (
             f"real python3 must not fire a finding: got {result}"
