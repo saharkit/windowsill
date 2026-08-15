@@ -28,6 +28,27 @@ def wav_upload(seconds: float, rate: int = 8000) -> bytes:
     return buf.getvalue()
 
 
+def preparse_request(
+    method: str = "POST",
+    path: str = "/stt",
+    headers: list[tuple[bytes, bytes]] | None = None,
+):
+    """A bare Starlette Request carrying only what the pre-parse gate reads — no body, no receive."""
+    return voice_server.Request(
+        {
+            "type": "http",
+            "method": method,
+            "path": path,
+            "headers": headers or [],
+            "query_string": b"",
+            "scheme": "http",
+            "server": ("test", 80),
+            "client": ("test", 123),
+            "root_path": "",
+        }
+    )
+
+
 def test_health_reports_capabilities(client, monkeypatch):
     monkeypatch.setattr(voice_server, "DEVICE", "cpu")
     monkeypatch.setattr(voice_server, "STT_MODEL", "small")
@@ -277,6 +298,33 @@ def test_tts_honours_an_explicit_speaker(client, fake_silero):
     assert fake_silero.calls[0]["speaker"] == "xenia"
 
 
+# --- field type checks: a non-string field is the client's 400, never an AttributeError 500 (#219) --
+
+
+@pytest.mark.parametrize("field", ["text", "language", "speaker"])
+def test_tts_rejects_a_non_string_field(client, fake_silero, field):
+    """Each of the three fields is type-checked, so a non-string one returns the house 400 rather than
+    crashing in .strip()/.lower() or reaching the model. A regression that checked only `text` would
+    let a non-string `language` or `speaker` through to a 500."""
+    response = client.post("/tts", json={field: 123})
+
+    assert response.status_code == 400
+    body = response.json()
+    assert body["error"] == f"{field} must be a string"
+    assert set(body) == {"error", "hint"}
+    assert fake_silero.calls == []
+
+
+def test_tts_stream_rejects_a_non_string_field_like_tts(client, fake_silero):
+    response = client.post("/tts/stream", json={"text": ["not", "a", "string"]})
+
+    assert response.status_code == 400
+    body = response.json()
+    assert body["error"] == "text must be a string"
+    assert set(body) == {"error", "hint"}
+    assert fake_silero.calls == []
+
+
 def test_tts_chunks_a_long_text_into_several_calls(client, fake_silero):
     text = " ".join(f"Предложение номер {i}." for i in range(120))
     client.post("/tts", json={"text": text})
@@ -387,6 +435,16 @@ def test_tts_text_cap_defaults_are_the_documented_ones(client, fake_silero):
     assert response.status_code == 200
 
 
+def test_tts_refuses_a_json_body_over_one_mib_wherever_the_bytes_live(client, fake_silero):
+    """The 1 MiB raw-body cap counts the WHOLE JSON body, not the text field: a huge `speaker` trips
+    it exactly like a huge `text` would, and before any synthesis starts."""
+    response = client.post("/tts", json={"text": "ok", "speaker": "x" * (1024 * 1024 + 1)})
+
+    assert response.status_code == 413
+    assert "1048576 byte limit" in response.json()["error"]
+    assert fake_silero.calls == []
+
+
 def test_stt_rejects_an_upload_over_the_size_cap(client, fake_whisper, monkeypatch):
     monkeypatch.setattr(voice_server, "MAX_UPLOAD_BYTES", 16)
 
@@ -398,11 +456,17 @@ def test_stt_rejects_an_upload_over_the_size_cap(client, fake_whisper, monkeypat
     assert fake_whisper.calls == []
 
 
-def test_stt_accepts_an_upload_at_the_size_cap(client, fake_whisper, monkeypatch):
+def test_stt_size_cap_counts_the_whole_body_not_just_the_file(client, fake_whisper, monkeypatch):
+    """The cap moved from the handler's file read to the pre-parse Content-Length gate (#219), so the
+    multipart framing counts too: a file exactly at the cap is over it once the wrapper is added. A
+    regression that put the check back in the handler (measuring only the file) would return 200 here."""
     monkeypatch.setattr(voice_server, "MAX_UPLOAD_BYTES", 8)
+
     response = client.post("/stt", files={"audio": ("clip.wav", b"RIFFfake", "audio/wav")})
-    assert response.status_code == 200
-    assert len(fake_whisper.calls) == 1
+
+    assert response.status_code == 413
+    assert "8 byte limit" in response.json()["error"]
+    assert fake_whisper.calls == []
 
 
 def test_stt_rejects_a_wav_longer_than_the_duration_cap(client, fake_whisper, monkeypatch):
@@ -436,6 +500,62 @@ def test_stt_duration_cap_passes_an_unparseable_riff(client, fake_whisper, monke
     response = client.post("/stt", files={"audio": ("clip.wav", b"RIFFfake", "audio/wav")})
     assert response.status_code == 200
     assert len(fake_whisper.calls) == 1
+
+
+# --- the pre-parse upload size gate (#219) ----------------------------------------------------------
+# Content-Length is the only size signal available ABOVE the body parser — by the time an endpoint or
+# dependency runs, Starlette has already spooled the multipart/JSON body. So the cap fires in
+# middleware (preparse_upload_refusal), before a byte is parsed. The helper is unit-tested here for
+# the shapes httpx cannot produce (a lengthless/chunked body, an unreadable length, the exact boundary).
+
+
+def test_preparse_gate_refuses_a_lengthless_post():
+    refusal = voice_server.preparse_upload_refusal(preparse_request(headers=[]))
+    assert refusal is not None
+    assert refusal.status_code == 413
+    assert "chunked" in refusal.body.decode()
+
+
+def test_preparse_gate_refuses_an_unreadable_content_length():
+    refusal = voice_server.preparse_upload_refusal(preparse_request(headers=[(b"content-length", b"nope")]))
+    assert refusal.status_code == 413
+
+
+def test_preparse_gate_lets_non_post_methods_through():
+    assert voice_server.preparse_upload_refusal(preparse_request(method="GET", path="/health")) is None
+
+
+def test_preparse_gate_accepts_a_body_at_the_cap(monkeypatch):
+    monkeypatch.setattr(voice_server, "MAX_UPLOAD_BYTES", 8)
+    refusal = voice_server.preparse_upload_refusal(preparse_request(headers=[(b"content-length", b"8")]))
+    assert refusal is None
+
+
+def test_preparse_gate_refuses_a_body_over_the_cap(monkeypatch):
+    monkeypatch.setattr(voice_server, "MAX_UPLOAD_BYTES", 8)
+    refusal = voice_server.preparse_upload_refusal(preparse_request(headers=[(b"content-length", b"9")]))
+    assert refusal.status_code == 413
+    assert "audio upload larger than the 8 byte limit" in refusal.body.decode()
+
+
+@pytest.mark.parametrize("path", ["/tts", "/tts/stream"])
+def test_preparse_gate_caps_the_two_tts_bodies_at_one_mib(monkeypatch, path):
+    monkeypatch.setattr(voice_server, "MAX_UPLOAD_BYTES", 25 * 1024 * 1024)
+    over = str(voice_server.MAX_TTS_BODY_BYTES + 1).encode()
+
+    refusal = voice_server.preparse_upload_refusal(
+        preparse_request(path=path, headers=[(b"content-length", over)])
+    )
+
+    assert refusal.status_code == 413
+    assert "TTS request body larger than the 1048576 byte limit" in refusal.body.decode()
+
+
+def test_preparse_gate_accepts_a_tts_body_under_one_mib():
+    refusal = voice_server.preparse_upload_refusal(
+        preparse_request(path="/tts", headers=[(b"content-length", b"1024")])
+    )
+    assert refusal is None
 
 
 # --- the wall-clock transcription budget (the cap the duration guard cannot enforce) ---------------
@@ -552,6 +672,37 @@ def test_wav_duration_skips_a_zero_rate_header():
     data = bytearray(wav_upload(1.0))
     struct.pack_into("<I", data, 24, 0)  # the fmt chunk's sample-rate field
     assert voice_server.wav_duration_seconds(bytes(data)) is None
+
+
+# --- an upload the recognizer cannot decode is a 400, never a 500 (#219) ---------------------------
+
+
+def test_transcribe_upload_flags_an_undecodable_upload(monkeypatch):
+    """The decode step — not the model load, not the slot — maps a decode failure to the named error."""
+    class UndecodableModel:
+        def transcribe(self, path, **kwargs):
+            raise RuntimeError("cannot decode")
+
+    monkeypatch.setattr(voice_server, "whisper", lambda: UndecodableModel())
+
+    with pytest.raises(voice_server.UndecodableUpload):
+        voice_server.transcribe_upload(b"RIFFfake", "ru")
+
+
+def test_stt_refuses_an_upload_the_decoder_cannot_read(client, monkeypatch):
+    """The handler turns UndecodableUpload into the house-shaped 400 rather than letting it 500."""
+
+    def undecodable(*args, **kwargs):
+        raise voice_server.UndecodableUpload("the recognizer could not decode the upload")
+
+    monkeypatch.setattr(voice_server, "transcribe_upload", undecodable)
+
+    response = client.post("/stt", files={"audio": ("clip.wav", b"RIFFfake", "audio/wav")})
+
+    assert response.status_code == 400
+    body = response.json()
+    assert body["error"] == "audio could not be decoded"
+    assert set(body) == {"error", "hint"}
 
 
 # --- cross-site browser guard ----------------------------------------------------------------------

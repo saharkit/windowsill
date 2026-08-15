@@ -35,7 +35,9 @@ LAN or an ssh tunnel. Everything is configured through the environment — see R
     VOICE_LOOP_HOOK_STAMP_FILE  the hook's heartbeat stamp (default
                              $XDG_STATE_HOME/voice-loop/hook-last-fired) — /health reports its age
     VOICE_LOOP_ACCENT        1 | 0 — enable automatic accentuation (default 1; ru and uk)
-    VOICE_LOOP_MAX_UPLOAD_BYTES  /stt upload size cap    (default 26214400 — 25 MB)
+    VOICE_LOOP_MAX_UPLOAD_BYTES  pre-parse size cap on every POST body, read off Content-Length
+                             before the body is parsed (default 26214400 — 25 MB; the two TTS
+                             endpoints also carry a fixed 1 MiB raw JSON-body cap — MAX_TTS_BODY_BYTES)
     VOICE_LOOP_MAX_STT_SECONDS   /stt duration cap for parseable WAV uploads (default 600)
     VOICE_LOOP_STT_TIMEOUT   /stt wall-clock transcription budget, ANY codec (default 900 seconds;
                              0 disables it — see bounded_segments below)
@@ -223,6 +225,11 @@ MAX_STT_SECONDS = float(os.environ.get("VOICE_LOOP_MAX_STT_SECONDS", "600"))
 STT_TIMEOUT = float(os.environ.get("VOICE_LOOP_STT_TIMEOUT", "900"))
 MAX_TTS_TEXT = int(os.environ.get("VOICE_LOOP_MAX_TTS_TEXT", "20000"))
 MAX_TTS_TEXT_BLOB = int(os.environ.get("VOICE_LOOP_MAX_TTS_TEXT_BLOB", "3000"))
+# The two TTS endpoints take a JSON body FastAPI decodes in full before the endpoint runs, so the
+# text-character caps above cannot see a body that is huge but text-light. This fixed raw-byte cap —
+# whitespace and every field counted — refuses an over-large body on Content-Length BEFORE that
+# decode, at the same pre-parse layer as the upload cap (see preparse_upload_refusal).
+MAX_TTS_BODY_BYTES = 1024 * 1024
 
 # Whisper on near-silent clips hallucinates well-known junk ("Спасибо за просмотр", TV credits,
 # "Thank you for watching") instead of returning nothing. The blocklist lives next to the server,
@@ -918,6 +925,61 @@ def cross_site_error(request: Request) -> JSONResponse | None:
     return None
 
 
+def preparse_upload_refusal(request: Request) -> JSONResponse | None:
+    """Refuse a POST whose declared size overruns a cap BEFORE the parser spools the body, or None.
+
+    Content-Length is the only size signal available above the body parser: by the time an endpoint
+    or a dependency runs, Starlette has already read the multipart/JSON body in full — FastAPI decodes
+    `payload` for the two TTS endpoints, and spools the multipart form for /stt. A missing length means
+    a chunked body — unmeasurable, so refused the same way. The endpoint's own read(MAX_UPLOAD_BYTES
+    + 1) stays as the memory backstop for a body whose real size disagrees with its header.
+    """
+    if request.method != "POST":
+        return None
+    declared = request.headers.get("content-length")
+    if declared is None:
+        return JSONResponse(
+            {
+                "error": "chunked request bodies are not accepted",
+                "hint": "send a Content-Length header so the body can be size-checked before it is read",
+            },
+            status_code=413,
+        )
+    try:
+        length = int(declared)
+    except ValueError:
+        return JSONResponse(
+            {
+                "error": "unreadable Content-Length header",
+                "hint": "send a valid integer Content-Length header",
+            },
+            status_code=413,
+        )
+    path = request.scope["path"]
+    if path in ("/tts", "/tts/stream"):
+        limit = min(MAX_UPLOAD_BYTES, MAX_TTS_BODY_BYTES)
+        subject = "TTS request body"
+        hint = "the whole JSON body counts — shorten the text, or split it across several /tts/stream requests"
+    else:
+        limit = MAX_UPLOAD_BYTES
+        subject = "audio upload"
+        hint = "send a shorter clip, or raise VOICE_LOOP_MAX_UPLOAD_BYTES on the server"
+    if length > limit:
+        return JSONResponse(
+            {"error": f"{subject} larger than the {limit} byte limit", "hint": hint}, status_code=413
+        )
+    return None
+
+
+@app.middleware("http")
+async def enforce_upload_bounds(request: Request, call_next):
+    """The pre-parse size gate on every POST — refuse an over-cap or lengthless body early."""
+    refusal = preparse_upload_refusal(request)
+    if refusal is not None:
+        return refusal
+    return await call_next(request)
+
+
 def switch_engine_hint(engine: str, language: str) -> str:
     """The `switch VOICE_LOOP_TTS_ENGINE=...` hint when the OTHER engine speaks a refused language.
 
@@ -1070,6 +1132,28 @@ def ukrainian_request_error(language: str) -> JSONResponse | None:
         if hint:
             body["hint"] = hint
         return JSONResponse(body, status_code=400)
+    return None
+
+
+def tts_payload_type_error(payload: dict) -> JSONResponse | None:
+    """The house-shaped 400 for a TTS field that is not a string, or None when the fields are clean.
+
+    ``(payload.get("text") or "").strip()`` / ``.lower()`` turn any non-string truthy ``text`` /
+    ``language`` into an AttributeError -> 500, and a non-string ``speaker`` is passed straight into
+    synthesis. Checked here, before those calls, at BOTH /tts and /tts/stream — a non-string field is
+    the client's error, not a crash. A Pydantic request model is deliberately NOT used: its 422
+    ``detail`` shape would be a third error shape in a file whose every refusal is ``{"error", "hint"}``.
+    """
+    for field in ("text", "language", "speaker"):
+        value = payload.get(field)
+        if value is not None and not isinstance(value, str):
+            return JSONResponse(
+                {
+                    "error": f"{field} must be a string",
+                    "hint": f"send {field!r} as a JSON string, e.g. {{\"text\": \"Привет.\"}}",
+                },
+                status_code=400,
+            )
     return None
 
 
@@ -1661,6 +1745,10 @@ class TranscriptionTimeout(Exception):
     """A transcription outran its wall-clock budget and was abandoned with its slot given back."""
 
 
+class UndecodableUpload(Exception):
+    """The recognizer could not decode the upload — a client error (400), never a server fault."""
+
+
 def _default_clock() -> float:
     """Monotonic seconds. Elapsed time is an INPUT here, injected so a test needs no sleep."""
     return time.monotonic()
@@ -1729,15 +1817,22 @@ def transcribe_upload(
                     raise TranscriptionTimeout(
                         f"transcription outran its {STT_TIMEOUT:.0f} second budget"
                     )
-                segments, info = model.transcribe(
-                    handle.name, language=language, vad_filter=True, initial_prompt=hint
-                )
-                text = " ".join(
-                    segment.text.strip()
-                    for segment in bounded_segments(
-                        segments, STT_TIMEOUT, clock=clock, deadline=deadline
+                try:
+                    segments, info = model.transcribe(
+                        handle.name, language=language, vad_filter=True, initial_prompt=hint
                     )
-                ).strip()
+                    text = " ".join(
+                        segment.text.strip()
+                        for segment in bounded_segments(
+                            segments, STT_TIMEOUT, clock=clock, deadline=deadline
+                        )
+                    ).strip()
+                except TranscriptionTimeout:
+                    raise
+                except Exception as exc:
+                    # A body the decoder cannot read is the client's error, not a crash: it becomes
+                    # the named UndecodableUpload the /stt handler maps to 400, rather than a bare 500.
+                    raise UndecodableUpload("the recognizer could not decode the upload") from exc
         except ModelSlotTimeout as exc:
             raise TranscriptionTimeout(f"transcription outran its {STT_TIMEOUT:.0f} second budget") from exc
     return text, info
@@ -1749,15 +1844,9 @@ async def stt(request: Request, audio: UploadFile = File(...), language: str = "
     if refusal is not None:
         return refusal
     language = (language or LANGUAGE).lower()
+    # The size cap is enforced on Content-Length before the multipart parser spooled this body (see
+    # preparse_upload_refusal); this bounded read stays as the memory backstop.
     data = await audio.read(MAX_UPLOAD_BYTES + 1)
-    if len(data) > MAX_UPLOAD_BYTES:
-        return JSONResponse(
-            {
-                "error": f"audio upload larger than the {MAX_UPLOAD_BYTES} byte limit",
-                "hint": "send a shorter clip, or raise VOICE_LOOP_MAX_UPLOAD_BYTES on the server",
-            },
-            status_code=413,
-        )
     duration = wav_duration_seconds(data)
     if duration is not None and duration > MAX_STT_SECONDS:
         return JSONResponse(
@@ -1782,6 +1871,16 @@ async def stt(request: Request, audio: UploadFile = File(...), language: str = "
                 "on the server",
             },
             status_code=503,
+        )
+    except UndecodableUpload:
+        log.warning("refused an upload the recognizer could not decode")
+        return JSONResponse(
+            {
+                "error": "audio could not be decoded",
+                "hint": "send a WAV or another format faster-whisper can read "
+                "(a 16 kHz mono PCM WAV always works)",
+            },
+            status_code=400,
         )
     text = filter_transcript(text)
     return JSONResponse({"text": text, "language": info.language, "duration": info.duration})
@@ -1824,6 +1923,9 @@ async def tts_endpoint(request: Request, payload: dict) -> Response:
     refusal = cross_site_error(request)
     if refusal is not None:
         return refusal
+    type_error = tts_payload_type_error(payload)
+    if type_error is not None:
+        return type_error
     text = (payload.get("text") or "").strip()
     language = (payload.get("language") or LANGUAGE).lower()
     if len(text) > MAX_TTS_TEXT_BLOB:
@@ -1930,6 +2032,9 @@ async def tts_stream_endpoint(request: Request, payload: dict) -> Response:
     refusal = cross_site_error(request)
     if refusal is not None:
         return refusal
+    type_error = tts_payload_type_error(payload)
+    if type_error is not None:
+        return type_error
     text = (payload.get("text") or "").strip()
     language = (payload.get("language") or LANGUAGE).lower()
     if len(text) > MAX_TTS_TEXT:

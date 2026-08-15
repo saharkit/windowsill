@@ -101,12 +101,20 @@ Three caps keep any single request from monopolizing an executor:
   can decode to hours of transcription. Uploads whose WAV header is cheaply parseable are
   additionally duration-capped at `VOICE_LOOP_MAX_STT_SECONDS` (600 s). Compressed codecs reveal
   their duration only by decoding — the very work the cap exists to avoid — so they pass through on
-  the byte cap alone, honestly unmeasured.
+  the byte cap alone, honestly unmeasured. An upload faster-whisper cannot decode at all is refused
+  with a `400`, never a bare `500`.
 - **`/stt` therefore also carries a wall clock**, `VOICE_LOOP_STT_TIMEOUT` (900 s), which needs no
   header and so bounds the holding time whatever the codec. Whisper decodes lazily, so the budget is
   checked as segments arrive and a transcription that outruns it is abandoned — `503`, with its slot
   handed straight back to whoever is queued. What can overshoot is one segment's decoding, not one
   file's. Set it to `0` to switch the bound off and let long uploads run as long as they need.
+
+Separately, **every POST body is size-gated before it is parsed**: the cap is read off
+`Content-Length` and enforced in middleware, before the multipart/JSON parser spools a byte, so a
+huge body is refused (`413`) without being read — and a chunked body (no `Content-Length`) is refused
+the same way. The two TTS endpoints carry a further fixed **1 MiB** cap on the raw JSON body
+(whitespace and every field counted), also on `Content-Length`, so a request whose `text` is short
+but whose other fields are huge is refused before FastAPI decodes it.
 
 The [recolor stage](#rvc-recolor-stage-voice-conversion) is deliberately **outside** all of this: it
 is not a model call on this box, so it takes no slot and its wait cannot block a synthesis queued
@@ -141,7 +149,7 @@ request waiting.
 | `VOICE_LOOP_STRESS_FILE` | `~/.config/voice-loop/stress.json` | your stress overrides |
 | `VOICE_LOOP_HOOK_STAMP_FILE` | `~/.local/state/voice-loop/hook-last-fired` | the hook's heartbeat stamp — `/health` reports its age as `hook_last_fired_age_s`; see [the troubleshooting entry](../docs/troubleshooting.md#the-voice-stops-entirely-mid-session-but-everything-works-by-hand) |
 | `VOICE_LOOP_ACCENT` | `1` | set `0` to skip automatic accentuation |
-| `VOICE_LOOP_MAX_UPLOAD_BYTES` | `26214400` (25 MB) | `/stt` upload size cap — a larger clip gets `413` |
+| `VOICE_LOOP_MAX_UPLOAD_BYTES` | `26214400` (25 MB) | pre-parse size cap on every POST body, checked on `Content-Length` before the body is parsed — a larger body gets `413` |
 | `VOICE_LOOP_MAX_STT_SECONDS` | `600` | `/stt` duration cap when the WAV header is parseable — see [Capacity](#capacity) |
 | `VOICE_LOOP_STT_TIMEOUT` | `900` | `/stt` wall-clock transcription budget, any codec; `0` disables it — see [Capacity](#capacity) |
 | `VOICE_LOOP_MAX_TTS_TEXT` | `20000` | `/tts/stream` text length cap — longer text gets `400` |
