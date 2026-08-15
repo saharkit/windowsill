@@ -2082,9 +2082,37 @@ def test_the_mirrored_hook_timeout_is_the_one_the_manifest_declares():
     assert declared == {HOOK_TIMEOUT_S}
 
 
-def test_hook_commands_probe_a_real_interpreter_before_running_speak():
-    """Mutation gap: removing the executable probes makes a Store ``python3`` alias launch the
-    Store instead of the hook; the stock-Windows entry surface then silently does nothing."""
+def _hook_stub_interpreter(stub_dir: Path, name: str, log_path: Path, speak_exit: int) -> None:
+    """A ``name`` executable that logs its argv and stands in for a working interpreter.
+
+    Probe calls (``-c "import sys"``) succeed; running speak.py exits ``speak_exit`` — the
+    scenario dial for the fallthrough cases below."""
+    stub = stub_dir / name
+    stub.write_text(
+        "#!/bin/sh\n"
+        f'printf "%s\\n" "{name} $*" >> "{log_path}"\n'
+        f'case " $* " in *"speak.py"*) exit {speak_exit} ;; esac\n'
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    stub.chmod(0o755)
+
+
+def _speak_invocations(log_path: Path) -> list[str]:
+    return [line for line in log_path.read_text(encoding="utf-8").splitlines() if "speak.py" in line]
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX stub executables and shell grouping")
+def test_hook_commands_probe_a_real_interpreter_before_running_speak(tmp_path):
+    """Runs the hooks.json command under a real shell with stub interpreters on PATH, so the
+    short-circuit is EXECUTED, not string-matched.
+
+    Mutation gap this pins (#205): flattening the chain back to
+    ``probe && speak || probe && speak || probe && speak`` fires speak.py once per working
+    interpreter — invisible to a literal-string assert, caught here by counting recorded
+    speak.py invocations. Still caught structurally: removing the ``import sys`` probes
+    fails the probe-presence assert; a probeless command that leans on shell ``||`` alone
+    cannot tell a Store ``python3`` alias from a working interpreter."""
     manifest = json.loads((Path(__file__).resolve().parents[1] / "hooks" / "hooks.json").read_text(encoding="utf-8"))
     commands: list[str] = []
     for registrations in manifest["hooks"].values():
@@ -2092,15 +2120,57 @@ def test_hook_commands_probe_a_real_interpreter_before_running_speak():
             for entry in registration["hooks"]:
                 commands.append(entry["command"])
     assert len(commands) >= 2, "expected at least two hook registrations (Stop + PostToolUse)"
-    expected = (
-        '(python3 -c "import sys" && python3 "${CLAUDE_PLUGIN_ROOT}/scripts/speak.py") '
-        '|| (python -c "import sys" && python "${CLAUDE_PLUGIN_ROOT}/scripts/speak.py") '
-        '|| (py -3 -c "import sys" && py -3 "${CLAUDE_PLUGIN_ROOT}/scripts/speak.py")'
-    )
+
+    plugin_root = tmp_path / "plugin"
+    (plugin_root / "scripts").mkdir(parents=True)
+    (plugin_root / "scripts" / "speak.py").write_text("# stub target; the interpreter stub logs the run\n")
+
+    def run_command(cmd: str, present: list[str], speak_exit: int = 0) -> tuple[int, list[str]]:
+        stub_dir = tmp_path / "stubs"
+        stub_dir.mkdir(exist_ok=True)
+        for stale in stub_dir.iterdir():
+            stale.unlink()  # each scenario names exactly the interpreters it wants present
+        log = tmp_path / "invocations.log"
+        log.write_text("", encoding="utf-8")
+        for name in present:
+            _hook_stub_interpreter(stub_dir, name, log, speak_exit)
+        result = subprocess.run(
+            cmd,
+            shell=True,
+            capture_output=True,
+            timeout=30,
+            env={**os.environ, "PATH": str(stub_dir), "CLAUDE_PLUGIN_ROOT": str(plugin_root)},
+        )
+        return result.returncode, _speak_invocations(log)
+
+    all_three = ["python3", "python", "py"]
     for cmd in commands:
-        assert cmd == expected, (
-            "hook command must group each interpreter probe with its speak.py action "
-            f"so the first successful pair short-circuits; got: {cmd!r}"
+        assert cmd.count("import sys") == cmd.count("speak.py"), (
+            "every speak.py run in the hook command must be guarded by its own interpreter probe; "
+            f"got: {cmd!r}"
+        )
+
+        # Short-circuit: with every interpreter working and speak.py succeeding, speak.py
+        # runs exactly once. The flattened chain runs it once per working interpreter.
+        code, spoke = run_command(cmd, all_three)
+        assert code == 0 and len(spoke) == 1, (
+            f"first working interpreter must short-circuit the chain: exit {code}, "
+            f"speak.py ran {len(spoke)} time(s); got: {cmd!r}"
+        )
+
+        # Fallthrough: the first interpreter absent, the second present — still exactly once.
+        code, spoke = run_command(cmd, ["python", "py"])
+        assert code == 0 and len(spoke) == 1, (
+            f"a missing python3 must fall through to the next interpreter, speaking once: "
+            f"exit {code}, speak.py ran {len(spoke)} time(s); got: {cmd!r}"
+        )
+
+        # Pinned as intended: a probe that succeeds but a speak.py that FAILS falls through
+        # to the next interpreter too — the next one may have the stdlib the first lacked.
+        code, spoke = run_command(cmd, all_three, speak_exit=3)
+        assert code == 3 and len(spoke) == 3, (
+            "a speak.py failure on one interpreter is retried on the next (and only) two, "
+            f"with the last exit code surfacing; got exit {code}, {len(spoke)} run(s): {cmd!r}"
         )
 
 
