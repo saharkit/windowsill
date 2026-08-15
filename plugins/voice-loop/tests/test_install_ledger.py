@@ -652,3 +652,13 @@ class TestRobustness:
         assert result["state"] == "none"
         assert result["read_status"] == "malformed"
         assert "JSONDecodeError" in result["read_detail"]
+
+    @pytest.mark.parametrize("state", [[], {}])
+    def test_non_string_state_is_classified_as_malformed(self, ledger_path, state):
+        os.makedirs(os.path.dirname(ledger_path), exist_ok=True)
+        with open(ledger_path, "w") as fh:
+            json.dump({"state": state, "steps": {}}, fh)
+        result = install_ledger.check_state(ledger_path)
+        assert result["state"] == "none"
+        assert result["read_status"] == "malformed"
+        assert "invalid ledger state" in result["read_detail"]

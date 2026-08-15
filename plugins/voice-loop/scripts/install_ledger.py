@@ -140,7 +140,7 @@ def read_ledger(ledger_path: str) -> LedgerData | None:
         return LedgerData({}, status="malformed", detail="ledger must be a JSON object")
     state = loaded.get("state", "none")
     steps = loaded.get("steps", {})
-    if state not in {"none", "in_progress", "complete", "cancelled"}:
+    if not isinstance(state, str) or state not in {"none", "in_progress", "complete", "cancelled"}:
         return LedgerData({}, status="malformed", detail=f"invalid ledger state: {state!r}")
     if not isinstance(steps, dict) or any(not isinstance(entry, dict) for entry in steps.values()):
         return LedgerData({}, status="malformed", detail="ledger steps must be an object of objects")
