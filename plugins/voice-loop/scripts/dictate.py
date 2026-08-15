@@ -124,7 +124,7 @@ import wsclient
 
 try:
     import fcntl
-except ImportError:  # pragma: no cover - POSIX-only; Linux and macOS are the supported platforms
+except ImportError:
     fcntl = None  # type: ignore[assignment]
 
 # Every recorder in the table records 16 kHz mono S16 — 32000 bytes of PCM per second. The clip
@@ -1286,7 +1286,7 @@ def _pid_alive(pid: int) -> bool:
     ask is a per-iteration process launch."""
     if pid <= 0:
         return False
-    if os.name == "nt":  # pragma: no cover — exercised on Windows; the lane runs Linux
+    if os.name == "nt":
         import ctypes
 
         try:
@@ -1356,7 +1356,7 @@ def _pid_alive(pid: int) -> bool:
     return True
 
 
-def _win_console_ctrl_c(pid: int) -> bool:  # pragma: no cover — exercised on Windows; the lane runs Linux
+def _win_console_ctrl_c(pid: int) -> bool:
     """Send CTRL_C_EVENT to the console *pid* lives in — True if the event went out.
 
     This is the Windows equivalent of SIGINT, and the only graceful stop that reaches a process
@@ -1444,9 +1444,8 @@ def _win_pid_is_recorder(pid: int, recorder: str) -> bool:
     """
     if pid <= 0 or not recorder:
         return False  # plain-Python guard, left under coverage: no Windows-only API before this
-    import ctypes  # pragma: no cover — exercised on Windows; the lane runs Linux
-
-    try:  # pragma: no cover — everything from here reaches kernel32
+    import ctypes
+    try:
         kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # stdlib; Windows arm
         PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
         kernel32.OpenProcess.argtypes = (
@@ -1482,7 +1481,7 @@ def _win_pid_is_recorder(pid: int, recorder: str) -> bool:
             return image == expected
         finally:
             kernel32.CloseHandle(handle)  # every path that opened it closes it
-    except (OSError, AttributeError):  # pragma: no cover — only the excluded Windows arm can raise these
+    except (OSError, AttributeError):
         return False  # kernel32 is not what we expect: cannot verify, do not signal
 
 
@@ -1501,9 +1500,9 @@ def _stop_recorder(pid: int, system: str, recorder: str = "") -> None:
     outlives its process and the kernel recycles PIDs, so a stale pid must not get a Ctrl+C in an
     unrelated console group, nor the TerminateProcess that follows it."""
     if system == "Windows":
-        if not _win_pid_is_recorder(pid, recorder):  # pragma: no cover — exercised on Windows
-            return  # pragma: no cover — a recycled pid: signal nobody, terminate nobody
-        _win_console_ctrl_c(pid)  # pragma: no cover — exercised on Windows; the lane runs Linux
+        if not _win_pid_is_recorder(pid, recorder):
+            return
+        _win_console_ctrl_c(pid)
     else:
         try:
             os.kill(pid, signal.SIGINT)

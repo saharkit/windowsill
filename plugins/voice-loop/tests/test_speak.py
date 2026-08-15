@@ -2082,11 +2082,9 @@ def test_the_mirrored_hook_timeout_is_the_one_the_manifest_declares():
     assert declared == {HOOK_TIMEOUT_S}
 
 
-def test_hook_commands_use_python3_not_bash():
-    """Mutation gap: changing ``python3`` back to ``bash`` in hooks.json would restore the
-    Windows-native failure — ``bash`` resolves to WSL's bash.exe which mangles Windows paths
-    and exits 127.  The hook must call the cross-platform interpreter, not a shell whose
-    resolution depends on the host."""
+def test_hook_commands_probe_a_real_interpreter_before_running_speak():
+    """Mutation gap: removing the executable probes makes a Store ``python3`` alias launch the
+    Store instead of the hook; the stock-Windows entry surface then silently does nothing."""
     manifest = json.loads((Path(__file__).resolve().parents[1] / "hooks" / "hooks.json").read_text(encoding="utf-8"))
     commands: list[str] = []
     for registrations in manifest["hooks"].values():
@@ -2095,8 +2093,11 @@ def test_hook_commands_use_python3_not_bash():
                 commands.append(entry["command"])
     assert len(commands) >= 2, "expected at least two hook registrations (Stop + PostToolUse)"
     for cmd in commands:
-        assert cmd.startswith("python3 "), (
-            f"hook command must use python3 (cross-platform), not a shell that differs per host; got: {cmd!r}"
+        assert cmd.startswith("python3 -c "), (
+            f"hook command must probe python3 before execution; got: {cmd!r}"
+        )
+        assert 'import sys' in cmd and 'python -c' in cmd and 'py -3 -c' in cmd, (
+            f"hook command must carry all stock-Windows interpreter probes; got: {cmd!r}"
         )
         assert "speak.py" in cmd, (
             f"hook command must invoke speak.py (the Python entry point); got: {cmd!r}"

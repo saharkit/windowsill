@@ -88,7 +88,12 @@ capture and playback — still depends on POSIX facilities (process groups, `pki
 `fcntl`) and is not a native-Windows path. [#42](https://github.com/saharkit/windowsill/issues/42)
 tracks that work.
 
-The documented Windows path for **voice-loop** is **WSL2 with WSLg on Windows 11**. From an
+**voice-loop also supports native Windows 11.** Its hook and `.cmd` launcher probe for a real
+interpreter instead of trusting the Microsoft Store `python3` alias; native dictation uses
+DirectShow, `clip.exe`, and PowerShell SendKeys. The voice-loop unit suite runs on `windows-latest`
+in CI. That CI leg is not a substitute for an attended microphone and speaker pass.
+
+The documented Windows-in-WSL path for **voice-loop** is **WSL2 with WSLg on Windows 11**. From an
 elevated PowerShell, install WSL2 with:
 
 ```powershell
@@ -167,7 +172,7 @@ agent reads first) and `.claude/` (its review-lens map).
 ## Conventions (every plugin here follows them)
 
 - **Every plugin is testable without hardware.** If a plugin talks to the world, it ships a loopback
-  or contract test that CI can run on Linux and macOS.
+  or contract test that CI can run on Linux, macOS, and (where native paths exist) Windows.
 - **The least-privilege path is the default path.** Anything needing root or a system consent is an
   explicit opt-in, with the command printed rather than silently executed.
 - **Configuration lives in the user's config file, never in the code.** No endpoints, keys or paths

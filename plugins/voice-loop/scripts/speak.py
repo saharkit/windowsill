@@ -199,8 +199,7 @@ except ImportError:
 
 try:
     import fcntl
-except ImportError:  # pragma: no cover - POSIX-only; Linux and macOS are the supported platforms
-    fcntl = None  # type: ignore[assignment]
+except ImportError:    fcntl = None  # type: ignore[assignment]
 
 # Retry backoff for the flush race: adaptive, front-loaded — most races resolve within the first
 # fraction of a second, so we probe early instead of sleeping a flat 5 x 0.7 s tail.
@@ -748,7 +747,7 @@ def acquire_lock(grace=()):
         fh = open(_LOCK_PATH, "w", encoding="utf-8")
     except OSError:
         return _NoLock()
-    if fcntl is None:  # pragma: no cover - supported installs run Linux (including WSL) or macOS
+    if fcntl is None:
         fh.close()
         log("speaking lock is unsupported on this platform — speech skipped")
         return None

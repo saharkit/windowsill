@@ -747,6 +747,25 @@ One rule before the per-desktop recipes: **on macOS, bind a physical chord, not 
 the macOS subsection below for why and for the question to ask. On Linux the F-row is a real key and
 `F9` remains the default.
 
+### Windows native
+
+On native Windows, install the durable launcher beside the Windows `.cmd` shim before binding a
+hotkey. The hook itself probes `python3`, `python`, and `py -3`, running each probe so the Microsoft
+Store `python3` alias cannot win by name alone. Bind the copied `.cmd` file (or the stable launcher
+from a shortcut) with the Windows shortcut UI or a global-hotkey helper:
+
+```powershell
+$bin = Join-Path $HOME "AppData\Local\voice-loop"
+New-Item -ItemType Directory -Force $bin | Out-Null
+Copy-Item "${CLAUDE_PLUGIN_ROOT}\scripts\voice-loop-dictate.cmd" "$bin\voice-loop-dictate.cmd"
+```
+
+The `.cmd` file is checked out with CRLF and invokes the first interpreter that actually runs. Use
+`$bin\voice-loop-dictate.cmd send` for the hands-free mode or `paste` for clipboard-only mode. The
+native recorder needs `ffmpeg` with DirectShow access to a microphone; `/doctor` and the setup proof
+must name a missing recorder rather than claiming a green install. If no graphical session exists,
+run the command directly instead of binding a key.
+
 ### No graphical session — skip the hotkey (Linux only)
 
 This check is **Linux only** — decide from the Step 0 `uname -s` line. macOS does not export

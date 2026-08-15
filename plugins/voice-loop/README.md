@@ -74,10 +74,12 @@ through) it is the **ear-check** — the agent speaks a line and you confirm you
 custom synthetic voice afterwards: `/voice-design`. To take the whole contour back off:
 [`/voice-remove`](#uninstall).
 
-Supported platforms: Linux and macOS. On Windows, use **WSL2 + WSLg on Windows 11**: install
-WSL2 with `wsl --install` from elevated PowerShell, then follow this page's Linux quickstart
-inside the distro. WSLg supplies the Linux GUI/audio integration for an attended Windows desktop;
-the WSL2 verification pass confirmed the marketplace install, the registered hook command,
+Supported platforms: Linux, macOS, and **native Windows 11**. On Windows, the hook uses a
+real-interpreter probe (`python3`, `python`, then `py -3`) and native dictation uses DirectShow,
+`clip.exe`, and PowerShell SendKeys. CI runs this unit suite on `windows-latest`; it does not replace
+an attended microphone and speaker pass. WSL2 + WSLg remains supported too: install WSL2 with
+`wsl --install` from elevated PowerShell, then follow this page's Linux quickstart inside the distro.
+WSLg supplies the Linux GUI/audio integration for an attended Windows desktop; the WSL2 verification pass confirmed the marketplace install, the registered hook command,
 CI-style fake-recorder dictation, and a `lan` loopback against a remote server. It ran on
 **Ubuntu 24.04**, and the distro version bounds the claim: a newer release is not covered, and the
 package names `/voice-setup` installs are not guaranteed to be the same there. A second pass on the
@@ -649,7 +651,7 @@ bash plugins/voice-loop/scripts/selftest.sh --endpoint http://127.0.0.1:8355
 
 Synthesizes a known phrase, feeds the audio straight back into recognition, and compares the
 transcript (case, punctuation and stress marks ignored). No microphone, no speakers, no display — it
-runs in a bare container, and it is what CI runs on Linux and macOS on every commit.
+runs in a bare container, and it is what CI runs on Linux, macOS, and native Windows on every commit.
 
 The server's own Python is unit-tested with a hard 100% coverage gate on Python 3.10–3.13, and the
 Stop hook is invoked for real in CI. The parts a machine cannot check for you — the hotkey, a real
