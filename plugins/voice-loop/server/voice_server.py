@@ -36,8 +36,9 @@ LAN or an ssh tunnel. Everything is configured through the environment — see R
                              $XDG_STATE_HOME/voice-loop/hook-last-fired) — /health reports its age
     VOICE_LOOP_ACCENT        1 | 0 — enable automatic accentuation (default 1; ru and uk)
     VOICE_LOOP_MAX_UPLOAD_BYTES  pre-parse size cap on every POST body, read off Content-Length
-                             before the body is parsed (default 26214400 — 25 MB; the two TTS
-                             endpoints also carry a fixed 1 MiB raw JSON-body cap — MAX_TTS_BODY_BYTES)
+                             before the body is parsed (default 26214400 — 25 MB)
+    VOICE_LOOP_MAX_TTS_BODY_BYTES  raw JSON-body cap on the two TTS endpoints, enforced on
+                             Content-Length before the body is parsed (default 1048576 — 1 MiB)
     VOICE_LOOP_MAX_STT_SECONDS   /stt duration cap for parseable WAV uploads (default 600)
     VOICE_LOOP_STT_TIMEOUT   /stt wall-clock transcription budget, ANY codec (default 900 seconds;
                              0 disables it — see bounded_segments below)
@@ -238,10 +239,10 @@ STT_TIMEOUT = float(os.environ.get("VOICE_LOOP_STT_TIMEOUT", "900"))
 MAX_TTS_TEXT = int(os.environ.get("VOICE_LOOP_MAX_TTS_TEXT", "20000"))
 MAX_TTS_TEXT_BLOB = int(os.environ.get("VOICE_LOOP_MAX_TTS_TEXT_BLOB", "3000"))
 # The two TTS endpoints take a JSON body FastAPI decodes in full before the endpoint runs, so the
-# text-character caps above cannot see a body that is huge but text-light. This fixed raw-byte cap —
+# text-character caps above cannot see a body that is huge but text-light. This raw-byte cap —
 # whitespace and every field counted — refuses an over-large body on Content-Length BEFORE that
 # decode, at the same pre-parse layer as the upload cap (see preparse_upload_refusal).
-MAX_TTS_BODY_BYTES = 1024 * 1024
+MAX_TTS_BODY_BYTES = int(os.environ.get("VOICE_LOOP_MAX_TTS_BODY_BYTES", str(1024 * 1024)))
 
 # Whisper on near-silent clips hallucinates well-known junk ("Спасибо за просмотр", TV credits,
 # "Thank you for watching") instead of returning nothing. The blocklist lives next to the server,
@@ -975,9 +976,9 @@ def preparse_upload_refusal(request: Request) -> JSONResponse | None:
             },
             status_code=413,
         )
-    try:
-        length = int(declared)
-    except ValueError:
+    # int() would also accept a sign, whitespace, or underscores; a Content-Length is 1*DIGIT. This
+    # refuses the negative and non-canonical shapes that would otherwise pass the size check below.
+    if not declared.isdecimal():
         return JSONResponse(
             {
                 "error": "unreadable Content-Length header",
@@ -985,11 +986,15 @@ def preparse_upload_refusal(request: Request) -> JSONResponse | None:
             },
             status_code=413,
         )
+    length = int(declared)
     path = request.scope["path"]
     if path in ("/tts", "/tts/stream"):
         limit = min(MAX_UPLOAD_BYTES, MAX_TTS_BODY_BYTES)
         subject = "TTS request body"
-        hint = "the whole JSON body counts — shorten the text, or split it across several /tts/stream requests"
+        hint = (
+            "the whole JSON body counts — shorten the text, or split it across several /tts/stream "
+            "requests, or raise VOICE_LOOP_MAX_TTS_BODY_BYTES on the server"
+        )
     else:
         limit = MAX_UPLOAD_BYTES
         subject = "audio upload"
@@ -1890,6 +1895,19 @@ def bounded_segments(
         yield segment
 
 
+def undecodable_upload_errors() -> tuple[type[Exception], ...]:
+    """The exception a body no decoder can read surfaces as — faster-whisper's av.error.InvalidDataError.
+
+    A file that is not decodable audio fails inside faster-whisper's PyAV open as InvalidDataError —
+    the one exception whose name says "bad input" rather than a server-side fault. Imported lazily
+    (like the recognizer itself): av is a transitive dependency of faster-whisper, which whisper()
+    imports before any transcription runs, so av is present by the time this is reached.
+    """
+    import av
+
+    return (av.error.InvalidDataError,)
+
+
 def transcribe_upload(
     data: bytes,
     language: str,
@@ -1933,9 +1951,11 @@ def transcribe_upload(
                     ).strip()
                 except TranscriptionTimeout:
                     raise
-                except Exception as exc:
+                except undecodable_upload_errors() as exc:
                     # A body the decoder cannot read is the client's error, not a crash: it becomes
-                    # the named UndecodableUpload the /stt handler maps to 400, rather than a bare 500.
+                    # the named UndecodableUpload the /stt handler maps to 400, rather than a bare
+                    # 500. Any other exception misses this clause and propagates to the ordinary 500
+                    # path, traceback and all.
                     raise UndecodableUpload("the recognizer could not decode the upload") from exc
         except ModelSlotTimeout as exc:
             raise TranscriptionTimeout(f"transcription outran its {STT_TIMEOUT:.0f} second budget") from exc
@@ -1976,8 +1996,8 @@ async def stt(request: Request, audio: UploadFile = File(...), language: str = "
             },
             status_code=503,
         )
-    except UndecodableUpload:
-        log.warning("refused an upload the recognizer could not decode")
+    except UndecodableUpload as exc:
+        log.warning("refused an upload the recognizer could not decode (%s)", exc.__cause__)
         return JSONResponse(
             {
                 "error": "audio could not be decoded",

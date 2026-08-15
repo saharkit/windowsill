@@ -681,11 +681,17 @@ def test_wav_duration_skips_a_zero_rate_header():
 # --- an upload the recognizer cannot decode is a 400, never a 500 (#219) ---------------------------
 
 
-def test_transcribe_upload_flags_an_undecodable_upload(monkeypatch):
+def test_transcribe_upload_flags_an_undecodable_upload(monkeypatch, import_fake):
     """The decode step — not the model load, not the slot — maps a decode failure to the named error."""
+    class InvalidDataError(Exception):
+        pass
+
+    error = import_fake("av.error", InvalidDataError=InvalidDataError)
+    import_fake("av", error=error)
+
     class UndecodableModel:
         def transcribe(self, path, **kwargs):
-            raise RuntimeError("cannot decode")
+            raise InvalidDataError("cannot decode")
 
     monkeypatch.setattr(voice_server, "whisper", lambda: UndecodableModel())
 

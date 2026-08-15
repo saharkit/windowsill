@@ -155,6 +155,7 @@ request waiting.
 | `VOICE_LOOP_HOOK_STAMP_FILE` | `~/.local/state/voice-loop/hook-last-fired` | the hook's heartbeat stamp — `/health` reports its age as `hook_last_fired_age_s`; see [the troubleshooting entry](../docs/troubleshooting.md#the-voice-stops-entirely-mid-session-but-everything-works-by-hand) |
 | `VOICE_LOOP_ACCENT` | `1` | set `0` to skip automatic accentuation |
 | `VOICE_LOOP_MAX_UPLOAD_BYTES` | `26214400` (25 MB) | pre-parse size cap on every POST body, checked on `Content-Length` before the body is parsed — a larger body gets `413` |
+| `VOICE_LOOP_MAX_TTS_BODY_BYTES` | `1048576` (1 MiB) | raw JSON-body cap on the two TTS endpoints, checked on `Content-Length` before the body is parsed — a larger body gets `413` |
 | `VOICE_LOOP_MAX_STT_SECONDS` | `600` | `/stt` duration cap when the WAV header is parseable — see [Capacity](#capacity) |
 | `VOICE_LOOP_STT_TIMEOUT` | `900` | `/stt` wall-clock transcription budget, any codec; `0` disables it — see [Capacity](#capacity) |
 | `VOICE_LOOP_MAX_TTS_TEXT` | `20000` | `/tts/stream` text length cap — longer text gets `400` |
