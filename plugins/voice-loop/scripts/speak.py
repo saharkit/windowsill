@@ -410,17 +410,29 @@ _live: dict = {"proc": None, "files": set(), "stream": None}
 # The exact record this process last installed. Comparing the full record prevents an older
 # invocation from unlinking a newer invocation's pidfile between its read and unlink.
 _pidfile_record: str | None = None
+_stream_holder_pid_record: str | None = None
+_stream_holder_socket_identity: tuple[int, int] | None = None
 
 
 def log(message: str) -> None:
     global _stop_reason_logged
     if _fired["event"] == "Stop" and message.startswith("stop:"):
         _stop_reason_logged = True
+    line = f"{time.strftime('%Y-%m-%dT%H:%M:%S')} {message}\n".encode("utf-8")
     try:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
+        flags |= getattr(os, "O_NOFOLLOW", 0)
         if os.path.exists(_LOG_PATH) and os.path.getsize(_LOG_PATH) > 1_000_000:
-            open(_LOG_PATH, "w").close()
-        with open(_LOG_PATH, "a", encoding="utf-8") as fh:
-            fh.write(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} {message}\n")
+            # Rotate by replacing the journal with a fresh, restrictive inode.  Never truncate a
+            # path in place: a planted symlink must be refused, and readers see old or new content.
+            fd, tmp = tempfile.mkstemp(prefix="voice-loop-log-", dir=os.path.dirname(_LOG_PATH), text=False)
+            os.close(fd)
+            os.replace(tmp, _LOG_PATH)
+        fd = os.open(_LOG_PATH, flags, 0o600)
+        try:
+            os.write(fd, line)
+        finally:
+            os.close(fd)
     except OSError:
         pass
 
@@ -1041,23 +1053,27 @@ def synthesize(text: str, s: dict, key: str) -> bytes | None:
     return body
 
 
-def _atomic_write_text(path: str, content: str, prefix: str) -> None:
+def _atomic_write_text(path: str, content: str, prefix: str) -> bool:
     """Replace a shared state file without exposing a partial document to another process."""
     directory = os.path.dirname(path) or "."
     tmp = ""
     try:
+        if os.path.islink(path):
+            return False
         fd, tmp = tempfile.mkstemp(prefix=prefix, dir=directory)
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             fh.write(content)
             fh.flush()
             os.fsync(fh.fileno())
         os.replace(tmp, path)
+        return True
     except OSError:
         if tmp:
             try:
                 os.unlink(tmp)
             except OSError:
                 pass
+    return False
 
 
 def _write_pidfile(*tokens) -> None:
@@ -1067,8 +1083,8 @@ def _write_pidfile(*tokens) -> None:
     directly; the chain's ``_on_sigterm`` handler uses ``killpg`` instead."""
     global _pidfile_record
     record = " ".join(str(t) for t in tokens)
-    _atomic_write_text(_PID_PATH, record, "voice-loop-playing-")
-    _pidfile_record = record
+    if _atomic_write_text(_PID_PATH, record, "voice-loop-playing-"):
+        _pidfile_record = record
 
 
 def _owns_pidfile() -> bool:
@@ -2056,11 +2072,10 @@ class TtsStreamHolder:
 
 
 def _write_stream_holder_pid(pid: int, digest: str) -> None:
-    try:
-        with open(_STREAM_HOLDER_PID, "w", encoding="utf-8") as fh:
-            fh.write(f"{pid} {digest}")
-    except OSError:
-        pass
+    global _stream_holder_pid_record
+    record = f"{pid} {digest}"
+    if _atomic_write_text(_STREAM_HOLDER_PID, record, "voice-loop-holder-"):
+        _stream_holder_pid_record = record
 
 
 def _read_stream_holder_pid() -> tuple[int | None, str]:
@@ -2076,15 +2091,28 @@ def _read_stream_holder_pid() -> tuple[int | None, str]:
     return None, ""
 
 
-def _clear_stream_holder_pid() -> None:
+def _clear_stream_holder_pid() -> bool:
+    global _stream_holder_pid_record
+    if _stream_holder_pid_record is None:
+        return False
+    try:
+        with open(_STREAM_HOLDER_PID, encoding="utf-8") as fh:
+            if fh.read() != _stream_holder_pid_record:
+                return False
+    except OSError:
+        return False
     try:
         os.unlink(_STREAM_HOLDER_PID)
     except OSError:
-        pass
+        return False
+    _stream_holder_pid_record = None
+    return True
 
 
-def _remove_socket_file(path: str) -> None:
+def _remove_socket_file(path: str, *, owner: str | None = None) -> None:
     try:
+        if owner is not None and os.path.realpath(path) != owner:
+            return
         os.unlink(path)
     except OSError:
         pass
@@ -2383,26 +2411,27 @@ def main() -> int:
     lock = None
     superseded = False  # a turn supersedes the chain before it exactly once, wherever it had to
     try:
+        # Every event path takes the speaking lock.  Eager remains non-blocking; Stop gets its short
+        # grace and takeover chance because it is the turn's last opportunity to speak.  The default
+        # path must be serialized too: without eager, no ledger exists to accidentally provide a lock.
+        if eager:
+            lock = acquire_lock()
+            if lock is None:
+                log("eager: another firing is speaking — line left unclaimed for the next firing")
+                return 0
+        else:
+            lock = acquire_lock(LOCK_GRACE)
+            if lock is None:
+                take_over()
+                superseded = True
+                lock = acquire_lock(LOCK_GRACE)
+            if lock is None:
+                log("stop: the speaking lock is still held — lines left unclaimed")
+                return 0
+
         if ledger_on:
             # Everything from reading the ledger to finishing playback happens under this lock, so a
-            # line cannot be claimed twice or spoken over. The acquire never blocks.
-            if eager:
-                lock = acquire_lock()
-                if lock is None:
-                    log("eager: another firing is speaking — line left unclaimed for the next firing")
-                    return 0
-            else:
-                # Stop: give the holder its beat, then supersede it — the SIGTERM releases that
-                # chain's flock with it — and take one more shot.
-                lock = acquire_lock(LOCK_GRACE)
-                if lock is None:
-                    take_over()
-                    superseded = True
-                    lock = acquire_lock(LOCK_GRACE)
-                if lock is None:
-                    log("stop: the speaking lock is still held — lines left unclaimed")
-                    return 0
-
+            # line cannot be claimed twice or spoken over. The acquire never blocks for eager.
             trim_ledger()
             # First run for this transcript: everything already in it is history. Write it off
             # without speaking it, so enabling eager mid-session cannot recite the session back.

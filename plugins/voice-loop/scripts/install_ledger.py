@@ -34,12 +34,25 @@ Exit codes: 0 on success (check: none/complete/cancelled), 1 on in_progress, 2 o
 
 from __future__ import annotations
 
+import contextlib
+import functools
 import json
 import os
+import stat
 import sys
 import tempfile
 from datetime import datetime, timezone
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
+
+try:
+    import fcntl
+except ImportError:
+    fcntl = None  # type: ignore[assignment]
+
+try:
+    import msvcrt
+except ImportError:
+    msvcrt = None  # type: ignore[assignment]
 
 # ---------------------------------------------------------------------------
 # Step vocabulary — every step the voice-setup skill walks through, in order.
@@ -94,8 +107,11 @@ def _default_ledger_path() -> str:
 
 def _atomic_write(path: str, content: str) -> None:
     """Write *content* to *path* atomically: temp sibling, fsync, os.replace."""
-    dirname = os.path.dirname(path)
+    if os.path.islink(path):
+        raise OSError("refusing to write through symlink")
+    dirname = os.path.dirname(path) or "."
     fd, tmp = tempfile.mkstemp(prefix="voice-loop-install-", dir=dirname)
+    os.chmod(tmp, stat.S_IRUSR | stat.S_IWUSR)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             fh.write(content)
@@ -115,6 +131,36 @@ def _atomic_write(path: str, content: str) -> None:
 # ---------------------------------------------------------------------------
 # Ledger read / write
 # ---------------------------------------------------------------------------
+
+
+@contextlib.contextmanager
+def _ledger_lock(path: str) -> Iterator[None]:
+    """Serialize ledger read-modify-write operations across processes."""
+    lock_path = f"{path}.lock"
+    flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(lock_path, flags, 0o600)
+    try:
+        if fcntl is not None:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        elif msvcrt is not None:
+            msvcrt.locking(fd, msvcrt.LK_LOCK, 1)
+        yield
+    finally:
+        if fcntl is not None:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+def _serialized_mutation(func):
+    @functools.wraps(func)
+    def wrapped(*args, **kwargs):
+        index = 1 if func.__name__ in {"step_begin", "step_done"} else 0
+        path = args[index] if len(args) > index and isinstance(args[index], str) else kwargs.get("ledger_path")
+        if path is None:
+            path = _default_ledger_path()
+        with _ledger_lock(path):
+            return func(*args, **kwargs)
+    return wrapped
 
 
 class LedgerData(dict):
@@ -238,6 +284,7 @@ def _next_pending(steps: dict[str, Any]) -> str | None:
     return None
 
 
+@_serialized_mutation
 def start_install(
     ledger_path: str | None = None,
     *,
@@ -294,6 +341,7 @@ def start_install(
     return check_state(ledger_path)
 
 
+@_serialized_mutation
 def step_begin(
     step_id: str,
     ledger_path: str | None = None,
@@ -325,6 +373,7 @@ def step_begin(
     return check_state(ledger_path)
 
 
+@_serialized_mutation
 def step_done(
     step_id: str,
     ledger_path: str | None = None,
@@ -357,6 +406,7 @@ def step_done(
     return check_state(ledger_path)
 
 
+@_serialized_mutation
 def finish_install(
     ledger_path: str | None = None,
     *,
@@ -403,6 +453,7 @@ def finish_install(
     return check_state(ledger_path)
 
 
+@_serialized_mutation
 def cancel_install(
     ledger_path: str | None = None,
     *,
@@ -425,6 +476,7 @@ def cancel_install(
     return check_state(ledger_path)
 
 
+@_serialized_mutation
 def reset_install(
     ledger_path: str | None = None,
 ) -> None:
