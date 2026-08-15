@@ -88,8 +88,20 @@ capture and playback — still depends on POSIX facilities (process groups, `pki
 `fcntl`) and is not a native-Windows path. [#42](https://github.com/saharkit/windowsill/issues/42)
 tracks that work.
 
-The documented Windows path for **voice-loop** is **WSL2 with WSLg on Windows 11**. From an
-elevated PowerShell, install WSL2 with:
+The documented Windows path for **voice-loop** is **WSL2 with WSLg on Windows 11**. If you want a
+native prerequisite install instead, the repository ships a Windows PowerShell recipe. From an
+**elevated Windows PowerShell 5.1** in the cloned repository, run:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\plugins\voice-loop\scripts\install.ps1
+```
+
+It installs Python, Git, Node.js and Claude Code, then adds this marketplace. The recipe prints the
+remaining plugin commands and verifies installer exit codes; it is safe to re-run after opening a
+fresh PowerShell session. The bundled voice-loop server and audio hooks still use the WSL2 route
+below, so follow the printed setup instructions for the native prerequisites before continuing.
+
+From an elevated PowerShell, install WSL2 with:
 
 ```powershell
 wsl --install
