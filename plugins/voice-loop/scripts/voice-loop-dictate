@@ -24,6 +24,10 @@ from pathlib import Path
 from typing import Any
 
 _PLUGIN_KEY = "voice-loop@windowsill"
+# Capture the host path class before tests (and callers) can patch os.name to select a branch.  The
+# pathlib.Path factory consults os.name on every construction, so a patched Windows runner would
+# otherwise try to instantiate PosixPath and fail before the launcher reaches its seam.
+_OS_PATH = type(Path())
 
 
 def _script_leaf(platform: str = os.name) -> str:
@@ -38,7 +42,7 @@ def _script_leaf(platform: str = os.name) -> str:
 
 
 def _config_dir() -> Path:
-    return Path(os.environ.get("CLAUDE_CONFIG_DIR", "~/.claude")).expanduser()
+    return _OS_PATH(os.environ.get("CLAUDE_CONFIG_DIR", "~/.claude")).expanduser()
 
 
 def _registry_paths() -> tuple[Path, ...]:
@@ -76,7 +80,7 @@ def _current_script(platform: str = os.name) -> Path | None:
             install_path = entry.get("installPath")
             if not isinstance(install_path, str) or not install_path:
                 continue
-            script = Path(install_path).expanduser() / leaf
+            script = _OS_PATH(install_path).expanduser() / leaf
             if script.is_file():
                 candidates.append((script, entry))
         user_candidates = [script for script, entry in candidates if entry.get("scope") == "user"]

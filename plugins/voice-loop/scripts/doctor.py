@@ -434,11 +434,14 @@ def _check_python_interpreter(
     # candidate, which matters because a Store stub later on PATH can win
     # after a PATH reorder or a fresh shell.  Keep the injected seam useful
     # to tests while using the real Windows probe in production.
+    # ``which`` is the executable probe.  A ``where.exe`` candidate is useful only when that
+    # probe already found a python3 executable: a failed/absent probe must not be reclassified as
+    # a Store stub merely because ``where.exe`` printed an alias that cannot execute.
     python3_paths = list(where() if where is not None else _where_python3(platform=platform))
     if python3_path is not None and python3_path not in python3_paths:
         python3_paths.insert(0, python3_path)
-    elif python3_path is None and python3_paths:
-        python3_path = python3_paths[0]
+    elif python3_path is None:
+        python3_paths = []
     stub_paths = [path for path in python3_paths if _is_store_stub(path)]
 
     # Decision 1: any Store stub on PATH.  Fires even when a real interpreter

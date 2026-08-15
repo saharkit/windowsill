@@ -45,7 +45,35 @@ _TOOLS_FOR_SHELL = (
 )
 
 
-def _build_jqless_bin(tmp_path: Path) -> str:
+def _real_bash() -> str:
+    """Find an actual POSIX bash, not Windows' WSL dispatch stub."""
+    candidates: list[str] = []
+    found = shutil.which("bash")
+    if found:
+        candidates.append(found)
+    if os.name == "nt":
+        for root in (
+            os.environ.get("ProgramFiles", r"C:\\Program Files"),
+            os.environ.get("LOCALAPPDATA", ""),
+        ):
+            if root:
+                candidates.extend([
+                    str(Path(root) / "Git" / "bin" / "bash.exe"),
+                    str(Path(root) / "Git" / "usr" / "bin" / "bash.exe"),
+                ])
+    for candidate in dict.fromkeys(candidates):
+        try:
+            probe = subprocess.run(
+                [candidate, "--version"], capture_output=True, text=True, timeout=3
+            )
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if probe.returncode == 0 and "GNU bash" in (probe.stdout + probe.stderr):
+            return candidate
+    pytest.skip("no POSIX shell found")
+
+
+def _build_jqless_bin(tmp_path: Path, bash: str) -> str:
     """A private /tmp bin directory whose links point at the real tools but whose DIRECTORY
     contains no ``jq`` binary. The test PATH is set to just this directory so the script's own
     interpreter/parser/toolchain is reachable while ``command -v jq`` — the very check the old
@@ -58,10 +86,10 @@ def _build_jqless_bin(tmp_path: Path) -> str:
     bin_dir = tmp_path / "jqless-bin"
     bin_dir.mkdir()
     for name in _TOOLS_FOR_SHELL:
-        resolved = shutil.which(name)
+        resolved = bash if name == "bash" else shutil.which(name)
         if not resolved:
             continue
-        target = bin_dir / name
+        target = bin_dir / ("bash.exe" if name == "bash" and os.name == "nt" else name)
         try:
             if os.name == "nt":
                 shutil.copy2(resolved, target)
@@ -87,7 +115,8 @@ def test_selftest_parses_config_via_python3_not_jq(tmp_path):
     enough that the parse step exits 2 before TTS. The "1/3 synthesizing via <URL>" line is the
     canonical signal that ``cfg .tts.endpoint`` returned the config-supplied URL.
     """
-    jqless_bin = _build_jqless_bin(tmp_path)
+    bash = _real_bash()
+    jqless_bin = _build_jqless_bin(tmp_path, bash)
     config = tmp_path / "config.json"
     config.write_text(
         json.dumps(
@@ -104,7 +133,7 @@ def test_selftest_parses_config_via_python3_not_jq(tmp_path):
     # synthesizing via <URL>" is printed. start_new_session=True puts the script in its own
     # process group so killpg stops the curl that comes next.
     proc = subprocess.Popen(
-        ["bash", str(_SELFTEST)],
+        [bash, str(_SELFTEST)],
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
@@ -166,9 +195,10 @@ def test_selftest_no_config_no_jq_exits_2_with_a_how_to(tmp_path):
     Two-way falsification: against the OLD jq path this test would print "config ignored" to
     stderr AND exit 2 — the obsolete warning is exactly what #179 retired.
     """
-    jqless_bin = _build_jqless_bin(tmp_path)
+    bash = _real_bash()
+    jqless_bin = _build_jqless_bin(tmp_path, bash)
     result = subprocess.run(
-        ["bash", str(_SELFTEST)],
+        [bash, str(_SELFTEST)],
         capture_output=True,
         text=True,
         timeout=5,

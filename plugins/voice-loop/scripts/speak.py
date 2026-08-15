@@ -201,6 +201,10 @@ try:
     import fcntl
 except ImportError:    fcntl = None  # type: ignore[assignment]
 
+try:
+    import msvcrt
+except ImportError:    msvcrt = None  # type: ignore[assignment]
+
 
 def _kill_process_group(pgid: int, sig: int) -> None:
     """Terminate a command's process group where the platform supports groups."""
@@ -754,30 +758,42 @@ class _NoLock:
 def acquire_lock(grace=()):
     """Take the exclusive speaking lock WITHOUT blocking.
 
-    Returns the open lockfile (the flock lives as long as it stays open — and dies with the process,
-    which is what lets a taken-over chain release it by exiting), a _NoLock when locking is not
-    available at all, or None when another firing holds it.
+    Returns the open lockfile (the flock/Windows byte lock lives as long as it stays open — and dies
+    with the process, which is what lets a taken-over chain release it by exiting), a _NoLock when
+    locking is not available at all, or None when another firing holds it.
 
     ``grace`` is a short sequence of pauses to re-try over, and only the Stop path passes one. An
     eager firing passes nothing and loses instantly: a firing that waits is a firing that piles up
     (one blocked python per tool call), that no takeover can supersede and no echo guard can stop —
     it holds no entry in ``playing.pid`` while it waits. Losing costs it nothing, because it has
     claimed nothing and the next firing is one tool call away."""
+    windows_lock = msvcrt is not None and os.name == "nt"
     try:
-        fh = open(_LOCK_PATH, "w", encoding="utf-8")
+        fh = open(_LOCK_PATH, "a+b" if windows_lock else "w", encoding=None if windows_lock else "utf-8")
     except OSError:
         return _NoLock(reason=f"the lockfile {_LOCK_PATH} could not be opened")
-    if fcntl is None:
-        # Windows lacks flock; do not mute speech solely for that unsupported advisory
-        # primitive. Speech proceeds without inter-process locking, and two speakers can now
-        # overlap — a fact the turn that speaks owes the log, logged where it is spoken.
-        fh.close()
-        return _NoLock(reason="speaking lock is unsupported on this platform — proceeding unlocked; speech may overlap")
+
+    if windows_lock:
+        # msvcrt.locking is the native advisory byte-range lock.  The byte must exist before
+        # locking, and the handle must remain open for the whole read/claim/synthesis/playback
+        # sequence just as the POSIX flock handle does.
+        fh.seek(0, os.SEEK_END)
+        if fh.tell() == 0:
+            fh.write(b"\\0")
+            fh.flush()
+
     for pause in (None, *grace):
         if pause is not None:
             time.sleep(pause)
         try:
-            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            if windows_lock:
+                fh.seek(0)
+                msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+            elif fcntl is not None:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            else:
+                fh.close()
+                return _NoLock(reason="speaking lock is unsupported on this platform — proceeding unlocked; speech may overlap")
             return fh
         except OSError:
             continue
@@ -786,13 +802,21 @@ def acquire_lock(grace=()):
 
 
 def release_lock(lock) -> None:
-    """Closing the file releases the flock; a _NoLock closes to nothing."""
+    """Release the platform lock and close its file; a _NoLock closes to nothing."""
     if lock is None:
         return
     try:
+        if msvcrt is not None and os.name == "nt" and not isinstance(lock, _NoLock):
+            lock.seek(0)
+            msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
+        elif fcntl is not None and not isinstance(lock, _NoLock):
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
         lock.close()
     except OSError:
-        pass
+        try:
+            lock.close()
+        except OSError:
+            pass
 
 
 def chunk_sentences(text: str, min_chars: int = MIN_CHUNK_CHARS) -> list[str]:
