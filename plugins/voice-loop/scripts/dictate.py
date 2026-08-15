@@ -185,6 +185,15 @@ STREAM_HEADER_PROBE_BYTES = 4096
 # How long the worker waits for the recorder to produce a readable header at all.
 STREAM_HEADER_TIMEOUT = 3.0
 
+# Input limits at the boundaries this script does not own.  The values are deliberately generous
+# for ordinary dictation, but finite: a broken microphone, endpoint, key file or state file must not
+# turn a hotkey into an unbounded read.
+MAX_CONFIG_BYTES = 1 << 20
+MAX_KEY_BYTES = 16 << 10
+MAX_RESPONSE_BYTES = 4 << 20
+MAX_AUDIO_BYTES = 128 << 20
+MAX_STATE_BYTES = 4 << 10
+
 _STATE_DIR = os.path.join(os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state")), "voice-loop")
 _LOG_PATH = os.path.join(_STATE_DIR, "dictate.log")
 _PID_PATH = os.path.join(_STATE_DIR, "dictate.pid")
@@ -290,16 +299,38 @@ def _is_loopback_host(host: str) -> bool:
     return host == "localhost" or host == "::1" or host.startswith("127.")
 
 
+def _read_bounded_text(path: str, limit: int, *, label: str) -> str | None:
+    """Read a state/config input with a hard byte ceiling and no partial acceptance."""
+    try:
+        with open(path, "rb") as fh:
+            raw = fh.read(limit + 1)
+    except FileNotFoundError:
+        raise
+    except OSError as err:
+        log(f"bounded input: {label} unreadable ({path}): {type(err).__name__}")
+        return None
+    if len(raw) > limit:
+        log(f"bounded input: {label} rejected ({path}): over {limit} bytes")
+        return None
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError as err:
+        log(f"bounded input: {label} rejected ({path}): {type(err).__name__}")
+        return None
+
+
 def load_config(path: str) -> dict:
     try:
-        with open(path, encoding="utf-8") as fh:
-            loaded = json.load(fh)
+        text = _read_bounded_text(path, MAX_CONFIG_BYTES, label="config")
+        if text is None:
+            return {}
+        loaded = json.loads(text)
         return loaded if isinstance(loaded, dict) else {}
     except FileNotFoundError:
         return {}  # no config at all is the normal zero-setup case — not worth a log line
     except (OSError, ValueError) as err:
-        # ValueError covers both corrupt JSON and UnicodeDecodeError (a non-UTF-8 file); one
-        # informative line so a broken config is diagnosable instead of silently ignored
+        # ValueError covers corrupt JSON; one informative line so a broken config is diagnosable
+        # instead of silently ignored
         log(f"config ignored ({path}): {type(err).__name__}: {err}")
         return {}
 
@@ -455,11 +486,13 @@ def read_key(key_file: str, key_env: str, environ) -> str:
     if key_file:
         path = os.path.expanduser(key_file)
         try:
-            with open(path, encoding="utf-8") as fh:
-                return re.sub(r"[ \t\r\n]", "", fh.read())
-        except (OSError, UnicodeDecodeError) as err:
-            # the type name only — never the file's content (it may be a half-corrupt key)
-            log(f"key file unreadable ({path}): {type(err).__name__} — falling back to ${key_env}")
+            raw = _read_bounded_text(path, MAX_KEY_BYTES, label="key file")
+            if raw is not None:
+                return re.sub(r"[ \t\r\n]", "", raw)
+        except FileNotFoundError:
+            pass
+        # the type name only — never the file's content (it may be a half-corrupt key)
+        log(f"key file unreadable ({path}) — falling back to ${key_env}")
     return environ.get(key_env, "")
 
 
@@ -866,7 +899,7 @@ def _paste_locked() -> bool:
     the toggle forever."""
     try:
         with open(_PASTE_LOCK_PATH, encoding="utf-8") as fh:
-            lock_pid = int(fh.read().strip() or "-1")
+            lock_pid = int(fh.read(MAX_STATE_BYTES + 1).strip() or "-1")
     except (OSError, ValueError):
         return False
     if lock_pid <= 0 or lock_pid == os.getpid():
@@ -1037,7 +1070,7 @@ def take_remembered_focus() -> str:
     to compare itself against."""
     try:
         with open(_FOCUS_PATH, encoding="utf-8") as fh:
-            identity = fh.read().strip()
+            identity = fh.read(MAX_STATE_BYTES + 1).strip()
     except OSError:
         identity = ""
     try:
@@ -1062,12 +1095,26 @@ def _post_multipart(url: str, headers: dict, body: bytes, boundary: str, timeout
     return _post_bytes(url, headers, body, f"multipart/form-data; boundary={boundary}", timeout)
 
 
+def _bounded_response_read(resp, limit: int) -> bytes:
+    """Read an endpoint response only up to the transcript boundary."""
+    try:
+        body = resp.read(limit + 1)
+    except TypeError:  # tiny test doubles may expose only the no-argument urllib shape
+        body = resp.read()
+    if len(body) > limit:
+        raise ValueError(f"response over {limit} bytes")
+    return body
+
+
 def _post_bytes(url: str, headers: dict, body: bytes, content_type: str, timeout: float) -> bytes | None:
     """POST a body of any encoding, return it even on an HTTP error (the body is the diagnosis).
     None only when the server was unreachable. Proxies bypassed (parity with ``curl --noproxy '*'``).
 
     The content type is an argument rather than a constant because it is a per-provider axis:
     Deepgram takes the WAV as the whole request body (``audio/wav``), not as a form part."""
+    if len(body) > MAX_AUDIO_BYTES:
+        log(f"stt request rejected: audio over {MAX_AUDIO_BYTES} bytes")
+        return None
     request = urllib.request.Request(
         url,
         data=body,
@@ -1077,12 +1124,16 @@ def _post_bytes(url: str, headers: dict, body: bytes, content_type: str, timeout
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     try:
         with opener.open(request, timeout=timeout) as resp:
-            return resp.read()
+            return _bounded_response_read(resp, MAX_RESPONSE_BYTES)
     except urllib.error.HTTPError as err:
         try:
-            return err.read()
-        except OSError:
+            return _bounded_response_read(err, MAX_RESPONSE_BYTES)
+        except (OSError, ValueError) as read_err:
+            log(f"stt response rejected: {type(read_err).__name__}")
             return b""
+    except ValueError as err:
+        log(f"stt response rejected: {err}")
+        return None
     except (urllib.error.URLError, TimeoutError, OSError) as err:
         log(f"stt unreachable: {getattr(err, 'reason', err)}")
         return None
@@ -1096,27 +1147,41 @@ def transcribe(s: dict) -> str:
     is one-shot: it does not retry the cloud, and it does not retry the fallback.
     """
     if s["stt_command"]:
-        # local engine without a server: the command gets the wav path as its last argument
-        # and prints the transcript (e.g. whisper.cpp: "whisper-cli -m model.bin -nt -f").
-        # No timeout on purpose — stt.timeout bounds the HTTP backends (curl -m parity); a local
-        # engine on a slow machine may legitimately take longer, and the shell never capped it.
+        # local engine without a server: parse the configured command into argv and append the WAV.
+        # Shell interpretation would make config text an execution boundary; the same timeout and
+        # check=False policy as the HTTP path keeps a wedged or failed engine visible and bounded.
         try:
-            with open(_LOG_PATH, "a", encoding="utf-8") as errlog:
-                out = subprocess.run(
-                    ["/bin/sh", "-c", f'{s["stt_command"]} "{_WAV_PATH}"'],
-                    stdout=subprocess.PIPE,
-                    stderr=errlog,
-                    check=False,
-                )
-        except OSError as err:
-            log(f"stt command failed: {err}")
+            argv = shlex.split(s["stt_command"])
+        except ValueError as err:
+            log(f"stt command rejected: {type(err).__name__}")
             return ""
-        return out.stdout.decode("utf-8", "replace").strip()
+        if not argv:
+            return ""
+        try:
+            out = subprocess.run(
+                [*argv, _WAV_PATH],
+                capture_output=True,
+                text=True,
+                timeout=s["timeout"],
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as err:
+            log(f"stt command failed: {type(err).__name__}")
+            return ""
+        if out.returncode != 0:
+            if out.stderr:
+                _log_stderr(out.stderr.encode("utf-8", "replace"))
+            log(f"stt command returned {out.returncode}")
+            return ""
+        return out.stdout.strip()
 
     try:
         with open(_WAV_PATH, "rb") as fh:
-            wav_bytes = fh.read()
+            wav_bytes = fh.read(MAX_AUDIO_BYTES + 1)
     except OSError:
+        return ""
+    if len(wav_bytes) > MAX_AUDIO_BYTES:
+        log(f"recording rejected: audio over {MAX_AUDIO_BYTES} bytes")
         return ""
     if s["backend"] == "cloud":
         boundary = uuid.uuid4().hex
@@ -1334,6 +1399,29 @@ def _win_console_ctrl_c(pid: int) -> bool:  # pragma: no cover — exercised on 
                 pass
 
 
+def _pid_looks_like_recorder(pid: int, recorder: str, platform_id: str = sys.platform) -> bool:
+    """Confirm a pidfile's live process is the recorder before signalling it.
+
+    Linux exposes argv through procfs; an unreadable or unrelated command is not ours. Other
+    platforms use the Windows handle-based check or retain the existing same-user process contract.
+    """
+    if pid <= 0 or not recorder:
+        return False
+    if platform_id.startswith("linux"):
+        cmdline = _cmdline_of(pid)
+        if cmdline is None:
+            return False
+        executable = "rec" if recorder == "sox" else recorder
+        # Match the executable's basename against every argv token: a recorder reached through a
+        # PATH-shadowing script (the CI fake) runs as `bash /path/pw-record …`, whose argv carries
+        # the script path rather than the bare name. A bare-name match would refuse that legitimate
+        # recorder and wedge the recording (the stop toggle would never signal it).
+        return any(os.path.basename(token) == executable for token in cmdline.split())
+    if platform_id == "win32" or os.name == "nt":
+        return _win_pid_is_recorder(pid, recorder)
+    return True
+
+
 def _win_pid_is_recorder(pid: int, recorder: str) -> bool:
     """PID-reuse guard for the Windows stop path: is *pid* still OUR recorder?
 
@@ -1425,7 +1513,7 @@ def _cmdline_of(pid: int) -> str | None:
     Duplicated helper — keep in sync with speak.py."""
     try:
         with open(f"/proc/{pid}/cmdline", "rb") as fh:
-            raw = fh.read()
+            raw = fh.read(MAX_STATE_BYTES + 1)
     except OSError:
         return None
     return raw.replace(b"\0", b" ").decode("utf-8", "replace")
@@ -1471,7 +1559,7 @@ def stop_speak_playback() -> None:
     innocent processes, so it is the fallback, never the rule."""
     try:
         with open(_SPEAK_PID_PATH, encoding="utf-8") as fh:
-            tokens = fh.read().split()
+            tokens = fh.read(MAX_STATE_BYTES + 1).split()
     except OSError:
         tokens = None
     if tokens is None:
@@ -1576,8 +1664,12 @@ def _read_stream_result(pid: int | None = None) -> dict | None:
     result is only this stop's answer if the worker that wrote it is the one whose pid we hold; an
     older worker's transcript pasted into a later recording is precisely the #50 class of bug."""
     try:
-        with open(_stream_result_path(pid), encoding="utf-8") as fh:
-            loaded = json.load(fh)
+        with open(_stream_result_path(pid), "rb") as fh:
+            raw = fh.read(MAX_STATE_BYTES + 1)
+        if len(raw) > MAX_STATE_BYTES:
+            log(f"stream result rejected: over {MAX_STATE_BYTES} bytes")
+            return None
+        loaded = json.loads(raw)
     except (OSError, ValueError):
         return None
     if not isinstance(loaded, dict):
@@ -1590,7 +1682,7 @@ def _read_stream_result(pid: int | None = None) -> dict | None:
 def _read_stream_pid() -> int | None:
     try:
         with open(_STREAM_PID_PATH, encoding="utf-8") as fh:
-            pid = int(fh.read().strip() or "-1")
+            pid = int(fh.read(MAX_STATE_BYTES + 1).strip() or "-1")
     except (OSError, ValueError):
         return None
     return pid if pid > 0 and pid != os.getpid() else None
@@ -2232,7 +2324,7 @@ def stop_and_transcribe(s: dict, system: str, mode: str, recorder_pid: int) -> i
     if text:
         try:
             with open(_LAST_SPOKEN_PATH, encoding="utf-8") as fh:
-                last_spoken = fh.read().strip()
+                last_spoken = fh.read(MAX_STATE_BYTES + 1).strip()
         except OSError:
             last_spoken = ""
         if last_spoken and _is_echo_of_last_spoken(text, last_spoken):
@@ -2415,19 +2507,23 @@ def main(argv: list[str]) -> int:
 
     try:
         with open(_PID_PATH, encoding="utf-8") as fh:
-            recorder_pid = int(fh.read().strip() or "-1")
+            recorder_pid = int(fh.read(MAX_STATE_BYTES + 1).strip() or "-1")
     except (OSError, ValueError):
         recorder_pid = -1
 
     if _pid_alive(recorder_pid):
-        return stop_and_transcribe(s, system, mode, recorder_pid)
+        recorder = resolve_recorder(s["recorder"], system, shutil.which)
+        if _pid_looks_like_recorder(recorder_pid, recorder, sys.platform):
+            return stop_and_transcribe(s, system, mode, recorder_pid)
+        log(f"recorder pid {recorder_pid} failed identity check — refusing to signal it")
+        return 1
     if recorder_pid > 0:
         # a stale pidfile (parsed pid, dead process) is removed, never obeyed — but only after
         # re-checking it still holds the SAME stale pid, so a racing invocation's fresh claim
         # (empty until its recorder spawns) is never swept away by this unlink
         try:
             with open(_PID_PATH, encoding="utf-8") as fh:
-                still_stale = fh.read().strip() == str(recorder_pid)
+                still_stale = fh.read(MAX_STATE_BYTES + 1).strip() == str(recorder_pid)
             if still_stale:
                 os.unlink(_PID_PATH)
         except OSError:

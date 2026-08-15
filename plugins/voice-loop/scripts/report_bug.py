@@ -414,6 +414,7 @@ LOG_RULES: tuple[tuple[str, str | None], ...] = (
     # speak.py
     ("config ignored (", None),
     ("key file unreadable (", None),
+    ("bounded input: ", None),
     ("marker with no text", None),
     ("ledger unwritable: ", None),
     ("ledger trim failed: ", None),
@@ -482,6 +483,10 @@ LOG_RULES: tuple[tuple[str, str | None], ...] = (
     # dictate.py
     ("dictate.debounce_ms is not a usable number (", "number ("),
     ("stt unreachable: ", None),
+    ("stt request rejected: ", None),
+    ("stt response rejected: ", None),
+    ("stt command rejected: ", None),
+    ("stt command returned ", None),
     ("stt command failed: ", None),
     # the provider name and the env var names it tried; both are config-shaped metadata, and
     # naming which provider had no key is the whole diagnostic value of the line
@@ -515,6 +520,9 @@ LOG_RULES: tuple[tuple[str, str | None], ...] = (
     ("no recorder available", None),
     ("recorder failed: ", None),
     ("recording via ", None),
+    ("recording rejected: ", None),
+    ("stream result rejected: ", None),
+    ("recorder pid ", None),
     # Windows native dictation (windowsill#177): the dshow recorder line carries the DirectShow
     # device name — routinely a person's name, a phone model or a company name — so the name is
     # cut at " device=". The pid stays: it is metadata, and it sits BEFORE the device so the cut

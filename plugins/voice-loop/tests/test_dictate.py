@@ -14,6 +14,7 @@ short-lived pythons owned by the tests themselves.
 from __future__ import annotations
 
 import importlib.util
+import io
 import json
 import os
 import socket
@@ -151,9 +152,31 @@ def test_key_file_wins_over_env(tmp_path):
     assert dictate.read_key(str(key_file), "K_ENV", {"K_ENV": "sk-fromenv"}) == "sk-fromfile"
 
 
+def test_oversized_key_file_falls_back_without_reading_the_whole_file(tmp_path):
+    """L2: a hostile key file must not become an unbounded read or a credential candidate."""
+    key_file = tmp_path / "k"
+    key_file.write_bytes(b"x" * (dictate.MAX_KEY_BYTES + 1))
+    assert dictate.read_key(str(key_file), "K_ENV", {"K_ENV": "from-env"}) == "from-env"
+
+
+def test_oversized_config_is_ignored(tmp_path):
+    """L2: a malformed giant config must fail closed instead of consuming the hotkey process."""
+    config = tmp_path / "config.json"
+    config.write_bytes(b"{" + b"x" * dictate.MAX_CONFIG_BYTES)
+    assert dictate.load_config(str(config)) == {}
+
+
 def test_missing_key_file_falls_back_to_env(tmp_path):
     assert dictate.read_key(str(tmp_path / "absent"), "K_ENV", {"K_ENV": "sk-fromenv"}) == "sk-fromenv"
     assert dictate.read_key("", "K_ENV", {}) == ""
+
+
+def test_bounded_text_rejects_a_file_that_cannot_be_read(state, tmp_path):
+    """L2: an input that exists but cannot be read is rejected, never half-accepted."""
+    unreadable = tmp_path / "adir"
+    unreadable.mkdir()
+    assert dictate._read_bounded_text(str(unreadable), 16, label="config") is None
+    assert "bounded input: config unreadable" in (state / "dictate.log").read_text(encoding="utf-8")
 
 
 # --- the recorder table: auto-selection and the exact device/format flags -----------------------
@@ -865,6 +888,133 @@ def test_transcript_from_response_reads_text_and_strips():
     assert dictate.transcript_from_response(b'{"text": " hello world \\n", "language": "en"}') == "hello world"
 
 
+def test_oversized_stt_response_is_rejected(state, monkeypatch, opener):
+    """L2: an endpoint cannot force dictation to buffer an unbounded response."""
+    (state / "dictate.wav").write_bytes(b"RIFFfakewav")
+    opener(b"x" * (dictate.MAX_RESPONSE_BYTES + 1))
+    s = dictate.resolve_settings({}, "Linux")
+    assert dictate.transcribe(s) == ""
+    assert "response rejected" in (state / "dictate.log").read_text(encoding="utf-8")
+
+
+class _HTTPErrorOpener:
+    """An opener whose .open() raises an HTTPError carrying a body — the diagnosis path."""
+
+    def __init__(self, error) -> None:
+        self._error = error
+
+    def open(self, request, timeout=None):
+        raise self._error
+
+
+def test_post_bytes_refuses_an_oversized_audio_body(state, monkeypatch):
+    """L2: the outbound guard refuses a request over the ceiling before it opens a socket."""
+    monkeypatch.setattr(dictate, "MAX_AUDIO_BYTES", 4)
+
+    def fail_if_called(*handlers):
+        raise AssertionError("the guard must refuse before building an opener")
+
+    monkeypatch.setattr(dictate.urllib.request, "build_opener", fail_if_called)
+    assert dictate._post_bytes("http://127.0.0.1:8355/stt", {}, b"12345", "audio/wav", 60.0) is None
+    assert "stt request rejected" in (state / "dictate.log").read_text(encoding="utf-8")
+
+
+def test_post_bytes_returns_the_error_body_on_an_http_error(state, monkeypatch):
+    """L2: an HTTP error's body is the diagnosis — returned, never swallowed."""
+    err = dictate.urllib.error.HTTPError("http://x", 500, "boom", {}, io.BytesIO(b"server said no"))
+    monkeypatch.setattr(dictate.urllib.request, "build_opener", lambda *handlers: _HTTPErrorOpener(err))
+    assert dictate._post_bytes("http://x", {}, b"data", "audio/wav", 60.0) == b"server said no"
+
+
+def test_post_bytes_rejects_an_oversized_error_body(state, monkeypatch):
+    """L2: even the diagnosis is bounded — an error body over the ceiling is dropped, not buffered."""
+    err = dictate.urllib.error.HTTPError(
+        "http://x", 500, "boom", {}, io.BytesIO(b"x" * (dictate.MAX_RESPONSE_BYTES + 1))
+    )
+    monkeypatch.setattr(dictate.urllib.request, "build_opener", lambda *handlers: _HTTPErrorOpener(err))
+    assert dictate._post_bytes("http://x", {}, b"data", "audio/wav", 60.0) == b""
+    assert "response rejected" in (state / "dictate.log").read_text(encoding="utf-8")
+
+
+def test_local_stt_command_is_argv_only_and_bounded(state, monkeypatch):
+    """L2: config text cannot become shell syntax, and a local engine gets a wall-clock bound."""
+    (state / "dictate.wav").write_bytes(b"RIFFfakewav")
+    calls = []
+
+    class Done:
+        returncode = 0
+        stdout = "local transcript"
+        stderr = ""
+
+    monkeypatch.setattr(dictate.subprocess, "run", lambda argv, **kw: calls.append((argv, kw)) or Done())
+    s = dictate.resolve_settings({"stt": {"command": "whisper-cli --model 'my model'"}}, "Linux")
+    assert dictate.transcribe(s) == "local transcript"
+    assert calls[0][0] == ["whisper-cli", "--model", "my model", str(state / "dictate.wav")]
+    assert calls[0][1]["timeout"] == 60.0
+    assert calls[0][1]["check"] is False
+    assert "shell" not in calls[0][1]
+
+
+def test_malformed_local_stt_command_fails_closed(state):
+    """L2: an unterminated quoted command must refuse execution rather than invoke a shell."""
+    (state / "dictate.wav").write_bytes(b"RIFFfakewav")
+    s = dictate.resolve_settings({"stt": {"command": "whisper-cli 'unterminated"}}, "Linux")
+    assert dictate.transcribe(s) == ""
+    assert "command rejected" in (state / "dictate.log").read_text(encoding="utf-8")
+
+
+def test_local_stt_command_failure_is_reported_with_stderr(state, monkeypatch):
+    """L2: a local engine that exits non-zero is logged with its stderr, never half-trusted."""
+    (state / "dictate.wav").write_bytes(b"RIFFfakewav")
+
+    class Failed:
+        returncode = 3
+        stdout = ""
+        stderr = "engine exploded\n"
+
+    monkeypatch.setattr(dictate.subprocess, "run", lambda argv, **kw: Failed())
+    s = dictate.resolve_settings({"stt": {"command": "whisper-cli"}}, "Linux")
+    assert dictate.transcribe(s) == ""
+    log = (state / "dictate.log").read_text(encoding="utf-8")
+    assert "command returned 3" in log
+    assert "engine exploded" in log
+
+
+def test_local_stt_command_survives_a_missing_engine(state, monkeypatch):
+    """L2: an engine that cannot be spawned is a logged empty transcript, not a traceback."""
+    (state / "dictate.wav").write_bytes(b"RIFFfakewav")
+
+    def no_such_engine(argv, **kw):
+        raise OSError("no such engine")
+
+    monkeypatch.setattr(dictate.subprocess, "run", no_such_engine)
+    s = dictate.resolve_settings({"stt": {"command": "whisper-cli"}}, "Linux")
+    assert dictate.transcribe(s) == ""
+    assert "command failed" in (state / "dictate.log").read_text(encoding="utf-8")
+
+
+def test_local_stt_command_that_times_out_is_logged(state, monkeypatch):
+    """L2: a wedged local engine is cut off by the wall-clock bound, not waited on forever."""
+    (state / "dictate.wav").write_bytes(b"RIFFfakewav")
+
+    def hang(argv, **kw):
+        raise dictate.subprocess.TimeoutExpired(cmd=argv, timeout=60.0)
+
+    monkeypatch.setattr(dictate.subprocess, "run", hang)
+    s = dictate.resolve_settings({"stt": {"command": "whisper-cli"}}, "Linux")
+    assert dictate.transcribe(s) == ""
+    assert "command failed" in (state / "dictate.log").read_text(encoding="utf-8")
+
+
+def test_oversized_recording_is_rejected_before_stt(state, monkeypatch):
+    """L2: a WAV that grew past the ceiling is dropped, not uploaded or transcribed."""
+    (state / "dictate.wav").write_bytes(b"RIFF" + b"x" * 64)
+    monkeypatch.setattr(dictate, "MAX_AUDIO_BYTES", 16)
+    s = dictate.resolve_settings({}, "Linux")
+    assert dictate.transcribe(s) == ""
+    assert "recording rejected" in (state / "dictate.log").read_text(encoding="utf-8")
+
+
 def test_transcript_from_response_is_empty_on_anything_malformed():
     assert dictate.transcript_from_response(None) == ""
     assert dictate.transcript_from_response(b"") == ""
@@ -1261,6 +1411,24 @@ class TestPasteLock:
         assert (state / "dictate-paste-lock").read_text(encoding="utf-8") == str(os.getpid())
         assert len(registered) == 1  # atexit handler registered
 
+    def test_stop_reads_last_spoken_with_a_bounded_read(self, state, monkeypatch):
+        """The echo guard's state read is bounded like every other state file."""
+        (state / "dictate.wav").write_bytes(b"\0" * (dictate.WAV_HEADER_BYTES + dictate.BYTES_PER_SECOND))
+        monkeypatch.setattr(dictate, "_LAST_SPOKEN_PATH", str(state / "last-spoken"))
+        (state / "last-spoken").write_text("some other spoken line", encoding="utf-8")
+        monkeypatch.setattr(dictate, "transcribe", lambda s: "hello")
+        monkeypatch.setattr(dictate, "_pid_alive", lambda pid: False)
+        monkeypatch.setattr(dictate.os, "kill", lambda pid, sig: None)
+        monkeypatch.setattr(dictate.time, "sleep", lambda seconds: None)
+        monkeypatch.setattr(dictate, "note", lambda message, system: None)
+        monkeypatch.setattr(dictate.subprocess, "run", lambda argv, **kw: None)
+        registered: list = []
+        monkeypatch.setattr(dictate.atexit, "register", lambda fn: registered.append(fn))
+
+        s = dictate.resolve_settings({"dictate": {"clipboard": "xclip"}}, "Linux")
+        assert dictate.stop_and_transcribe(s, "Linux", "send", 12345) == 0
+        assert "transcript: hello" in (state / "dictate.log").read_text(encoding="utf-8")
+
 
 # --- macOS sound defaults (windowsill#50) ---------------------------------------------------------
 
@@ -1343,6 +1511,12 @@ def test_pid_identity_rejects_a_failed_or_unavailable_ps(monkeypatch):
 
     monkeypatch.setattr(dictate.subprocess, "run", no_ps)
     assert dictate.pid_looks_like_speak(9, platform_id="darwin") is False
+
+
+def test_cmdline_of_reads_its_own_process_and_returns_none_for_a_dead_pid():
+    own = dictate._cmdline_of(os.getpid())
+    assert isinstance(own, str) and own
+    assert dictate._cmdline_of(10**9) is None
 
 
 # --- the echo guard: pidfile-scoped kills, pkill only as the no-pidfile fallback ----------------
@@ -1697,6 +1871,7 @@ def test_a_repeat_burst_through_main_produces_exactly_one_recording_cycle(state,
 def test_a_second_press_past_the_window_still_stops_the_recording(state, monkeypatch):
     """The guard must debounce autorepeat without breaking the toggle it protects."""
     monkeypatch.setattr(dictate.subprocess, "Popen", lambda argv, **kw: FakeProc())
+    monkeypatch.setattr(dictate, "_pid_looks_like_recorder", lambda pid, recorder, platform_id: True)
     monkeypatch.setattr(dictate, "stop_speak_playback", lambda: None)
     monkeypatch.setattr(dictate, "note", lambda message, system: None)
     monkeypatch.setattr(dictate, "_pid_alive", lambda pid: pid == FakeProc.pid)
@@ -1728,6 +1903,64 @@ def test_a_negative_debounce_ms_is_off_not_a_wedged_toggle(state):
     assert dictate.resolve_settings({"dictate": {"debounce_ms": -250}}, "Linux")["debounce_ms"] == 0.0
 
 
+def test_live_unrelated_pid_is_refused_before_signal(state, monkeypatch):
+    """L2: a recycled pid must not turn a toggle into a signal for an unrelated process."""
+    (state / "dictate.pid").write_text("4242", encoding="utf-8")
+    monkeypatch.setattr(dictate, "_pid_alive", lambda pid: True)
+    monkeypatch.setattr(dictate, "_pid_looks_like_recorder", lambda *args: False)
+    assert dictate.main(["dictate.py"]) == 1
+    assert "failed identity check" in (state / "dictate.log").read_text(encoding="utf-8")
+
+
+def test_pid_guard_rejects_a_non_positive_pid_or_blank_recorder():
+    assert dictate._pid_looks_like_recorder(0, "pw-record", "linux") is False
+    assert dictate._pid_looks_like_recorder(-1, "pw-record", "linux") is False
+    assert dictate._pid_looks_like_recorder(4242, "", "linux") is False
+
+
+def test_pid_guard_matches_the_recorder_executable(state, monkeypatch):
+    monkeypatch.setattr(
+        dictate, "_cmdline_of", lambda pid: "pw-record --rate 16000 --channels 1 /s/dictate.wav"
+    )
+    assert dictate._pid_looks_like_recorder(4242, "pw-record", "linux") is True
+
+
+def test_pid_guard_matches_a_path_shadowing_script_by_basename(state, monkeypatch):
+    """The CI fake recorder runs as `bash /path/pw-record …`: its argv carries the script path,
+    not the bare name. A bare-name match would refuse that legitimate recorder and wedge the
+    recording — the exact failure this branch's own dictation contract hit."""
+    monkeypatch.setattr(
+        dictate,
+        "_cmdline_of",
+        lambda pid: "bash /tmp/dictate-fake/pw-record --rate 16000 /s/dictate.wav",
+    )
+    assert dictate._pid_looks_like_recorder(4242, "pw-record", "linux") is True
+
+
+def test_pid_guard_maps_sox_to_the_rec_front_end(state, monkeypatch):
+    monkeypatch.setattr(dictate, "_cmdline_of", lambda pid: "rec -q -r 16000 -c 1 -b 16 /s/dictate.wav")
+    assert dictate._pid_looks_like_recorder(4242, "sox", "linux") is True
+
+
+def test_pid_guard_refuses_an_unrelated_command(state, monkeypatch):
+    monkeypatch.setattr(dictate, "_cmdline_of", lambda pid: "sshd: user@pts/0")
+    assert dictate._pid_looks_like_recorder(4242, "pw-record", "linux") is False
+
+
+def test_pid_guard_refuses_when_the_cmdline_is_unreadable(state, monkeypatch):
+    monkeypatch.setattr(dictate, "_cmdline_of", lambda pid: None)
+    assert dictate._pid_looks_like_recorder(4242, "pw-record", "linux") is False
+
+
+def test_pid_guard_delegates_to_the_windows_handle_check(monkeypatch):
+    monkeypatch.setattr(dictate, "_win_pid_is_recorder", lambda pid, recorder: True)
+    assert dictate._pid_looks_like_recorder(4242, "pw-record", "win32") is True
+
+
+def test_pid_guard_keeps_the_raw_signal_contract_off_linux():
+    assert dictate._pid_looks_like_recorder(4242, "pw-record", "darwin") is True
+
+
 def test_debounce_ms_is_configurable_and_zero_disables_it(state, monkeypatch):
     assert dictate.resolve_settings({"dictate": {"debounce_ms": 150}}, "Linux")["debounce_ms"] == 150.0
     assert dictate.resolve_settings({"dictate": {"debounce_ms": 0}}, "Linux")["debounce_ms"] == 0.0
@@ -1737,6 +1970,7 @@ def test_debounce_ms_is_configurable_and_zero_disables_it(state, monkeypatch):
     monkeypatch.setattr(dictate, "stop_speak_playback", lambda: None)
     monkeypatch.setattr(dictate, "note", lambda message, system: None)
     monkeypatch.setattr(dictate, "_pid_alive", lambda pid: pid == FakeProc.pid)
+    monkeypatch.setattr(dictate, "_pid_looks_like_recorder", lambda pid, recorder, platform_id: True)
     stopped: list[int] = []
     monkeypatch.setattr(dictate, "stop_and_transcribe", lambda s, system, mode, pid: stopped.append(pid) or 0)
     _write_config(monkeypatch, state, {"dictate": {"recorder": "arecord", "debounce_ms": 0}})
@@ -3056,6 +3290,12 @@ class TestStreamWorkerState:
         monkeypatch.setattr(dictate, "_STREAM_RESULT_PATH", str(state / "nope" / "dictate-stream.json"))
         dictate._write_stream_result({"status": "ok"})
         assert "stream result not written" in _log_of(state)
+
+    def test_an_oversized_result_document_is_rejected_not_adopted(self, state, monkeypatch):
+        monkeypatch.setattr(dictate, "MAX_STATE_BYTES", 8)
+        (state / f"dictate-stream.{os.getpid()}.json").write_bytes(b"x" * 20)
+        assert dictate._read_stream_result() is None
+        assert "stream result rejected" in _log_of(state)
 
 
 class TestTheStopToggleUsesWhatTheStreamAssembled:
