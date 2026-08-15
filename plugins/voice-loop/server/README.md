@@ -160,6 +160,14 @@ request waiting.
 clients should detect features through the capability flags (`"streaming": true` and friends), not
 by comparing version strings.
 
+`GET /health` reports whether it has actually **verified** the server rather than merely answered:
+`status` is `"verified-healthy"` only when the configured voice engine answered its availability
+probe AND the VRAM figure the models need was read; anything short of both is `"unknown"`, with
+`reason` naming which check did not answer. The legacy `ok` boolean is `true` exactly when `status`
+is `"verified-healthy"` — so a server whose engine cannot be reached, or whose card will not report
+free VRAM, stops claiming `ok` instead of answering it without looking. On a CPU-only box there is
+no VRAM figure to read, so that half of the check is satisfied vacuously.
+
 `GET /health` also reports the **hook's heartbeat**: `hook_last_fired` (ISO-8601 UTC) and
 `hook_last_fired_age_s` (seconds since), read from the stamp the speaking hook rewrites on every
 invocation. An age that keeps growing while the session continues means the harness has stopped
@@ -559,7 +567,9 @@ What lands there:
 - **Never costs you your voice.** A clip that cannot be written is logged and skipped; the request
   it came from is unaffected.
 - `GET /health` reports `corpus_clips` and `corpus_seconds` — `null` for both when no corpus is
-  configured, which is a different answer from `0` and `0.0`.
+  configured, and still `null` while one is configured but nothing has been written yet. `/health`
+  reads the counters a write maintains and never scans the directory, so the first thing that turns
+  the pair into numbers is a clip being recorded, not a health check.
 
 Then ask whether there is enough yet, from the plugin's `scripts/`:
 

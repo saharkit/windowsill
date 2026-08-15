@@ -56,6 +56,8 @@ def test_health_reports_capabilities(client, monkeypatch):
     body = client.get("/health").json()
 
     assert body["ok"] is True
+    assert body["status"] == "verified-healthy"  # the built-in engine answers, and CPU needs no VRAM
+    assert body["reason"] is None
     assert body["version"] == voice_server.SERVER_VERSION == "0.5.0"
     assert body["model_concurrency"] == voice_server.MODEL_CONCURRENCY >= 1
     assert body["model_in_flight"] == 0
