@@ -390,6 +390,9 @@ _stop_reason_logged = False
 # the current player child, the temp WAVs on disk, and the open SSE response (its socket
 # must close mid-stream on takeover, not linger until the server finishes synthesizing)
 _live: dict = {"proc": None, "files": set(), "stream": None}
+# The exact record this process last installed. Comparing the full record prevents an older
+# invocation from unlinking a newer invocation's pidfile between its read and unlink.
+_pidfile_record: str | None = None
 
 
 def log(message: str) -> None:
@@ -730,8 +733,10 @@ def acquire_lock(grace=()):
         fh = open(_LOCK_PATH, "w", encoding="utf-8")
     except OSError:
         return _NoLock()
-    if fcntl is None:  # pragma: no cover - POSIX-only; Linux and macOS both have fcntl
-        return fh
+    if fcntl is None:  # pragma: no cover - supported installs run Linux (including WSL) or macOS
+        fh.close()
+        log("speaking lock is unsupported on this platform — speech skipped")
+        return None
     for pause in (None, *grace):
         if pause is not None:
             time.sleep(pause)
@@ -938,34 +943,65 @@ def synthesize(text: str, s: dict, key: str) -> bytes | None:
     return body
 
 
+def _atomic_write_text(path: str, content: str, prefix: str) -> None:
+    """Replace a shared state file without exposing a partial document to another process."""
+    directory = os.path.dirname(path) or "."
+    tmp = ""
+    try:
+        fd, tmp = tempfile.mkstemp(prefix=prefix, dir=directory)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(content)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    except OSError:
+        if tmp:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+
+
 def _write_pidfile(*tokens) -> None:
-    """Write the speaking-chain identity to ``playing.pid``.  Tokens are space-joined; the
-    first is always our own PID.  An optional ``"pg"`` marker before a child PID means the child
+    """Write the speaking-chain identity to ``playing.pid`` atomically. Tokens are space-joined;
+    the first is always our own PID. An optional ``"pg"`` marker before a child PID means the child
     was spawned in its own process group (``tts.command``) — ``take_over`` never signals those
     directly; the chain's ``_on_sigterm`` handler uses ``killpg`` instead."""
+    global _pidfile_record
+    record = " ".join(str(t) for t in tokens)
+    _atomic_write_text(_PID_PATH, record, "voice-loop-playing-")
+    _pidfile_record = record
+
+
+def _owns_pidfile() -> bool:
+    """True only if the file still contains the exact record this process installed."""
+    if _pidfile_record is None:
+        return False
     try:
-        with open(_PID_PATH, "w", encoding="utf-8") as fh:
-            fh.write(" ".join(str(t) for t in tokens))
+        with open(_PID_PATH, encoding="utf-8") as fh:
+            return fh.read() == _pidfile_record
     except OSError:
-        pass
+        return False
 
 
 def _clear_pidfile() -> None:
-    """Drop playing.pid if it is still OURS — the counterpart of _write_pidfile, and every path
-    that writes the file owes it one. A pidfile left behind holding an exited pid is not inert:
-    dictate.py reads it as "a chain is playing", signals a pid that is gone, and skips the pkill
-    fallback it keeps for exactly this case (a chain that died without cleanup)."""
+    """Drop playing.pid only when its recorded owner is this process.
+
+    The ownership check is deliberately before unlinking: a stale invocation must not clear a newer
+    chain's state after PID reuse or after a takeover has installed a replacement record."""
+    global _pidfile_record
+    if not _owns_pidfile():
+        return
     try:
-        with open(_PID_PATH, encoding="utf-8") as fh:
-            if fh.read().split()[:1] == [str(os.getpid())]:
-                os.unlink(_PID_PATH)
-    except (OSError, IndexError):
+        os.unlink(_PID_PATH)
+    except OSError:
         pass
+    finally:
+        _pidfile_record = None
 
 
 def _cmdline_of(pid: int) -> str | None:
-    """/proc/<pid>/cmdline with NULs as spaces — None when unreadable (process already gone, or
-    not ours to inspect). Linux-only by construction; callers gate on the platform.
+    """Linux ``/proc/<pid>/cmdline`` with NULs as spaces — None when unreadable.
     Duplicated helper — keep in sync with dictate.py."""
     try:
         with open(f"/proc/{pid}/cmdline", "rb") as fh:
@@ -975,20 +1011,34 @@ def _cmdline_of(pid: int) -> str | None:
     return raw.replace(b"\0", b" ").decode("utf-8", "replace")
 
 
-def pid_looks_like_speak(pid: int, read_cmdline=_cmdline_of, platform_id: str = sys.platform) -> bool:
-    """PID-reuse guard (duplicated helper — keep in sync with dictate.py): a pidfile outlives its
-    process and the kernel recycles PIDs, so before SIGTERMing a recorded pid, confirm it still
-    looks like the voice-loop speaking chain: the player child's argv carries the
-    "voice-loop-speak-" temp-WAV prefix, the python half of the chain carries "speak.py".
+def _ps_cmdline_of(pid: int) -> str | None:
+    """Read a macOS command line without signalling a process or invoking a shell."""
+    try:
+        result = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "command="],
+            capture_output=True,
+            check=False,
+            timeout=1.0,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    return result.stdout.decode("utf-8", "replace").strip() or None
 
-    Non-Linux has no /proc/<pid>/cmdline; rather than depend on parsing `ps` there, the check is
-    skipped and the historical raw-signal behaviour kept (the pidfile is same-user state, so the
-    blast radius of a stale pid is one same-user SIGTERM — unchanged from before). On Linux an
-    unreadable cmdline means the process is already gone (nothing to stop) or is not ours to
-    inspect (then not ours to signal either) — both mean: do not signal."""
-    if not platform_id.startswith("linux"):
-        return True
-    cmdline = read_cmdline(pid)
+
+def pid_looks_like_speak(pid: int, read_cmdline=_cmdline_of, platform_id: str = sys.platform) -> bool:
+    """PID-reuse guard: only a process whose command line identifies this speaking chain is trusted.
+
+    Linux uses ``/proc`` and macOS uses its bounded ``ps`` query. Other platforms have no verified
+    identity path here, so they fail closed rather than turning a stale pidfile into a signal for an
+    unrelated process."""
+    if platform_id.startswith("linux"):
+        cmdline = read_cmdline(pid)
+    elif platform_id == "darwin":
+        cmdline = _ps_cmdline_of(pid) if read_cmdline is _cmdline_of else read_cmdline(pid)
+    else:
+        return False
     if cmdline is None:
         return False
     return "voice-loop-speak" in cmdline or "speak.py" in cmdline
@@ -1476,16 +1526,25 @@ def _play_stream(audio_iter, s: dict, t0: float) -> tuple[int, int, int, int | N
             player_argv = player_argv + ["-D", "pipewire:" + s["sink"]]
     proc: subprocess.Popen | None = None
     proc_wav: str | None = None
+    proc_audio_len = 0
+    proc_started_at: float | None = None
     played = 0
     total_bytes = 0
     first_audio_at: float | None = None
     rc: int | None = None
 
     def reap() -> None:
-        nonlocal proc, proc_wav, rc
+        nonlocal proc, proc_wav, proc_audio_len, proc_started_at, rc, played, total_bytes, first_audio_at
         if proc is not None:
             rc = proc.wait()
+            if rc == 0:
+                played += 1
+                total_bytes += proc_audio_len
+                if first_audio_at is None:
+                    first_audio_at = proc_started_at
             proc = None
+            proc_audio_len = 0
+            proc_started_at = None
         if proc_wav is not None:
             _live["files"].discard(proc_wav)
             try:
@@ -1501,8 +1560,7 @@ def _play_stream(audio_iter, s: dict, t0: float) -> tuple[int, int, int, int | N
                 fh.write(audio)
             _live["files"].add(wav)
             reap()  # let the previous chunk finish before starting this one
-            if first_audio_at is None:
-                first_audio_at = time.monotonic()  # sound starts at the spawn below
+            proc_started_at = time.monotonic()  # delivery is confirmed only after a zero exit
             try:
                 proc = subprocess.Popen(
                     player_argv + [wav], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
@@ -1517,9 +1575,8 @@ def _play_stream(audio_iter, s: dict, t0: float) -> tuple[int, int, int, int | N
                 break
             _live["proc"] = proc
             proc_wav = wav
+            proc_audio_len = len(audio)
             _write_pidfile(os.getpid(), proc.pid)
-            played += 1
-            total_bytes += len(audio)
         reap()
     finally:
         _live["proc"] = None

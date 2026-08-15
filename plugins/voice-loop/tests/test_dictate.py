@@ -1301,11 +1301,48 @@ def test_pid_identity_rejects_a_reused_or_gone_pid_on_linux():
     assert dictate.pid_looks_like_speak(9, read_cmdline=lambda pid: None, platform_id="linux") is False
 
 
-def test_pid_identity_check_is_skipped_off_linux():
-    def never(pid):
-        raise AssertionError("cmdline must not be read off Linux")
+def test_pid_identity_check_uses_a_verified_macos_command_line():
+    assert dictate.pid_looks_like_speak(
+        9, read_cmdline=lambda pid: "python3 /repo/scripts/speak.py", platform_id="darwin"
+    ) is True
+    assert dictate.pid_looks_like_speak(
+        9, read_cmdline=lambda pid: "ssh user@example", platform_id="darwin"
+    ) is False
 
-    assert dictate.pid_looks_like_speak(9, read_cmdline=never, platform_id="darwin") is True
+
+def test_pid_identity_check_fails_closed_on_an_unsupported_platform():
+    assert dictate.pid_looks_like_speak(9, read_cmdline=lambda pid: "speak.py", platform_id="win32") is False
+
+
+def test_pid_identity_queries_ps_for_the_macos_command_line(monkeypatch):
+    calls = []
+
+    class PsResult:
+        returncode = 0
+        stdout = b"python3 /repo/scripts/speak.py"
+
+    def fake_run(argv, **kwargs):
+        calls.append(argv)
+        return PsResult()
+
+    monkeypatch.setattr(dictate.subprocess, "run", fake_run)
+    assert dictate.pid_looks_like_speak(9, platform_id="darwin") is True
+    assert calls == [["ps", "-p", "9", "-o", "command="]]
+
+
+def test_pid_identity_rejects_a_failed_or_unavailable_ps(monkeypatch):
+    class FailedPs:
+        returncode = 1
+        stdout = b""
+
+    monkeypatch.setattr(dictate.subprocess, "run", lambda argv, **kwargs: FailedPs())
+    assert dictate.pid_looks_like_speak(9, platform_id="darwin") is False
+
+    def no_ps(argv, **kwargs):
+        raise OSError("no ps binary")
+
+    monkeypatch.setattr(dictate.subprocess, "run", no_ps)
+    assert dictate.pid_looks_like_speak(9, platform_id="darwin") is False
 
 
 # --- the echo guard: pidfile-scoped kills, pkill only as the no-pidfile fallback ----------------

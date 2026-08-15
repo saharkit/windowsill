@@ -448,6 +448,7 @@ LOG_RULES: tuple[tuple[str, str | None], ...] = (
     # the two quiet exits #106 made audible: neither carries a word of the turn's text
     ("stop: nothing marked in the last assistant message", None),
     ("stop: speech is switched off", None),
+    ("speaking lock is unsupported on this platform — speech skipped", None),
     ("stop: dropped a read identical to the last spoken line (dedup): ", "(dedup): "),
     ("text: ", "text: "),
     ("local command failed: ", None),

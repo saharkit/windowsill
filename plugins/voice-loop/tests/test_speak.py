@@ -46,6 +46,7 @@ def state(monkeypatch, tmp_path):
     monkeypatch.setattr(speak, "_LEDGER_PATH", str(tmp_path / "spoken.ledger"))
     monkeypatch.setattr(speak, "_LOCK_PATH", str(tmp_path / "speaking.lock"))
     monkeypatch.setattr(speak, "_STAMP_PATH", str(tmp_path / "hook-last-fired"))
+    monkeypatch.setattr(speak, "_pidfile_record", None)
 
     monkeypatch.setattr(speak, "_CONTOUR_PATH", str(tmp_path / "contour.json"))
     monkeypatch.setattr(speak, "_CONTOUR_ANNOUNCED_PATH", str(tmp_path / "contour-announced"))
@@ -466,6 +467,88 @@ def test_first_audio_ms_is_minus_one_when_nothing_ever_played(state, monkeypatch
     assert spawns == []
 
 
+def test_a_nonzero_player_exit_is_not_recorded_as_played(state, monkeypatch):
+    """L2 mutation gap: counting at spawn would report delivery even when the player rejects the
+    audio. Only a zero exit is a delivered chunk, so a failed player must leave the result empty."""
+
+    class FailedPlayer:
+        pid = 123
+        returncode = None
+
+        def wait(self):
+            self.returncode = 1
+            return self.returncode
+
+        def poll(self):
+            return self.returncode
+
+    monkeypatch.setattr(speak.subprocess, "Popen", lambda argv, **kwargs: FailedPlayer())
+    result = speak._play_stream(iter([WAV_A]), speak.resolve_settings({}, "Linux"), time.monotonic())
+    assert result[0] == 0
+    assert result[1] == 0
+    assert result[3] == 1
+
+
+def test_pidfile_write_is_atomic_and_stale_owner_cannot_clear_new_state(state, monkeypatch):
+    """L2 mutation gap: an in-place write can expose truncated tokens, and an old cleanup can erase
+    a replacement chain. Temp-then-replace plus the exact installed record protects both boundaries."""
+    speak._write_pidfile(111, 222)
+    monkeypatch.setattr(speak.os, "getpid", lambda: 111)
+    speak._atomic_write_text(str(state / "playing.pid"), "333 444", "replacement-")
+    speak._clear_pidfile()
+    assert (state / "playing.pid").read_text(encoding="utf-8") == "333 444"
+    assert not list(state.glob("voice-loop-playing-*"))
+
+
+def test_atomic_write_removes_its_temp_file_when_the_replace_fails(state, monkeypatch):
+    def deny_replace(src, dst):
+        raise OSError("replace denied")
+
+    monkeypatch.setattr(speak.os, "replace", deny_replace)
+    speak._atomic_write_text(str(state / "playing.pid"), "111", "voice-loop-playing-")
+    assert not (state / "playing.pid").exists()
+    assert not list(state.glob("voice-loop-playing-*"))
+
+
+def test_atomic_write_swallows_a_failed_cleanup(state, monkeypatch):
+    def deny_replace(src, dst):
+        raise OSError("replace denied")
+
+    def deny_unlink(path):
+        raise OSError("unlink denied")
+
+    monkeypatch.setattr(speak.os, "replace", deny_replace)
+    monkeypatch.setattr(speak.os, "unlink", deny_unlink)
+    # the cleanup is best-effort: a failure to remove the temp file must not mask the original error
+    speak._atomic_write_text(str(state / "playing.pid"), "111", "voice-loop-playing-")
+
+
+def test_atomic_write_skips_cleanup_when_the_temp_file_is_never_created(state, monkeypatch):
+    def deny_mkstemp(**kwargs):
+        raise OSError("mkstemp denied")
+
+    monkeypatch.setattr(speak.tempfile, "mkstemp", deny_mkstemp)
+    speak._atomic_write_text(str(state / "playing.pid"), "111", "voice-loop-playing-")
+    assert not (state / "playing.pid").exists()
+
+
+def test_pidfile_ownership_is_false_when_the_record_cannot_be_read(state, monkeypatch):
+    monkeypatch.setattr(speak, "_pidfile_record", "111")
+    monkeypatch.setattr(speak, "_PID_PATH", str(state / "no-such-dir" / "playing.pid"))
+    assert speak._owns_pidfile() is False
+
+
+def test_pidfile_clear_swallows_a_failed_unlink(state, monkeypatch):
+    speak._write_pidfile(111)
+
+    def deny_unlink(path):
+        raise OSError("unlink denied")
+
+    monkeypatch.setattr(speak.os, "unlink", deny_unlink)
+    speak._clear_pidfile()
+    assert speak._pidfile_record is None  # the finally still released the record
+
+
 # --- corrupt config / key files: ignored loudly, never a crash ----------------------------------
 
 
@@ -713,11 +796,48 @@ def test_pid_identity_rejects_a_reused_or_gone_pid_on_linux():
     assert speak.pid_looks_like_speak(9, read_cmdline=lambda pid: None, platform_id="linux") is False
 
 
-def test_pid_identity_check_is_skipped_off_linux():
-    def never(pid):
-        raise AssertionError("cmdline must not be read off Linux")
+def test_pid_identity_check_uses_the_macos_command_line_seam():
+    assert speak.pid_looks_like_speak(
+        9, read_cmdline=lambda pid: "python3 /repo/scripts/speak.py", platform_id="darwin"
+    ) is True
+    assert speak.pid_looks_like_speak(
+        9, read_cmdline=lambda pid: "ssh user@example", platform_id="darwin"
+    ) is False
 
-    assert speak.pid_looks_like_speak(9, read_cmdline=never, platform_id="darwin") is True
+
+def test_pid_identity_check_fails_closed_on_an_unsupported_platform():
+    assert speak.pid_looks_like_speak(9, read_cmdline=lambda pid: "speak.py", platform_id="win32") is False
+
+
+def test_pid_identity_queries_ps_for_the_macos_command_line(monkeypatch):
+    calls = []
+
+    class PsResult:
+        returncode = 0
+        stdout = b"aplay -q /tmp/voice-loop-speak-abc"
+
+    def fake_run(argv, **kwargs):
+        calls.append(argv)
+        return PsResult()
+
+    monkeypatch.setattr(speak.subprocess, "run", fake_run)
+    assert speak.pid_looks_like_speak(9, platform_id="darwin") is True
+    assert calls == [["ps", "-p", "9", "-o", "command="]]
+
+
+def test_pid_identity_rejects_a_failed_or_unavailable_ps(monkeypatch):
+    class FailedPs:
+        returncode = 1
+        stdout = b""
+
+    monkeypatch.setattr(speak.subprocess, "run", lambda argv, **kwargs: FailedPs())
+    assert speak.pid_looks_like_speak(9, platform_id="darwin") is False
+
+    def no_ps(argv, **kwargs):
+        raise OSError("no ps binary")
+
+    monkeypatch.setattr(speak.subprocess, "run", no_ps)
+    assert speak.pid_looks_like_speak(9, platform_id="darwin") is False
 
 
 def test_cmdline_of_reads_our_own_process():
