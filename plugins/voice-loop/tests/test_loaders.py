@@ -250,7 +250,7 @@ def test_config_home_ignores_a_present_but_empty_xdg_variable(monkeypatch, tmp_p
     dictionary a RELATIVE voice-loop/stress.json, an operator-controlled regex file loaded from
     whatever directory the server happened to start in. The spec's default applies when the
     variable is "either not set or empty"; only the first half was honoured."""
-    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(voice_server.Path, "home", classmethod(lambda cls: tmp_path))
     monkeypatch.setenv("XDG_CONFIG_HOME", "")
 
     home = voice_server._config_home()
@@ -265,7 +265,7 @@ def test_config_home_reads_a_set_xdg_variable(monkeypatch, tmp_path):
 
 
 def test_config_home_falls_back_to_the_home_default_when_unset(monkeypatch, tmp_path):
-    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(voice_server.Path, "home", classmethod(lambda cls: tmp_path))
     monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
     assert voice_server._config_home() == tmp_path / ".config"
 
