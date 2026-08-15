@@ -515,6 +515,32 @@ def test_stt_deadline_refuses_before_loading_or_transcribing(client, monkeypatch
     assert calls == []
 
 
+def test_stt_deadline_refuses_before_loading_after_elapsed_budget(monkeypatch, one_slot_gate):
+    """A request whose budget expires before model loading must not load Whisper."""
+    calls: list[str] = []
+    monkeypatch.setattr(voice_server, "STT_TIMEOUT", 0.01)
+    monkeypatch.setattr(voice_server, "resolve_device", lambda: "cpu")
+    monkeypatch.setattr(voice_server, "whisper", lambda: calls.append("load"))
+    clock_values = iter((100.0, 100.0, 100.02))
+
+    with pytest.raises(voice_server.TranscriptionTimeout, match="0 second budget"):
+        voice_server.transcribe_upload(b"RIFFfake", "ru", clock=lambda: next(clock_values))
+    assert calls == []
+
+
+def test_stt_deadline_refuses_before_transcribing_after_loading(monkeypatch, one_slot_gate):
+    """A model load that consumes the deadline must not start transcription."""
+    calls: list[str] = []
+    monkeypatch.setattr(voice_server, "STT_TIMEOUT", 0.01)
+    monkeypatch.setattr(voice_server, "resolve_device", lambda: "cpu")
+    monkeypatch.setattr(voice_server, "whisper", lambda: calls.append("load") or object())
+    clock_values = iter((100.0, 100.0, 100.005, 100.02))
+
+    with pytest.raises(voice_server.TranscriptionTimeout, match="0 second budget"):
+        voice_server.transcribe_upload(b"RIFFfake", "ru", clock=lambda: next(clock_values))
+    assert calls == ["load"]
+
+
 def test_stt_timeout_default_is_the_documented_one(client, fake_whisper):
     assert voice_server.STT_TIMEOUT == 900.0
     response = client.post("/stt", files={"audio": ("clip.wav", b"RIFFfake", "audio/wav")})
