@@ -2160,6 +2160,15 @@ def test_windows_install_recipe_exists_and_is_readable():
     )
     assert "-PassThru" in text, "installer exit codes must be available to the recipe"
     assert "Test-RealPython $python3Exe" in text, "existing python3.exe must be verified, not trusted"
+    assert "WaitForExit(5000)" in text, "Python probes must have a finite timeout"
+    assert "ReparsePoint" in text, "Store aliases must be rejected without executing them"
+    assert "RebootExitCodes" in text and "@(3010,1641)" in text, (
+        "MSI success-with-reboot exit codes must be accepted"
+    )
+    assert "$npmExitCode = $LASTEXITCODE" in text, "npm's native exit status must be checked"
+    assert "npm prefix -g" in text and "$npmPrefix" in text, (
+        "Claude Code verification must use npm's install location, not stale PATH entries"
+    )
     assert "ExecutionPolicyOverride" in text, "Process-scope Bypass must not abort the recipe"
 
 

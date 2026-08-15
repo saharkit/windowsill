@@ -75,21 +75,56 @@ function Test-Command {
 # ---------------------------------------------------------------------------
 function Test-RealPython {
     param([string]$Name)
+    $command = Get-Command $Name -ErrorAction SilentlyContinue
+    if (-not $command -or -not $command.Source) {
+        return $false
+    }
+
+    # The Microsoft Store alias is a zero-length reparse point.  Do not execute
+    # it: on some stock Windows installations that opens the Store or waits for
+    # a user decision instead of returning an exit code.
+    $item = Get-Item -LiteralPath $command.Source -ErrorAction SilentlyContinue
+    if ($item -and (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) -and $item.Length -eq 0) {
+        return $false
+    }
+
+    $stdoutPath = [IO.Path]::GetTempFileName()
+    $stderrPath = "$stdoutPath.err"
+    $proc = $null
     try {
-        $output = & $Name --version 2>&1 | Out-String
+        $proc = Start-Process -FilePath $command.Source -ArgumentList @("--version") `
+            -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath -PassThru
+        if (-not $proc.WaitForExit(5000)) {
+            try { $proc.Kill() } catch { }
+            return $false
+        }
+        $output = (Get-Content -LiteralPath $stdoutPath -Raw -ErrorAction SilentlyContinue) + `
+            (Get-Content -LiteralPath $stderrPath -Raw -ErrorAction SilentlyContinue)
         return $output -match 'Python \d+\.\d+'
     } catch {
         return $false
+    } finally {
+        if ($proc) { $proc.Dispose() }
+        Remove-Item $stdoutPath, $stderrPath -Force -ErrorAction SilentlyContinue
     }
 }
 
 # ---------------------------------------------------------------------------
-# Helper: run an installer and fail on a non-zero exit code
+# Helper: run an installer and fail on an exit code that is not explicitly
+# accepted.  MSI 3010 means success with a reboot pending.
 # ---------------------------------------------------------------------------
 function Invoke-Installer {
-    param([string]$Description, [string]$FilePath, [string[]]$ArgumentList)
+    param(
+        [string]$Description,
+        [string]$FilePath,
+        [string[]]$ArgumentList,
+        [int[]]$SuccessExitCodes = @(0),
+        [int[]]$RebootExitCodes = @()
+    )
     $proc = Start-Process -FilePath $FilePath -ArgumentList $ArgumentList -Wait -PassThru -NoNewWindow
-    if ($proc.ExitCode -ne 0) {
+    if ($RebootExitCodes -contains $proc.ExitCode) {
+        Write-Host "    $Description succeeded; reboot pending (exit code $($proc.ExitCode))." -ForegroundColor Yellow
+    } elseif ($SuccessExitCodes -notcontains $proc.ExitCode) {
         throw "$Description failed with exit code $($proc.ExitCode)"
     }
 }
@@ -248,7 +283,7 @@ Invoke-Step "Node.js LTS" {
         Write-Host "    downloading $nodeUrl ..."
         Invoke-Download $nodeUrl $installer
         Write-Host "    running installer (silent)..."
-        Invoke-Installer "Node.js installer" "msiexec.exe" @("/i",$installer,"/quiet","/norestart")
+        Invoke-Installer "Node.js installer" "msiexec.exe" @("/i",$installer,"/quiet","/norestart") @(0) @(3010,1641)
         Remove-Item $installer -Force -ErrorAction SilentlyContinue
 
         # Refresh PATH.
@@ -277,19 +312,39 @@ Invoke-Step "Claude Code" {
     # Refresh PATH one more time so npm is definitely visible.
     $env:Path = [System.Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path", "User")
 
-    if (Test-Command claude) {
-        $ver = & claude --version 2>&1
+    # Resolve the npm global bin directory instead of trusting an arbitrary
+    # claude command already present on PATH.
+    $npmPrefix = (& npm prefix -g 2>&1 | Out-String).Trim()
+    $prefixExitCode = $LASTEXITCODE
+    if ($prefixExitCode -ne 0 -or -not $npmPrefix) {
+        throw "npm could not report its global prefix"
+    }
+    $claudeCommand = Get-ChildItem -LiteralPath $npmPrefix -Filter "claude.*" -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.Extension -in @(".cmd", ".ps1", ".exe") } |
+        Select-Object -First 1
+    if ($claudeCommand) {
+        $ver = & $claudeCommand.FullName --version 2>&1
         Write-Host "    already installed: $ver"
         return
     }
 
     Write-Host "    npm install -g @anthropic-ai/claude-code ..."
-    npm install -g @anthropic-ai/claude-code
-    if (Test-Command claude) {
-        $ver = & claude --version 2>&1
+    & npm install -g @anthropic-ai/claude-code
+    $npmExitCode = $LASTEXITCODE
+    if ($npmExitCode -ne 0) {
+        throw "Claude Code npm install failed with exit code $npmExitCode"
+    }
+
+    # Check the global npm bin directory directly.  A stale claude command on
+    # PATH must not turn a failed or incomplete install into a false success.
+    $claudeCommand = Get-ChildItem -LiteralPath $npmPrefix -Filter "claude.*" -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.Extension -in @(".cmd", ".ps1", ".exe") } |
+        Select-Object -First 1
+    if ($claudeCommand) {
+        $ver = & $claudeCommand.FullName --version 2>&1
         Write-Host "    installed: $ver"
     } else {
-        throw "Claude Code installer exited successfully, but claude is not available on PATH"
+        throw "Claude Code npm install succeeded, but no claude command was created in $npmPrefix"
     }
 }
 
