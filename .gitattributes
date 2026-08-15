@@ -11,3 +11,6 @@
 *.cmd text eol=crlf
 plugins/voice-loop/scripts/voice-loop-dictate text eol=lf
 plugins/voice-loop/scripts/speak text eol=lf
+
+# Keep the UTF-8 BOM in PowerShell recipes as ordinary content for Windows PowerShell 5.1.
+*.ps1 -text

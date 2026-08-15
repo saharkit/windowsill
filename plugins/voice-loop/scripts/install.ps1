@@ -1,4 +1,4 @@
-# voice-loop -- Windows native install recipe.
+﻿# voice-loop -- Windows native install recipe.
 #
 # Run from an ADMIN PowerShell (right-click PowerShell -> "Run as administrator").
 # This script installs every prerequisite the measured pass (#42) had to discover
@@ -75,11 +75,65 @@ function Test-Command {
 # ---------------------------------------------------------------------------
 function Test-RealPython {
     param([string]$Name)
+    $command = Get-Command $Name -ErrorAction SilentlyContinue
+    if (-not $command -or -not $command.Source) {
+        return $false
+    }
+
+    # The Microsoft Store alias is a zero-length reparse point.  Do not execute
+    # it: on some stock Windows installations that opens the Store or waits for
+    # a user decision instead of returning an exit code.
+    $item = Get-Item -LiteralPath $command.Source -ErrorAction SilentlyContinue
+    if ($item -and (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) -and $item.Length -eq 0) {
+        return $false
+    }
+
+    $stdoutPath = [IO.Path]::GetTempFileName()
+    $stderrPath = "$stdoutPath.err"
+    $proc = $null
     try {
-        $output = & $Name --version 2>&1 | Out-String
+        $proc = Start-Process -FilePath $command.Source -ArgumentList @("--version") `
+            -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath -PassThru
+        if (-not $proc.WaitForExit(5000)) {
+            try { $proc.Kill() } catch { }
+            return $false
+        }
+        $output = (Get-Content -LiteralPath $stdoutPath -Raw -ErrorAction SilentlyContinue) + `
+            (Get-Content -LiteralPath $stderrPath -Raw -ErrorAction SilentlyContinue)
         return $output -match 'Python \d+\.\d+'
     } catch {
         return $false
+    } finally {
+        if ($proc) { $proc.Dispose() }
+        Remove-Item $stdoutPath, $stderrPath -Force -ErrorAction SilentlyContinue
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Helper: run an installer and fail on an exit code that is not explicitly
+# accepted.  MSI 3010 means success with a reboot pending.
+# ---------------------------------------------------------------------------
+function Invoke-Installer {
+    param(
+        [string]$Description,
+        [string]$FilePath,
+        [string[]]$ArgumentList,
+        [int[]]$SuccessExitCodes = @(0),
+        [int[]]$RebootExitCodes = @()
+    )
+    $proc = Start-Process -FilePath $FilePath -ArgumentList $ArgumentList -Wait -PassThru -NoNewWindow
+    if ($RebootExitCodes -contains $proc.ExitCode) {
+        Write-Host "    $Description succeeded; reboot pending (exit code $($proc.ExitCode))." -ForegroundColor Yellow
+    } elseif ($SuccessExitCodes -notcontains $proc.ExitCode) {
+        throw "$Description failed with exit code $($proc.ExitCode)"
+    }
+}
+
+function Invoke-Download {
+    param([string]$Url, [string]$Destination)
+    & curl.exe -L -o $Destination $Url
+    if ($LASTEXITCODE -ne 0) {
+        throw "download failed with exit code $($LASTEXITCODE): $Url"
     }
 }
 
@@ -96,9 +150,9 @@ Invoke-Step "Python 3.12" {
     $pythonUrl = "https://www.python.org/ftp/python/3.12.10/python-3.12.10-amd64.exe"
     $installer = "$env:TEMP\python-3.12.10-amd64.exe"
     Write-Host "    downloading $pythonUrl ..."
-    curl.exe -L -o $installer $pythonUrl
+    Invoke-Download $pythonUrl $installer
     Write-Host "    running installer (silent, per-machine, with PATH)..."
-    Start-Process -FilePath $installer -ArgumentList "/quiet","InstallAllUsers=1","PrependPath=1","Include_test=0" -Wait -NoNewWindow
+    Invoke-Installer "Python installer" $installer @("/quiet","InstallAllUsers=1","PrependPath=1","Include_test=0")
     Remove-Item $installer -Force -ErrorAction SilentlyContinue
 
     # REFRESH PATH for this session so the steps below see python.
@@ -108,7 +162,7 @@ Invoke-Step "Python 3.12" {
         $ver = & python --version 2>&1
         Write-Host "    installed: $ver"
     } else {
-        Write-Host "    installed -- python will be visible in a fresh PowerShell session" -ForegroundColor Yellow
+        throw "Python installer exited successfully, but python.exe is not a working interpreter"
     }
 }
 
@@ -139,7 +193,13 @@ Invoke-Step "python3.exe alias" {
     $python3Exe = Join-Path $pythonDir "python3.exe"
 
     if (Test-Path $python3Exe) {
-        Write-Host "    python3.exe already exists at $python3Exe"
+        if (Test-RealPython $python3Exe) {
+            Write-Host "    python3.exe already exists at $python3Exe"
+        } else {
+            Remove-Item $python3Exe -Force
+            Copy-Item $pythonExe $python3Exe
+            Write-Host "    replaced non-functional python3.exe at $python3Exe"
+        }
     } else {
         Copy-Item $pythonExe $python3Exe
         Write-Host "    copied $pythonExe -> $python3Exe"
@@ -151,7 +211,7 @@ Invoke-Step "python3.exe alias" {
         $ver = & python3 --version 2>&1
         Write-Host "    python3 resolves: $ver"
     } else {
-        Write-Host "    python3.exe created -- will be visible in a fresh PowerShell session" -ForegroundColor Yellow
+        throw "python3.exe was created, but it is not a working Python interpreter"
     }
 }
 
@@ -169,8 +229,16 @@ Invoke-Step "PowerShell execution policy" {
         return
     }
     Write-Host "    CurrentUser policy is $policy -- setting to RemoteSigned..."
-    Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned -Force
-    Write-Host "    set to RemoteSigned (CurrentUser scope -- narrowest that unblocks npm.ps1)"
+    try {
+        Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned -Force -ErrorAction Stop
+        Write-Host "    set to RemoteSigned (CurrentUser scope -- narrowest that unblocks npm.ps1)"
+    } catch {
+        if ($_.FullyQualifiedErrorId -like "ExecutionPolicyOverride*") {
+            Write-Host "    Process-scope Bypass overrides CurrentUser policy; npm.ps1 is already unblocked"
+        } else {
+            throw
+        }
+    }
 }
 
 # ---------------------------------------------------------------------------
@@ -186,9 +254,9 @@ Invoke-Step "Git for Windows" {
     $gitUrl = "https://github.com/git-for-windows/git/releases/download/v2.47.1.windows.2/Git-2.47.1.2-64-bit.exe"
     $installer = "$env:TEMP\git-install.exe"
     Write-Host "    downloading $gitUrl ..."
-    curl.exe -L -o $installer $gitUrl
+    Invoke-Download $gitUrl $installer
     Write-Host "    running installer (silent)..."
-    Start-Process -FilePath $installer -ArgumentList "/VERYSILENT","/NORESTART","/NOCANCEL" -Wait -NoNewWindow
+    Invoke-Installer "Git installer" $installer @("/VERYSILENT","/NORESTART","/NOCANCEL")
     Remove-Item $installer -Force -ErrorAction SilentlyContinue
 
     # Refresh PATH for this session.
@@ -198,7 +266,7 @@ Invoke-Step "Git for Windows" {
         $ver = & git --version 2>&1
         Write-Host "    installed: $ver"
     } else {
-        Write-Host "    installed -- git will be visible in a fresh PowerShell session" -ForegroundColor Yellow
+        throw "Git installer exited successfully, but git is not available on PATH"
     }
 }
 
@@ -213,9 +281,9 @@ Invoke-Step "Node.js LTS" {
         $nodeUrl = "https://nodejs.org/dist/v22.14.0/node-v22.14.0-x64.msi"
         $installer = "$env:TEMP\node-install.msi"
         Write-Host "    downloading $nodeUrl ..."
-        curl.exe -L -o $installer $nodeUrl
+        Invoke-Download $nodeUrl $installer
         Write-Host "    running installer (silent)..."
-        Start-Process -FilePath "msiexec.exe" -ArgumentList "/i",$installer,"/quiet","/norestart" -Wait -NoNewWindow
+        Invoke-Installer "Node.js installer" "msiexec.exe" @("/i",$installer,"/quiet","/norestart") @(0) @(3010,1641)
         Remove-Item $installer -Force -ErrorAction SilentlyContinue
 
         # Refresh PATH.
@@ -225,7 +293,7 @@ Invoke-Step "Node.js LTS" {
             $ver = & node --version 2>&1
             Write-Host "    installed: $ver"
         } else {
-            Write-Host "    installed -- node will be visible in a fresh PowerShell session" -ForegroundColor Yellow
+            throw "Node.js installer exited successfully, but node is not available on PATH"
         }
     }
 
@@ -244,19 +312,39 @@ Invoke-Step "Claude Code" {
     # Refresh PATH one more time so npm is definitely visible.
     $env:Path = [System.Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path", "User")
 
-    if (Test-Command claude) {
-        $ver = & claude --version 2>&1
+    # Resolve the npm global bin directory instead of trusting an arbitrary
+    # claude command already present on PATH.
+    $npmPrefix = (& npm prefix -g 2>&1 | Out-String).Trim()
+    $prefixExitCode = $LASTEXITCODE
+    if ($prefixExitCode -ne 0 -or -not $npmPrefix) {
+        throw "npm could not report its global prefix"
+    }
+    $claudeCommand = Get-ChildItem -LiteralPath $npmPrefix -Filter "claude.*" -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.Extension -in @(".cmd", ".ps1", ".exe") } |
+        Select-Object -First 1
+    if ($claudeCommand) {
+        $ver = & $claudeCommand.FullName --version 2>&1
         Write-Host "    already installed: $ver"
         return
     }
 
     Write-Host "    npm install -g @anthropic-ai/claude-code ..."
-    npm install -g @anthropic-ai/claude-code
-    if (Test-Command claude) {
-        $ver = & claude --version 2>&1
+    & npm install -g @anthropic-ai/claude-code
+    $npmExitCode = $LASTEXITCODE
+    if ($npmExitCode -ne 0) {
+        throw "Claude Code npm install failed with exit code $npmExitCode"
+    }
+
+    # Check the global npm bin directory directly.  A stale claude command on
+    # PATH must not turn a failed or incomplete install into a false success.
+    $claudeCommand = Get-ChildItem -LiteralPath $npmPrefix -Filter "claude.*" -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.Extension -in @(".cmd", ".ps1", ".exe") } |
+        Select-Object -First 1
+    if ($claudeCommand) {
+        $ver = & $claudeCommand.FullName --version 2>&1
         Write-Host "    installed: $ver"
     } else {
-        Write-Host "    installed -- claude will be visible in a fresh PowerShell session" -ForegroundColor Yellow
+        throw "Claude Code npm install succeeded, but no claude command was created in $npmPrefix"
     }
 }
 
