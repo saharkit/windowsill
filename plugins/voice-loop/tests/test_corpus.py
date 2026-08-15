@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import os
 
+import threading
+
 import pytest
 
 import voice_server
@@ -219,13 +221,70 @@ def test_health_reports_nulls_when_no_corpus_is_configured(client):
 
 
 def test_health_reports_how_far_the_corpus_has_got(client, varying_xtts, corpus_dir):
-    """Zeroes, not nulls, once one is configured: "recording nothing" and "recording, still empty"
-    are different answers and only one of them is a problem."""
+    """Nulls until a write has counted something, then the counters that write maintains.
+
+    /health must never be the thing that walks the directory, so a configured-but-unwritten corpus
+    reads null — "not counted yet" — and only a WRITE turns that into numbers.
+    """
     empty = client.get("/health").json()
-    assert (empty["corpus_clips"], empty["corpus_seconds"]) == (0, 0.0)
+    assert (empty["corpus_clips"], empty["corpus_seconds"]) == (None, None)
 
     client.post("/tts", json={"text": "Привет."})
     body = client.get("/health").json()
 
     assert body["corpus_clips"] == 1
     assert body["corpus_seconds"] == pytest.approx(0.1, abs=0.05)
+
+
+class RecordingLock:
+    """A real threading.Lock that also counts acquires — the corpus-lock instrumentation.
+
+    Delegates every method to a real lock, so the only new thing is the counter; nothing about
+    mutual exclusion is reimplemented.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.acquires = 0
+
+    def acquire(self, *args, **kwargs) -> bool:
+        self.acquires += 1
+        return self._lock.acquire(*args, **kwargs)
+
+    def release(self) -> None:
+        self._lock.release()
+
+    def __enter__(self) -> "RecordingLock":
+        self.acquire()
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.release()
+
+
+def test_health_holds_no_corpus_lock_and_opens_no_wav(client, monkeypatch, corpus_dir):
+    """L2 GAP: deleting this lets /health walk the corpus again — the one cheap endpoint becomes
+    the one that stalls on every clip on disk. The lock is instrumented and WAV opens are counted,
+    so a regression to the scan path fails loudly instead of as a slow /health."""
+    (corpus_dir / "ru").mkdir(parents=True)
+    for i in range(50):
+        (corpus_dir / "ru" / f"clip-{i:02}.wav").write_bytes(pcm_wav(seconds=1.0))
+
+    lock = RecordingLock()
+    monkeypatch.setattr(voice_server, "_corpus_lock", lock)
+
+    opened: list[object] = []
+    real_read_bytes = voice_server.Path.read_bytes
+
+    def counting_read_bytes(self, *args, **kwargs):
+        opened.append(self)
+        return real_read_bytes(self, *args, **kwargs)
+
+    monkeypatch.setattr(voice_server.Path, "read_bytes", counting_read_bytes)
+
+    body = client.get("/health").json()
+
+    assert lock.acquires == 0
+    assert opened == []
+    # And it still answers honestly: nothing has been written by this process, so nothing counted.
+    assert (body["corpus_clips"], body["corpus_seconds"]) == (None, None)

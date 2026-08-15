@@ -310,9 +310,103 @@ def test_health_reports_the_engine_and_the_loaded_cloner(client, monkeypatch):
     body = client.get("/health").json()
     assert body["tts_engine"] == "silero"
     assert body["xtts_loaded"] is False
+    assert body["status"] == "verified-healthy"  # the built-in engine answers, no VRAM to read
 
     monkeypatch.setattr(voice_server, "TTS_ENGINE", "xtts")
     voice_server._xtts = object()
     body = client.get("/health").json()
     assert body["tts_engine"] == "xtts"
     assert body["xtts_loaded"] is True
+
+
+@pytest.mark.parametrize(
+    "engine, language, fake, expected",
+    [
+        ("silero", "ru", None, None),
+        ("silero", "xx", None, "engine unreachable: no silero voice for language 'xx'"),
+        ("xtts", "ru", "xtts", None),
+        ("xtts", "ru", None, "engine unreachable: coqui-tts (ModuleNotFoundError)"),
+        ("ukrainian", "uk", "ukrainian", None),
+        ("ukrainian", "uk", None, "engine unreachable: ukrainian-tts (ModuleNotFoundError)"),
+        ("bogus", "ru", None, "engine unreachable: unknown engine 'bogus'"),
+    ],
+)
+def test_engine_verification(monkeypatch, import_fake, engine, language, fake, expected):
+    """L1: the engine probe's decision, one branch per case — including the named reason for every
+    way it can answer "not verified". The /health tests only pin that this result becomes `unknown`."""
+    monkeypatch.setattr(voice_server, "TTS_ENGINE", engine)
+    monkeypatch.setattr(voice_server, "LANGUAGE", language)
+    if fake == "xtts":
+        api = import_fake("TTS.api", TTS=object)
+        import_fake("TTS", api=api)
+    elif fake == "ukrainian":
+        tts_module = import_fake("ukrainian_tts.tts", TTS=object)
+        import_fake("ukrainian_tts", tts=tts_module)
+
+    assert voice_server._engine_verification() == expected
+
+
+def test_vram_verification_is_vacuous_on_cpu(monkeypatch):
+    """L1: no VRAM figure exists on CPU, so the probe must not fail a CPU server."""
+    monkeypatch.setattr(voice_server, "DEVICE", "cpu")
+    assert voice_server._vram_verification() is None
+
+
+def test_vram_verification_reads_the_figure_on_gpu(monkeypatch):
+    """L1: a GPU that answers its VRAM probe reads as verified — deleting this leaves the only
+    "readable card" branch unexercised, so a probe that always reports unreadable would survive."""
+    monkeypatch.setattr(voice_server, "DEVICE", "cuda")
+    monkeypatch.setattr(voice_server.torch.cuda, "mem_get_info", lambda _device: (4 * 1024**3, 6 * 1024**3))
+    assert voice_server._vram_verification() is None
+
+
+def test_vram_verification_reports_an_unreadable_figure(monkeypatch):
+    """L1: the failure modes the tenant guard already names — a raising probe reads as unreadable."""
+    monkeypatch.setattr(voice_server, "DEVICE", "cuda")
+
+    def no_vram(_device):
+        raise RuntimeError("driver cannot report free VRAM")
+
+    monkeypatch.setattr(voice_server.torch.cuda, "mem_get_info", no_vram)
+    assert voice_server._vram_verification() == "vram unreadable (RuntimeError)"
+
+
+def test_health_reports_unknown_when_the_engine_is_unreachable(client, monkeypatch):
+    """L2 GAP: deleting this lets a server whose TTS engine cannot be reached keep answering `ok`
+    — the "healthy" and "I did not look" conflation this ticket retires."""
+    monkeypatch.setattr(voice_server, "TTS_ENGINE", "xtts")  # coqui-tts is not installed here
+
+    body = client.get("/health").json()
+
+    assert body["status"] == "unknown"
+    assert body["ok"] is False
+    assert "engine unreachable" in body["reason"]
+
+
+def test_health_reports_unknown_when_the_vram_figure_cannot_be_read(client, monkeypatch):
+    """L2 GAP: deleting this lets a GPU-bound server keep answering `ok` even though the VRAM
+    figure its tenancy guard needs could not be read — again, "healthy" and "I did not look"."""
+    monkeypatch.setattr(voice_server, "DEVICE", "cuda")
+
+    def no_vram(_device):
+        raise RuntimeError("driver cannot report free VRAM")
+
+    monkeypatch.setattr(voice_server.torch.cuda, "mem_get_info", no_vram)
+
+    body = client.get("/health").json()
+
+    assert body["status"] == "unknown"
+    assert body["ok"] is False
+    assert "vram unreadable" in body["reason"]
+
+
+def test_health_reports_verified_healthy_when_the_engine_and_vram_answer(client, monkeypatch, coqui_installed):
+    """The converse of the two unknown cases: `ok` is reachable, but only after both probes answer."""
+    monkeypatch.setattr(voice_server, "TTS_ENGINE", "xtts")
+    monkeypatch.setattr(voice_server, "DEVICE", "cpu")
+
+    body = client.get("/health").json()
+
+    assert body["status"] == "verified-healthy"
+    assert body["ok"] is True
+    assert body["reason"] is None

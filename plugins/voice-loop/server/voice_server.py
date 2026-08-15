@@ -1542,6 +1542,20 @@ def corpus_totals() -> tuple[int, float]:
         return _corpus_clips, _corpus_seconds
 
 
+def corpus_counts() -> tuple[int, float] | None:
+    """(clips, seconds) this process has counted so far, or None before the first write.
+
+    /health's read: the counters a write maintains, never a scan of the directory. `corpus_totals()`
+    is the write path's scan-and-cache; this is the health path's answer, and it must not be the
+    thing that walks the corpus — the endpoint whose job is to be cheap would otherwise be the one
+    that stalls it. Reads the two counters without the lock: a health snapshot may tear by one clip,
+    which is a fair price for never blocking.
+    """
+    if _corpus_clips is None:
+        return None
+    return _corpus_clips, _corpus_seconds
+
+
 def record_corpus_clip(seconds: float) -> None:
     """Count one clip this process just wrote, and say so the once when that fills the corpus."""
     global _corpus_clips, _corpus_seconds
@@ -1669,15 +1683,66 @@ def hook_heartbeat(clock: Callable[[], float] = _default_wall_clock) -> tuple[st
     return stamp, clock() - fired
 
 
+def _engine_verification() -> str | None:
+    """A reason the configured voice engine cannot be verified, or None when it answered.
+
+    The probe is the engine's availability check — the same import the request path performs
+    (`xtts_request_error` / `ukrainian_request_error`), NOT a model load — so /health stays the
+    cheap endpoint it is and never warms a model. Silero ships inside the server (loaded from
+    torch.hub), so its availability is the configured language having a voice.
+    """
+    if TTS_ENGINE == "silero":
+        if LANGUAGE not in SILERO_VOICES:
+            return f"engine unreachable: no silero voice for language {LANGUAGE!r}"
+        return None
+    if TTS_ENGINE == "xtts":
+        try:
+            from TTS.api import TTS  # noqa: F401 — availability probe only; xtts() does the load
+        except ImportError as err:
+            return f"engine unreachable: coqui-tts ({type(err).__name__})"
+        return None
+    if TTS_ENGINE == "ukrainian":
+        try:
+            from ukrainian_tts.tts import TTS  # noqa: F401 — availability probe only
+        except ImportError as err:
+            return f"engine unreachable: ukrainian-tts ({type(err).__name__})"
+        return None
+    return f"engine unreachable: unknown engine {TTS_ENGINE!r}"
+
+
+def _vram_verification() -> str | None:
+    """A reason the VRAM figure the models need could not be read, or None when it was.
+
+    Only a GPU-bound device has a VRAM figure at all; on CPU there is nothing to read, so the probe
+    is satisfied vacuously. The failure modes mirror the tenant guard (`xtts_device`): no such
+    function on an older torch, a driver that errors, or a CUDA-less wheel's lazy-init assertion —
+    all three read as "unreadable", which is a different answer from "there is little of it".
+    """
+    device = resolve_device()
+    if model_device(device) != "gpu":
+        return None
+    try:
+        torch.cuda.mem_get_info(device)
+    except (AttributeError, AssertionError, RuntimeError) as err:
+        return f"vram unreadable ({type(err).__name__})"
+    return None
+
+
 @app.get("/health")
 def health() -> dict[str, object]:
     queues = queue_depths()
     hook_fired_at, hook_fired_age = hook_heartbeat()
-    # Nulls rather than zeroes when no corpus is configured: "none is being recorded" and "one is
-    # being recorded and is still empty" are different answers, and only one of them is a problem.
-    corpus = corpus_totals() if CORPUS_DIR else None
+    # Nulls rather than zeroes until the first clip is written: "no corpus configured" and "one is
+    # configured but nothing has been written yet" both read as null, and only a WRITE is allowed
+    # to turn them into numbers — see corpus_counts(), the read that never scans the directory.
+    corpus = corpus_counts() if CORPUS_DIR else None
+    reason = _engine_verification() or _vram_verification()
     return {
-        "ok": True,
+        # `ok` is reachable only after the configured engine answered and the VRAM figure was
+        # read — a health answer that did not look must not read the same as one that did.
+        "ok": reason is None,
+        "status": "verified-healthy" if reason is None else "unknown",
+        "reason": reason,
         "version": SERVER_VERSION,
         "model_concurrency": MODEL_CONCURRENCY,
         "model_in_flight": sum(queue["in_flight"] for queue in queues.values()),
