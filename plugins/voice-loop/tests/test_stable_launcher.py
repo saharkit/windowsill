@@ -151,7 +151,6 @@ def test_main_on_windows_spawns_a_real_child_and_propagates_its_exit_code(tmp_pa
         child = tmp_path / "dictate-toggle.cmd"
         child.write_text(
             "@echo off\r\n"
-            'py -3 -c "import sys" >nul 2>nul && (py -3 "%~dp0child_body.py" %* & exit /b %ERRORLEVEL%)\r\n'
             'python "%~dp0child_body.py" %*\r\n',
             encoding="utf-8",
         )

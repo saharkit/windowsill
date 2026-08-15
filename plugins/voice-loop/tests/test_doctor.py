@@ -698,10 +698,10 @@ class TestDoctorMissingEngineDiagnosis:
         output = json.loads(captured.out)
         assert rc == 1
         findings = output["findings"]
-        assert len(findings) == 1
-        assert findings[0]["key"] == "sill_core_missing"
-        assert findings[0]["bin"] == "real_anomaly"
-        assert "install sill-core" in findings[0]["fix"].lower()
+        finding = next(item for item in findings if item["key"] == "sill_core_missing")
+        assert finding["bin"] == "real_anomaly"
+        assert "The diagnosis engine" in finding["title"]
+        assert "install sill-core" in finding["fix"].lower()
 
         # Exercise the reader verdicts and neutral argument branches in the same diagnosis setup.
         state_home = tmp_path / "state"
@@ -741,7 +741,15 @@ class TestDoctorMissingEngineDiagnosis:
         rc = doctor.main(["doctor", "--state-home", str(state_home), "--config-path", str(tmp_path / "config.json")])
         rendered = json.loads(capsys.readouterr().out)
         assert rc == 0
-        assert [finding["key"] for finding in rendered["findings"]] == ["wsl"]
+        keys = [finding["key"] for finding in rendered["findings"]]
+        # What this asserts is the FILTER, not the exact roster: with a real engine and a
+        # Windows-boundary finding, unfinished_install is dropped and wsl survives. A host may
+        # legitimately contribute its own findings -- a Windows box resolves `python3` to the
+        # Store alias and correctly reports python3_is_store_stub -- so comparing the whole list
+        # couples this test to the machine it runs on, which is what made it red on the one
+        # platform this work is about.
+        assert "unfinished_install" not in keys
+        assert "wsl" in keys
         assert rendered["ledger_status"] == "ok"
 
     def test_import_failed_emits_diagnosis_json(
@@ -790,10 +798,10 @@ class TestDoctorMissingEngineDiagnosis:
 
         assert rc == 1
         findings = output["findings"]
-        assert len(findings) == 1
-        assert findings[0]["key"] == "sill_core_import_failed"
-        assert findings[0]["bin"] == "real_anomaly"
-        assert "reinstall sill-core" in findings[0]["fix"].lower()
+        finding = next(item for item in findings if item["key"] == "sill_core_import_failed")
+        assert finding["bin"] == "real_anomaly"
+        assert "The diagnosis engine" in finding["title"]
+        assert "reinstall sill-core" in finding["fix"].lower()
 
 
 # ---------------------------------------------------------------------------

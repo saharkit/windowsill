@@ -1960,8 +1960,13 @@ def test_a_line_written_while_the_previous_clip_plays_is_queued_not_dropped(stat
         if elapsed[0] >= PLAYBACK_SECONDS_IN_FLIGHT and child.poll() is None:
             _append_message(transcript, "🔊 the line that waited its turn")
             child.kill()
-            # Popen.wait() is the portable process-handle reap; os.waitpid() can hang on Windows.
-            child.wait(timeout=10)
+            # Reap with NO timeout, deliberately. os.waitpid() hangs on Windows, but a TIMED
+            # Popen.wait() busy-waits through time.sleep -- and this test patches
+            # speak.time.sleep, which IS the module-global time.sleep, so a timed wait recurses
+            # straight back into fake_sleep. An untimed wait() blocks in the kernel on both
+            # platforms (waitpid on POSIX, WaitForSingleObject on Windows) and touches no clock.
+            # Unbounded is safe here: the child was killed on the line above.
+            child.wait()
 
     try:
         payload = json.dumps({"transcript_path": str(transcript), "hook_event_name": "Stop"})
@@ -1971,7 +1976,7 @@ def test_a_line_written_while_the_previous_clip_plays_is_queued_not_dropped(stat
     finally:
         if child.poll() is None:
             child.kill()
-            child.wait(timeout=10)
+            child.wait()  # untimed for the same reason as above: no clock, no recursion
 
     assert spoken == ["the line that waited its turn"]  # voiced, not dropped
     assert elapsed[0] >= PLAYBACK_SECONDS_IN_FLIGHT  # and it really did outlast the clip
