@@ -1412,7 +1412,11 @@ def _pid_looks_like_recorder(pid: int, recorder: str, platform_id: str = sys.pla
         if cmdline is None:
             return False
         executable = "rec" if recorder == "sox" else recorder
-        return executable in cmdline.split()
+        # Match the executable's basename against every argv token: a recorder reached through a
+        # PATH-shadowing script (the CI fake) runs as `bash /path/pw-record …`, whose argv carries
+        # the script path rather than the bare name. A bare-name match would refuse that legitimate
+        # recorder and wedge the recording (the stop toggle would never signal it).
+        return any(os.path.basename(token) == executable for token in cmdline.split())
     if platform_id == "win32" or os.name == "nt":
         return _win_pid_is_recorder(pid, recorder)
     return True

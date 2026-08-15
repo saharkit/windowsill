@@ -949,11 +949,19 @@ jobs:
             || { echo "TTS did not return a WAV for the fake microphone"; exit 1; }
           cat > "$fake/pw-record" <<'SH'
           #!/usr/bin/env bash
-          # fake microphone: "record" by copying pre-synthesized speech, then wait to be stopped
+          # fake microphone: "record" by copying pre-synthesized speech, then wait to be stopped.
+          # The wait keeps THIS interpreter as the pidfile process instead of exec'ing away into
+          # `sleep`: the stop toggle's PID-reuse guard (windowsill#203) reads /proc/<pid>/cmdline and
+          # refuses to signal a process that no longer looks like the recorder — and a recording that
+          # can never be stopped is a leak. The trap reaps the sleep child and turns the stop signal
+          # into a clean exit, so the pid dies on INT the same way it did under `exec sleep`.
           wav=""
           for arg in "$@"; do wav="$arg"; done
           cp "${FAKE_RECORD_WAV:?}" "${wav:?}"
-          exec sleep 60
+          sleep 60 &
+          waiter=$!
+          trap 'kill "$waiter" 2>/dev/null; exit 0' INT TERM
+          wait "$waiter"
           SH
           cat > "$fake/wl-copy" <<'SH'
           #!/usr/bin/env bash
@@ -970,11 +978,17 @@ jobs:
           }
           JSON
           export PATH="$fake:$PATH"
+          state="${XDG_STATE_HOME:-$HOME/.local/state}/voice-loop"
           # debounce_ms is widened from its 750 ms default so BOTH sides of the guard are
           # deterministic here rather than racing an interpreter start: every fire in the train
           # below is unambiguously inside the window (0.3 s apart plus a python start, against 2 s),
           # and the real second toggle (3 s later) is unambiguously outside it.
-          python3 plugins/voice-loop/scripts/dictate.py paste   # toggle 1: start the fake recorder
+          #
+          # Every dictate.py fire is a contract: a non-zero exit ends the step under `set -e` with
+          # no message, so each is named here — this step is the one place a silent toggle failure
+          # (windowsill#203's own failure mode) must not reproduce itself.
+          python3 plugins/voice-loop/scripts/dictate.py paste \
+            || { echo "dictate start toggle failed (exit $?)"; cat "$state/dictate.log" 2>/dev/null || true; exit 1; }   # toggle 1: start the fake recorder
           # A HELD key, for real: an autorepeat TRAIN whose span (>= 2.4 s of sleeps alone) is
           # LONGER than the window. This is the input shape that tells a debounce from a rate
           # limiter — measured from the last ADMITTED toggle, the fire past 2 s is re-admitted and
@@ -982,11 +996,12 @@ jobs:
           # starts a second one; measured from the last FIRE, the whole hold stays one toggle.
           for _ in 1 2 3 4 5 6 7 8; do
             sleep 0.3
-            python3 plugins/voice-loop/scripts/dictate.py paste   # OS key repeat: must be IGNORED
+            python3 plugins/voice-loop/scripts/dictate.py paste \
+              || { echo "dictate key-repeat toggle failed (exit $?)"; cat "$state/dictate.log" 2>/dev/null || true; exit 1; }   # OS key repeat: must be IGNORED
           done
           sleep 3
-          python3 plugins/voice-loop/scripts/dictate.py paste   # toggle 2: stop -> STT -> clipboard
-          state="${XDG_STATE_HOME:-$HOME/.local/state}/voice-loop"
+          python3 plugins/voice-loop/scripts/dictate.py paste \
+            || { echo "dictate stop toggle failed (exit $?)"; cat "$state/dictate.log" 2>/dev/null || true; exit 1; }   # toggle 2: stop -> STT -> clipboard
           echo "--- dictate.log"; cat "$state/dictate.log"
           echo "--- clipboard capture"; cat "$FAKE_CLIP_FILE" 2>/dev/null || true; echo
           grep -q "recording via pw-record" "$state/dictate.log" \
@@ -1031,10 +1046,16 @@ jobs:
           state="$XDG_STATE_HOME/voice-loop"
           cat > "$fake/pw-record" <<'SH'
           #!/usr/bin/env bash
+          # Same fake microphone as the dictation contract step above: copy pre-synthesized speech,
+          # then wait to be stopped WITHOUT exec'ing away — the stop toggle's PID-reuse guard
+          # (windowsill#203) reads /proc/<pid>/cmdline and must still see this recorder in it.
           wav=""
           for arg in "$@"; do wav="$arg"; done
           cp "${FAKE_RECORD_WAV:?}" "${wav:?}"
-          exec sleep 60
+          sleep 60 &
+          waiter=$!
+          trap 'kill "$waiter" 2>/dev/null; exit 0' INT TERM
+          wait "$waiter"
           SH
           cat > "$fake/wl-copy" <<'SH'
           #!/usr/bin/env bash
@@ -1156,9 +1177,11 @@ jobs:
           export FAKE_DG_KEY="not-a-real-key-and-never-leaves-this-runner"
           export PATH="$fake:$PATH"
 
-          python3 plugins/voice-loop/scripts/dictate.py paste    # toggle 1: record + open the socket
+          python3 plugins/voice-loop/scripts/dictate.py paste \
+            || { echo "dictate start toggle failed (exit $?)"; cat "$state/dictate.log" 2>/dev/null || true; exit 1; }    # toggle 1: record + open the socket
           sleep 2
-          python3 plugins/voice-loop/scripts/dictate.py paste    # toggle 2: stop -> collect -> paste
+          python3 plugins/voice-loop/scripts/dictate.py paste \
+            || { echo "dictate stop toggle failed (exit $?)"; cat "$state/dictate.log" 2>/dev/null || true; exit 1; }    # toggle 2: stop -> collect -> paste
           wait "$dg" || true
 
           echo "--- dictate.log"; cat "$state/dictate.log"
@@ -1209,9 +1232,11 @@ jobs:
           config['stt']['cloud']['endpoint'] = 'http://127.0.0.1:9'   # discard: never listening
           json.dump(config, open(path, 'w'))
           "
-          python3 plugins/voice-loop/scripts/dictate.py paste
+          python3 plugins/voice-loop/scripts/dictate.py paste \
+            || { echo "dictate start toggle failed on the dead endpoint (exit $?)"; cat "$state/dictate.log" 2>/dev/null || true; exit 1; }
           sleep 2
-          python3 plugins/voice-loop/scripts/dictate.py paste
+          python3 plugins/voice-loop/scripts/dictate.py paste \
+            || { echo "dictate stop toggle failed on the dead endpoint (exit $?)"; cat "$state/dictate.log" 2>/dev/null || true; exit 1; }
           echo "--- dictate.log (degrade)"; cat "$state/dictate.log"
           grep -q "streaming stt failed" "$state/dictate.log" \
             || { echo "the dead endpoint did not produce a streaming failure"; exit 1; }
