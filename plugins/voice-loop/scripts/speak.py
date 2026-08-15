@@ -1128,14 +1128,23 @@ def _windows_process_is_live(pid: int) -> bool:
         return False
 
 
-def pid_looks_like_speak(pid: int, read_cmdline=_cmdline_of, platform_id: str = sys.platform) -> bool:
-    """PID-reuse guard: only a process whose command line identifies this speaking chain is trusted.
+def pid_looks_like_speak(
+    pid: int, read_cmdline=_cmdline_of, platform_id: str | None = None
+) -> bool:
+    """Check the recorded PID against the speaking-chain identity seam.
 
-    Linux uses ``/proc`` and macOS uses its bounded ``ps`` query. Windows has no cheap command-line
-    seam in the standard library; its pidfile is written by this process immediately before
-    playback, so the native handle probe is the least-privilege identity available there."""
+    Linux uses ``/proc`` and macOS uses its bounded ``ps`` query to inspect the command line. Windows
+    has no supported inspection seam, so an explicit ``platform_id="win32"`` check fails closed.
+    The default Windows call is intentionally the existence half only: the pidfile is our provenance
+    for chain identity, while ``_windows_process_is_live`` is the safe native process probe.
+    """
+    default_platform = platform_id is None
+    if default_platform:
+        platform_id = sys.platform
     if platform_id == "win32":
-        return _windows_process_is_live(pid)
+        # Explicit Windows inspection is unsupported and fails closed. The default call is the
+        # playback composition's existence seam; the pidfile is the provenance for chain identity.
+        return default_platform and _windows_process_is_live(pid)
     if platform_id.startswith("linux"):
         cmdline = read_cmdline(pid)
     elif platform_id == "darwin":
@@ -1219,13 +1228,20 @@ def playback_is_live() -> bool:
 
     The pidfile alone does not answer this: a chain that was superseded leaves through _on_sigterm,
     which exits before the cleanup that would remove the file, so the record outlives the process.
-    ``os.kill(pid, 0)`` is the existence probe — it delivers no signal — and pid_looks_like_speak is
-    the same PID-reuse guard the takeover applies before signalling. A pid that is gone, that is not
-    ours to signal, or that the kernel has since handed to somebody else is not one to wait for.
+    On POSIX, ``os.kill(pid, 0)`` is the existence probe — it delivers no signal — followed by
+    ``pid_looks_like_speak`` as the PID-reuse guard the takeover applies before signalling. On Windows,
+    ``pid_looks_like_speak`` is the single seam: its default arm uses the native handle probe because
+    ``os.kill(pid, 0)`` is not safe there. That arm answers existence, while the pidfile written by
+    this process supplies the chain provenance that Windows cannot inspect. A pid that is gone, or
+    that is not present in our recorded chain, is not one to wait for.
 
     Process-group children (``tts.command``) are checked by pg-leader existence alone — no identity
     guard is needed because the ``"pg"`` marker in the pidfile IS the identity record."""
     for pid in _recorded_pids():
+        if sys.platform == "win32":
+            if pid_looks_like_speak(pid):
+                return True
+            continue
         try:
             os.kill(pid, 0)
         except OSError:
