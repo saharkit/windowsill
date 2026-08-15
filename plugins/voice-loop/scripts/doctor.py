@@ -401,9 +401,13 @@ def _check_python_interpreter(
     3. No real Python interpreter at all — fires when NEITHER ``python3`` NOR
        ``python`` resolves to a real interpreter (either absent or another
        Store stub).
+    4. A real interpreter is installed but only as ``python`` — python.org
+       ships no ``python3.exe``, so nothing answers to ``python3`` and every
+       launcher's ``command -v python3`` guard exits silently.
 
     Returns ``None`` on Linux/macOS (the check is inert) and when no Store
-    stub is present and a real interpreter is available.
+    stub is present, a real ``python3`` is resolvable, and the interpreter
+    answers to the name the launchers call.
 
     The probe seams are keyword-only with production defaults
     (``sys.platform`` and ``shutil.which``), so the test can inject a
@@ -524,6 +528,57 @@ def _check_python_interpreter(
             "evidence": {
                 "python3_is_stub": python3_path is not None and _is_store_stub(python3_path),
                 "python_is_stub": python_path is not None and _is_store_stub(python_path),
+            },
+        }
+
+    # Decision 3: a real interpreter exists but only as ``python``.
+    # python.org ships no ``python3.exe``, so nothing answers to the one
+    # name every launcher calls.  The launchers guard with
+    # ``command -v python3`` and exit 0 on absence — speak-back and
+    # dictation do NOTHING, with no error anywhere.  This is the most
+    # invisible of the three prerequisites: the interpreter is installed
+    # and healthy, so only the missing NAME is wrong.
+    if python3_path is None or _is_store_stub(python3_path):
+        first_python = (
+            _redact_windows_path(python_path) if python_path is not None else None
+        )
+        return {
+            "bin": "real_anomaly",
+            "key": "python3_alias_missing",
+            "title": (
+                "Python is installed, but nothing on PATH answers to "
+                "`python3`"
+            ),
+            "explanation": (
+                "A real Python interpreter is installed (`python` resolves"
+                f"{f' to `{first_python}`' if first_python else ''}), but "
+                "the python.org Windows installer ships `python.exe` and "
+                "NOT `python3.exe` — and every voice-loop launcher calls "
+                "`python3`.  Nothing errors: each launcher checks "
+                "`command -v python3`, finds nothing, and exits silently, "
+                "so the plugin appears to do nothing at all (no spoken "
+                "replies, no dictation)."
+            ),
+            "fix": (
+                "Create a `python3` alias for the real interpreter: open "
+                "the Python install directory (typically "
+                "`C:\\Program Files\\Python312\\` or "
+                "`C:\\Users\\<user>\\AppData\\Local\\Programs\\Python\\"
+                "Python312\\`), copy `python.exe` to `python3.exe` in the "
+                "same directory, then open a new shell and run "
+                "`where.exe python3` — it must list that copy and no "
+                "`WindowsApps` entry.  Alternatively `mklink "
+                "python3.exe python.exe` from an administrator prompt in "
+                "the same directory achieves the same without a second "
+                "copy."
+            ),
+            "offer_flip": False,
+            "flip_path": "",
+            "flip_value": None,
+            "evidence": {
+                "python_resolves_real": python_path is not None
+                and not _is_store_stub(python_path),
+                "python3_absent": python3_path is None,
             },
         }
 

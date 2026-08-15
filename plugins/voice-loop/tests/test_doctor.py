@@ -857,6 +857,88 @@ class TestWindowsPrerequisites:
         assert decision_missing is not None
         assert decision_stub["key"] != decision_missing["key"]
 
+    def test_python3_alias_missing_fires_and_reaches_output(
+        self, monkeypatch, capsys
+    ) -> None:
+        """Real python.org install, no ``python3`` anywhere → the finding fires.
+
+        Gap (#178, prerequisite 2): python.org ships ``python.exe`` and no
+        ``python3.exe``, while every launcher calls ``python3`` and guards
+        with ``command -v python3`` → exit 0.  The user sees a plugin that
+        does NOTHING, with no error — and before this check, /doctor saw a
+        healthy install and stayed silent too, because ``python`` resolves
+        to a real interpreter and no Store stub is on PATH.  This pins both
+        the decision and its merge into the final JSON output.
+        """
+        real_check = doctor._check_python_interpreter
+
+        fake_account = "FakeAccountForAliasTest"
+        fake_real_python = (
+            f"C:\\Users\\{fake_account}\\AppData\\Local\\Programs\\Python\\"
+            "Python312\\python.exe"
+        )
+
+        def patched_check():
+            return real_check(
+                platform="win32",
+                which=lambda name: fake_real_python if name == "python" else None,
+                where=lambda: [],
+            )
+
+        monkeypatch.setattr(doctor, "_check_python_interpreter", patched_check)
+        monkeypatch.setattr(doctor, "read_config", lambda path: {})
+        monkeypatch.setattr(
+            doctor,
+            "read_ledger",
+            lambda state_home: {"state": "none", "completed_steps": []},
+        )
+        monkeypatch.setattr(
+            doctor, "read_logs", lambda state_home, tail_lines=60: {}
+        )
+        monkeypatch.setattr(doctor, "load_manifest", lambda root: [])
+        monkeypatch.setattr(
+            doctor,
+            "_sill_core_root",
+            lambda: (_ for _ in ()).throw(
+                FileNotFoundError("sill-core not found")
+            ),
+        )
+
+        rc = doctor.main([])
+        captured = capsys.readouterr()
+        output = json.loads(captured.out)
+
+        assert rc == 0
+        keys = [f["key"] for f in output["findings"]]
+        assert "python3_alias_missing" in keys, (
+            f"python3 alias finding missing from output: {keys}"
+        )
+
+        finding = next(
+            f for f in output["findings"] if f["key"] == "python3_alias_missing"
+        )
+        assert finding["bin"] == "real_anomaly"
+        # The finding must say what to DO: name the alias fix concretely.
+        assert "python3.exe" in finding["fix"]
+        assert "where.exe python3" in finding["fix"]
+        # And the redacted real-interpreter path in the explanation must
+        # not carry the account name (same identity rule as the stub
+        # finding's evidence — /doctor stdout feeds /report-bug).
+        blob = json.dumps(finding)
+        assert fake_account not in blob, (
+            f"account name leaked into finding: {blob}"
+        )
+
+        # The control: a real ``python3`` present must NOT fire it.
+        clean = real_check(
+            platform="win32",
+            which=lambda name: (
+                "C:\\Python311\\python3.exe" if name == "python3" else None
+            ),
+            where=lambda: ["C:\\Python311\\python3.exe"],
+        )
+        assert clean is None, f"real python3 must not fire: {clean}"
+
     def test_windows_findings_merged_into_main_output(
         self, monkeypatch, capsys
     ) -> None:

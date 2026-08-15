@@ -55,6 +55,21 @@ Parse the JSON output with `jq` or a python one-liner.  The top-level fields:
   `explanation`, `fix`, `offer_flip`, `flip_path`, `flip_value`, and
   `evidence`
 
+Besides the three bins, `doctor.py` checks the **runtime prerequisites**
+before any config or ledger is read, on Windows only (inert elsewhere):
+
+- a real Python interpreter on PATH (not just the Microsoft Store stub —
+  `python3_is_store_stub`, `python_interpreter_missing`)
+- something that answers to `python3` — the python.org installer ships
+  `python.exe` and no `python3.exe`, while every launcher calls `python3`
+  (`python3_alias_missing`)
+- the `sill-core` engine itself, which `/doctor` needs to run at all
+  (`sill_core_missing`, `sill_core_import_failed`)
+
+These findings ride the same `findings` list and the same
+`real_anomaly` bin as everything else — present them like any other
+real-anomaly finding.
+
 If `config_present` is false, state that fact before presenting the findings.
 
 ## Step 1 — present the findings
