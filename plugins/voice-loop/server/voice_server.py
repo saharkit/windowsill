@@ -359,14 +359,24 @@ _model_waiting = {device: 0 for device in MODEL_DEVICES}
 _in_flight_lock = threading.Lock()
 
 
+class ModelSlotTimeout(Exception):
+    """A request's deadline expired while waiting for a model slot."""
+
+
 @contextmanager
-def model_slot(device: str = ""):
-    """Hold one slot on `device`'s queue (default: the primary device's) for one model call."""
+def model_slot(device: str = "", timeout: float | None = None):
+    """Hold one slot on `device`'s queue (default: the primary device's) for one model call.
+
+    A caller with a deadline passes the remaining seconds here so queue wait is part of the bounded
+    work, rather than a wait that happens before the clock is consulted.
+    """
     device = model_device(device or resolve_device())
     with _in_flight_lock:
         _model_waiting[device] += 1
     try:
-        _model_gates[device].acquire()
+        acquired = _model_gates[device].acquire(timeout=timeout) if timeout is not None else _model_gates[device].acquire()
+        if not acquired:
+            raise ModelSlotTimeout("model slot wait exceeded the request deadline")
     finally:  # queued or refused, the caller is no longer waiting
         with _in_flight_lock:
             _model_waiting[device] -= 1
@@ -1657,7 +1667,10 @@ def _default_clock() -> float:
 
 
 def bounded_segments(
-    segments, budget: float, clock: Callable[[], float] = _default_clock
+    segments,
+    budget: float,
+    clock: Callable[[], float] = _default_clock,
+    deadline: float | None = None,
 ) -> Iterator[object]:
     """Consume transcript segments until the wall clock passes `budget` seconds, then give up.
 
@@ -1675,17 +1688,22 @@ def bounded_segments(
     A budget of 0 or less means no bound — the behaviour before this cap existed, kept for an
     operator who would rather wait than lose a long dictation.
     """
-    if budget <= 0:
+    if budget <= 0 and deadline is None:
         yield from segments
         return
-    deadline = clock() + budget
+    deadline = deadline if deadline is not None else clock() + budget
     for segment in segments:
         if clock() > deadline:
             raise TranscriptionTimeout(f"transcription outran its {budget:.0f} second budget")
         yield segment
 
 
-def transcribe_upload(data: bytes, language: str, prompt: str | None = None) -> tuple[str, object]:
+def transcribe_upload(
+    data: bytes,
+    language: str,
+    prompt: str | None = None,
+    clock: Callable[[], float] = _default_clock,
+) -> tuple[str, object]:
     """The blocking body of /stt — runs in the threadpool so the event loop stays responsive.
 
     ``prompt`` is the per-request jargon hint a client's ``stt.prompt`` sends as ``?prompt=``; it
@@ -1695,16 +1713,33 @@ def transcribe_upload(data: bytes, language: str, prompt: str | None = None) -> 
     server, and the path every existing request still takes.
     """
     hint = prompt if prompt else STT_HINT
+    deadline = clock() + STT_TIMEOUT if STT_TIMEOUT > 0 else None
     with tempfile.NamedTemporaryFile(suffix=".wav") as handle:
         handle.write(data)
         handle.flush()
-        with model_slot(resolve_device()):  # whisper is the one model that follows the GPU
-            segments, info = whisper().transcribe(
-                handle.name, language=language, vad_filter=True, initial_prompt=hint
-            )
-            text = " ".join(
-                segment.text.strip() for segment in bounded_segments(segments, STT_TIMEOUT)
-            ).strip()
+        remaining = None if deadline is None else max(0.0, deadline - clock())
+        try:
+            with model_slot(resolve_device(), timeout=remaining):  # whisper follows the GPU
+                if deadline is not None and clock() > deadline:
+                    raise TranscriptionTimeout(
+                        f"transcription outran its {STT_TIMEOUT:.0f} second budget"
+                    )
+                model = whisper()
+                if deadline is not None and clock() > deadline:
+                    raise TranscriptionTimeout(
+                        f"transcription outran its {STT_TIMEOUT:.0f} second budget"
+                    )
+                segments, info = model.transcribe(
+                    handle.name, language=language, vad_filter=True, initial_prompt=hint
+                )
+                text = " ".join(
+                    segment.text.strip()
+                    for segment in bounded_segments(
+                        segments, STT_TIMEOUT, clock=clock, deadline=deadline
+                    )
+                ).strip()
+        except ModelSlotTimeout as exc:
+            raise TranscriptionTimeout(f"transcription outran its {STT_TIMEOUT:.0f} second budget") from exc
     return text, info
 
 
