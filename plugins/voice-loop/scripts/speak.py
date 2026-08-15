@@ -201,6 +201,19 @@ try:
     import fcntl
 except ImportError:    fcntl = None  # type: ignore[assignment]
 
+
+def _kill_process_group(pgid: int, sig: int) -> None:
+    """Terminate a command's process group where the platform supports groups."""
+    killpg = getattr(os, "killpg", None)
+    if killpg is not None:
+        killpg(pgid, sig)
+    else:
+        # Windows has no POSIX process groups; the direct child is the session's
+        # process boundary and is terminated by the caller's Popen handle.
+        proc = _live.get("proc")
+        if proc is not None:
+            proc.terminate()
+
 # Retry backoff for the flush race: adaptive, front-loaded — most races resolve within the first
 # fraction of a second, so we probe early instead of sleeping a flat 5 x 0.7 s tail.
 BACKOFF = (0.15, 0.3, 0.5, 0.7, 1.0)
@@ -748,9 +761,11 @@ def acquire_lock(grace=()):
     except OSError:
         return _NoLock()
     if fcntl is None:
+        # Windows lacks flock; do not mute speech solely for that unsupported
+        # advisory primitive. Speech proceeds without inter-process locking.
         fh.close()
         log("speaking lock is unsupported on this platform — speech skipped")
-        return None
+        return _NoLock()
     for pause in (None, *grace):
         if pause is not None:
             time.sleep(pause)
@@ -1504,7 +1519,7 @@ def _on_sigterm(signum, frame):  # noqa: ARG001 — signal-handler signature
     pgid = _live.get("pgid")
     if pgid is not None:
         try:
-            os.killpg(pgid, signal.SIGTERM)
+            _kill_process_group(pgid, signal.SIGTERM)
         except (ProcessLookupError, PermissionError):
             pass
     stream = _live.get("stream")
@@ -2036,7 +2051,9 @@ def _connect_stream_holder(text: str, s: dict):
     """Connect to the resident holder, send the request, half-close the write side, and return the
     open connection (whose read side plays back as SSE). None when the holder could not be reached
     so play_text uses the blob path for this one turn."""
-    if not ensure_stream_holder(s):
+    if not ensure_stream_holder(s) or not hasattr(socket, "AF_UNIX"):
+        # Windows has no Unix-domain socket API; the resident holder is an
+        # optional latency path and the blob endpoint remains the contract.
         return None
     conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
@@ -2100,6 +2117,8 @@ def _bind_unix_listener(path: str):
         os.unlink(path)
     except OSError:
         pass
+    if not hasattr(socket, "AF_UNIX"):
+        raise OSError("Unix-domain sockets are unavailable on this platform")
     listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     listener.bind(path)
     listener.listen(1)

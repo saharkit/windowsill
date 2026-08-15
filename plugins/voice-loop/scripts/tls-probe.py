@@ -111,7 +111,11 @@ def cfg(config: dict, dotted: str, default):
 def config_path(environ=os.environ) -> str:
     return environ.get(
         "VOICE_LOOP_CONFIG",
-        os.path.join(environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")), "voice-loop/config.json"),
+        os.path.join(
+            environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")),
+            "voice-loop",
+            "config.json",
+        ),
     )
 
 

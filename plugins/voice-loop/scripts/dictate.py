@@ -127,6 +127,24 @@ try:
 except ImportError:
     fcntl = None  # type: ignore[assignment]
 
+
+def _secure_chmod(fd: int, mode: int) -> None:
+    """Apply a private mode where the platform exposes descriptor chmod.
+
+    ``mkstemp`` already creates a private file on Windows, whose ACL-backed mode
+    bits cannot express POSIX group/other permissions.  Keep the POSIX hardening
+    and deliberately leave the Windows ACL alone rather than calling an absent
+    ``os.fchmod``.
+    """
+    chmod = getattr(os, "fchmod", None)
+    if chmod is not None:
+        chmod(fd, mode)
+
+
+def _hard_kill_signal() -> int:
+    """Return the strongest portable signal available to the worker cleanup."""
+    return getattr(signal, "SIGKILL", signal.SIGTERM)
+
 # Every recorder in the table records 16 kHz mono S16 — 32000 bytes of PCM per second. The clip
 # guard converts the WAV's size to seconds with this constant, so the two must move together.
 RECORD_RATE = 16000
@@ -1654,7 +1672,7 @@ def _write_stream_result(result: dict) -> None:
     result_path = _stream_result_path(pid)
     try:
         fd, tmp = tempfile.mkstemp(prefix="voice-loop-stream-", dir=os.path.dirname(result_path))
-        os.fchmod(fd, 0o600)
+        _secure_chmod(fd, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             json.dump(result, fh)
         os.replace(tmp, result_path)
@@ -1747,7 +1765,7 @@ def _write_preview(data: dict, path: str) -> None:
     means the preview surface is silently off, which is the documented degrade."""
     try:
         fd, tmp = tempfile.mkstemp(prefix="voice-loop-preview-", dir=os.path.dirname(path))
-        os.fchmod(fd, 0o600)
+        _secure_chmod(fd, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             json.dump(data, fh)
         os.replace(tmp, path)
@@ -1834,7 +1852,7 @@ def finish_stream_worker() -> str | None:
         log(f"stream worker did not finish within {STREAM_FINISH_TIMEOUT:.0f}s — using the recorded clip")
         if pid_looks_like_stream_worker(pid):
             try:
-                os.kill(pid, signal.SIGKILL)  # not merely abandoned: it holds a metered socket
+                os.kill(pid, _hard_kill_signal())  # not merely abandoned: it holds a metered socket
             except OSError:
                 pass
         clear_stream_state(stop_survivor=False)

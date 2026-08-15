@@ -86,7 +86,8 @@ jq . "${XDG_CONFIG_HOME:-$HOME/.config}/voice-loop/config.json" >/dev/null 2>&1 
 # 1.11 — no inline secrets
 python3 -c "
 import json, sys
-cfg = json.load(open('${XDG_CONFIG_HOME:-$HOME/.config}/voice-loop/config.json'))
+cfg_path = r'${XDG_CONFIG_HOME:-$HOME/.config}/voice-loop/config.json'
+cfg = json.load(open(cfg_path, encoding='utf-8'))
 def has_inline_key(node, path=''):
     if isinstance(node, dict):
         for k, v in node.items():
@@ -104,7 +105,7 @@ if found:
     print('FAIL: inline secrets found in config — fix before filing')
 else:
     print('PASS: no inline secrets')
-"
+" "${XDG_CONFIG_HOME:-$HOME/.config}/voice-loop/config.json"
 
 # 1.12 — selftest
 bash "${CLAUDE_PLUGIN_ROOT}/scripts/selftest.sh" 2>&1; echo "exit: $?"

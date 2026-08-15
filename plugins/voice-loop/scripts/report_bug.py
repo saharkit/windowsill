@@ -998,6 +998,8 @@ def write_bundle(path: str, text: str) -> str:
     directory = os.path.dirname(os.path.abspath(path)) or "."
     os.makedirs(directory, exist_ok=True)
     fd, tmp = tempfile.mkstemp(prefix=".voice-loop-report-", dir=directory)
+    if hasattr(os, "fchmod"):
+        os.fchmod(fd, 0o600)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             fh.write(text)

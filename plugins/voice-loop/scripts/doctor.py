@@ -434,7 +434,7 @@ def _check_python_interpreter(
     # candidate, which matters because a Store stub later on PATH can win
     # after a PATH reorder or a fresh shell.  Keep the injected seam useful
     # to tests while using the real Windows probe in production.
-    python3_paths = list(where() if where is not None else _where_python3())
+    python3_paths = list(where() if where is not None else _where_python3(platform=platform))
     if python3_path is not None and python3_path not in python3_paths:
         python3_paths.insert(0, python3_path)
     elif python3_path is None and python3_paths:
