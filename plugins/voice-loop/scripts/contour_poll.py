@@ -520,30 +520,35 @@ def _warn(message: str) -> None:
     print(f"contour-poll: {message}", file=sys.stderr)
 
 
-def read_status(path: str, warn=_warn) -> dict:
-    """The previous status file, tolerantly — but never SILENTLY.
+class StatusData(dict):
+    """Previous status payload plus the verdict established while reading it."""
 
-    An absent file is the first run and says nothing. Anything else — unreadable, or there and not
-    parseable — costs this poll its baseline: the ``oom_overflows`` counters it would have compared
-    against, which is one cycle's deltas and nothing more (the file carries no accumulated window;
-    see the module docstring). That is cheap, but it is not free, and it used to happen with no
-    line anywhere, so a status file being quietly corrupted every poll looked exactly like health.
-    """
+    def __init__(self, data: dict, *, status: str, detail: str = "") -> None:
+        super().__init__(data)
+        self.status = status
+        self.detail = detail
+
+
+def read_status(path: str, warn=_warn) -> StatusData:
+    """Read the previous status and distinguish missing, unreadable and malformed files."""
     try:
         with open(path, encoding="utf-8") as fh:
             loaded = json.load(fh)
     except FileNotFoundError:
-        return {}
+        return StatusData({}, status="missing")
     except OSError as err:
-        warn(f"the previous status file at {path} could not be read ({err}) — this poll has no baseline")
-        return {}
-    except ValueError as err:
-        warn(f"the previous status file at {path} is not readable JSON ({err}) — this poll has no baseline")
-        return {}
+        detail = f"{type(err).__name__}: {err}"
+        warn(f"the previous status file at {path} could not be read ({detail}) — this poll has no baseline")
+        return StatusData({}, status="unreadable", detail=detail)
+    except (ValueError, UnicodeDecodeError) as err:
+        detail = f"{type(err).__name__}: {err}"
+        warn(f"the previous status file at {path} is not readable JSON ({detail}) — this poll has no baseline")
+        return StatusData({}, status="malformed", detail=detail)
     if not isinstance(loaded, dict):
+        detail = "status must be a JSON object"
         warn(f"the previous status file at {path} does not hold a JSON object — this poll has no baseline")
-        return {}
-    return loaded
+        return StatusData({}, status="malformed", detail=detail)
+    return StatusData(loaded, status="ok")
 
 
 class StatusWriteError(Exception):

@@ -50,7 +50,10 @@ Parse the JSON output with `jq` or a python one-liner.  The top-level fields:
 
 - `config_present` — `true`/`false`; say "no config found at `<path>`" when false
 - `config_path` — where the config was looked for
+- `config_status` — `"missing"`, `"ok"`, `"malformed"`, or `"unreadable"`; `config_read_detail` explains a non-healthy read
 - `ledger_state` — `"none"`, `"in_progress"`, `"complete"`, or `"cancelled"`
+- `ledger_status` — `"missing"`, `"ok"`, `"malformed"`, or `"unreadable"`; `ledger_read_detail` explains a non-healthy read
+- `log_status` — an object mapping `speak.log` and `dictate.log` to `"missing"`, `"ok"`, `"malformed"`, or `"unreadable"`; `log_read_details` explains non-healthy reads. Log content remains available with replacement characters when only decoding is malformed.
 - `findings` — a list of finding objects, each with `bin`, `key`, `title`,
   `explanation`, `fix`, `offer_flip`, `flip_path`, `flip_value`, and
   `evidence`

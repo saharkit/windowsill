@@ -639,10 +639,26 @@ class TestRobustness:
         os.makedirs(os.path.dirname(ledger_path), exist_ok=True)
         with open(ledger_path, "w") as fh:
             fh.write("this is not json{{{")
-        assert install_ledger.check_state(ledger_path)["state"] == "none"
+        result = install_ledger.check_state(ledger_path)
+        assert result["state"] == "none"
+        assert result["read_status"] == "malformed"
+        assert "JSONDecodeError" in result["read_detail"]
 
-    def test_empty_ledger_file_treated_as_none(self, ledger_path):
+    def test_empty_ledger_file_treated_as_malformed(self, ledger_path):
         os.makedirs(os.path.dirname(ledger_path), exist_ok=True)
         with open(ledger_path, "w") as fh:
             fh.write("")
-        assert install_ledger.check_state(ledger_path)["state"] == "none"
+        result = install_ledger.check_state(ledger_path)
+        assert result["state"] == "none"
+        assert result["read_status"] == "malformed"
+        assert "JSONDecodeError" in result["read_detail"]
+
+    @pytest.mark.parametrize("state", [[], {}])
+    def test_non_string_state_is_classified_as_malformed(self, ledger_path, state):
+        os.makedirs(os.path.dirname(ledger_path), exist_ok=True)
+        with open(ledger_path, "w") as fh:
+            json.dump({"state": state, "steps": {}}, fh)
+        result = install_ledger.check_state(ledger_path)
+        assert result["state"] == "none"
+        assert result["read_status"] == "malformed"
+        assert "invalid ledger state" in result["read_detail"]

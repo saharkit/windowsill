@@ -116,18 +116,35 @@ def _atomic_write(path: str, content: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-def read_ledger(ledger_path: str) -> dict[str, Any] | None:
-    """Read the ledger file, returning the parsed dict or None if absent/unreadable.
+class LedgerData(dict):
+    """Parsed ledger data with a non-payload read verdict."""
 
-    A missing ledger is not an error — it means "no install has been started."
-    A ledger that fails to parse is treated as absent (the cost of being wrong
-    here is re-running a step, never a corrupted install).
-    """
+    def __init__(self, data: dict[str, Any], *, status: str, detail: str = "") -> None:
+        super().__init__(data)
+        self.status = status
+        self.detail = detail
+
+
+def read_ledger(ledger_path: str) -> LedgerData | None:
+    """Read the ledger while distinguishing missing, unreadable and malformed files."""
     try:
         with open(ledger_path, encoding="utf-8") as fh:
-            return json.load(fh)
-    except (OSError, json.JSONDecodeError):
-        return None
+            loaded = json.load(fh)
+    except FileNotFoundError:
+        return LedgerData({}, status="missing")
+    except OSError as err:
+        return LedgerData({}, status="unreadable", detail=f"{type(err).__name__}: {err}")
+    except (json.JSONDecodeError, UnicodeDecodeError) as err:
+        return LedgerData({}, status="malformed", detail=f"{type(err).__name__}: {err}")
+    if not isinstance(loaded, dict):
+        return LedgerData({}, status="malformed", detail="ledger must be a JSON object")
+    state = loaded.get("state", "none")
+    steps = loaded.get("steps", {})
+    if not isinstance(state, str) or state not in {"none", "in_progress", "complete", "cancelled"}:
+        return LedgerData({}, status="malformed", detail=f"invalid ledger state: {state!r}")
+    if not isinstance(steps, dict) or any(not isinstance(entry, dict) for entry in steps.values()):
+        return LedgerData({}, status="malformed", detail="ledger steps must be an object of objects")
+    return LedgerData(loaded, status="ok")
 
 
 def write_ledger(
@@ -154,7 +171,10 @@ def check_state(
     """Return the current install state as a JSON-serialisable dict.
 
     The returned dict always has a ``state`` key: ``"none"``, ``"in_progress"``,
-    ``"complete"``, or ``"cancelled"``.  When the state is ``"in_progress"`` or
+    ``"complete"``, or ``"cancelled"``.  A present but unreadable or malformed
+    ledger is reported as ``state: "none"`` with ``read_status`` and
+    ``read_detail`` fields, so the CLI contract remains closed while preserving
+    the reason for recovery.  When the state is ``"in_progress"`` or
     ``"complete"``, ``completed_steps`` lists the step ids that finished.
     ``"in_progress"`` also carries ``current_step`` if a step was begun but not
     yet completed.
@@ -162,8 +182,10 @@ def check_state(
     if ledger_path is None:
         ledger_path = _default_ledger_path()
     ledger = read_ledger(ledger_path)
-    if ledger is None:
+    if ledger is None or ledger.status == "missing":
         return {"state": "none"}
+    if ledger.status != "ok":
+        return {"state": "none", "read_status": ledger.status, "read_detail": ledger.detail}
 
     state = ledger.get("state", "none")
     result: dict[str, Any] = {"state": state}
@@ -220,7 +242,7 @@ def start_install(
         clock = _default_clock
 
     existing = read_ledger(ledger_path)
-    if existing is not None:
+    if existing is not None and existing.status == "ok":
         state = existing.get("state", "none")
         if state == "cancelled":
             # Auto-restart from cancelled — the user is re-running setup after
@@ -401,7 +423,7 @@ def completed_steps(
     if ledger_path is None:
         ledger_path = _default_ledger_path()
     ledger = read_ledger(ledger_path)
-    if ledger is None:
+    if ledger is None or ledger.status != "ok":
         return []
     steps = ledger.get("steps", {})
     return [sid for sid in INSTALL_STEPS if steps.get(sid, {}).get("status") == "complete"]
@@ -423,9 +445,13 @@ def _validate_step(step_id: str) -> None:
 def _require_ledger(ledger_path: str) -> dict[str, Any]:
     """Return the parsed ledger, or raise RuntimeError if none exists yet."""
     ledger = read_ledger(ledger_path)
-    if ledger is None:
+    if ledger is None or ledger.status == "missing":
         raise RuntimeError(
             f"no install ledger at {ledger_path!r} — run 'start' first"
+        )
+    if ledger.status != "ok":
+        raise RuntimeError(
+            f"install ledger at {ledger_path!r} is {ledger.status}: {ledger.detail}"
         )
     return ledger
 

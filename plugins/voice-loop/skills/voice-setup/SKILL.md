@@ -57,6 +57,8 @@ Proceed to Step 0.
 
 **Exit 1, `{"state": "in_progress", "completed_steps": [...], "next_step": "...", "current_step": "..."}`** — a previous install was interrupted. Present the three choices:
 
+A check that reports exit 0 with `{"state": "none", "read_status": "malformed"|"unreadable", "read_detail": "..."}` found a ledger that exists but cannot be trusted. Do not treat it as an interrupted install or resume from invented steps: show the read detail, ask them to run `python3 "$LEDGER_CMD" reset`, and then run `start` for a clean install.
+
 > A previous install was interrupted.
 > Steps completed: <names>. Step in flight: <name>.
 >

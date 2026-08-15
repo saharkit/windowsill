@@ -708,9 +708,9 @@ def test_jobs_are_the_recent_outcomes_and_nothing_else(install, offline):
     assert not any("stt unreachable" in job for job in jobs)  # a failure to connect is not a job state
 
 
-def test_a_missing_log_is_a_fact_not_a_failure(tmp_path):
+def test_a_missing_log_is_a_verified_missing_source(tmp_path):
     tail = report_bug.read_log_tail(str(tmp_path / "nope.log"))
-    assert tail == {"present": False, "lines": [], "unclassified": 0}
+    assert tail == {"present": False, "status": "missing", "lines": [], "unclassified": 0}
 
 
 def test_the_tail_is_the_last_n_lines(tmp_path):
@@ -951,7 +951,7 @@ def test_a_config_that_is_not_json_is_reported_as_such(tmp_path, offline, monkey
     state = tmp_path / "state"
     state.mkdir()
     bundle = report_bug.build_bundle(state_dir=str(state), config_path=str(broken), clock=clock_at())
-    assert bundle["config"]["status"].startswith("unreadable")
+    assert bundle["config"]["status"].startswith("malformed")
     assert bundle["servers"] == []  # no config, no endpoints to probe — not a crash
 
 
