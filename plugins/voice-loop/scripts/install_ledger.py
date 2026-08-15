@@ -137,6 +137,14 @@ def _atomic_write(path: str, content: str) -> None:
 def _ledger_lock(path: str) -> Iterator[None]:
     """Serialize ledger read-modify-write operations across processes."""
     lock_path = f"{path}.lock"
+    # This open runs before any caller's own makedirs (start_install's sits inside the
+    # lock), so on a genuinely fresh machine — no state directory yet — it is the open
+    # that would hit ENOENT, not the ledger write.  Create the directory first,
+    # best-effort, the same shape as speak.py main().
+    try:
+        os.makedirs(os.path.dirname(lock_path) or ".", exist_ok=True)
+    except OSError:
+        pass  # a real failure here surfaces from the open below
     flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
     fd = os.open(lock_path, flags, 0o600)
     try:

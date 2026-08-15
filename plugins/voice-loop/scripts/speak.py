@@ -411,7 +411,6 @@ _live: dict = {"proc": None, "files": set(), "stream": None}
 # invocation from unlinking a newer invocation's pidfile between its read and unlink.
 _pidfile_record: str | None = None
 _stream_holder_pid_record: str | None = None
-_stream_holder_socket_identity: tuple[int, int] | None = None
 
 
 def log(message: str) -> None:
@@ -2093,13 +2092,7 @@ def _read_stream_holder_pid() -> tuple[int | None, str]:
 
 def _clear_stream_holder_pid() -> bool:
     global _stream_holder_pid_record
-    if _stream_holder_pid_record is None:
-        return False
-    try:
-        with open(_STREAM_HOLDER_PID, encoding="utf-8") as fh:
-            if fh.read() != _stream_holder_pid_record:
-                return False
-    except OSError:
+    if not _stream_holder_pid_is_ours():
         return False
     try:
         os.unlink(_STREAM_HOLDER_PID)
@@ -2109,13 +2102,36 @@ def _clear_stream_holder_pid() -> bool:
     return True
 
 
-def _remove_socket_file(path: str, *, owner: str | None = None) -> None:
+def _remove_socket_file(path: str) -> None:
     try:
-        if owner is not None and os.path.realpath(path) != owner:
-            return
         os.unlink(path)
     except OSError:
         pass
+
+
+def _stream_holder_pid_is_ours() -> bool:
+    """True while the pidfile still carries exactly the record this process installed.  A fresher
+    holder atomically replaces that record on startup (before it binds), so the comparison is the
+    generation fence: it tells THIS holder apart from its replacement where the socket path cannot
+    — the path is identical across generations, and even the inode is not a fence (tmpfs recycles
+    it across an unbind/rebind)."""
+    if _stream_holder_pid_record is None:
+        return False
+    try:
+        with open(_STREAM_HOLDER_PID, encoding="utf-8") as fh:
+            return fh.read() == _stream_holder_pid_record
+    except OSError:
+        return False
+
+
+def _holder_exit_cleanup() -> None:
+    """The holder's exit cleanup, fenced by generation.  A SIGTERMed holder can reach this exit up
+    to one accept-timeout AFTER its replacement rebound the same socket path (the replacement's
+    own bind unlinks any stale file first), so the socket is unlinked only while the pidfile is
+    still ours — an unconditional unlink here would delete the NEW holder's socket."""
+    if _stream_holder_pid_is_ours():
+        _remove_socket_file(_STREAM_HOLDER_SOCK)
+    _clear_stream_holder_pid()
 
 
 def pid_looks_like_stream_holder(pid: int, read_cmdline=_cmdline_of, platform_id: str = sys.platform) -> bool:
@@ -2313,8 +2329,7 @@ def run_holder(
             listener.close()
         except OSError:
             pass
-        _remove_socket_file(_STREAM_HOLDER_SOCK)
-        _clear_stream_holder_pid()
+        _holder_exit_cleanup()
     return 0
 
 
@@ -2403,9 +2418,10 @@ def main() -> int:
         log(refusal)
         return 0
 
-    # The ledger, the lock and the seeding are eager mode's machinery, and they exist ONLY when the
-    # user has opted in. With eager off there is one event path, no race to be idempotent against,
-    # and therefore nothing to gate on: everything below reduces to the pre-0.3.2 Stop hook.
+    # The ledger and the seeding are eager mode's machinery, and they exist ONLY when the user has
+    # opted in. The lock is not part of this gate: every event path takes it below (eager without
+    # blocking, Stop with its grace and takeover), because with eager off there is no ledger to
+    # accidentally provide one.
     ledger_on = s["eager"]
 
     lock = None

@@ -420,6 +420,34 @@ def test_bind_unix_listener_creates_a_listener_and_drops_a_stale_file(tmp_path):
         listener.close()
 
 
+def test_an_exiting_holder_spares_the_socket_its_replacement_rebound(holder_state):
+    """The generation fence on the exit unlink: a SIGTERMed holder reaches its exit up to one
+    accept-timeout AFTER its replacement rebound the same socket path, so the unlink must not
+    run once the pidfile carries the replacement's record (the replacement announces itself
+    there before it binds, and its own bind unlinks any stale file)."""
+    speak._write_stream_holder_pid(111, "digest-a")  # holder A installed its record...
+    open(speak._STREAM_HOLDER_SOCK, "w").close()  # ...then its replacement rebound the path
+    with open(speak._STREAM_HOLDER_PID, "w", encoding="utf-8") as fh:  # ...and announced itself
+        fh.write("222 digest-b")
+
+    speak._holder_exit_cleanup()  # A's exit: superseded — the fence must hold
+
+    assert os.path.exists(speak._STREAM_HOLDER_SOCK)  # the replacement's socket survived
+    assert os.path.exists(speak._STREAM_HOLDER_PID)  # and its pidfile was left alone too
+
+
+def test_an_unsuperseded_holder_cleans_up_its_socket_and_pidfile(holder_state):
+    """With no replacement, the same exit cleanup removes both files — the fence must not
+    become a leak."""
+    speak._write_stream_holder_pid(111, "digest-a")
+    open(speak._STREAM_HOLDER_SOCK, "w").close()
+
+    speak._holder_exit_cleanup()
+
+    assert not os.path.exists(speak._STREAM_HOLDER_SOCK)
+    assert not os.path.exists(speak._STREAM_HOLDER_PID)
+
+
 def test_connect_stream_holder_returns_none_when_the_holder_is_not_ready(monkeypatch, tmp_path):
     """ensure_stream_holder False (could not spawn/bind) short-circuits before a socket is opened —
     a holder that is not there is the blob path, not a connection error to log."""
@@ -683,3 +711,4 @@ def test_run_holder_serves_a_turn_and_self_exits_when_its_listener_closes(monkey
     assert b"event: end" in outcome["sse"]
     # the holder cleaned up after itself: pidfile and socket file gone
     assert not os.path.exists(str(tmp_path / "h.pid"))
+    assert not os.path.exists(str(tmp_path / "h.sock"))
