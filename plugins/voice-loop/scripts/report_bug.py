@@ -878,7 +878,61 @@ def build_bundle(
     }
 
 
-# --- rendering ------------------------------------------------------------------------------------
+# --- consent artifact and rendering ----------------------------------------------------------------
+
+# The bundle is an external contract.  Keep this allowlist beside the serializer so adding a value
+# cannot silently create a new outbound field that nobody reviewed for redaction.
+_BUNDLE_FIELDS = frozenset({
+    "generated_at", "summary", "versions", "machine", "config", "environment", "tools",
+    "servers", "state", "jobs", "logs",
+})
+
+
+class ReportArtifact(tuple):
+    """The one immutable title/body pair a report transport is allowed to carry."""
+
+    __slots__ = ()
+
+    def __new__(cls, title: str, body: str):
+        return super().__new__(cls, (title, body))
+
+    @property
+    def title(self) -> str:
+        return self[0]
+
+    @property
+    def body(self) -> str:
+        return self[1]
+
+    @property
+    def payload(self) -> bytes:
+        return self.body.encode("utf-8")
+
+
+def sanitize_bundle(bundle: dict[str, object]) -> dict[str, object]:
+    """Fail closed if the bundle schema drifts, then redact every value at the boundary."""
+    unknown = set(bundle) - _BUNDLE_FIELDS
+    missing = _BUNDLE_FIELDS - set(bundle)
+    if unknown or missing:
+        details = []
+        if unknown:
+            details.append("unknown field(s): " + ", ".join(sorted(unknown)))
+        if missing:
+            details.append("missing field(s): " + ", ".join(sorted(missing)))
+        raise ValueError("report bundle schema mismatch (" + "; ".join(details) + ")")
+    return {str(key): redact_value(value, str(key)) for key, value in bundle.items()}
+
+
+def make_artifact(title: str, bundle: dict[str, object]) -> ReportArtifact:
+    """Redact title and body together before either can be displayed or transported."""
+    safe_bundle = sanitize_bundle(bundle)
+    return ReportArtifact(title=redact(title), body=render_digest(safe_bundle))
+
+
+def artifact_from_body(title: str, body: str) -> ReportArtifact:
+    """Create a transport artifact from already-rendered bytes, redacting its title only once."""
+    return ReportArtifact(title=redact(title), body=body)
+
 
 _FENCE = "```"
 
@@ -901,11 +955,8 @@ def _kv_block(mapping: dict[str, object]) -> str:
 
 
 def render_digest(bundle: dict) -> str:
-    """The bundle as the one artifact that travels: shown in chat, written to disk, sent as the body.
-
-    Byte-exact by construction — every transport is handed THIS string, and the consent step shows
-    THIS string. There is no fuller variant kept back for the maintainer.
-    """
+    """Render the only body allowed into a :class:`ReportArtifact`."""
+    bundle = sanitize_bundle(bundle)
     logs = bundle.get("logs", {})
     unclassified = sum(int(tail.get("unclassified", 0)) for tail in logs.values())
     parts = [
@@ -1037,9 +1088,24 @@ def gh_ready(runner: Runner = _default_runner) -> tuple[bool, str]:
     return True, "gh is installed and authenticated"
 
 
-def create_issue(title: str, body_path: str, repo: str = REPO, runner: Runner = _default_runner) -> tuple[bool, str]:
-    """``gh issue create`` with the digest as the body. The file is passed by PATH, never by argv:
-    a bundle is thousands of characters and an argv is not the place for it."""
+def create_issue(
+    artifact: ReportArtifact | str,
+    body_path: str,
+    repo: str = REPO,
+    runner: Runner = _default_runner,
+) -> tuple[bool, str]:
+    """Send exactly the immutable artifact body through ``gh``.
+
+    ``str`` is retained only as a compatibility shim for callers from older plugin versions; the
+    command path below always supplies a :class:`ReportArtifact` and verifies the file bytes first.
+    """
+    if isinstance(artifact, ReportArtifact):
+        with open(body_path, "rb") as fh:
+            if fh.read() != artifact.payload:
+                return False, "report artifact does not match the bundle file"
+        title = artifact.title
+    else:
+        title = redact(artifact)
     argv = ["gh", "issue", "create", "--repo", repo, "--title", title, "--body-file", body_path]
     try:
         proc = runner(argv, GH_TIMEOUT)
@@ -1074,9 +1140,20 @@ def _fit_url(build: Callable[[str], str], body: str, limit: int, note: str) -> s
     return best
 
 
-def issue_url(title: str, body: str, repo: str = REPO, limit: int = ISSUE_URL_LIMIT, note: str = "") -> str:
-    """A pre-filled new-issue form. Nothing is sent until the user presses Submit — that is the
-    point of this tier: the consent is the Submit button, in GitHub's own UI."""
+def issue_url(
+    artifact: ReportArtifact | str,
+    body: str | None = None,
+    repo: str = REPO,
+    limit: int = ISSUE_URL_LIMIT,
+    note: str = "",
+) -> str:
+    """Build a URL from the artifact, with truncation represented in the displayed payload."""
+    if isinstance(artifact, ReportArtifact):
+        title, body = artifact.title, artifact.body
+    else:
+        title = redact(artifact)
+        if body is None:
+            raise TypeError("body is required when passing a title")
     base = f"https://github.com/{repo}/issues/new?"
 
     def build(text: str) -> str:
@@ -1085,9 +1162,20 @@ def issue_url(title: str, body: str, repo: str = REPO, limit: int = ISSUE_URL_LI
     return _fit_url(build, body, limit, note or "\n\n… truncated to fit the URL — the full bundle is the file on disk.")
 
 
-def mailto_url(address: str, subject: str, body: str, limit: int = MAILTO_LIMIT, note: str = "") -> str:
-    """A mailto: for the no-GitHub tier. The bundle file stays on disk: mailto cannot attach, so the
-    body carries the digest as far as it fits and the user attaches the file if they want the rest."""
+def mailto_url(
+    address: str,
+    artifact: ReportArtifact | str,
+    body: str | None = None,
+    limit: int = MAILTO_LIMIT,
+    note: str = "",
+) -> str:
+    """Build a mailto URL from the artifact; any truncation is visible in its sent body."""
+    if isinstance(artifact, ReportArtifact):
+        subject, body = artifact.title, artifact.body
+    else:
+        subject = redact(artifact)
+        if body is None:
+            raise TypeError("body is required when passing a subject")
     base = f"mailto:{urllib.parse.quote(address)}?"
 
     def build(text: str) -> str:
@@ -1130,11 +1218,17 @@ def _load_bundle_text(path: str) -> str:
         return fh.read()
 
 
+def _load_artifact(title: str, path: str) -> ReportArtifact:
+    """Load exactly the bytes shown on disk and bind them to the redacted title."""
+    return artifact_from_body(title, _load_bundle_text(path))
+
+
 def _cmd_collect(args: argparse.Namespace) -> int:
     # The module constants are read HERE rather than taken as default arguments: a default is bound
     # once at import, and these have to be the paths in force when the command actually runs.
     bundle = build_bundle(summary=args.summary, lines=args.lines, state_dir=_STATE_DIR, config_path=_CONFIG_PATH)
-    text = render_digest(bundle)
+    artifact = make_artifact(args.title, bundle)
+    text = artifact.body
     path = args.out or default_bundle_path(_STATE_DIR)
     write_bundle(path, text)
     if args.json:
@@ -1159,7 +1253,7 @@ def _cmd_transports(args: argparse.Namespace) -> int:
 
 
 def _cmd_url(args: argparse.Namespace) -> int:
-    print(issue_url(args.title, _load_bundle_text(args.bundle)))
+    print(issue_url(_load_artifact(args.title, args.bundle)))
     return 0
 
 
@@ -1171,7 +1265,7 @@ def _cmd_mailto(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 1
-    print(mailto_url(address, args.title, _load_bundle_text(args.bundle)))
+    print(mailto_url(address, _load_artifact(args.title, args.bundle)))
     return 0
 
 
@@ -1180,7 +1274,13 @@ def _cmd_gh(args: argparse.Namespace) -> int:
     if not ready:
         print(why, file=sys.stderr)
         return 1
-    ok, message = create_issue(args.title, args.bundle, args.repo)
+    try:
+        artifact = _load_artifact(args.title, args.bundle)
+    except FileNotFoundError:
+        # Preserve the typed error from gh for a missing path; tests and callers that replace the
+        # sender still get the same argv seam without inventing a second body source.
+        artifact = redact(args.title)
+    ok, message = create_issue(artifact, args.bundle, args.repo)
     print(message, file=sys.stdout if ok else sys.stderr)
     return 0 if ok else 1
 
@@ -1194,6 +1294,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     collect = sub.add_parser("collect", help="write the bundle and print the exact bytes it contains")
     collect.add_argument("--out", default="", help="bundle path (default: the state dir, timestamped)")
+    collect.add_argument("--title", default="voice-loop bug report", help="the report title, redacted with the body")
     collect.add_argument("--summary", default="", help="the user's own description of what went wrong")
     collect.add_argument("--lines", type=int, default=LOG_TAIL_LINES, help=f"log lines per log (default {LOG_TAIL_LINES})")
     collect.add_argument("--json", action="store_true", help="print {path, digest} as JSON")

@@ -258,10 +258,10 @@ available, then ask **one** AskUserQuestion:
 Uses `gh issue create` with the `conformance` label:
 
 ```sh
-gh issue create --repo saharkit/windowsill \
+bash "${CLAUDE_PLUGIN_ROOT}/scripts/report-bug.sh" gh \
+  --label conformance \
   --title "conformance: voice-loop v<version> (<date>)" \
-  --body-file "<path to report>" \
-  --label conformance
+  --bundle "<path to report>"
 ```
 
 Only if `gh` is authenticated. Print the issue URL. **Never send without an
@@ -275,12 +275,12 @@ Build it with a one-liner that reuses the URL builder the collector already has:
 ```sh
 python3 -c "
 import sys; sys.path.insert(0, '${CLAUDE_PLUGIN_ROOT}/scripts')
-from report_bug import issue_url
+from report_bug import artifact_from_body, issue_url
 # The label goes into the body as a markdown comment so triage can add it —
 # GitHub's new-issue form does not accept ?labels= in the query string
 body = open('${REPORT_PATH}').read()
-body = '<!-- conformance -->\n' + body
-print(issue_url('conformance: voice-loop v<version> (<date>)', body))
+artifact = artifact_from_body('conformance: voice-loop v<version> (<date>)', '<!-- conformance -->\n' + body)
+print(issue_url(artifact))
 "
 ```
 
