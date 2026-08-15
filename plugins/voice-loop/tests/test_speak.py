@@ -1245,9 +1245,12 @@ def test_a_keyless_clear_text_config_is_not_the_guard_s_business(monkeypatch):
 
 def test_main_refuses_a_clear_text_cloud_config_and_never_builds_a_request(state, monkeypatch, opener):
     """L1 composition junction: the refusal decision is pinned in the guard tests above and in
-    providers.py; what only a main() drive can catch is the WIRING being lost — the guard skipped,
-    or reached only after the first request was already built. For a refused configuration no
-    request and no player may exist."""
+    providers.py; what only a real hook drive can catch is the WIRING being lost — the guard
+    skipped, or reached only after the first request was already built. entry() is the whole hook
+    (the turn's speech AND the contour check, which resolves its own settings and synthesizes on
+    its own path), so an ACTIVE alert is planted: for a refused configuration no request, no
+    player and no page may exist — the alert stays unannounced, to be retried once the config is
+    fixed, exactly like a page whose delivery failed."""
     fake = opener(b"MP3-audio-bytes")
     config = state / "config.json"
     config.write_text(
@@ -1259,6 +1262,7 @@ def test_main_refuses_a_clear_text_cloud_config_and_never_builds_a_request(state
     )
     transcript = state / "transcript.jsonl"
     transcript.write_text(_assistant("🔊 hello") + "\n", encoding="utf-8")
+    _contour_status(state, [_DEMOTED])
     monkeypatch.setenv("VOICE_LOOP_CONFIG", str(config))
     monkeypatch.setenv("VOICE_LOOP_TTS_API_KEY", "sk-secret")
     monkeypatch.setattr(
@@ -1275,10 +1279,11 @@ def test_main_refuses_a_clear_text_cloud_config_and_never_builds_a_request(state
     players: list[list[str]] = []
     monkeypatch.setattr(speak.subprocess, "Popen", lambda argv, **kw: players.append(argv) or SilentPlayer())
 
-    assert speak.main() == 0
+    assert speak.entry() == 0
     assert fake.requests == [], "a refused configuration must not build a request"
     assert players == [], "nothing to play: no synthesis happened"
     assert "cloud tts refused" in (state / "speak.log").read_text(encoding="utf-8")
+    assert not (state / "contour-announced").exists(), "a refused configuration must not page either"
 
 
 def test_deepgram_synthesis_goes_through_synthesize_with_no_branch_in_the_way(opener):

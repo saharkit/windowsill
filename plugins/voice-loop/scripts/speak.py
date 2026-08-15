@@ -1440,7 +1440,8 @@ def contour_check(config: dict, t0: float, event: str = "Stop") -> None:
     Silence is the overwhelming common case and is cheap: no poller status file (the normal state
     of an install that never set the poller up), no active alerts, or nothing new — all cost one
     tolerant read. Opted out with ``contour.alerts: false``; a user who switched speech off
-    entirely (``speak.enabled``) is not paged either.
+    entirely (``speak.enabled``) is not paged either; nor is a configuration the endpoint policy
+    refuses (#215) — the page cannot carry the key in the clear.
     """
     s = resolve_settings(config, platform.system())
     if not s["enabled"]:
@@ -1452,6 +1453,16 @@ def contour_check(config: dict, t0: float, event: str = "Stop") -> None:
         # a feature it never enabled. Eager off means ONE event path — Stop — the page included.
         return
     if cfg(config, "contour.alerts", True) in (False, "false"):
+        return
+    # The endpoint policy, for THIS path too (windowsill #215): the check runs after main() has
+    # returned, resolves its own settings, and its play_text below is a full cloud synthesis
+    # carrying the API key — the turn's own configuration-time guard covers nothing here, and the
+    # warning it replaced used to be the only signal on this path. Same posture as main(): the page
+    # is dropped with the refusal logged, so the alert stays unannounced and is retried once the
+    # configuration is fixed — never sent in the clear.
+    refusal = _clear_text_refusal(s)
+    if refusal:
+        log(refusal)
         return
     alerts = contour_alerts(read_contour_status(contour_status_path(config)), _utcnow())
 

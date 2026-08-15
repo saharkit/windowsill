@@ -804,6 +804,8 @@ def test_a_literal_host_never_reaches_the_resolver():
     ("addresses", "expected"),
     [
         (["127.0.0.1"], True),  # a name that resolves to loopback IS local — the ssh-tunnel-by-name case
+        (["127.0.0.1", "::1"], True),  # every address loopback: a connection still cannot leave
+        (["127.0.0.1", "192.0.2.1"], False),  # ONE routable address can leave the machine, whatever else it also resolves to
         (["192.0.2.1"], False),
         ([], False),  # nothing resolved: not provably local
         (["not-an-address"], False),  # a resolver handing back garbage: not provably local
@@ -811,7 +813,9 @@ def test_a_literal_host_never_reaches_the_resolver():
 )
 def test_a_name_is_local_only_where_it_resolves(addresses, expected):
     """The policy's second half: locality of a NAME is a fact about where it resolves, decided by
-    the injected resolver — the module itself never does I/O. Fail-closed on every bad answer."""
+    the injected resolver — the module itself never does I/O. Fail-closed on every bad answer, and
+    ALL of the answers must be loopback: which address the OS picks for a connection is not ours
+    to choose, so one routable entry is a connection that can leave the machine (#215)."""
     assert providers.is_local_host("tunnel.internal", resolve=lambda host: addresses) is expected
 
 

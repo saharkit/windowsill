@@ -338,7 +338,13 @@ def _multipart_type(boundary: str) -> str:
 
 
 def is_local_host(host: str, resolve: Callable[[str], list[str]] | None = None) -> bool:
-    """True only for an address that points at the local machine.
+    """True only for a host a connection to it cannot leave this machine.
+
+    That is the question the endpoint policy is really asking (#215): "is this host local" stands
+    in for "can this connection leave the machine", and a name that resolves to BOTH 127.0.0.1 and
+    a routable address CAN leave it — which of its addresses a connection lands on is the OS's
+    choice, never ours — so a resolved name is local only when EVERY address is loopback, with at
+    least one address resolved at all.
 
     A LITERAL loopback address — anything in 127.0.0.0/8, or ``::1`` — or the literal name
     ``localhost``. Nothing else is local by spelling: ``127.evil.com`` is a DNS name a caller
@@ -356,9 +362,12 @@ def is_local_host(host: str, resolve: Callable[[str], list[str]] | None = None) 
     if resolve is None:
         return False
     try:
-        return any(ipaddress.ip_address(address).is_loopback for address in resolve(host))
+        addresses = [ipaddress.ip_address(address) for address in resolve(host)]
     except (TypeError, ValueError):
         return False
+    # ALL loopback, and at least one address at all: one routable answer anywhere in the
+    # resolution is a connection that can leave the machine, whatever else the name also means.
+    return bool(addresses) and all(address.is_loopback for address in addresses)
 
 
 def clear_text_credential_error(
