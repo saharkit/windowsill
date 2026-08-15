@@ -951,7 +951,7 @@ def test_a_config_that_is_not_json_is_reported_as_such(tmp_path, offline, monkey
     state = tmp_path / "state"
     state.mkdir()
     bundle = report_bug.build_bundle(state_dir=str(state), config_path=str(broken), clock=clock_at())
-    assert bundle["config"]["status"].startswith("unreadable")
+    assert bundle["config"]["status"].startswith("malformed")
     assert bundle["servers"] == []  # no config, no endpoints to probe — not a crash
 
 

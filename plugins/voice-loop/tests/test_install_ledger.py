@@ -640,7 +640,8 @@ class TestRobustness:
         with open(ledger_path, "w") as fh:
             fh.write("this is not json{{{")
         result = install_ledger.check_state(ledger_path)
-        assert result["state"] == "malformed"
+        assert result["state"] == "none"
+        assert result["read_status"] == "malformed"
         assert "JSONDecodeError" in result["read_detail"]
 
     def test_empty_ledger_file_treated_as_malformed(self, ledger_path):
@@ -648,5 +649,6 @@ class TestRobustness:
         with open(ledger_path, "w") as fh:
             fh.write("")
         result = install_ledger.check_state(ledger_path)
-        assert result["state"] == "malformed"
+        assert result["state"] == "none"
+        assert result["read_status"] == "malformed"
         assert "JSONDecodeError" in result["read_detail"]

@@ -138,6 +138,12 @@ def read_ledger(ledger_path: str) -> LedgerData | None:
         return LedgerData({}, status="malformed", detail=f"{type(err).__name__}: {err}")
     if not isinstance(loaded, dict):
         return LedgerData({}, status="malformed", detail="ledger must be a JSON object")
+    state = loaded.get("state", "none")
+    steps = loaded.get("steps", {})
+    if state not in {"none", "in_progress", "complete", "cancelled"}:
+        return LedgerData({}, status="malformed", detail=f"invalid ledger state: {state!r}")
+    if not isinstance(steps, dict) or any(not isinstance(entry, dict) for entry in steps.values()):
+        return LedgerData({}, status="malformed", detail="ledger steps must be an object of objects")
     return LedgerData(loaded, status="ok")
 
 
@@ -165,7 +171,10 @@ def check_state(
     """Return the current install state as a JSON-serialisable dict.
 
     The returned dict always has a ``state`` key: ``"none"``, ``"in_progress"``,
-    ``"complete"``, or ``"cancelled"``.  When the state is ``"in_progress"`` or
+    ``"complete"``, or ``"cancelled"``.  A present but unreadable or malformed
+    ledger is reported as ``state: "none"`` with ``read_status`` and
+    ``read_detail`` fields, so the CLI contract remains closed while preserving
+    the reason for recovery.  When the state is ``"in_progress"`` or
     ``"complete"``, ``completed_steps`` lists the step ids that finished.
     ``"in_progress"`` also carries ``current_step`` if a step was begun but not
     yet completed.
@@ -176,7 +185,7 @@ def check_state(
     if ledger is None or ledger.status == "missing":
         return {"state": "none"}
     if ledger.status != "ok":
-        return {"state": ledger.status, "read_detail": ledger.detail}
+        return {"state": "none", "read_status": ledger.status, "read_detail": ledger.detail}
 
     state = ledger.get("state", "none")
     result: dict[str, Any] = {"state": state}

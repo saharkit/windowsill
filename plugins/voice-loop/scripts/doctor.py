@@ -602,8 +602,8 @@ def read_config(path: str) -> DiagnosticData:
         return DiagnosticData({}, status="missing", detail=f"{path} does not exist")
     except OSError as err:
         return DiagnosticData({}, status="unreadable", detail=f"{type(err).__name__}: {err}")
-    except json.JSONDecodeError as err:
-        return DiagnosticData({}, status="malformed", detail=f"JSONDecodeError: {err}")
+    except (json.JSONDecodeError, UnicodeDecodeError) as err:
+        return DiagnosticData({}, status="malformed", detail=f"{type(err).__name__}: {err}")
     if not isinstance(loaded, dict):
         return DiagnosticData({}, status="malformed", detail=f"expected JSON object, got {type(loaded).__name__}")
     return DiagnosticData(loaded, status="ok")
@@ -617,16 +617,16 @@ def read_ledger(state_home: str) -> DiagnosticData:
     except FileNotFoundError:
         return DiagnosticData({"state": "none", "completed_steps": []}, status="missing")
     except OSError as err:
-        return DiagnosticData({"state": "unreadable", "completed_steps": []}, status="unreadable", detail=f"{type(err).__name__}: {err}")
-    except json.JSONDecodeError as err:
-        return DiagnosticData({"state": "malformed", "completed_steps": []}, status="malformed", detail=f"JSONDecodeError: {err}")
+        return DiagnosticData({"state": "none", "completed_steps": []}, status="unreadable", detail=f"{type(err).__name__}: {err}")
+    except (json.JSONDecodeError, UnicodeDecodeError) as err:
+        return DiagnosticData({"state": "none", "completed_steps": []}, status="malformed", detail=f"{type(err).__name__}: {err}")
     if not isinstance(raw, dict) or not isinstance(raw.get("steps", {}), dict):
-        return DiagnosticData({"state": "malformed", "completed_steps": []}, status="malformed", detail="ledger must be a JSON object with object steps")
+        return DiagnosticData({"state": "none", "completed_steps": []}, status="malformed", detail="ledger must be a JSON object with object steps")
 
     ledger: dict[str, Any] = {"state": raw.get("state", "none")}
     steps = raw.get("steps", {})
     if any(not isinstance(entry, dict) for entry in steps.values()):
-        return DiagnosticData({"state": "malformed", "completed_steps": []}, status="malformed", detail="ledger step entries must be objects")
+        return DiagnosticData({"state": "none", "completed_steps": []}, status="malformed", detail="ledger step entries must be objects")
     ledger["completed_steps"] = [
         sid for sid, entry in steps.items() if entry.get("status") == "complete"
     ]
@@ -646,19 +646,30 @@ def read_logs(state_home: str, tail_lines: int = 60) -> DiagnosticData:
     for log_name in ("speak.log", "dictate.log"):
         path = os.path.join(state_dir, log_name)
         try:
-            with open(path, encoding="utf-8") as fh:
+            with open(path, encoding="utf-8", errors="replace") as fh:
                 lines = fh.read().splitlines()
             logs[log_name] = lines[-tail_lines:]
             statuses[log_name] = "ok"
         except FileNotFoundError:
             logs[log_name] = []
             statuses[log_name] = "missing"
-        except UnicodeDecodeError as err:
-            logs[log_name] = []
-            statuses[log_name] = "malformed"
-            details[log_name] = f"UnicodeDecodeError: {err}"
+            continue
         except OSError as err:
             logs[log_name] = []
+            statuses[log_name] = "unreadable"
+            details[log_name] = f"{type(err).__name__}: {err}"
+            continue
+
+        try:
+            with open(path, encoding="utf-8") as fh:
+                fh.read()
+        except UnicodeDecodeError as err:
+            statuses[log_name] = "malformed"
+            details[log_name] = f"{type(err).__name__}: {err}"
+        except FileNotFoundError:
+            statuses[log_name] = "missing"
+            details[log_name] = f"{path} disappeared after reading"
+        except OSError as err:
             statuses[log_name] = "unreadable"
             details[log_name] = f"{type(err).__name__}: {err}"
     result = DiagnosticData(logs, status="ok" if all(s == "ok" for s in statuses.values()) else "degraded")
@@ -742,10 +753,10 @@ def main(argv: list[str] | None = None) -> int:
         output: dict[str, Any] = {
             "config_present": bool(config),
             "config_path": config_path,
-            "config_status": getattr(config, "status", "ok"),
+            "config_status": getattr(config, "status", "unknown"),
             "config_read_detail": getattr(config, "detail", ""),
             "ledger_state": ledger.get("state", "none"),
-            "ledger_status": getattr(ledger, "status", "ok"),
+            "ledger_status": getattr(ledger, "status", "unknown"),
             "ledger_read_detail": getattr(ledger, "detail", ""),
             "log_status": getattr(logs, "source_status", {}),
             "log_read_details": getattr(logs, "source_details", {}),
@@ -787,10 +798,10 @@ def main(argv: list[str] | None = None) -> int:
         output: dict[str, Any] = {
             "config_present": bool(config),
             "config_path": config_path,
-            "config_status": getattr(config, "status", "ok"),
+            "config_status": getattr(config, "status", "unknown"),
             "config_read_detail": getattr(config, "detail", ""),
             "ledger_state": ledger.get("state", "none"),
-            "ledger_status": getattr(ledger, "status", "ok"),
+            "ledger_status": getattr(ledger, "status", "unknown"),
             "ledger_read_detail": getattr(ledger, "detail", ""),
             "log_status": getattr(logs, "source_status", {}),
             "log_read_details": getattr(logs, "source_details", {}),

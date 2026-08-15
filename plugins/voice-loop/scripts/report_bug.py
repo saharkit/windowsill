@@ -653,23 +653,50 @@ def scrub_log_line(line: str) -> tuple[str, bool]:
 
 
 def read_log_tail(path: str, lines: int = LOG_TAIL_LINES) -> dict[str, object]:
-    """The last ``lines`` of a log, scrubbed, with a verified read status."""
+    """The last ``lines`` of a log, scrubbed, with a verified read status.
+
+    Content is recovered with replacement characters so one damaged byte cannot hide the
+    useful tail.  A separate strict probe records whether the source was fully decodable.
+    """
     try:
-        with open(path, encoding="utf-8") as fh:
+        with open(path, encoding="utf-8", errors="replace") as fh:
             raw = fh.read().splitlines()
     except FileNotFoundError:
         return {"present": False, "status": "missing", "lines": [], "unclassified": 0}
-    except UnicodeDecodeError as err:
-        return {"present": False, "error": type(err).__name__, "lines": [], "unclassified": 0}
     except OSError as err:
-        return {"present": False, "error": f"{type(err).__name__}", "lines": [], "unclassified": 0}
+        return {"present": False, "status": "unreadable", "read_detail": type(err).__name__, "lines": [], "unclassified": 0}
+
+    status = "ok"
+    detail = ""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            fh.read()
+    except UnicodeDecodeError as err:
+        status = "malformed"
+        detail = f"{type(err).__name__}: {err}"
+    except FileNotFoundError:
+        status = "missing"
+        detail = f"{path} disappeared after reading"
+    except OSError as err:
+        status = "unreadable"
+        detail = f"{type(err).__name__}: {err}"
+
     tail = raw[-lines:] if lines > 0 else []
     scrubbed, unclassified = [], 0
     for line in tail:
         text, classified = scrub_log_line(line)
         scrubbed.append(text)
         unclassified += 0 if classified else 1
-    return {"present": True, "status": "ok", "total_lines": len(raw), "lines": scrubbed, "unclassified": unclassified}
+    result: dict[str, object] = {
+        "present": True,
+        "status": status,
+        "total_lines": len(raw),
+        "lines": scrubbed,
+        "unclassified": unclassified,
+    }
+    if detail:
+        result["read_detail"] = detail
+    return result
 
 
 def recent_jobs(*tails: dict[str, object], limit: int = JOB_LINES) -> list[str]:
@@ -696,7 +723,7 @@ def read_json(path: str) -> tuple[dict, str]:
     except OSError as err:
         return {}, f"unreadable ({type(err).__name__})"
     except (ValueError, UnicodeDecodeError) as err:
-        return {}, f"unreadable (malformed {type(err).__name__})"
+        return {}, f"malformed ({type(err).__name__})"
     return (loaded, "ok") if isinstance(loaded, dict) else ({}, f"malformed (expected object, got {type(loaded).__name__})")
 
 
