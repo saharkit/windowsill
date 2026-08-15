@@ -1,4 +1,4 @@
-# voice-loop -- Windows native install recipe.
+﻿# voice-loop -- Windows native install recipe.
 #
 # Run from an ADMIN PowerShell (right-click PowerShell -> "Run as administrator").
 # This script installs every prerequisite the measured pass (#42) had to discover
@@ -84,6 +84,25 @@ function Test-RealPython {
 }
 
 # ---------------------------------------------------------------------------
+# Helper: run an installer and fail on a non-zero exit code
+# ---------------------------------------------------------------------------
+function Invoke-Installer {
+    param([string]$Description, [string]$FilePath, [string[]]$ArgumentList)
+    $proc = Start-Process -FilePath $FilePath -ArgumentList $ArgumentList -Wait -PassThru -NoNewWindow
+    if ($proc.ExitCode -ne 0) {
+        throw "$Description failed with exit code $($proc.ExitCode)"
+    }
+}
+
+function Invoke-Download {
+    param([string]$Url, [string]$Destination)
+    & curl.exe -L -o $Destination $Url
+    if ($LASTEXITCODE -ne 0) {
+        throw "download failed with exit code $($LASTEXITCODE): $Url"
+    }
+}
+
+# ---------------------------------------------------------------------------
 # Step 1 -- Python 3.12 (direct installer, no winget)
 # ---------------------------------------------------------------------------
 Invoke-Step "Python 3.12" {
@@ -96,9 +115,9 @@ Invoke-Step "Python 3.12" {
     $pythonUrl = "https://www.python.org/ftp/python/3.12.10/python-3.12.10-amd64.exe"
     $installer = "$env:TEMP\python-3.12.10-amd64.exe"
     Write-Host "    downloading $pythonUrl ..."
-    curl.exe -L -o $installer $pythonUrl
+    Invoke-Download $pythonUrl $installer
     Write-Host "    running installer (silent, per-machine, with PATH)..."
-    Start-Process -FilePath $installer -ArgumentList "/quiet","InstallAllUsers=1","PrependPath=1","Include_test=0" -Wait -NoNewWindow
+    Invoke-Installer "Python installer" $installer @("/quiet","InstallAllUsers=1","PrependPath=1","Include_test=0")
     Remove-Item $installer -Force -ErrorAction SilentlyContinue
 
     # REFRESH PATH for this session so the steps below see python.
@@ -108,7 +127,7 @@ Invoke-Step "Python 3.12" {
         $ver = & python --version 2>&1
         Write-Host "    installed: $ver"
     } else {
-        Write-Host "    installed -- python will be visible in a fresh PowerShell session" -ForegroundColor Yellow
+        throw "Python installer exited successfully, but python.exe is not a working interpreter"
     }
 }
 
@@ -139,7 +158,13 @@ Invoke-Step "python3.exe alias" {
     $python3Exe = Join-Path $pythonDir "python3.exe"
 
     if (Test-Path $python3Exe) {
-        Write-Host "    python3.exe already exists at $python3Exe"
+        if (Test-RealPython $python3Exe) {
+            Write-Host "    python3.exe already exists at $python3Exe"
+        } else {
+            Remove-Item $python3Exe -Force
+            Copy-Item $pythonExe $python3Exe
+            Write-Host "    replaced non-functional python3.exe at $python3Exe"
+        }
     } else {
         Copy-Item $pythonExe $python3Exe
         Write-Host "    copied $pythonExe -> $python3Exe"
@@ -151,7 +176,7 @@ Invoke-Step "python3.exe alias" {
         $ver = & python3 --version 2>&1
         Write-Host "    python3 resolves: $ver"
     } else {
-        Write-Host "    python3.exe created -- will be visible in a fresh PowerShell session" -ForegroundColor Yellow
+        throw "python3.exe was created, but it is not a working Python interpreter"
     }
 }
 
@@ -169,8 +194,16 @@ Invoke-Step "PowerShell execution policy" {
         return
     }
     Write-Host "    CurrentUser policy is $policy -- setting to RemoteSigned..."
-    Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned -Force
-    Write-Host "    set to RemoteSigned (CurrentUser scope -- narrowest that unblocks npm.ps1)"
+    try {
+        Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned -Force -ErrorAction Stop
+        Write-Host "    set to RemoteSigned (CurrentUser scope -- narrowest that unblocks npm.ps1)"
+    } catch {
+        if ($_.FullyQualifiedErrorId -like "ExecutionPolicyOverride*") {
+            Write-Host "    Process-scope Bypass overrides CurrentUser policy; npm.ps1 is already unblocked"
+        } else {
+            throw
+        }
+    }
 }
 
 # ---------------------------------------------------------------------------
@@ -186,9 +219,9 @@ Invoke-Step "Git for Windows" {
     $gitUrl = "https://github.com/git-for-windows/git/releases/download/v2.47.1.windows.2/Git-2.47.1.2-64-bit.exe"
     $installer = "$env:TEMP\git-install.exe"
     Write-Host "    downloading $gitUrl ..."
-    curl.exe -L -o $installer $gitUrl
+    Invoke-Download $gitUrl $installer
     Write-Host "    running installer (silent)..."
-    Start-Process -FilePath $installer -ArgumentList "/VERYSILENT","/NORESTART","/NOCANCEL" -Wait -NoNewWindow
+    Invoke-Installer "Git installer" $installer @("/VERYSILENT","/NORESTART","/NOCANCEL")
     Remove-Item $installer -Force -ErrorAction SilentlyContinue
 
     # Refresh PATH for this session.
@@ -198,7 +231,7 @@ Invoke-Step "Git for Windows" {
         $ver = & git --version 2>&1
         Write-Host "    installed: $ver"
     } else {
-        Write-Host "    installed -- git will be visible in a fresh PowerShell session" -ForegroundColor Yellow
+        throw "Git installer exited successfully, but git is not available on PATH"
     }
 }
 
@@ -213,9 +246,9 @@ Invoke-Step "Node.js LTS" {
         $nodeUrl = "https://nodejs.org/dist/v22.14.0/node-v22.14.0-x64.msi"
         $installer = "$env:TEMP\node-install.msi"
         Write-Host "    downloading $nodeUrl ..."
-        curl.exe -L -o $installer $nodeUrl
+        Invoke-Download $nodeUrl $installer
         Write-Host "    running installer (silent)..."
-        Start-Process -FilePath "msiexec.exe" -ArgumentList "/i",$installer,"/quiet","/norestart" -Wait -NoNewWindow
+        Invoke-Installer "Node.js installer" "msiexec.exe" @("/i",$installer,"/quiet","/norestart")
         Remove-Item $installer -Force -ErrorAction SilentlyContinue
 
         # Refresh PATH.
@@ -225,7 +258,7 @@ Invoke-Step "Node.js LTS" {
             $ver = & node --version 2>&1
             Write-Host "    installed: $ver"
         } else {
-            Write-Host "    installed -- node will be visible in a fresh PowerShell session" -ForegroundColor Yellow
+            throw "Node.js installer exited successfully, but node is not available on PATH"
         }
     }
 
@@ -256,7 +289,7 @@ Invoke-Step "Claude Code" {
         $ver = & claude --version 2>&1
         Write-Host "    installed: $ver"
     } else {
-        Write-Host "    installed -- claude will be visible in a fresh PowerShell session" -ForegroundColor Yellow
+        throw "Claude Code installer exited successfully, but claude is not available on PATH"
     }
 }
 

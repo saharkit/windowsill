@@ -2152,11 +2152,15 @@ def test_windows_install_recipe_exists_and_is_readable():
     )
     # The script must use direct installers (curl.exe + Start-Process).
     assert "curl.exe" in text.lower(), "install.ps1 must use curl.exe for downloads"
-    # PowerShell 5.1 (the in-box Windows 11 shell) reads a .ps1 without a UTF-8 BOM as ANSI, so a
-    # UTF-8 em-dash (0x94) decodes to a closing smart quote that terminates a double-quoted string
-    # mid-argument and the whole script fails to parse. The recipe must be pure ASCII to parse as
-    # written on a stock machine.
-    assert text.isascii(), "install.ps1 must be ASCII — non-ASCII bytes break the in-box PowerShell parse"
+    # Windows PowerShell 5.1 reads a BOM-less .ps1 as ANSI. The BOM must be present in the
+    # delivered bytes so the in-box parser decodes the script as UTF-8 rather than corrupting its
+    # non-ASCII prose into syntax.
+    assert install_ps1.read_bytes().startswith(bytes.fromhex("efbbbf")), (
+        "install.ps1 must carry a UTF-8 BOM for the in-box PowerShell parser"
+    )
+    assert "-PassThru" in text, "installer exit codes must be available to the recipe"
+    assert "Test-RealPython $python3Exe" in text, "existing python3.exe must be verified, not trusted"
+    assert "ExecutionPolicyOverride" in text, "Process-scope Bypass must not abort the recipe"
 
 
 class _FakeStat:
