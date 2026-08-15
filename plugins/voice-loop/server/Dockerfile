@@ -5,6 +5,13 @@
 #
 # Models are baked in at build time, so the container starts warm and needs no network at runtime.
 # For GPU, start from an nvidia/cuda base and install the matching torch wheel instead.
+#
+# The published interface is the `-p` mapping above, and its HOST side is the whole boundary: this
+# server has NO authentication, so publishing without the `127.0.0.1:` prefix puts it on every
+# interface a stranger can dial. VOICE_LOOP_HOST below stays 0.0.0.0 ON PURPOSE — inside the
+# container the server must bind every interface or the mapping forwards to nothing; "fixing" the
+# ENV to 127.0.0.1 would silently break the container while leaving the real exposure untouched
+# (windowsill #215, asserted by tests/test_loaders.py).
 FROM python:3.12-slim
 
 ENV PYTHONUNBUFFERED=1 \

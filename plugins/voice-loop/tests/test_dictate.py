@@ -2344,22 +2344,112 @@ def test_cloud_error_response_degrades_to_local_whisper(state, monkeypatch, open
     assert "cloud stt failed — falling back to local whisper" in log_text
 
 
-# --- plaintext endpoint warning: http:// on non-loopback -----------------------------------------
+# --- the endpoint policy: clear text + credential is refused at configuration time (#215) --------
 
 
-def test_non_loopback_http_batch_endpoint_is_warned(state, monkeypatch, opener):
-    """A user-configured http:// endpoint resolves to plaintext — the API key, the raw audio
-    and the transcript all travel in the clear. Warn once, and let the call proceed."""
+def test_a_clear_text_cloud_endpoint_is_refused_at_configuration_time(state, monkeypatch, opener):
+    """windowsill #215: an http:// endpoint carrying the API key used to be WARNED about while the
+    clip was posted anyway. The policy is now a REFUSAL, made when the configuration is assembled
+    — before any request exists — naming the endpoint and the fix."""
     (state / "dictate.wav").write_bytes(b"RIFFfakewav")
     fake = opener(b'{"text": " hello "}')
     monkeypatch.setenv("VOICE_LOOP_STT_API_KEY", "sk-secret")
     s = dictate.resolve_settings(
         {"stt": {"backend": "cloud", "cloud": {"endpoint": "http://192.168.1.100:8080"}}}, "Linux"
     )
+    refusal = dictate._clear_text_refusal(s)
+    assert refusal is not None
+    assert "192.168.1.100" in refusal
+    assert "https://" in refusal
+    assert fake.requests == []
+
+
+def test_an_endpoint_name_that_merely_starts_with_127_is_refused(state, monkeypatch):
+    """The exact shape from the tracker (#215): 127.evil.com is a DNS name that merely LOOKS
+    loopback and resolves wherever its owner pointed it. Local is decided by the RESOLVED address
+    — here a public one — so the credential never rides the clear text to it."""
+    monkeypatch.setenv("VOICE_LOOP_STT_API_KEY", "sk-secret")
+    monkeypatch.setattr(
+        dictate.socket, "getaddrinfo", lambda host, *a, **k: [["", "", "", "", ("93.184.216.34", 0)]]
+    )
+    s = dictate.resolve_settings(
+        {"stt": {"backend": "cloud", "cloud": {"endpoint": "http://127.evil.com:9000"}}}, "Linux"
+    )
+    refusal = dictate._clear_text_refusal(s)
+    assert refusal == (
+        "cloud stt refused: http endpoint '127.evil.com' would carry the API key and the audio in the "
+        "clear — point it at https://, or at this machine"
+    )
+
+
+def test_a_local_by_resolution_endpoint_is_classified_once_not_per_request(state, monkeypatch, opener):
+    """windowsill #215's trap: resolving per REQUEST is a blocking call on every transcription and
+    every live socket. The guard resolves the name ONCE, at configuration time; transcribe() then
+    posts without ever looking the host up again."""
+    (state / "dictate.wav").write_bytes(b"RIFFfakewav")
+    fake = opener(b'{"text": " hello "}')
+    lookups: list[str] = []
+
+    def one_address(host, *args, **kwargs):
+        lookups.append(host)
+        return [["", "", "", "", ("127.0.0.1", 0)]]
+
+    monkeypatch.setattr(dictate.socket, "getaddrinfo", one_address)
+    monkeypatch.setenv("VOICE_LOOP_STT_API_KEY", "sk-secret")
+    s = dictate.resolve_settings(
+        {"stt": {"backend": "cloud", "cloud": {"endpoint": "http://tunnel.internal:8355"}}}, "Linux"
+    )
+    assert dictate._clear_text_refusal(s) is None  # the name resolves to loopback: admitted
+    assert lookups == ["tunnel.internal"]  # exactly one lookup, and the guard made it
+    monkeypatch.setattr(
+        dictate.socket, "getaddrinfo", lambda host, *a, **k: pytest.fail(f"per-request lookup of {host}")
+    )
     assert dictate.transcribe(s) == "hello"
-    log_text = _log_of(state)
-    assert "cloud stt endpoint is http:// to 192.168.1.100" in log_text
-    assert "api key" in log_text.lower()
+
+
+def test_the_default_local_cloud_path_is_never_refused(state, monkeypatch, opener):
+    """The local voice-loop server on http://127.0.0.1 is the DEFAULT — a key over plaintext to
+    loopback is what the shipped configuration does, and the policy allows it."""
+    (state / "dictate.wav").write_bytes(b"RIFFfakewav")
+    fake = opener(b'{"text": " hello "}')
+    monkeypatch.setenv("VOICE_LOOP_STT_API_KEY", "sk-secret")
+    s = dictate.resolve_settings({"stt": {"backend": "cloud"}}, "Linux")
+    assert dictate._clear_text_refusal(s) is None
+    assert dictate.transcribe(s) == "hello"
+
+
+def test_a_keyless_clear_text_config_is_not_the_guard_s_business(state, monkeypatch):
+    """No credential configured, nothing rides the clear text — the guard stays out of the way
+    (the cloud path refuses keyless calls itself, unchanged)."""
+    monkeypatch.delenv("VOICE_LOOP_STT_API_KEY", raising=False)
+    s = dictate.resolve_settings(
+        {"stt": {"backend": "cloud", "cloud": {"endpoint": "http://192.168.1.100:8080"}}}, "Linux"
+    )
+    assert dictate._clear_text_refusal(s) is None
+
+
+def test_main_refuses_a_clear_text_cloud_config_before_any_recording(state, monkeypatch):
+    """L1 composition junction: the refusal decision is pinned in the guard tests above and in
+    providers.py; only a main() drive catches the WIRING being lost — the guard skipped, or
+    reached after the recorder had already been spawned. A refused configuration must not get
+    that far."""
+    spawned: list[list[str]] = []
+
+    class FakeProc:
+        pid = 4242
+
+    monkeypatch.setattr(dictate.subprocess, "Popen", lambda argv, **kw: spawned.append(argv) or FakeProc())
+    monkeypatch.setenv("VOICE_LOOP_STT_API_KEY", "sk-secret")
+    _write_config(
+        monkeypatch,
+        state,
+        {"stt": {"backend": "cloud", "cloud": {"endpoint": "http://192.168.1.100:8080"}},
+         "dictate": {"recorder": "arecord", "debounce_ms": 0}},
+    )
+
+    assert dictate.main(["dictate.py"]) == 1
+    assert spawned == [], "a refused configuration must not start a recorder"
+    assert "cloud stt refused" in _log_of(state)
 
 
 def test_loopback_http_batch_endpoint_is_silent(state, monkeypatch, opener):
@@ -3054,59 +3144,29 @@ class TestStreamSessionRoundTrip:
         keepalives = [payload for opcode, payload in fake.server.frames if b"KeepAlive" in payload]
         assert keepalives, "an idle stretch sent no keepalive — the vendor would have hung up"
 
-    def test_plaintext_non_loopback_streaming_endpoint_is_warned(self, state):
-        """A ws:// URL to a non-loopback host carries credentials in the clear — warn before
-        the connect attempt, so the warning always reaches the log."""
-        (state / "dictate.wav").write_bytes(_wav_bytes(b"\x01\x02" * 500))
-        fake_connect = _FailingConnect("connection refused")
+    def test_a_ws_cloud_stream_endpoint_is_refused_at_configuration_time(self, monkeypatch):
+        """windowsill #215: the streaming URL is the websocket rewrite of the SAME configured
+        host (websocket_scheme), so a clear-text host carries the key and the audio over ws:// —
+        the same refusal as the batch path, made at configuration time, before the socket is
+        dialed. That ws:// is one rule with http:// is pinned at the policy's own layer in
+        test_providers.py; this test pins that the streaming settings REACH the guard."""
+        monkeypatch.setenv("VOICE_LOOP_STT_API_KEY", "dg-secret")
+        refusal = dictate._clear_text_refusal(_streaming_settings("http://192.168.1.100:8080"))
+        assert refusal is not None
+        assert "192.168.1.100" in refusal
+        assert "in the clear" in refusal
 
-        result = dictate.run_stream_session(
-            _streaming_settings("http://192.168.1.100:8080"),
-            providers.STT_PROVIDERS["deepgram"],
-            "dg-secret",
-            stopping=lambda: True,
-            recorder_alive=lambda: False,
-            wav_path=str(state / "dictate.wav"),
-            connect=fake_connect,
-        )
-        assert result["status"] == "failed"
-        log_text = _log_of(state)
-        assert "streaming stt endpoint is ws:// to 192.168.1.100" in log_text
-        assert "api key" in log_text.lower()
+    def test_a_loopback_ws_streaming_config_is_never_refused(self, monkeypatch):
+        """The local voice-loop server on ws://127.0.0.1 is the DEFAULT local path — the policy
+        allows plaintext to loopback, with the key present to prove the admission is the LOCAL
+        decision and not the keyless shortcut."""
+        monkeypatch.setenv("VOICE_LOOP_STT_API_KEY", "dg-secret")
+        assert dictate._clear_text_refusal(_streaming_settings("http://127.0.0.1:8355")) is None
 
-    def test_loopback_ws_streaming_endpoint_is_silent(self, state):
-        """The local voice-loop server on ws://127.0.0.1 is the DEFAULT local path — never warn."""
-        (state / "dictate.wav").write_bytes(_wav_bytes(b"\x01\x02" * 500))
-        fake_connect = _FailingConnect("connection refused")
-
-        result = dictate.run_stream_session(
-            _streaming_settings("http://127.0.0.1:8355"),
-            providers.STT_PROVIDERS["deepgram"],
-            "dg-secret",
-            stopping=lambda: True,
-            recorder_alive=lambda: False,
-            wav_path=str(state / "dictate.wav"),
-            connect=fake_connect,
-        )
-        assert result["status"] == "failed"
-        assert "api key" not in _log_of(state).lower()
-
-    def test_wss_streaming_endpoint_is_silent(self, state):
-        """A correctly configured wss:// endpoint warrants no warning."""
-        (state / "dictate.wav").write_bytes(_wav_bytes(b"\x01\x02" * 500))
-        fake_connect = _FailingConnect("connection refused")
-
-        result = dictate.run_stream_session(
-            _streaming_settings("https://api.deepgram.com"),
-            providers.STT_PROVIDERS["deepgram"],
-            "dg-secret",
-            stopping=lambda: True,
-            recorder_alive=lambda: False,
-            wav_path=str(state / "dictate.wav"),
-            connect=fake_connect,
-        )
-        assert result["status"] == "failed"
-        assert "api key" not in _log_of(state).lower()
+    def test_a_wss_streaming_config_is_never_refused(self, monkeypatch):
+        """A correctly configured wss:// endpoint carries nothing in the clear."""
+        monkeypatch.setenv("VOICE_LOOP_STT_API_KEY", "dg-secret")
+        assert dictate._clear_text_refusal(_streaming_settings("https://api.deepgram.com")) is None
 
 
 # --- the worker's lifecycle: spawned by start, stopped by stop, never outliving either -----------

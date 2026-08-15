@@ -61,6 +61,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import ipaddress
 import io
 import json
 import logging
@@ -197,9 +198,20 @@ RVC_TIMEOUT = float(os.environ.get("VOICE_LOOP_RVC_TIMEOUT", "10"))
 CORPUS_DIR = os.environ.get("VOICE_LOOP_CORPUS_DIR", "")
 CORPUS_MAX_SECONDS = float(os.environ.get("VOICE_LOOP_CORPUS_MAX_SECONDS", "1800"))
 USE_ACCENT = os.environ.get("VOICE_LOOP_ACCENT", "1") not in ("0", "false", "no")
+
+
+def _config_home() -> Path:
+    """The XDG config home, where a present-but-EMPTY variable counts as unset (windowsill #215).
+
+    The spec uses the default when $XDG_CONFIG_HOME "is either not set or empty", and the old
+    spelling honoured only the first half: ``Path("")`` is ``.``, which turned the stress
+    dictionary into a RELATIVE ``voice-loop/stress.json`` — an operator-controlled regex file
+    loaded from whatever directory the server happened to start in."""
+    return Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
+
+
 STRESS_FILE = Path(
-    os.environ.get("VOICE_LOOP_STRESS_FILE", "")
-    or Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "voice-loop" / "stress.json"
+    os.environ.get("VOICE_LOOP_STRESS_FILE", "") or _config_home() / "voice-loop" / "stress.json"
 )
 # The hook's heartbeat: speak.py rewrites this stamp on EVERY firing, so its age answers "is the
 # harness still calling the hook?" — the question a mid-session silence needs answered first (the
@@ -898,6 +910,24 @@ def chunk(text: str, limit: int = MAX_TTS_CHARS) -> list[str]:
     return chunks
 
 
+def _is_loopback_host(host: str) -> bool:
+    """The server half of the endpoint-and-origin policy (windowsill #215), mirrored for the client
+    scripts in providers.py — the server and the scripts share no import path, so a test asserts
+    the two classifiers agree.
+
+    A literal loopback address — anything in 127.0.0.0/8, or ::1 — or the literal name "localhost".
+    NOTHING else: 127.evil.com is a DNS name a caller controls, not a loopback address, and a name's
+    locality would take a lookup on the REQUEST path, which is a blocking call no request may make
+    (#215 resolves once, at configuration time, on the client side). A name that is not literally
+    "localhost" is therefore not local: fail closed."""
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
 def is_local_origin(origin: str) -> bool:
     """True for origins a same-machine page legitimately sends: loopback hosts and the opaque "null"."""
     if origin == "null":
@@ -906,7 +936,7 @@ def is_local_origin(origin: str) -> bool:
         host = urlsplit(origin).hostname or ""
     except ValueError:
         return False
-    return host == "localhost" or host == "::1" or host.startswith("127.")
+    return _is_loopback_host(host)
 
 
 def cross_site_error(request: Request) -> JSONResponse | None:
@@ -1062,7 +1092,15 @@ def xtts_request_error(language: str) -> JSONResponse | None:
             status_code=500,
         )
     if not Path(XTTS_REFERENCE).is_file():
-        return JSONResponse({"error": f"XTTS reference wav not found: {XTTS_REFERENCE}"}, status_code=500)
+        # The configured path stays in the log and out of the body: /tts has no authentication,
+        # and an absolute path is information about this operator's filesystem (windowsill #215 —
+        # the same rule xtts_import_error applies to exception text). The caller gets the SHAPE.
+        log.warning("xtts reference wav not found: %s", XTTS_REFERENCE)
+        return JSONResponse(
+            {"error": "XTTS reference wav not found — the configured VOICE_LOOP_XTTS_REFERENCE "
+                      "does not exist"},
+            status_code=500,
+        )
     if language not in XTTS_LANGUAGES:
         body: dict[str, object] = {
             "error": f"XTTS-v2 does not speak language {language!r}",
@@ -1656,10 +1694,11 @@ def _is_loopback_bind(host: str) -> bool:
     """True only for binds that point at the local machine — the one case where the stamp file
     is the same file the hook on this machine writes. A non-loopback bind (``0.0.0.0``, a LAN IP,
     anything reachable from another box) means the server can see its OWN state dir's stamp, not
-    the client's — and reporting an age in that case is a confabulation (#179, defect 2)."""
+    the client's — and reporting an age in that case is a confabulation (#179, defect 2).
+    The address itself is classified by ``_is_loopback_host`` — the one loopback policy (#215)."""
     if not host:
         return False
-    return host == "localhost" or host.startswith("127.") or host == "::1"
+    return _is_loopback_host(host)
 
 
 def hook_heartbeat(clock: Callable[[], float] = _default_wall_clock) -> tuple[str | None, float | None]:

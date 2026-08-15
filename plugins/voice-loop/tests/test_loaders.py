@@ -7,7 +7,9 @@ no model is downloaded, nothing touches the network.
 
 from __future__ import annotations
 
+import re
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -238,3 +240,75 @@ def test_default_language_is_english_when_the_env_does_not_choose(monkeypatch):
     monkeypatch.delenv("VOICE_LOOP_LANGUAGE", raising=False)
     module = importlib.reload(voice_server)
     assert module.LANGUAGE == "en"
+
+
+# --- the config home: an empty XDG variable is unset, not "here" (#215) --------------------------
+
+
+def test_config_home_ignores_a_present_but_empty_xdg_variable(monkeypatch, tmp_path):
+    """windowsill #215: XDG_CONFIG_HOME="" used to become Path("") — "." — which made the stress
+    dictionary a RELATIVE voice-loop/stress.json, an operator-controlled regex file loaded from
+    whatever directory the server happened to start in. The spec's default applies when the
+    variable is "either not set or empty"; only the first half was honoured."""
+    monkeypatch.setattr(voice_server.Path, "home", classmethod(lambda cls: tmp_path))
+    monkeypatch.setenv("XDG_CONFIG_HOME", "")
+
+    home = voice_server._config_home()
+
+    assert home == tmp_path / ".config"
+    assert home.is_absolute()
+
+
+def test_config_home_reads_a_set_xdg_variable(monkeypatch, tmp_path):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+    assert voice_server._config_home() == tmp_path / "xdg"
+
+
+def test_config_home_falls_back_to_the_home_default_when_unset(monkeypatch, tmp_path):
+    monkeypatch.setattr(voice_server.Path, "home", classmethod(lambda cls: tmp_path))
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    assert voice_server._config_home() == tmp_path / ".config"
+
+
+# --- the container's published interface (windowsill #215) ---------------------------------------
+#
+# The image's own ENV binds 0.0.0.0 ON PURPOSE — inside the container the server must bind every
+# interface or the `-p` mapping forwards to nothing. What a stranger can dial is the HOST side of
+# the documented `docker run … -p` mapping, so that — never the ENV — is what these tests pin.
+
+
+def _documented_publishes() -> list[tuple[str, str]]:
+    """(file, host-side address) of every documented `docker run` publish; "" where a publish
+    carries no host address, which is Docker's "every interface" default."""
+    server_dir = Path(__file__).resolve().parents[1] / "server"
+    found: list[tuple[str, str]] = []
+    for name in ("Dockerfile", "README.md"):
+        text = (server_dir / name).read_text(encoding="utf-8")
+        for token in re.findall(r"-p[ \t]+(\S+)", text):
+            parts = token.split(":")
+            if len(parts) == 3:
+                found.append((name, parts[0]))
+            elif len(parts) == 2:
+                found.append((name, ""))
+    return found
+
+
+def test_the_documented_docker_publish_binds_the_host_side_to_loopback():
+    """L2: the publish already reads `-p 127.0.0.1:8355:8355`, and nothing but this test notices
+    a doc edit back to bare `-p 8355:8355` — which publishes the unauthenticated server on every
+    interface the host has, silently."""
+    found = _documented_publishes()
+    assert found, "the documented `docker run` publish went missing — restore it"
+    for name, host in found:
+        assert host == "127.0.0.1", (
+            f"{name} publishes on {host or 'every interface'} — the server has no authentication"
+        )
+
+
+def test_the_image_env_keeps_binding_wide_on_purpose():
+    """The companion guard (#215): the tempting "fix" — VOICE_LOOP_HOST=127.0.0.1 in the image —
+    silently breaks the container (the mapping then forwards to a loopback the publishing bridge
+    cannot reach) while leaving the real exposure, the publish, untouched. The ENV stays wide and
+    the boundary stays on `-p`; this test fails if that decision is quietly reversed."""
+    dockerfile = (Path(__file__).resolve().parents[1] / "server" / "Dockerfile").read_text(encoding="utf-8")
+    assert "VOICE_LOOP_HOST=0.0.0.0" in dockerfile

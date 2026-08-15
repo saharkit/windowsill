@@ -1164,29 +1164,131 @@ def test_an_unset_elevenlabs_voice_logs_misconfiguration_and_never_posts(state, 
     assert "voice" in log_text
 
 
-def test_non_loopback_http_tts_endpoint_is_warned(state, opener):
-    """The TTS half of the plaintext transport warning (the STT side already had one): an http://
-    endpoint to a non-loopback host carries the API key and the text in the clear."""
+def test_a_clear_text_cloud_endpoint_is_refused_at_configuration_time(state, monkeypatch, opener):
+    """windowsill #215: an http:// endpoint carrying the API key used to be WARNED about while the
+    request was sent. The policy is now a REFUSAL, made when the configuration is assembled —
+    before any request exists — naming the endpoint and the fix."""
     fake = opener(b"MP3-audio-bytes")
+    monkeypatch.setenv("VOICE_LOOP_TTS_API_KEY", "sk-secret")
     s = speak.resolve_settings(
         {"tts": {"backend": "cloud", "endpoint": "http://192.168.1.100:8080",
                  "cloud": {"provider": "elevenlabs", "voice_id": "v123"}}},
         "Linux",
     )
-    assert speak.synthesize("hi", s, "xi-secret") == b"MP3-audio-bytes"
-    log_text = (state / "speak.log").read_text(encoding="utf-8")
-    assert "cloud tts endpoint is http:// to 192.168.1.100" in log_text
-    assert "in the clear" in log_text
+    refusal = speak._clear_text_refusal(s)
+    assert refusal is not None
+    assert "192.168.1.100" in refusal
+    assert "https://" in refusal
+    assert fake.requests == []
 
 
-def test_loopback_http_tts_endpoint_is_silent(state, opener):
-    """The local server on 127.0.0.1 is the TTS default and must never warn about plaintext."""
+def test_an_endpoint_name_that_merely_starts_with_127_is_refused(state, monkeypatch):
+    """The exact shape from the tracker (#215): 127.evil.com is a DNS name that merely LOOKS
+    loopback and resolves wherever its owner pointed it. Local is decided by the RESOLVED address
+    — here a public one — so the credential never rides the clear text to it."""
+    monkeypatch.setenv("VOICE_LOOP_TTS_API_KEY", "sk-secret")
+    monkeypatch.setattr(
+        speak.socket, "getaddrinfo", lambda host, *a, **k: [["", "", "", "", ("93.184.216.34", 0)]]
+    )
+    s = speak.resolve_settings(
+        {"tts": {"backend": "cloud", "endpoint": "http://127.evil.com:9000",
+                 "cloud": {"provider": "elevenlabs", "voice_id": "v123"}}},
+        "Linux",
+    )
+    refusal = speak._clear_text_refusal(s)
+    assert refusal == (
+        "cloud tts refused: http endpoint '127.evil.com' would carry the API key and the audio in the "
+        "clear — point it at https://, or at this machine"
+    )
+
+
+def test_a_local_by_resolution_endpoint_is_classified_once_not_per_request(state, monkeypatch, opener):
+    """windowsill #215's trap: resolving per REQUEST is a blocking call on every synthesis. The
+    guard resolves the name ONCE, at configuration time; synthesize() then sends without ever
+    looking the host up again."""
+    fake = opener(b"MP3-audio-bytes")
+    lookups: list[str] = []
+
+    def one_address(host, *args, **kwargs):
+        lookups.append(host)
+        return [["", "", "", "", ("127.0.0.1", 0)]]
+
+    monkeypatch.setattr(speak.socket, "getaddrinfo", one_address)
+    monkeypatch.setenv("VOICE_LOOP_TTS_API_KEY", "sk-secret")
+    s = speak.resolve_settings(
+        {"tts": {"backend": "cloud", "endpoint": "http://tunnel.internal:8355",
+                 "cloud": {"provider": "openai"}}},
+        "Linux",
+    )
+    assert speak._clear_text_refusal(s) is None  # the name resolves to loopback: admitted
+    assert lookups == ["tunnel.internal"]  # exactly one lookup, and the guard made it
+    monkeypatch.setattr(
+        speak.socket, "getaddrinfo", lambda host, *a, **k: pytest.fail(f"per-request lookup of {host}")
+    )
+    assert speak.synthesize("hi", s, "sk-secret") == b"MP3-audio-bytes"
+
+
+def test_the_default_local_cloud_path_is_never_refused(state, monkeypatch, opener):
+    """The local server on 127.0.0.1 is the cloud backend's default landing (openai has no remote
+    host): a key over that http:// endpoint is plaintext to loopback, which the policy allows."""
     fake = opener(b"WAV-audio-bytes")
-    s = speak.resolve_settings({"tts": {"backend": "cloud"}}, "Linux")  # openai -> local speech host
+    monkeypatch.setenv("VOICE_LOOP_TTS_API_KEY", "sk-secret")
+    s = speak.resolve_settings({"tts": {"backend": "cloud"}}, "Linux")
+    assert speak._clear_text_refusal(s) is None
     assert speak.synthesize("hi", s, "sk-secret") == b"WAV-audio-bytes"
-    log_path = state / "speak.log"
-    log_text = log_path.read_text(encoding="utf-8") if log_path.exists() else ""
-    assert "in the clear" not in log_text
+
+
+def test_a_keyless_clear_text_config_is_not_the_guard_s_business(monkeypatch):
+    """No credential configured, nothing rides the clear text — the guard stays out of the way
+    (the cloud path refuses keyless calls itself, unchanged)."""
+    monkeypatch.delenv("VOICE_LOOP_TTS_API_KEY", raising=False)
+    s = speak.resolve_settings(
+        {"tts": {"backend": "cloud", "endpoint": "http://192.168.1.100:8080"}}, "Linux"
+    )
+    assert speak._clear_text_refusal(s) is None
+
+
+def test_main_refuses_a_clear_text_cloud_config_and_never_builds_a_request(state, monkeypatch, opener):
+    """L1 composition junction: the refusal decision is pinned in the guard tests above and in
+    providers.py; what only a real hook drive can catch is the WIRING being lost — the guard
+    skipped, or reached only after the first request was already built. entry() is the whole hook
+    (the turn's speech AND the contour check, which resolves its own settings and synthesizes on
+    its own path), so an ACTIVE alert is planted: for a refused configuration no request, no
+    player and no page may exist — the alert stays unannounced, to be retried once the config is
+    fixed, exactly like a page whose delivery failed."""
+    fake = opener(b"MP3-audio-bytes")
+    config = state / "config.json"
+    config.write_text(
+        json.dumps(
+            {"tts": {"backend": "cloud", "endpoint": "http://192.168.1.100:8080",
+                     "cloud": {"provider": "elevenlabs", "voice_id": "v123"}}}
+        ),
+        encoding="utf-8",
+    )
+    transcript = state / "transcript.jsonl"
+    transcript.write_text(_assistant("🔊 hello") + "\n", encoding="utf-8")
+    _contour_status(state, [_DEMOTED])
+    monkeypatch.setenv("VOICE_LOOP_CONFIG", str(config))
+    monkeypatch.setenv("VOICE_LOOP_TTS_API_KEY", "sk-secret")
+    monkeypatch.setattr(
+        speak.sys, "stdin", io.StringIO(json.dumps({"transcript_path": str(transcript)}))
+    )
+
+    class SilentPlayer:
+        pid = 4242
+        returncode = 0
+
+        def wait(self):
+            return 0
+
+    players: list[list[str]] = []
+    monkeypatch.setattr(speak.subprocess, "Popen", lambda argv, **kw: players.append(argv) or SilentPlayer())
+
+    assert speak.entry() == 0
+    assert fake.requests == [], "a refused configuration must not build a request"
+    assert players == [], "nothing to play: no synthesis happened"
+    assert "cloud tts refused" in (state / "speak.log").read_text(encoding="utf-8")
+    assert not (state / "contour-announced").exists(), "a refused configuration must not page either"
 
 
 def test_deepgram_synthesis_goes_through_synthesize_with_no_branch_in_the_way(opener):

@@ -211,7 +211,7 @@ def test_health_keeps_the_heartbeat_on_loopback_binds(client, monkeypatch, tmp_p
 
 def test_is_loopback_bind_classifies_addresses_for_wsl2_carveout():
     """L1: the classification helper is the answer the heartbeat will trust next to HOOK_STAMP_FILE.
-    Tests for its branches keep the carve-out exact — a typo in the prefix string would re-open
+    Tests for its branches keep the carve-out exact — a typo in the address test would re-open
     the LAN confabulation or silence every local install.
     """
     assert voice_server._is_loopback_bind("127.0.0.1") is True
@@ -222,6 +222,8 @@ def test_is_loopback_bind_classifies_addresses_for_wsl2_carveout():
     assert voice_server._is_loopback_bind("192.168.1.42") is False
     assert voice_server._is_loopback_bind("::") is False
     assert voice_server._is_loopback_bind("") is False
+    # the shape the old startswith("127.") admitted (#215): a DNS name is not a loopback address
+    assert voice_server._is_loopback_bind("127.evil.com") is False
 
 
 # --- /stt ------------------------------------------------------------------------------------------
@@ -731,6 +733,24 @@ def test_stt_refuses_a_foreign_origin(client, fake_whisper):
         "/stt",
         files={"audio": ("clip.wav", b"RIFFfake", "audio/wav")},
         headers={"Origin": "https://evil.example"},
+    )
+
+    assert response.status_code == 403
+    assert response.json() == {"error": "cross-origin browser requests are not accepted"}
+    assert fake_whisper.calls == []
+
+
+def test_stt_refuses_an_origin_whose_host_merely_starts_with_127(client, fake_whisper):
+    """windowsill #215, the exact shape it names: ``Origin: http://127.evil.com:8080``. The host
+    is a DNS name a caller controls — it resolves wherever its owner pointed it — and the old
+    ``host.startswith("127.")`` classified it as loopback, letting any page that registered such a
+    name fire unauthenticated browser POSTs at this server. The resolved address is a
+    configuration-time question (#215); at request time a name that is not literally "localhost"
+    is simply not local."""
+    response = client.post(
+        "/stt",
+        files={"audio": ("clip.wav", b"RIFFfake", "audio/wav")},
+        headers={"Origin": "http://127.evil.com:8080"},
     )
 
     assert response.status_code == 403

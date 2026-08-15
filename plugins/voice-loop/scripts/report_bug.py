@@ -515,11 +515,10 @@ LOG_RULES: tuple[tuple[str, str | None], ...] = (
     ("dictation latency stop_to_paste_ms=", None),
     ("cloud stt returned an error: ", "error: "),
     ("cloud stt returned undecodable response: ", "response: "),
-    # plaintext endpoint warnings (#110): the hostname is config metadata (the operator's own
-    # endpoint), and the prose is fixed — nothing sensitive travels through these lines
-    ("cloud stt endpoint is http:// to ", None),
-    ("cloud tts endpoint is http:// to ", None),
-    ("streaming stt endpoint is ws:// to ", None),
+    # the plaintext endpoint warnings (#110) are gone with the warnings themselves (#215): a
+    # clear-text endpoint carrying a credential is now REFUSED at configuration time, and that
+    # refusal line is built dynamically — so it travels the unknown-line path, cut at its first
+    # ": " with the hostname dropped, and is counted as unclassified in the bundle.
     ("debounce stamp unavailable (", None),
     ("debounce stamp locked by another toggle", None),
     ("debounce stamp not written: ", None),

@@ -46,6 +46,11 @@ docker build -t voice-loop-server .
 docker run --rm -p 127.0.0.1:8355:8355 voice-loop-server
 ```
 
+The `127.0.0.1:` prefix on `-p` is the boundary: the server has no authentication, and without it
+Docker publishes the port on every interface the host has. `VOICE_LOOP_HOST=0.0.0.0` inside the
+image is correct as it stands — inside the container the server must bind every interface or the
+mapping forwards to nothing — so never "fix" this by narrowing the ENV; fix the publish.
+
 The image bakes the models in at build time, so the container needs no network at runtime. Build with
 `--build-arg PREFETCH_MODELS=0` for a small image that downloads on first request instead.
 
