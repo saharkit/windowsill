@@ -1193,8 +1193,10 @@ def test_an_endpoint_name_that_merely_starts_with_127_is_refused(state, monkeypa
         "Linux",
     )
     refusal = speak._clear_text_refusal(s)
-    assert refusal is not None
-    assert "127.evil.com" in refusal
+    assert refusal == (
+        "cloud tts refused: http endpoint '127.evil.com' would carry the API key and the audio in the "
+        "clear — point it at https://, or at this machine"
+    )
 
 
 def test_a_local_by_resolution_endpoint_is_classified_once_not_per_request(state, monkeypatch, opener):
