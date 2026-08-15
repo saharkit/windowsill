@@ -2381,6 +2381,29 @@ def test_https_batch_endpoint_is_silent(state, monkeypatch, opener):
 # silent dead mic. These cases are the ones where it used to do something else.
 
 
+def test_an_unset_stt_endpoint_logs_misconfiguration_and_never_posts(state, monkeypatch):
+    """A cloud provider with no default host (openai, the OpenAI-compatible path) and no endpoint
+    used to build a relative URL that urllib turns into an opaque "unknown url type" — a network
+    error for "you have not configured an endpoint". The guard says that instead, before any post."""
+    monkeypatch.setenv("VOICE_LOOP_STT_API_KEY", "sk-secret")
+    posts: list[tuple] = []
+    monkeypatch.setattr(dictate, "_post_bytes", lambda *args, **kwargs: posts.append(args) or None)
+    s = {
+        "stt_provider": "openai",
+        "key_env": "VOICE_LOOP_STT_API_KEY",
+        "key_file": "",
+        "cloud_endpoint": "",
+        "endpoint": "",
+        "stt_model": "whisper-1",
+        "language": "en",
+        "timeout": 60.0,
+    }
+    assert dictate._transcribe_cloud(s, b"RIFFfakewav", "BOUND") is None
+    assert posts == [], "an unset endpoint must not reach the network"
+    log_text = (state / "dictate.log").read_text(encoding="utf-8")
+    assert "cloud stt: no endpoint for openai" in log_text
+
+
 def _log_of(state) -> str:
     """The log as text — '' when the run never wrote one, which is itself an assertion some of the
     cases below make (a silent clip must not produce a line at all)."""

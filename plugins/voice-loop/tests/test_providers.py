@@ -25,24 +25,52 @@ _FIXTURES = Path(__file__).resolve().parent / "fixtures"
 # --- the property the whole ticket is about ------------------------------------------------------
 
 
+# The forbidden shape: a provider name compared against a literal, which is how a dispatch path
+# sneaks back in. Every spelling matters — the two dispatch sites read ``s["provider"]`` /
+# ``s["stt_provider"]``, and the idiomatic ``.get()`` spelling is the one a bare ``provider ==``
+# grep misses (the ``)`` before the ``==`` defeats it), which is exactly how #54 shipped its body
+# without its comment.
+_PROVIDER_BRANCH = re.compile(
+    r"""
+    \[["'](?:stt_)?provider["']\]\s*==             # s["provider"] ==  /  s['stt_provider'] ==
+    |\.get\(\s*["'](?:stt_)?provider["']\s*\)\s*==  # s.get("provider") ==  /  s.get('stt_provider') ==
+    |\b\w*provider\s*==                             # provider ==  /  stt_provider ==
+    """,
+    re.VERBOSE,
+)
+
+
 def test_no_dispatch_path_compares_a_provider_against_a_literal():
     """windowsill#94's first acceptance criterion, as a test rather than a reviewer's grep.
 
     The form matters: the two DISPATCH sites read ``s["provider"]`` / ``s["stt_provider"]``, so a
     check written as ``grep 'provider =='`` matches the three cosmetic sites and misses both of the
-    ones that decide where a request goes — which is how #54 shipped its body without its comment.
-    Both forms are checked here.
+    ones that decide where a request goes. The idiomatic ``.get()`` spelling is the other one a
+    naive grep misses, and is covered by ``_PROVIDER_BRANCH`` (see the self-test below).
 
     This file is exempt from its own rule: the pattern below is data, and the string it looks for
     has to be written down somewhere.
     """
-    forbidden = re.compile(r"""\[.(stt_)?provider.\]\s*==|\b\w*provider\s*==""")
     offenders = []
     for path in sorted(_SCRIPTS.glob("*.py")):
         for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
-            if forbidden.search(line):
+            if _PROVIDER_BRANCH.search(line):
                 offenders.append(f"{path.name}:{number}: {line.strip()}")
     assert not offenders, "a provider is an entry, never a branch — but: " + "; ".join(offenders)
+
+
+def test_the_guard_catches_the_get_spelling_of_a_provider_branch():
+    """The acceptance criterion: the forbidden-shape guard must FAIL when the shape it forbids is
+    planted in its most idiomatic ``.get()`` spelling. A ``grep 'provider =='`` does not see
+    ``s.get("provider") == "openai"`` — the ``")`` before the ``==`` defeats it — which is how a
+    dispatch branch ships while the guard stays green."""
+    for planted in (
+        'entry = providers.TTS_PROVIDERS[s.get("provider") == "openai"]',
+        'if s.get("stt_provider") == "deepgram":',
+        "branch = s['stt_provider'] == 'elevenlabs'",
+        'if stt_provider == "openai":',
+    ):
+        assert _PROVIDER_BRANCH.search(planted), f"the guard missed: {planted!r}"
 
 
 def test_adding_a_provider_is_one_entry_and_the_entry_is_complete():
@@ -345,6 +373,18 @@ def test_a_deepgram_output_format_the_user_cleared_leaves_the_vendor_default():
     entry = providers.TTS_PROVIDERS["deepgram"]
     s = {"endpoint": "", "cloud_model": "aura-2-thalia-en", "output_format": ""}
     assert entry.request(s, "k", "hi").url == "https://api.deepgram.com/v1/speak?model=aura-2-thalia-en"
+
+
+def test_elevenlabs_tts_refuses_an_unset_voice():
+    """The sibling of _openai_tts's `voice_id or "alloy"` defence: ElevenLabs has no default voice,
+    so an unset one must not interpolate an empty path segment (``/v1/text-to-speech//…``) that
+    comes back as an opaque 404. Refusing at build time is the "you have not configured a voice"
+    the caller logs instead of a request."""
+    entry = providers.TTS_PROVIDERS["elevenlabs"]
+    s = {"cloud_model": "eleven_multilingual_v2", "voice_id": "", "voice_settings": None,
+         "output_format": entry.default_output_format, "endpoint": ""}
+    with pytest.raises(ValueError, match="voice"):
+        entry.request(s, "xi-secret", "hello")
 
 
 def test_a_configured_endpoint_beats_the_providers_own_default_host():

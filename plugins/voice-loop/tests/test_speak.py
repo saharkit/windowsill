@@ -168,6 +168,15 @@ def test_default_player_on_macos():
     assert speak.resolve_settings({}, "Darwin")["player"] == "afplay"
 
 
+def test_default_player_on_windows_is_the_inbox_powershell_soundplayer():
+    """The POSIX default (aplay) is not present on Windows, and the "never fail a turn" contract
+    turned that into silent speak-back. The in-box PowerShell SoundPlayer is the Windows
+    equivalent, and its ``{file}`` placeholder is what lets the WAV path ride inside ``-Command``."""
+    player = speak.resolve_settings({}, "Windows")["player"]
+    assert "powershell.exe" in player
+    assert "{file}" in player
+
+
 @pytest.mark.parametrize("value", [False, "false"])
 def test_enabled_false_disables(value):
     assert speak.resolve_settings({"speak": {"enabled": value}}, "Linux")["enabled"] is False
@@ -487,6 +496,20 @@ def test_a_nonzero_player_exit_is_not_recorded_as_played(state, monkeypatch):
     assert result[0] == 0
     assert result[1] == 0
     assert result[3] == 1
+
+
+def test_a_file_placeholder_player_embeds_the_wav_without_resplitting_its_path():
+    """shlex is POSIX: splitting a substituted Windows path (backslashes) would corrupt it. The
+    placeholder is replaced AFTER splitting, so the path stays one argv element inside -Command,
+    and a player without the placeholder still appends the WAV as the last argument."""
+    player = "powershell.exe -NoProfile -Command \"(New-Object System.Media.SoundPlayer '{file}').PlaySync()\""
+    assert speak._player_argv(player, r"C:\Users\John Doe\voice.wav") == [
+        "powershell.exe",
+        "-NoProfile",
+        "-Command",
+        "(New-Object System.Media.SoundPlayer 'C:\\Users\\John Doe\\voice.wav').PlaySync()",
+    ]
+    assert speak._player_argv("aplay -q", "/tmp/a.wav") == ["aplay", "-q", "/tmp/a.wav"]
 
 
 def test_pidfile_write_is_atomic_and_stale_owner_cannot_clear_new_state(state, monkeypatch):
@@ -1122,6 +1145,45 @@ def test_elevenlabs_omits_voice_settings_when_unset(opener):
     request, _ = fake.requests[0]
     assert request.full_url == "https://api.elevenlabs.io/v1/text-to-speech/v123?output_format=mp3_44100_128"
     assert json.loads(request.data) == {"text": "hi", "model_id": "eleven_multilingual_v2"}
+
+
+def test_an_unset_elevenlabs_voice_logs_misconfiguration_and_never_posts(state, opener):
+    """The empty voice_id used to interpolate an empty path segment and come back as an opaque 404;
+    the builder now refuses it, and synthesize() turns that refusal into a log line and no request."""
+    fake = opener(b"MP3-audio-bytes")
+    s = speak.resolve_settings(
+        {"tts": {"backend": "cloud", "cloud": {"provider": "elevenlabs"}}}, "Linux"
+    )
+    assert speak.synthesize("hi", s, "xi-secret") is None
+    assert fake.requests == [], "an unset voice must not reach the network"
+    log_text = (state / "speak.log").read_text(encoding="utf-8")
+    assert "cloud tts misconfigured" in log_text
+    assert "voice" in log_text
+
+
+def test_non_loopback_http_tts_endpoint_is_warned(state, opener):
+    """The TTS half of the plaintext transport warning (the STT side already had one): an http://
+    endpoint to a non-loopback host carries the API key and the text in the clear."""
+    fake = opener(b"MP3-audio-bytes")
+    s = speak.resolve_settings(
+        {"tts": {"backend": "cloud", "endpoint": "http://192.168.1.100:8080",
+                 "cloud": {"provider": "elevenlabs", "voice_id": "v123"}}},
+        "Linux",
+    )
+    assert speak.synthesize("hi", s, "xi-secret") == b"MP3-audio-bytes"
+    log_text = (state / "speak.log").read_text(encoding="utf-8")
+    assert "cloud tts endpoint is http:// to 192.168.1.100" in log_text
+    assert "in the clear" in log_text
+
+
+def test_loopback_http_tts_endpoint_is_silent(state, opener):
+    """The local server on 127.0.0.1 is the TTS default and must never warn about plaintext."""
+    fake = opener(b"WAV-audio-bytes")
+    s = speak.resolve_settings({"tts": {"backend": "cloud"}}, "Linux")  # openai -> local speech host
+    assert speak.synthesize("hi", s, "sk-secret") == b"WAV-audio-bytes"
+    log_path = state / "speak.log"
+    log_text = log_path.read_text(encoding="utf-8") if log_path.exists() else ""
+    assert "in the clear" not in log_text
 
 
 def test_deepgram_synthesis_goes_through_synthesize_with_no_branch_in_the_way(opener):
@@ -2090,6 +2152,11 @@ def test_windows_install_recipe_exists_and_is_readable():
     )
     # The script must use direct installers (curl.exe + Start-Process).
     assert "curl.exe" in text.lower(), "install.ps1 must use curl.exe for downloads"
+    # PowerShell 5.1 (the in-box Windows 11 shell) reads a .ps1 without a UTF-8 BOM as ANSI, so a
+    # UTF-8 em-dash (0x94) decodes to a closing smart quote that terminates a double-quoted string
+    # mid-argument and the whole script fails to parse. The recipe must be pure ASCII to parse as
+    # written on a stock machine.
+    assert text.isascii(), "install.ps1 must be ASCII — non-ASCII bytes break the in-box PowerShell parse"
 
 
 class _FakeStat:
