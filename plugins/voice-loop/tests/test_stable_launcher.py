@@ -115,43 +115,35 @@ def test_main_execs_current_script_with_hotkey_arguments(tmp_path, monkeypatch, 
     assert calls == [(str(current / "scripts" / "dictate-toggle.sh"), [str(current / "scripts" / "dictate-toggle.sh"), "send"])]
 
 
-def test_main_on_windows_spawns_subprocess_and_returns_child_exit(tmp_path, monkeypatch):
-    """Gap: native Windows (`os.name == "nt"`) has no `os.execv`. The same launcher must reach the
-    child, propagate its exit code, and never re-enter the POSIX branch — without this branch, a
-    Windows hotkey fires the launcher and fails with `OSError: [Errno 22]` from `os.execv` every
-    time, the dictation equivalent of #151 (a path that broke while manual invocation kept
-    working, except here manual invocation never worked at all).
+def test_main_on_windows_spawns_a_real_child_and_propagates_its_exit_code(tmp_path, monkeypatch):
+    """Native Windows (`os.name == "nt"`) has no `os.execv`, so main() must reach the child through
+    subprocess.run and surface the child's own exit code. A replaced spawn function returns whatever
+    the test told it to, so it can never prove the exit code actually came from the child; a real
+    executable that records its own argv and exits 7 proves both halves at once — argv reaches it
+    verbatim and its exit code is propagated to the caller.
 
-    `_current_script` is mocked to a sentinel Path so the test never constructs ``Path()`` while
-    ``os.name`` is patched to ``"nt"`` — the stdlib `Path()` factory follows `os.name` and would
-    return WindowsPath, which `__init__` raises on Linux. The sentinel is the ``.cmd`` leaf because
-    the module-level ``_SCRIPT`` selects it under the same patch: ``subprocess.run`` reaches the
-    child through CreateProcess, which does not consult shell file associations, so a ``.sh`` leaf
-    is WinError 193 on every invocation — the hotkey that never once fires."""
-    fake_script = Path("/fake/install/scripts/dictate-toggle.cmd")
-    monkeypatch.setattr(_launcher, "_current_script", lambda: fake_script)
+    `os.name` is patched to "nt" so main() takes the subprocess branch; the child is a POSIX
+    executable with a shebang, which exec runs the same way CreateProcess runs a `.cmd` shim on
+    Windows — the platform difference this patch stands in for."""
+    record = tmp_path / "argv.json"
+    child = tmp_path / "dictate-toggle.cmd"
+    child.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, sys\n"
+        f"json.dump(sys.argv[1:], open({str(record)!r}, 'w'))\n"
+        "raise SystemExit(7)\n",
+        encoding="utf-8",
+    )
+    child.chmod(0o755)
+    monkeypatch.setattr(_launcher, "_current_script", lambda: child)
     monkeypatch.setattr(_launcher.os, "name", "nt")
     monkeypatch.setattr(_launcher.sys, "argv", ["launcher", "send"])
     execv_calls: list[tuple[str, list[str]]] = []
     monkeypatch.setattr(_launcher.os, "execv", lambda path, argv: execv_calls.append((path, argv)))
 
-    spawn_calls: list[list[str]] = []
-
-    class Done:
-        returncode = 7
-
-    def fake_run(argv, **kw):
-        spawn_calls.append(argv)
-        assert kw["check"] is False
-        return Done()
-
-    monkeypatch.setattr(_launcher.subprocess, "run", fake_run)
-
     assert _launcher.main() == 7  # the child's exit code, surfaced to the caller
     assert execv_calls == [], "Windows must not invoke os.execv (it raises OSError there)"
-    assert spawn_calls == [
-        [str(fake_script), "send"]
-    ], "argv reaches the child verbatim, including the user's hotkey arguments"
+    assert json.loads(record.read_text(encoding="utf-8")) == ["send"]  # argv reached the child verbatim
 
 
 def test_current_script_resolves_the_cmd_leaf_on_windows(tmp_path, monkeypatch):

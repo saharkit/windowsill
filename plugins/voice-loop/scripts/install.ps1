@@ -1,6 +1,6 @@
-# voice-loop — Windows native install recipe.
+# voice-loop -- Windows native install recipe.
 #
-# Run from an ADMIN PowerShell (right-click PowerShell → "Run as administrator").
+# Run from an ADMIN PowerShell (right-click PowerShell -> "Run as administrator").
 # This script installs every prerequisite the measured pass (#42) had to discover
 # by hand, so a clean Windows guest reaches a working install without a human
 # discovering anything the transcript already knew.
@@ -9,23 +9,23 @@
 #   powershell -ExecutionPolicy Bypass -File install.ps1
 #
 # What it installs (in order):
-#   1. Python 3.12       — from python.org (winget is broken on that guest)
-#   2. python3.exe        — python.org ships python.exe but not python3.exe,
+#   1. Python 3.12       -- from python.org (winget is broken on that guest)
+#   2. python3.exe        -- python.org ships python.exe but not python3.exe,
 #                           and every launcher in this plugin calls python3
-#   3. Git for Windows    — Claude Code needs git on PATH
-#   4. Node.js (LTS)      — Claude Code's runtime
-#   5. Claude Code         — npm install -g @anthropic-ai/claude-code
-#   6. The marketplace      — claude plugin marketplace add saharkit/windowsill
-#   7. voice-loop + sill-core — the two plugins, installed together
+#   3. Git for Windows    -- Claude Code needs git on PATH
+#   4. Node.js (LTS)      -- Claude Code's runtime
+#   5. Claude Code         -- npm install -g @anthropic-ai/claude-code
+#   6. The marketplace      -- claude plugin marketplace add saharkit/windowsill
+#   7. voice-loop + sill-core -- the two plugins, installed together
 #
-# What it does NOT install (out of scope for this ticket — see the tracker):
-#   - Dictation (recorder, STT, paste chain — porting effort, not a config change)
+# What it does NOT install (out of scope for this ticket -- see the tracker):
+#   - Dictation (recorder, STT, paste chain -- porting effort, not a config change)
 #   - A local speech server (the bundled server is POSIX-only; use a cloud TTS
 #     provider, or point the LAN backend at a Linux box on the network)
 #
 # Elevation: this script detects whether the session is elevated and reports it.
 # An install that needs elevation but does not have it will hang on the UAC prompt
-# with no console to approve — so we check first rather than assuming.
+# with no console to approve -- so we check first rather than assuming.
 #
 # Idempotent: every step checks whether its work is already done before acting.
 # Re-running a completed install is a fast no-op.
@@ -33,13 +33,13 @@
 $ErrorActionPreference = "Stop"
 
 # ---------------------------------------------------------------------------
-# Elevation check — report, do not assume
+# Elevation check -- report, do not assume
 # ---------------------------------------------------------------------------
 $isElevated = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole] "Administrator")
 if ($isElevated) {
     Write-Host "[elevation] running elevated (Administrator)" -ForegroundColor Green
 } else {
-    Write-Host "[elevation] running UNelevated — installers that need elevation will show a UAC prompt" -ForegroundColor Yellow
+    Write-Host "[elevation] running UNelevated -- installers that need elevation will show a UAC prompt" -ForegroundColor Yellow
     Write-Host "[elevation] if the prompt appears behind this window and you cannot see it, re-run from an admin PowerShell" -ForegroundColor Yellow
 }
 
@@ -84,7 +84,7 @@ function Test-RealPython {
 }
 
 # ---------------------------------------------------------------------------
-# Step 1 — Python 3.12 (direct installer, no winget)
+# Step 1 -- Python 3.12 (direct installer, no winget)
 # ---------------------------------------------------------------------------
 Invoke-Step "Python 3.12" {
     if (Test-RealPython python) {
@@ -108,17 +108,17 @@ Invoke-Step "Python 3.12" {
         $ver = & python --version 2>&1
         Write-Host "    installed: $ver"
     } else {
-        Write-Host "    installed — python will be visible in a fresh PowerShell session" -ForegroundColor Yellow
+        Write-Host "    installed -- python will be visible in a fresh PowerShell session" -ForegroundColor Yellow
     }
 }
 
 # ---------------------------------------------------------------------------
-# Step 2 — python3.exe (python.org ships python.exe but NOT python3.exe)
+# Step 2 -- python3.exe (python.org ships python.exe but NOT python3.exe)
 #
 # Every launcher in this plugin calls python3: speak.sh, dictate-toggle.sh,
 # selftest.sh, and now hooks.json calls python3 directly. Without this copy,
 # python3 resolves to the Microsoft Store stub (App Installer's python3.exe),
-# which opens the Store page instead of running the interpreter — invisible
+# which opens the Store page instead of running the interpreter -- invisible
 # failure: it looks like the plugin misbehaving.
 # ---------------------------------------------------------------------------
 Invoke-Step "python3.exe alias" {
@@ -133,7 +133,7 @@ Invoke-Step "python3.exe alias" {
 
     $pythonExe = (Get-Command python -ErrorAction SilentlyContinue).Source
     if (-not $pythonExe) {
-        throw "python.exe not found on PATH — cannot create python3.exe alias"
+        throw "python.exe not found on PATH -- cannot create python3.exe alias"
     }
     $pythonDir = Split-Path $pythonExe -Parent
     $python3Exe = Join-Path $pythonDir "python3.exe"
@@ -151,12 +151,12 @@ Invoke-Step "python3.exe alias" {
         $ver = & python3 --version 2>&1
         Write-Host "    python3 resolves: $ver"
     } else {
-        Write-Host "    python3.exe created — will be visible in a fresh PowerShell session" -ForegroundColor Yellow
+        Write-Host "    python3.exe created -- will be visible in a fresh PowerShell session" -ForegroundColor Yellow
     }
 }
 
 # ---------------------------------------------------------------------------
-# Step 3 — npm needs PowerShell execution policy at RemoteSigned (CurrentUser)
+# Step 3 -- npm needs PowerShell execution policy at RemoteSigned (CurrentUser)
 #
 # npm ships as npm.ps1; with Restricted (the Windows default) PowerShell
 # refuses to execute it. RemoteSigned at CurrentUser is the narrowest scope
@@ -168,13 +168,13 @@ Invoke-Step "PowerShell execution policy" {
         Write-Host "    CurrentUser execution policy is already $policy"
         return
     }
-    Write-Host "    CurrentUser policy is $policy — setting to RemoteSigned..."
+    Write-Host "    CurrentUser policy is $policy -- setting to RemoteSigned..."
     Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned -Force
-    Write-Host "    set to RemoteSigned (CurrentUser scope — narrowest that unblocks npm.ps1)"
+    Write-Host "    set to RemoteSigned (CurrentUser scope -- narrowest that unblocks npm.ps1)"
 }
 
 # ---------------------------------------------------------------------------
-# Step 4 — Git for Windows (Claude Code needs git on PATH)
+# Step 4 -- Git for Windows (Claude Code needs git on PATH)
 # ---------------------------------------------------------------------------
 Invoke-Step "Git for Windows" {
     if (Test-Command git) {
@@ -198,12 +198,12 @@ Invoke-Step "Git for Windows" {
         $ver = & git --version 2>&1
         Write-Host "    installed: $ver"
     } else {
-        Write-Host "    installed — git will be visible in a fresh PowerShell session" -ForegroundColor Yellow
+        Write-Host "    installed -- git will be visible in a fresh PowerShell session" -ForegroundColor Yellow
     }
 }
 
 # ---------------------------------------------------------------------------
-# Step 5 — Node.js LTS (Claude Code's runtime)
+# Step 5 -- Node.js LTS (Claude Code's runtime)
 # ---------------------------------------------------------------------------
 Invoke-Step "Node.js LTS" {
     if (Test-Command node) {
@@ -225,7 +225,7 @@ Invoke-Step "Node.js LTS" {
             $ver = & node --version 2>&1
             Write-Host "    installed: $ver"
         } else {
-            Write-Host "    installed — node will be visible in a fresh PowerShell session" -ForegroundColor Yellow
+            Write-Host "    installed -- node will be visible in a fresh PowerShell session" -ForegroundColor Yellow
         }
     }
 
@@ -233,12 +233,12 @@ Invoke-Step "Node.js LTS" {
         $ver = & npm --version 2>&1
         Write-Host "    npm version: $ver"
     } else {
-        throw "npm not found on PATH after Node.js install — check the execution policy step above"
+        throw "npm not found on PATH after Node.js install -- check the execution policy step above"
     }
 }
 
 # ---------------------------------------------------------------------------
-# Step 6 — Claude Code
+# Step 6 -- Claude Code
 # ---------------------------------------------------------------------------
 Invoke-Step "Claude Code" {
     # Refresh PATH one more time so npm is definitely visible.
@@ -256,16 +256,16 @@ Invoke-Step "Claude Code" {
         $ver = & claude --version 2>&1
         Write-Host "    installed: $ver"
     } else {
-        Write-Host "    installed — claude will be visible in a fresh PowerShell session" -ForegroundColor Yellow
+        Write-Host "    installed -- claude will be visible in a fresh PowerShell session" -ForegroundColor Yellow
     }
 }
 
 # ---------------------------------------------------------------------------
-# Step 7 — Marketplace and plugins
+# Step 7 -- Marketplace and plugins
 #
 # The marketplace add is done in the SHELL (claude plugin marketplace add ...)
 # because it needs no auth. The plugin install is done from WITHIN a session
-# (/plugin install ...) as documented in README.md — but we print the commands
+# (/plugin install ...) as documented in README.md -- but we print the commands
 # because the plugin install needs a running Claude Code session.
 # ---------------------------------------------------------------------------
 Invoke-Step "Marketplace" {
@@ -273,10 +273,10 @@ Invoke-Step "Marketplace" {
     $env:Path = [System.Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path", "User")
 
     if (-not (Test-Command claude)) {
-        throw "claude not on PATH — was the Claude Code install successful?"
+        throw "claude not on PATH -- was the Claude Code install successful?"
     }
 
-    # Marketplace add — idempotent, needs no login (auth gates execution, not install).
+    # Marketplace add -- idempotent, needs no login (auth gates execution, not install).
     Write-Host "    claude plugin marketplace add saharkit/windowsill ..."
     claude plugin marketplace add saharkit/windowsill
     Write-Host "    marketplace added."
@@ -284,7 +284,7 @@ Invoke-Step "Marketplace" {
 
 Write-Host @"
 
-=== MANUAL STEP — install the plugins ===
+=== MANUAL STEP -- install the plugins ===
 
 The next step needs a RUNNING Claude Code session. Start one:
 
@@ -295,7 +295,7 @@ Then type these two commands inside the session:
     /plugin install voice-loop@windowsill
     /plugin install sill-core@windowsill
 
-(voice-loop needs sill-core for /doctor — the diagnosis engine is a separate plugin.)
+(voice-loop needs sill-core for /doctor -- the diagnosis engine is a separate plugin.)
 
 === VERIFY ===
 
@@ -303,17 +303,20 @@ After both plugins are installed, run the doctor inside the session:
 
     /voice-loop:doctor
 
-Speak-back: end a reply with a 🔊 line.  The hook fires, speak.py runs, and
-the line should be audible through System.Speech (en-US voices only — no
-third-party dependency).
+Speak-back: end a reply with a line starting with the speak marker (the
+default is the loudspeaker emoji). The hook fires and speak.py runs. The
+bundled speech server is POSIX-only, so on Windows the line is audible
+through a CLOUD TTS provider -- set tts.backend: "cloud", a tts.cloud.provider
+and its key (see PROVIDERS.md) -- played by the in-box PowerShell sound
+player, or through a LAN server on a Linux box (README: "Running on Windows").
 
-Dictation is NOT part of this pass (see the tracker — out of scope).
+Dictation is NOT part of this pass (see the tracker -- out of scope).
 
 === FRESH SESSION ===
 
 After each install step that changed PATH (Python, Git, Node.js), a NEW
 PowerShell session sees the updated PATH.  If a step reports "visible in a
-fresh session", close and re-open PowerShell and re-run this script — it is
+fresh session", close and re-open PowerShell and re-run this script -- it is
 idempotent and will skip already-completed steps.
 
 "@

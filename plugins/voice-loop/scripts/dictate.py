@@ -1242,6 +1242,16 @@ def _transcribe_cloud(s: dict, wav_bytes: bytes, boundary: str) -> str | None:
 
     request = entry.request(s, key, wav_bytes, boundary)
     parsed = urllib.parse.urlsplit(request.url)
+    if not parsed.scheme or not parsed.hostname:
+        # The endpoint resolved to nothing: a provider with no remote default host (openai, the
+        # OpenAI-compatible path) and no stt.cloud.endpoint / stt.endpoint would otherwise build a
+        # relative URL that urllib turns into an opaque "unknown url type" — the user's real problem
+        # is "you have not configured an endpoint", so say that instead of reaching for the network.
+        log(
+            f"cloud stt: no endpoint for {entry.name} — stt.cloud.endpoint is unset and "
+            f"{entry.name} has no default host"
+        )
+        return None
     if parsed.scheme == "http" and parsed.hostname and not _is_loopback_host(parsed.hostname):
         log(
             f"cloud stt endpoint is http:// to {parsed.hostname} — "

@@ -456,6 +456,8 @@ LOG_RULES: tuple[tuple[str, str | None], ...] = (
     ("local command rc=", None),
     ("timings extract_ms=", None),
     ("cloud tts: no key", None),
+    # a builder refusing a misconfiguration (an unset ElevenLabs voice) — the reason is fixed prose
+    ("cloud tts misconfigured: ", None),
     # a provider name the registry does not know is the user's own typo — cut like paste_target's
     ("tts.cloud.provider is not a known provider — using ", "instead of "),
     ("stream died before its first chunk", None),
@@ -491,6 +493,8 @@ LOG_RULES: tuple[tuple[str, str | None], ...] = (
     # the provider name and the env var names it tried; both are config-shaped metadata, and
     # naming which provider had no key is the whole diagnostic value of the line
     ("cloud stt: no key for ", None),
+    # a provider with no default host and no endpoint: the line names the provider and fixed prose
+    ("cloud stt: no endpoint for ", None),
     ("stt.cloud.provider is not a known provider — using ", "instead of "),
     ("cloud stt failed — falling back to local whisper", None),
     # streaming dictation (#99): the worker's lifecycle and the degrade. Counts, byte totals, pids
@@ -512,6 +516,7 @@ LOG_RULES: tuple[tuple[str, str | None], ...] = (
     # plaintext endpoint warnings (#110): the hostname is config metadata (the operator's own
     # endpoint), and the prose is fixed — nothing sensitive travels through these lines
     ("cloud stt endpoint is http:// to ", None),
+    ("cloud tts endpoint is http:// to ", None),
     ("streaming stt endpoint is ws:// to ", None),
     ("debounce stamp unavailable (", None),
     ("debounce stamp locked by another toggle", None),

@@ -525,12 +525,21 @@ def _openai_tts(entry: TtsProvider, s: dict, key: str, text: str) -> TtsRequest:
 
 def _elevenlabs_tts(entry: TtsProvider, s: dict, key: str, text: str) -> TtsRequest:
     """ElevenLabs text-to-speech: the voice is in the PATH, the container is one opaque
-    ``output_format`` token, and the anti-robovoice knobs ride as ``voice_settings`` when set."""
+    ``output_format`` token, and the anti-robovoice knobs ride as ``voice_settings`` when set.
+
+    The voice is the one axis with no sane default: OpenAI can fall back to ``alloy`` and Deepgram's
+    voice IS its model, but an ElevenLabs voice is an account-specific design. An unset one used to
+    interpolate an empty path segment (``/v1/text-to-speech//…``) and come back as an opaque 404;
+    refusing it here turns "you have not configured a voice" into an explicit error the caller logs
+    instead of a request."""
+    voice_id = s.get("voice_id")
+    if not voice_id:
+        raise ValueError("elevenlabs text-to-speech needs a voice — tts.cloud.voice_id is unset")
     payload: dict = {"text": text, "model_id": s["cloud_model"]}
     if s["voice_settings"] is not None:
         payload["voice_settings"] = s["voice_settings"]
     return TtsRequest(
-        f"{entry.endpoint(s)}/v1/text-to-speech/{s['voice_id']}?output_format={s['output_format']}",
+        f"{entry.endpoint(s)}/v1/text-to-speech/{voice_id}?output_format={s['output_format']}",
         {"xi-api-key": key},
         payload,
     )

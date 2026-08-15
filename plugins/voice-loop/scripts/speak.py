@@ -176,6 +176,7 @@ import sys
 import tempfile
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import wave
 from collections.abc import Callable, Iterator
@@ -481,6 +482,20 @@ def resolve_tts_provider(name: str):
     return entry
 
 
+def _default_player(system: str) -> str:
+    """The player a config that names none resolves to, per platform.
+
+    macOS plays WAVs through ``afplay``; Linux through ``aplay -q``. Windows has neither — the
+    POSIX default made every Windows hook silently play nothing, because the "never fail a turn"
+    contract swallows the missing-command error. The in-box equivalent is PowerShell driving
+    ``System.Media.SoundPlayer``, which plays a WAV synchronously with nothing extra installed.
+    ``{file}`` is the placeholder ``_player_argv`` fills with the temp WAV path, because shlex
+    (POSIX) must not re-split a Windows path inside the ``-Command`` script."""
+    if system == "Windows":
+        return "powershell.exe -NoProfile -Command \"(New-Object System.Media.SoundPlayer '{file}').PlaySync()\""
+    return "afplay" if system == "Darwin" else "aplay -q"
+
+
 def resolve_settings(config: dict, system: str) -> dict:
     """Every knob speak.sh honoured, same names, same defaults, same precedence."""
     speaker = str(cfg(config, "tts.speaker", ""))
@@ -493,7 +508,7 @@ def resolve_settings(config: dict, system: str) -> dict:
         # that costs one stdin read per tool call and never touches the transcript.
         "eager": cfg(config, "speak.eager", False) not in (False, "false"),
         "marker": str(cfg(config, "speak.marker", "🔊")),
-        "player": str(cfg(config, "speak.player", "afplay" if system == "Darwin" else "aplay -q")),
+        "player": str(cfg(config, "speak.player", _default_player(system))),
         # PipeWire sink to route TTS audio into for echo cancellation — when set, the player targets
         # this sink (via pw-play --target or aplay -D pipewire:<sink>) instead of the default device.
         "sink": str(cfg(config, "speak.sink", "")),
@@ -911,6 +926,12 @@ def _open_stream(endpoint: str, payload: dict, timeout: float):
         return None
 
 
+def _is_loopback_host(host: str) -> bool:
+    """True only for addresses that point at the local machine — the one case where plaintext is
+    safe (the bundled server on 127.0.0.1 is the default and must never warn)."""
+    return host == "localhost" or host == "::1" or host.startswith("127.")
+
+
 def synthesize(text: str, s: dict, key: str) -> bytes | None:
     """One chunk -> audio bytes, or None (with the reason logged). Mirrors speak.sh's checks:
     empty body and JSON-error-document responses are dropped, not played.
@@ -922,8 +943,20 @@ def synthesize(text: str, s: dict, key: str) -> bytes | None:
     """
     if s["backend"] == "cloud":
         entry = resolve_tts_provider(s["provider"])
-        request = entry.request(s, key, text)
+        try:
+            request = entry.request(s, key, text)
+        except ValueError as err:
+            # a builder that refuses a misconfiguration (an unset ElevenLabs voice) — say why and
+            # stop, rather than turn it into a request that fails opaquely.
+            log(f"cloud tts misconfigured: {err}")
+            return None
         endpoint = entry.endpoint(s)  # for the error messages below, which name where it went
+        parsed = urllib.parse.urlsplit(request.url)
+        if parsed.scheme == "http" and parsed.hostname and not _is_loopback_host(parsed.hostname):
+            log(
+                f"cloud tts endpoint is http:// to {parsed.hostname} — "
+                "the API key and the text travel in the clear"
+            )
         body = _post(request.url, request.headers, request.payload, s["timeout"])
     else:
         endpoint = s["endpoint"] or providers.LOCAL_SPEECH_HOST
@@ -1499,6 +1532,16 @@ def _synthesized_audio(chunks: list[str], s: dict, key: str):
         yield audio
 
 
+def _player_argv(player: str, wav: str) -> list[str]:
+    """The argv that plays ``wav``. A ``{file}`` placeholder in the player string is replaced with
+    the WAV path BEFORE it is treated as one argv element — the Windows PowerShell player embeds the
+    path inside a ``-Command`` script, and splitting a substituted Windows path (backslashes) would
+    corrupt it. Without a placeholder the WAV is appended as the last argument, exactly as before."""
+    if "{file}" in player:
+        return [part.replace("{file}", wav) for part in shlex.split(player)]
+    return shlex.split(player) + [wav]
+
+
 def _play_stream(audio_iter, s: dict, t0: float) -> tuple[int, int, int, int | None]:
     """Produce chunk N+1 while chunk N plays. The source is ANY iterator of playable audio bytes —
     locally-synthesized sentence chunks and decoded SSE chunks enter the same queue. One player
@@ -1514,16 +1557,18 @@ def _play_stream(audio_iter, s: dict, t0: float) -> tuple[int, int, int, int | N
 
     Returns (chunks_played, total_bytes, first_audio_ms, last_rc), where first_audio_ms is
     t0 -> the spawn of the first player process, and -1 when nothing ever played."""
-    player_argv = shlex.split(s["player"])
+    player_template = s["player"]
     # Acoustic echo cancellation: when speak.sink names a PipeWire sink, route audio into it so the
     # echo canceller can subtract it from the mic signal. pw-play --target does this natively; aplay
-    # reaches it via the pipewire ALSA plugin with -D pipewire:<node>.
+    # reaches it via the pipewire ALSA plugin with -D pipewire:<node>. A sink is a PipeWire knob, so
+    # it never combines with a {file} player template (the Windows player).
     _player_env: dict | None = None
+    sink_prefix: list[str] | None = None
     if s.get("sink"):
         if shutil.which("pw-play"):
-            player_argv = ["pw-play", "--target=" + s["sink"]]
+            sink_prefix = ["pw-play", "--target=" + s["sink"]]
         else:
-            player_argv = player_argv + ["-D", "pipewire:" + s["sink"]]
+            sink_prefix = shlex.split(player_template) + ["-D", "pipewire:" + s["sink"]]
     proc: subprocess.Popen | None = None
     proc_wav: str | None = None
     proc_audio_len = 0
@@ -1563,7 +1608,9 @@ def _play_stream(audio_iter, s: dict, t0: float) -> tuple[int, int, int, int | N
             proc_started_at = time.monotonic()  # delivery is confirmed only after a zero exit
             try:
                 proc = subprocess.Popen(
-                    player_argv + [wav], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                    sink_prefix + [wav] if sink_prefix is not None else _player_argv(player_template, wav),
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
                 )
             except OSError as err:
                 log(f"player failed: {err}")
