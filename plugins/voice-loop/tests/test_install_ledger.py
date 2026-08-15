@@ -639,10 +639,14 @@ class TestRobustness:
         os.makedirs(os.path.dirname(ledger_path), exist_ok=True)
         with open(ledger_path, "w") as fh:
             fh.write("this is not json{{{")
-        assert install_ledger.check_state(ledger_path)["state"] == "none"
+        result = install_ledger.check_state(ledger_path)
+        assert result["state"] == "malformed"
+        assert "JSONDecodeError" in result["read_detail"]
 
-    def test_empty_ledger_file_treated_as_none(self, ledger_path):
+    def test_empty_ledger_file_treated_as_malformed(self, ledger_path):
         os.makedirs(os.path.dirname(ledger_path), exist_ok=True)
         with open(ledger_path, "w") as fh:
             fh.write("")
-        assert install_ledger.check_state(ledger_path)["state"] == "none"
+        result = install_ledger.check_state(ledger_path)
+        assert result["state"] == "malformed"
+        assert "JSONDecodeError" in result["read_detail"]

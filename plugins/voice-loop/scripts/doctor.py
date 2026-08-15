@@ -26,6 +26,15 @@ from pathlib import Path, PureWindowsPath
 from typing import Any, Callable
 
 
+class DiagnosticData(dict):
+    """Mapping data with a read verdict kept outside the payload."""
+
+    def __init__(self, data: dict[str, Any], *, status: str, detail: str = "") -> None:
+        super().__init__(data)
+        self.status = status
+        self.detail = detail
+
+
 def _default_state_home() -> str:
     return os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state"))
 
@@ -585,25 +594,39 @@ def _check_python_interpreter(
     return None
 
 
-def read_config(path: str) -> dict[str, Any]:
+def read_config(path: str) -> DiagnosticData:
     try:
         with open(path, encoding="utf-8") as fh:
-            return json.load(fh)
-    except (OSError, json.JSONDecodeError):
-        return {}
+            loaded = json.load(fh)
+    except FileNotFoundError:
+        return DiagnosticData({}, status="missing", detail=f"{path} does not exist")
+    except OSError as err:
+        return DiagnosticData({}, status="unreadable", detail=f"{type(err).__name__}: {err}")
+    except json.JSONDecodeError as err:
+        return DiagnosticData({}, status="malformed", detail=f"JSONDecodeError: {err}")
+    if not isinstance(loaded, dict):
+        return DiagnosticData({}, status="malformed", detail=f"expected JSON object, got {type(loaded).__name__}")
+    return DiagnosticData(loaded, status="ok")
 
 
-def read_ledger(state_home: str) -> dict[str, Any]:
+def read_ledger(state_home: str) -> DiagnosticData:
     path = os.path.join(state_home, "voice-loop", "install.ledger")
     try:
         with open(path, encoding="utf-8") as fh:
             raw = json.load(fh)
-    except (OSError, json.JSONDecodeError):
-        return {"state": "none", "completed_steps": []}
+    except FileNotFoundError:
+        return DiagnosticData({"state": "none", "completed_steps": []}, status="missing")
+    except OSError as err:
+        return DiagnosticData({"state": "unreadable", "completed_steps": []}, status="unreadable", detail=f"{type(err).__name__}: {err}")
+    except json.JSONDecodeError as err:
+        return DiagnosticData({"state": "malformed", "completed_steps": []}, status="malformed", detail=f"JSONDecodeError: {err}")
+    if not isinstance(raw, dict) or not isinstance(raw.get("steps", {}), dict):
+        return DiagnosticData({"state": "malformed", "completed_steps": []}, status="malformed", detail="ledger must be a JSON object with object steps")
 
-    ledger: dict[str, Any] = {}
-    ledger["state"] = raw.get("state", "none")
+    ledger: dict[str, Any] = {"state": raw.get("state", "none")}
     steps = raw.get("steps", {})
+    if any(not isinstance(entry, dict) for entry in steps.values()):
+        return DiagnosticData({"state": "malformed", "completed_steps": []}, status="malformed", detail="ledger step entries must be objects")
     ledger["completed_steps"] = [
         sid for sid, entry in steps.items() if entry.get("status") == "complete"
     ]
@@ -612,21 +635,36 @@ def read_ledger(state_home: str) -> dict[str, Any]:
     ]
     if in_flight:
         ledger["current_step"] = in_flight[0]
-    return ledger
+    return DiagnosticData(ledger, status="ok")
 
 
-def read_logs(state_home: str, tail_lines: int = 60) -> dict[str, list[str]]:
+def read_logs(state_home: str, tail_lines: int = 60) -> DiagnosticData:
     logs: dict[str, list[str]] = {}
+    statuses: dict[str, str] = {}
+    details: dict[str, str] = {}
     state_dir = os.path.join(state_home, "voice-loop")
     for log_name in ("speak.log", "dictate.log"):
         path = os.path.join(state_dir, log_name)
         try:
-            with open(path, encoding="utf-8", errors="replace") as fh:
+            with open(path, encoding="utf-8") as fh:
                 lines = fh.read().splitlines()
             logs[log_name] = lines[-tail_lines:]
-        except OSError:
+            statuses[log_name] = "ok"
+        except FileNotFoundError:
             logs[log_name] = []
-    return logs
+            statuses[log_name] = "missing"
+        except UnicodeDecodeError as err:
+            logs[log_name] = []
+            statuses[log_name] = "malformed"
+            details[log_name] = f"UnicodeDecodeError: {err}"
+        except OSError as err:
+            logs[log_name] = []
+            statuses[log_name] = "unreadable"
+            details[log_name] = f"{type(err).__name__}: {err}"
+    result = DiagnosticData(logs, status="ok" if all(s == "ok" for s in statuses.values()) else "degraded")
+    result.source_status = statuses
+    result.source_details = details
+    return result
 
 
 def load_manifest(plugin_root: Path) -> list[dict[str, Any]]:
@@ -704,7 +742,13 @@ def main(argv: list[str] | None = None) -> int:
         output: dict[str, Any] = {
             "config_present": bool(config),
             "config_path": config_path,
+            "config_status": getattr(config, "status", "ok"),
+            "config_read_detail": getattr(config, "detail", ""),
             "ledger_state": ledger.get("state", "none"),
+            "ledger_status": getattr(ledger, "status", "ok"),
+            "ledger_read_detail": getattr(ledger, "detail", ""),
+            "log_status": getattr(logs, "source_status", {}),
+            "log_read_details": getattr(logs, "source_details", {}),
             "findings": [
                 {
                     "bin": "real_anomaly",
@@ -743,7 +787,13 @@ def main(argv: list[str] | None = None) -> int:
         output: dict[str, Any] = {
             "config_present": bool(config),
             "config_path": config_path,
+            "config_status": getattr(config, "status", "ok"),
+            "config_read_detail": getattr(config, "detail", ""),
             "ledger_state": ledger.get("state", "none"),
+            "ledger_status": getattr(ledger, "status", "ok"),
+            "ledger_read_detail": getattr(ledger, "detail", ""),
+            "log_status": getattr(logs, "source_status", {}),
+            "log_read_details": getattr(logs, "source_details", {}),
             "findings": [
                 {
                     "bin": "real_anomaly",
@@ -781,7 +831,13 @@ def main(argv: list[str] | None = None) -> int:
     output: dict[str, Any] = {
         "config_present": bool(config),
         "config_path": config_path,
+        "config_status": getattr(config, "status", "ok"),
+        "config_read_detail": getattr(config, "detail", ""),
         "ledger_state": ledger.get("state", "none"),
+        "ledger_status": getattr(ledger, "status", "ok"),
+        "ledger_read_detail": getattr(ledger, "detail", ""),
+        "log_status": getattr(logs, "source_status", {}),
+        "log_read_details": getattr(logs, "source_details", {}),
         "findings": [
             {
                 "bin": f.bin.value,
