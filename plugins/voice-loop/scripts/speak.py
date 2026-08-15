@@ -410,17 +410,28 @@ _live: dict = {"proc": None, "files": set(), "stream": None}
 # The exact record this process last installed. Comparing the full record prevents an older
 # invocation from unlinking a newer invocation's pidfile between its read and unlink.
 _pidfile_record: str | None = None
+_stream_holder_pid_record: str | None = None
 
 
 def log(message: str) -> None:
     global _stop_reason_logged
     if _fired["event"] == "Stop" and message.startswith("stop:"):
         _stop_reason_logged = True
+    line = f"{time.strftime('%Y-%m-%dT%H:%M:%S')} {message}\n".encode("utf-8")
     try:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
+        flags |= getattr(os, "O_NOFOLLOW", 0)
         if os.path.exists(_LOG_PATH) and os.path.getsize(_LOG_PATH) > 1_000_000:
-            open(_LOG_PATH, "w").close()
-        with open(_LOG_PATH, "a", encoding="utf-8") as fh:
-            fh.write(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} {message}\n")
+            # Rotate by replacing the journal with a fresh, restrictive inode.  Never truncate a
+            # path in place: a planted symlink must be refused, and readers see old or new content.
+            fd, tmp = tempfile.mkstemp(prefix="voice-loop-log-", dir=os.path.dirname(_LOG_PATH), text=False)
+            os.close(fd)
+            os.replace(tmp, _LOG_PATH)
+        fd = os.open(_LOG_PATH, flags, 0o600)
+        try:
+            os.write(fd, line)
+        finally:
+            os.close(fd)
     except OSError:
         pass
 
@@ -1041,23 +1052,27 @@ def synthesize(text: str, s: dict, key: str) -> bytes | None:
     return body
 
 
-def _atomic_write_text(path: str, content: str, prefix: str) -> None:
+def _atomic_write_text(path: str, content: str, prefix: str) -> bool:
     """Replace a shared state file without exposing a partial document to another process."""
     directory = os.path.dirname(path) or "."
     tmp = ""
     try:
+        if os.path.islink(path):
+            return False
         fd, tmp = tempfile.mkstemp(prefix=prefix, dir=directory)
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             fh.write(content)
             fh.flush()
             os.fsync(fh.fileno())
         os.replace(tmp, path)
+        return True
     except OSError:
         if tmp:
             try:
                 os.unlink(tmp)
             except OSError:
                 pass
+    return False
 
 
 def _write_pidfile(*tokens) -> None:
@@ -1067,8 +1082,8 @@ def _write_pidfile(*tokens) -> None:
     directly; the chain's ``_on_sigterm`` handler uses ``killpg`` instead."""
     global _pidfile_record
     record = " ".join(str(t) for t in tokens)
-    _atomic_write_text(_PID_PATH, record, "voice-loop-playing-")
-    _pidfile_record = record
+    if _atomic_write_text(_PID_PATH, record, "voice-loop-playing-"):
+        _pidfile_record = record
 
 
 def _owns_pidfile() -> bool:
@@ -2056,11 +2071,10 @@ class TtsStreamHolder:
 
 
 def _write_stream_holder_pid(pid: int, digest: str) -> None:
-    try:
-        with open(_STREAM_HOLDER_PID, "w", encoding="utf-8") as fh:
-            fh.write(f"{pid} {digest}")
-    except OSError:
-        pass
+    global _stream_holder_pid_record
+    record = f"{pid} {digest}"
+    if _atomic_write_text(_STREAM_HOLDER_PID, record, "voice-loop-holder-"):
+        _stream_holder_pid_record = record
 
 
 def _read_stream_holder_pid() -> tuple[int | None, str]:
@@ -2076,11 +2090,16 @@ def _read_stream_holder_pid() -> tuple[int | None, str]:
     return None, ""
 
 
-def _clear_stream_holder_pid() -> None:
+def _clear_stream_holder_pid() -> bool:
+    global _stream_holder_pid_record
+    if not _stream_holder_pid_is_ours():
+        return False
     try:
         os.unlink(_STREAM_HOLDER_PID)
     except OSError:
-        pass
+        return False
+    _stream_holder_pid_record = None
+    return True
 
 
 def _remove_socket_file(path: str) -> None:
@@ -2088,6 +2107,31 @@ def _remove_socket_file(path: str) -> None:
         os.unlink(path)
     except OSError:
         pass
+
+
+def _stream_holder_pid_is_ours() -> bool:
+    """True while the pidfile still carries exactly the record this process installed.  A fresher
+    holder atomically replaces that record on startup (before it binds), so the comparison is the
+    generation fence: it tells THIS holder apart from its replacement where the socket path cannot
+    — the path is identical across generations, and even the inode is not a fence (tmpfs recycles
+    it across an unbind/rebind)."""
+    if _stream_holder_pid_record is None:
+        return False
+    try:
+        with open(_STREAM_HOLDER_PID, encoding="utf-8") as fh:
+            return fh.read() == _stream_holder_pid_record
+    except OSError:
+        return False
+
+
+def _holder_exit_cleanup() -> None:
+    """The holder's exit cleanup, fenced by generation.  A SIGTERMed holder can reach this exit up
+    to one accept-timeout AFTER its replacement rebound the same socket path (the replacement's
+    own bind unlinks any stale file first), so the socket is unlinked only while the pidfile is
+    still ours — an unconditional unlink here would delete the NEW holder's socket."""
+    if _stream_holder_pid_is_ours():
+        _remove_socket_file(_STREAM_HOLDER_SOCK)
+    _clear_stream_holder_pid()
 
 
 def pid_looks_like_stream_holder(pid: int, read_cmdline=_cmdline_of, platform_id: str = sys.platform) -> bool:
@@ -2285,8 +2329,7 @@ def run_holder(
             listener.close()
         except OSError:
             pass
-        _remove_socket_file(_STREAM_HOLDER_SOCK)
-        _clear_stream_holder_pid()
+        _holder_exit_cleanup()
     return 0
 
 
@@ -2378,6 +2421,13 @@ def main() -> int:
     # The ledger, the lock and the seeding are eager mode's machinery, and they exist ONLY when the
     # user has opted in. With eager off there is one event path, no race to be idempotent against,
     # and therefore nothing to gate on: everything below reduces to the pre-0.3.2 Stop hook.
+    #
+    # The lock MUST stay behind this gate.  An eager-off Stop that arrived while a previous line was
+    # still playing has to WAIT BESIDE the playing chain (#51: the ladder plus wait_out_playback
+    # reads playing.pid for as long as the clip is in the air), which an acquired lock forbids twice
+    # over — the grace ladder would either end the turn with the lock unheld, or take the lock by
+    # SIGTERming the very chain the wait below is about to wait on.  Takeover is not lost: an
+    # eager-off Stop that actually HAS a line supersedes the older chain at claim time, below.
     ledger_on = s["eager"]
 
     lock = None
@@ -2385,7 +2435,7 @@ def main() -> int:
     try:
         if ledger_on:
             # Everything from reading the ledger to finishing playback happens under this lock, so a
-            # line cannot be claimed twice or spoken over. The acquire never blocks.
+            # line cannot be claimed twice or spoken over. The acquire never blocks for eager.
             if eager:
                 lock = acquire_lock()
                 if lock is None:

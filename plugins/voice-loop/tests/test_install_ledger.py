@@ -66,7 +66,13 @@ class TestFreshStart:
     def test_completed_steps_empty_when_no_ledger(self, ledger_path):
         assert install_ledger.completed_steps(ledger_path) == []
 
-    def test_reset_is_idempotent_when_no_ledger(self, ledger_path):
+    def test_reset_is_idempotent_when_no_ledger(self, tmp_path):
+        # A genuinely fresh machine: not just no ledger — no state DIRECTORY either
+        # (only tmp_path exists; "voice-loop" is never created by the fixture).  The
+        # lock file is opened inside that directory before reset reaches its no-op
+        # unlink, so open-before-makedirs fails right here instead of on the user's
+        # first checkpoint.
+        ledger_path = str(tmp_path / "voice-loop" / "install.ledger")
         install_ledger.reset_install(ledger_path)  # must not raise
         assert install_ledger.check_state(ledger_path)["state"] == "none"
 
