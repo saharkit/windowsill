@@ -14,6 +14,13 @@ def test_cmd_launchers_are_declared_for_crlf_checkout():
         assert f"{name} text eol=crlf" in attrs
 
 
+def test_speak_cmd_is_honestly_windows_only():
+    """Mutation gap: a POSIX preamble would be dead code under the required CRLF checkout."""
+    script = (_SCRIPTS / "speak.cmd").read_text(encoding="utf-8")
+    assert script.startswith("@echo off\n")
+    assert "exec sh -c" not in script
+
+
 def test_public_pages_declare_utf8():
     """Mutation gap: opening a mirrored page from disk without charset metadata can garble Unicode."""
     for path in (_ROOT / "docs" / "index.html", _ROOT / "docs" / "voice-loop" / "index.html", _ROOT / "docs" / "ru" / "index.html", _ROOT / "docs" / "ru" / "voice-loop" / "index.html"):

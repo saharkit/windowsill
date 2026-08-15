@@ -2092,15 +2092,15 @@ def test_hook_commands_probe_a_real_interpreter_before_running_speak():
             for entry in registration["hooks"]:
                 commands.append(entry["command"])
     assert len(commands) >= 2, "expected at least two hook registrations (Stop + PostToolUse)"
+    expected = (
+        '(python3 -c "import sys" && python3 "${CLAUDE_PLUGIN_ROOT}/scripts/speak.py") '
+        '|| (python -c "import sys" && python "${CLAUDE_PLUGIN_ROOT}/scripts/speak.py") '
+        '|| (py -3 -c "import sys" && py -3 "${CLAUDE_PLUGIN_ROOT}/scripts/speak.py")'
+    )
     for cmd in commands:
-        assert cmd.startswith("python3 -c "), (
-            f"hook command must probe python3 before execution; got: {cmd!r}"
-        )
-        assert 'import sys' in cmd and 'python -c' in cmd and 'py -3 -c' in cmd, (
-            f"hook command must carry all stock-Windows interpreter probes; got: {cmd!r}"
-        )
-        assert "speak.py" in cmd, (
-            f"hook command must invoke speak.py (the Python entry point); got: {cmd!r}"
+        assert cmd == expected, (
+            "hook command must group each interpreter probe with its speak.py action "
+            f"so the first successful pair short-circuits; got: {cmd!r}"
         )
 
 

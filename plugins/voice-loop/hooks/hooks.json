@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 -c \"import sys\" && python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/speak.py\" || python -c \"import sys\" && python \"${CLAUDE_PLUGIN_ROOT}/scripts/speak.py\" || py -3 -c \"import sys\" && py -3 \"${CLAUDE_PLUGIN_ROOT}/scripts/speak.py\"",
+            "command": "(python3 -c \"import sys\" && python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/speak.py\") || (python -c \"import sys\" && python \"${CLAUDE_PLUGIN_ROOT}/scripts/speak.py\") || (py -3 -c \"import sys\" && py -3 \"${CLAUDE_PLUGIN_ROOT}/scripts/speak.py\")",
             "async": true,
             "timeout": 90
           }
@@ -19,7 +19,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 -c \"import sys\" && python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/speak.py\" || python -c \"import sys\" && python \"${CLAUDE_PLUGIN_ROOT}/scripts/speak.py\" || py -3 -c \"import sys\" && py -3 \"${CLAUDE_PLUGIN_ROOT}/scripts/speak.py\"",
+            "command": "(python3 -c \"import sys\" && python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/speak.py\") || (python -c \"import sys\" && python \"${CLAUDE_PLUGIN_ROOT}/scripts/speak.py\") || (py -3 -c \"import sys\" && py -3 \"${CLAUDE_PLUGIN_ROOT}/scripts/speak.py\")",
             "async": true,
             "timeout": 90
           }
