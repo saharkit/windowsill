@@ -805,8 +805,9 @@ def test_artifact_redacts_title_and_rejects_unknown_bundle_fields(install, offli
 def test_transport_artifact_body_matches_the_bytes_it_sends(tmp_path):
     """L2 gap: catches consent drift when a transport reads a different body than displayed."""
     path = tmp_path / "bundle.md"
-    path.write_text("displayed bytes\n", encoding="utf-8")
-    artifact = report_bug.artifact_from_body("private /home/vasilisa", path.read_text())
+    # CRLF on purpose: the reader must not re-normalise the file's bytes or the byte check below fails.
+    path.write_bytes(b"displayed bytes\r\n")
+    artifact = report_bug._load_artifact("private /home/vasilisa", str(path))
     runner = runner_returning(stdout="https://github.com/saharkit/windowsill/issues/99\n")
     ok, message = report_bug.create_issue(artifact, str(path), runner=runner)
     assert ok and message.endswith("/99")

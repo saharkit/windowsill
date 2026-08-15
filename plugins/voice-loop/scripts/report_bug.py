@@ -924,9 +924,11 @@ def sanitize_bundle(bundle: dict[str, object]) -> dict[str, object]:
 
 
 def make_artifact(title: str, bundle: dict[str, object]) -> ReportArtifact:
-    """Redact title and body together before either can be displayed or transported."""
-    safe_bundle = sanitize_bundle(bundle)
-    return ReportArtifact(title=redact(title), body=render_digest(safe_bundle))
+    """Redact title and body together before either can be displayed or transported.
+
+    The body's only sanitise is `render_digest`'s own pass; sanitising here as well is redundant.
+    """
+    return ReportArtifact(title=redact(title), body=render_digest(bundle))
 
 
 def artifact_from_body(title: str, body: str) -> ReportArtifact:
@@ -1217,7 +1219,10 @@ def transports(runner: Runner = _default_runner) -> list[dict[str, object]]:
 
 
 def _load_bundle_text(path: str) -> str:
-    with open(path, encoding="utf-8") as fh:
+    # `newline=""` turns OFF universal-newlines translation: the file's bytes are the contract, and
+    # `create_issue` verifies the artifact against them byte-for-byte. A CRLF bundle written by any
+    # other tool would otherwise be silently re-normalised on read and then rejected as "not the file".
+    with open(path, encoding="utf-8", newline="") as fh:
         return fh.read()
 
 
