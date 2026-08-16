@@ -504,7 +504,7 @@ def resolve_settings(config: dict, system: str) -> dict:
         "cloud_endpoint": str(cfg(config, "stt.cloud.endpoint", "")),
         "key_env": str(cfg(config, "stt.cloud.api_key_env", cfg(config, "stt.api_key_env", "VOICE_LOOP_STT_API_KEY"))),
         "key_file": str(cfg(config, "stt.cloud.key_file", "")),
-        "timeout": contracts.resolve_number(cfg(config, "stt.timeout", 60), 60.0, "stt.timeout", log, minimum=0.000001, maximum=60),
+        "timeout": contracts.resolve_number(cfg(config, "stt.timeout", 60), 60.0, "stt.timeout", log, minimum=0.000001),
         # Streaming is OPT-IN and defaults OFF (windowsill#99): the batch path is the proven one,
         # and a live socket is a second failure surface a user must ask for. Same "true"/JSON-true
         # spelling as auto_paste, and nothing else counts.

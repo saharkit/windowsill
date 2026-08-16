@@ -105,11 +105,12 @@ def read_playing_pid(path: str) -> PlayingPid | None:
         token = tokens[index]
         if token == "pg":
             if index + 1 >= len(tokens):
-                return None
+                index += 1
+                continue
             value = tokens[index + 1]
             index += 2
             if not value.isdigit() or int(value) <= 0:
-                return None
+                continue
             pgids.append(int(value))
             continue
         if token.isdigit() and int(token) > 0:
@@ -124,8 +125,7 @@ def _cmdline_of(pid: int) -> str | None:
             raw = fh.read(MAX_STATE_BYTES + 1)
     except OSError:
         return None
-    if len(raw) > MAX_STATE_BYTES:
-        return None
+    raw = raw[:MAX_STATE_BYTES]
     return raw.replace(b"\0", b" ").decode("utf-8", "replace")
 
 

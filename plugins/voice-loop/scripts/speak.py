@@ -534,7 +534,7 @@ def resolve_settings(config: dict, system: str) -> dict:
         # this sink (via pw-play --target or aplay -D pipewire:<sink>) instead of the default device.
         "sink": str(cfg(config, "speak.sink", "")),
         "max_chars": contracts.resolve_number(cfg(config, "speak.max_chars", 600), 600, "speak.max_chars", log, minimum=1, integer=True),
-        "timeout": contracts.resolve_number(cfg(config, "speak.timeout", 60), 60.0, "speak.timeout", log, minimum=0.000001, maximum=60),
+        "timeout": contracts.resolve_number(cfg(config, "speak.timeout", 60), 60.0, "speak.timeout", log, minimum=0.000001),
         "backend": str(cfg(config, "tts.backend", "lan")),
         # left empty here: the per-backend default differs (see synthesize) — the LAN server and a
         # provider with no remote default host both land on the local speech server, while a
