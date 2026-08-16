@@ -18,4 +18,5 @@ set -u
 command -v python3 >/dev/null 2>&1 || { echo "FAIL: python3 is required" >&2; exit 64; }
 DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd) || exit 64
 [ -f "$DIR/contour_poll.py" ] || { echo "FAIL: contour_poll.py is missing beside $0" >&2; exit 64; }
+[ -f "$DIR/contracts.py" ] || { echo "FAIL: contracts.py is missing beside $0" >&2; exit 64; }
 exec python3 "$DIR/contour_poll.py" "$@"

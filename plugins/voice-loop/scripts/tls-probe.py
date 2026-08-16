@@ -50,6 +50,7 @@ from pathlib import Path
 # The one module in scripts/ this file imports: the provider registry (see providers.py). Which
 # host is worth probing is a per-provider fact — "does this provider have a remote default host?"
 # — and it belongs in the entry, not in a special case here.
+import contracts
 import providers
 
 # The fallback probe target: a host with a perfectly ordinary public certificate that this install
@@ -89,12 +90,7 @@ PROXY_VARS = ("HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy")
 
 
 def load_config(path: str) -> dict:
-    try:
-        with open(path, encoding="utf-8") as fh:
-            loaded = json.load(fh)
-        return loaded if isinstance(loaded, dict) else {}
-    except (OSError, ValueError):
-        return {}
+    return contracts.load_config(path)
 
 
 def cfg(config: dict, dotted: str, default):
@@ -110,22 +106,7 @@ def cfg(config: dict, dotted: str, default):
 
 
 def config_path(environ=os.environ) -> str:
-    """Where this probe reads the config from.
-
-    The default is joined from ``Path`` parts, never from a tail carrying its own ``/`` — the
-    platform separator must be chosen once, by ``os.path``, at the join. A literal
-    ``"voice-loop/config.json"`` tail reads identically on POSIX and produces a mixed-separator
-    path on Windows, so callers could not compare the result against a ``Path`` without a
-    normalisation step that each of them would have to remember.
-    """
-    return environ.get(
-        "VOICE_LOOP_CONFIG",
-        str(
-            Path(environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")))
-            / "voice-loop"
-            / "config.json"
-        ),
-    )
+    return contracts.config_path(environ)
 
 
 def resolve_url(config: dict) -> str:

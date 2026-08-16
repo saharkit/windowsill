@@ -120,6 +120,7 @@ import uuid
 # for both beside dictate.py the same way it checks for dictate.py itself, and they resolve because
 # sys.path[0] is this file's directory — the tests, which load this file by spec_from_file_location,
 # put scripts/ on sys.path themselves.
+import contracts
 import providers
 import wsclient
 
@@ -367,19 +368,10 @@ def _read_bounded_text(path: str, limit: int, *, label: str) -> str | None:
 
 
 def load_config(path: str) -> dict:
-    try:
-        text = _read_bounded_text(path, MAX_CONFIG_BYTES, label="config")
-        if text is None:
-            return {}
-        loaded = json.loads(text)
-        return loaded if isinstance(loaded, dict) else {}
-    except FileNotFoundError:
-        return {}  # no config at all is the normal zero-setup case — not worth a log line
-    except (OSError, ValueError) as err:
-        # ValueError covers corrupt JSON; one informative line so a broken config is diagnosable
-        # instead of silently ignored
-        log(f"config ignored ({path}): {type(err).__name__}: {err}")
-        return {}
+    return contracts.load_config(
+        path,
+        lambda err: log(f"config ignored ({path}): {type(err).__name__}: {err}"),
+    )
 
 
 def cfg(config: dict, dotted: str, default):
@@ -512,7 +504,7 @@ def resolve_settings(config: dict, system: str) -> dict:
         "cloud_endpoint": str(cfg(config, "stt.cloud.endpoint", "")),
         "key_env": str(cfg(config, "stt.cloud.api_key_env", cfg(config, "stt.api_key_env", "VOICE_LOOP_STT_API_KEY"))),
         "key_file": str(cfg(config, "stt.cloud.key_file", "")),
-        "timeout": float(cfg(config, "stt.timeout", 60)),
+        "timeout": contracts.resolve_number(cfg(config, "stt.timeout", 60), 60.0, "stt.timeout", log, minimum=0.000001),
         # Streaming is OPT-IN and defaults OFF (windowsill#99): the batch path is the proven one,
         # and a live socket is a second failure surface a user must ask for. Same "true"/JSON-true
         # spelling as auto_paste, and nothing else counts.
@@ -1563,43 +1555,8 @@ def _stop_recorder(pid: int, system: str, recorder: str = "") -> None:
         _wait_gone(pid)
 
 
-def _cmdline_of(pid: int) -> str | None:
-    """/proc/<pid>/cmdline with NULs as spaces — None when unreadable (process already gone, or
-    not ours to inspect). Linux-only by construction; callers gate on the platform.
-    Duplicated helper — keep in sync with speak.py."""
-    try:
-        with open(f"/proc/{pid}/cmdline", "rb") as fh:
-            raw = fh.read(MAX_STATE_BYTES + 1)
-    except OSError:
-        return None
-    return raw.replace(b"\0", b" ").decode("utf-8", "replace")
-
-
-def pid_looks_like_speak(pid: int, read_cmdline=_cmdline_of, platform_id: str = sys.platform) -> bool:
-    """PID-reuse guard (duplicated helper — keep in sync with speak.py)."""
-    if platform_id == "darwin":
-        if read_cmdline is _cmdline_of:
-            try:
-                result = subprocess.run(
-                    ["ps", "-p", str(pid), "-o", "command="],
-                    capture_output=True,
-                    check=False,
-                    timeout=1.0,
-                )
-            except (OSError, subprocess.TimeoutExpired):
-                return False
-            if result.returncode != 0:
-                return False
-            cmdline = result.stdout.decode("utf-8", "replace").strip() or None
-        else:
-            cmdline = read_cmdline(pid)
-    elif platform_id.startswith("linux"):
-        cmdline = read_cmdline(pid)
-    else:
-        return False
-    if cmdline is None:
-        return False
-    return "voice-loop-speak" in cmdline or "speak.py" in cmdline
+_cmdline_of = contracts._cmdline_of
+pid_looks_like_speak = contracts.pid_looks_like_speak
 
 
 def stop_speak_playback() -> None:
@@ -1613,12 +1570,8 @@ def stop_speak_playback() -> None:
     The historical pkill pattern-kill runs ONLY when no pidfile exists (a pre-pidfile speak, or a
     chain that died without cleanup): it misses tts.command players and can substring-match
     innocent processes, so it is the fallback, never the rule."""
-    try:
-        with open(_SPEAK_PID_PATH, encoding="utf-8") as fh:
-            tokens = fh.read(MAX_STATE_BYTES + 1).split()
-    except OSError:
-        tokens = None
-    if tokens is None:
+    record = contracts.read_playing_pid(_SPEAK_PID_PATH)
+    if record is None:
         if os.name == "nt":  # pkill and os.getuid are POSIX-only; Windows has no pattern fallback
             return
         try:
@@ -1631,12 +1584,8 @@ def stop_speak_playback() -> None:
         except OSError:
             pass
         return
-    for token in tokens:
-        try:
-            pid = int(token)
-        except ValueError:
-            continue
-        if pid > 0 and pid != os.getpid() and pid_looks_like_speak(pid):
+    for pid in record.pids:
+        if pid != os.getpid() and pid_looks_like_speak(pid):
             try:
                 os.kill(pid, signal.SIGTERM)
             except OSError:
@@ -2521,10 +2470,7 @@ def main(argv: list[str]) -> int:
     except OSError:
         pass
     system = platform.system()
-    cfg_path = os.environ.get(
-        "VOICE_LOOP_CONFIG",
-        os.path.join(os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")), "voice-loop/config.json"),
-    )
+    cfg_path = contracts.config_path()
     s = resolve_settings(load_config(cfg_path), system)
 
     # The endpoint policy, at configuration time — before any request is built or socket dialed,
