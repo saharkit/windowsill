@@ -190,6 +190,7 @@ from datetime import datetime, timezone
 # directly), exit silently: the same contract the bash launcher provided — a half-copied scripts/
 # directory is silence, not a traceback in the middle of a turn.
 try:
+    import contracts
     import providers
     import wsclient
 except ImportError:
@@ -474,17 +475,10 @@ def stamp_hook_fired(clock: Callable[[], float] = _default_wall_clock) -> None:
 
 
 def load_config(path: str) -> dict:
-    try:
-        with open(path, encoding="utf-8") as fh:
-            loaded = json.load(fh)
-        return loaded if isinstance(loaded, dict) else {}
-    except FileNotFoundError:
-        return {}  # no config at all is the normal zero-setup case — not worth a log line
-    except (OSError, ValueError) as err:
-        # ValueError covers both corrupt JSON and UnicodeDecodeError (a non-UTF-8 file); one
-        # informative line so a broken config is diagnosable instead of silently ignored
-        log(f"config ignored ({path}): {type(err).__name__}: {err}")
-        return {}
+    return contracts.load_config(
+        path,
+        lambda err: log(f"config ignored ({path}): {type(err).__name__}: {err}"),
+    )
 
 
 def cfg(config: dict, dotted: str, default):
@@ -539,8 +533,8 @@ def resolve_settings(config: dict, system: str) -> dict:
         # PipeWire sink to route TTS audio into for echo cancellation — when set, the player targets
         # this sink (via pw-play --target or aplay -D pipewire:<sink>) instead of the default device.
         "sink": str(cfg(config, "speak.sink", "")),
-        "max_chars": int(cfg(config, "speak.max_chars", 600)),
-        "timeout": float(cfg(config, "speak.timeout", 60)),
+        "max_chars": contracts.resolve_number(cfg(config, "speak.max_chars", 600), 600, "speak.max_chars", log, minimum=1, integer=True),
+        "timeout": contracts.resolve_number(cfg(config, "speak.timeout", 60), 60.0, "speak.timeout", log, minimum=0.000001, maximum=60),
         "backend": str(cfg(config, "tts.backend", "lan")),
         # left empty here: the per-backend default differs (see synthesize) — the LAN server and a
         # provider with no remote default host both land on the local speech server, while a
@@ -571,7 +565,7 @@ def resolve_settings(config: dict, system: str) -> dict:
         # voice_settings.speed — ElevenLabs accepts ~0.7-1.2; the operator's contour runs ~0.9.
         # Read off the voice_settings object the same place the other knobs live, default 1.0 (no
         # change). Folded into voice_settings at BOS time so it rides the held socket's first frame.
-        "speed": float(cfg(config, "tts.cloud.voice_settings.speed", 1.0)),
+        "speed": contracts.resolve_number(cfg(config, "tts.cloud.voice_settings.speed", 1.0), 1.0, "tts.cloud.voice_settings.speed", log),
         # the audio container the STREAMING path asks for — raw s16le (pcm_22050) by default, so the
         # holder wraps it in a WAV and the player queue needs no decoder. Distinct from the batch
         # output_format (mp3), because a streaming socket sends samples, not a compressed blob.
@@ -1113,15 +1107,7 @@ def _clear_pidfile() -> None:
         _pidfile_record = None
 
 
-def _cmdline_of(pid: int) -> str | None:
-    """Linux ``/proc/<pid>/cmdline`` with NULs as spaces — None when unreadable.
-    Duplicated helper — keep in sync with dictate.py."""
-    try:
-        with open(f"/proc/{pid}/cmdline", "rb") as fh:
-            raw = fh.read()
-    except OSError:
-        return None
-    return raw.replace(b"\0", b" ").decode("utf-8", "replace")
+_cmdline_of = contracts._cmdline_of
 
 
 def _ps_cmdline_of(pid: int) -> str | None:
@@ -1163,83 +1149,21 @@ def _windows_process_is_live(pid: int) -> bool:
         return False
 
 
-def pid_looks_like_speak(
-    pid: int, read_cmdline=_cmdline_of, platform_id: str | None = None
-) -> bool:
-    """Check the recorded PID against the speaking-chain identity seam.
+pid_looks_like_speak = contracts.pid_looks_like_speak
 
-    Linux uses ``/proc`` and macOS uses its bounded ``ps`` query to inspect the command line. Windows
-    has no supported inspection seam, so an explicit ``platform_id="win32"`` check fails closed.
-    The default Windows call is intentionally the existence half only: the pidfile is our provenance
-    for chain identity, while ``_windows_process_is_live`` is the safe native process probe.
-    """
-    default_platform = platform_id is None
-    if default_platform:
-        platform_id = sys.platform
-    if platform_id == "win32":
-        # Explicit Windows inspection is unsupported and fails closed. The default call is the
-        # playback composition's existence seam; the pidfile is the provenance for chain identity.
-        return default_platform and _windows_process_is_live(pid)
-    if platform_id.startswith("linux"):
-        cmdline = read_cmdline(pid)
-    elif platform_id == "darwin":
-        cmdline = _ps_cmdline_of(pid) if read_cmdline is _cmdline_of else read_cmdline(pid)
-    else:
-        return False
-    if cmdline is None:
-        return False
-    return "voice-loop-speak" in cmdline or "speak.py" in cmdline
+
+def _playing_pid_record():
+    return contracts.read_playing_pid(_PID_PATH)
 
 
 def _recorded_pids() -> list[int]:
-    """The speaking chain PIDs that THIS process may safely SIGTERM — the previous chain's python
-    process and its player children.  ``"pg"``-marked children (``tts.command`` process groups) are
-    EXCLUDED: they are terminated by the old chain's ``_on_sigterm`` handler via ``killpg``, never
-    targeted individually.  One reader for both users of this file — ``take_over`` and
-    ``playback_is_live`` — so neither can drift into seeing it differently."""
-    try:
-        with open(_PID_PATH, encoding="utf-8") as fh:
-            tokens = fh.read().split()
-    except OSError:
-        return []
-    pids: list[int] = []
-    skip_next = False
-    for tok in tokens:
-        if tok == "pg":
-            skip_next = True
-            continue
-        if skip_next:
-            skip_next = False
-            continue
-        try:
-            pids.append(int(tok))
-        except ValueError:
-            continue
-    return [pid for pid in pids if pid and pid != os.getpid()]
+    record = _playing_pid_record()
+    return [pid for pid in (record.pids if record else ()) if pid != os.getpid()]
 
 
 def _recorded_pgids() -> list[int]:
-    """Process-group leader PIDs that the ``tts.command`` path recorded — process-group children
-    whose liveness ``playback_is_live`` checks but which ``take_over`` never signals directly
-    (the old chain's ``_on_sigterm`` handler uses ``killpg`` on its own children when the chain's
-    python process receives SIGTERM)."""
-    try:
-        with open(_PID_PATH, encoding="utf-8") as fh:
-            tokens = fh.read().split()
-    except OSError:
-        return []
-    pgids: list[int] = []
-    i = 0
-    while i < len(tokens):
-        if tokens[i] == "pg" and i + 1 < len(tokens):
-            try:
-                pgids.append(int(tokens[i + 1]))
-            except ValueError:
-                pass
-            i += 2
-        else:
-            i += 1
-    return [pgid for pgid in pgids if pgid and pgid != os.getpid()]
+    record = _playing_pid_record()
+    return [pgid for pgid in (record.pgids if record else ()) if pgid != os.getpid()]
 
 
 def take_over() -> None:
@@ -2336,10 +2260,7 @@ def run_holder(
 def run_holder_main(digest: str) -> int:
     """The holder process entry: load config, refuse fast when streaming is off / the provider has
     no variant / there is no key, fold speed into voice_settings, and run the loop."""
-    cfg_path = os.environ.get(
-        "VOICE_LOOP_CONFIG",
-        os.path.join(os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")), "voice-loop/config.json"),
-    )
+    cfg_path = contracts.config_path()
     s = resolve_settings(load_config(cfg_path), platform.system())
     if not s["streaming"]:
         return 1
@@ -2377,10 +2298,7 @@ def main() -> int:
     # harness still calls the hook, and that proof is the whole point of the stamp.
     stamp_hook_fired()
 
-    cfg_path = os.environ.get(
-        "VOICE_LOOP_CONFIG",
-        os.path.join(os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")), "voice-loop/config.json"),
-    )
+    cfg_path = contracts.config_path()
     s = resolve_settings(load_config(cfg_path), platform.system())
 
     try:
@@ -2653,10 +2571,7 @@ def entry() -> int:
     rc = main()
     if _fired["event"] == "Stop" and not _stop_reason_logged:
         log("stop: exited with no reason recorded")
-    cfg_path = os.environ.get(
-        "VOICE_LOOP_CONFIG",
-        os.path.join(os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")), "voice-loop/config.json"),
-    )
+    cfg_path = contracts.config_path()
     contour_check(load_config(cfg_path), time.monotonic(), _fired["event"])
     return rc
 

@@ -25,6 +25,8 @@ import sys
 from pathlib import Path, PureWindowsPath
 from typing import Any, Callable
 
+import contracts
+
 
 class DiagnosticData(dict):
     """Mapping data with a read verdict kept outside the payload."""
@@ -40,14 +42,7 @@ def _default_state_home() -> str:
 
 
 def _default_config_path() -> str:
-    return os.environ.get(
-        "VOICE_LOOP_CONFIG",
-        os.path.join(
-            os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")),
-            "voice-loop",
-            "config.json",
-        ),
-    )
+    return contracts.config_path()
 
 
 def _plugin_root() -> Path:
@@ -602,13 +597,12 @@ def _check_python_interpreter(
 
 def read_config(path: str) -> DiagnosticData:
     try:
-        with open(path, encoding="utf-8") as fh:
-            loaded = json.load(fh)
+        loaded = contracts.read_config(path)
     except FileNotFoundError:
         return DiagnosticData({}, status="missing", detail=f"{path} does not exist")
     except OSError as err:
         return DiagnosticData({}, status="unreadable", detail=f"{type(err).__name__}: {err}")
-    except (json.JSONDecodeError, UnicodeDecodeError) as err:
+    except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as err:
         return DiagnosticData({}, status="malformed", detail=f"{type(err).__name__}: {err}")
     if not isinstance(loaded, dict):
         return DiagnosticData({}, status="malformed", detail=f"expected JSON object, got {type(loaded).__name__}")

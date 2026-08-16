@@ -29,4 +29,5 @@ DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd) || exit 0
 # scripts/ does nothing rather than half-recording, same as a missing dictate.py.
 [ -f "$DIR/providers.py" ] || exit 0
 [ -f "$DIR/wsclient.py" ] || exit 0
+[ -f "$DIR/contracts.py" ] || exit 0
 exec python3 "$DIR/dictate.py" "$@"

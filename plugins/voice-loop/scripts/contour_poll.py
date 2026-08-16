@@ -98,6 +98,7 @@ branching on it must never be handed a config typo instead:
 from __future__ import annotations
 
 import http.client
+import contracts
 import json
 import os
 import shlex
@@ -201,24 +202,15 @@ class ConfigError(Exception):
 
 
 def load_config(path: str) -> dict:
-    """The config file, or {} when there is none. Anything else is a ConfigError, not a default.
-
-    A MISSING file is the documented install that never configured a contour, and it defaults.
-    A file that is there and unreadable, or there and not JSON, is a typo somebody has to be told
-    about — silently polling loopback instead is the monitoring hole this poller exists to close.
-    """
+    """The config file, or {} when there is none; malformed input remains a poller error."""
     try:
-        with open(path, encoding="utf-8") as fh:
-            loaded = json.load(fh)
+        return contracts.load_config(path, strict=True)
     except FileNotFoundError:
         return {}
     except OSError as err:
         raise ConfigError(f"cannot read {path}: {err}") from err
     except ValueError as err:
         raise ConfigError(f"{path} is not valid JSON: {err}") from err
-    if not isinstance(loaded, dict):
-        raise ConfigError(f"{path} must hold a JSON object, not {type(loaded).__name__}")
-    return loaded
 
 
 def cfg(config: dict, dotted: str, default):
@@ -234,10 +226,7 @@ def cfg(config: dict, dotted: str, default):
 
 
 def config_path(environ=os.environ) -> str:
-    return environ.get(
-        "VOICE_LOOP_CONFIG",
-        os.path.join(environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")), "voice-loop/config.json"),
-    )
+    return contracts.config_path(environ)
 
 
 def _name_from_url(url: str) -> str:
