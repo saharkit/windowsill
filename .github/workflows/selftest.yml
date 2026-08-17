@@ -1402,13 +1402,14 @@ jobs:
           mkdir -p "$badge_dir/.github"
           badge_tmp="$badge_dir/.github/coverage-badge.json.tmp"
           python - "$badge_tmp" "$measured" <<'PY'
-          import json, sys
+          import json, os, sys
           path, measured = sys.argv[1], sys.argv[2]
           value = int(measured)
-          color = "brightgreen" if value >= 90 else "yellow" if value >= 75 else "red"
+          floor = int(os.environ["SHELF_COVERAGE_FLOOR"])
+          color = "brightgreen" if value >= floor else "yellow" if value >= floor - 10 else "red"
           with open(path, "w", encoding="utf-8") as fh:
               json.dump({"schemaVersion": 1, "label": "coverage", "message": f"{value}%", "color": color}, fh)
-              fh.write("\\n")
+              fh.write("\n")
           PY
           mv "$badge_tmp" "$badge_dir/.github/coverage-badge.json"
           git -C "$badge_dir" add .github/coverage-badge.json
@@ -1416,7 +1417,7 @@ jobs:
             git -C "$badge_dir" config user.name "github-actions[bot]"
             git -C "$badge_dir" config user.email "41898282+github-actions[bot]@users.noreply.github.com"
             git -C "$badge_dir" commit -m "ci: update coverage badge"
-            git -C "$badge_dir" push origin HEAD:badges
+            git -C "$badge_dir" push origin HEAD:badges || echo "warning: coverage badge push failed; continuing"
           fi
 
   # The ONE context the main-protection ruleset requires (infra#216, the night-wards #1538 pattern):
