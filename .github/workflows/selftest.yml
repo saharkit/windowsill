@@ -1406,7 +1406,9 @@ jobs:
           path, measured = sys.argv[1], sys.argv[2]
           value = int(measured)
           floor = int(os.environ["SHELF_COVERAGE_FLOOR"])
-          color = "brightgreen" if value >= floor else "yellow" if value >= floor - 10 else "red"
+          # Red below the gate floor, yellow for the narrow passing band just above it, green with headroom —
+          # the badge must never read yellow-or-green at a coverage the gate rejects.
+          color = "brightgreen" if value >= floor + 5 else "yellow" if value >= floor else "red"
           with open(path, "w", encoding="utf-8") as fh:
               json.dump({"schemaVersion": 1, "label": "coverage", "message": f"{value}%", "color": color}, fh)
               fh.write("\n")
@@ -1417,7 +1419,7 @@ jobs:
             git -C "$badge_dir" config user.name "github-actions[bot]"
             git -C "$badge_dir" config user.email "41898282+github-actions[bot]@users.noreply.github.com"
             git -C "$badge_dir" commit -m "ci: update coverage badge"
-            git -C "$badge_dir" push origin HEAD:badges || echo "warning: coverage badge push failed; continuing"
+            git -C "$badge_dir" push origin HEAD:badges || echo "::warning::coverage badge push to the badges branch failed; the badge was not updated (non-fatal)"
           fi
 
   # The ONE context the main-protection ruleset requires (infra#216, the night-wards #1538 pattern):

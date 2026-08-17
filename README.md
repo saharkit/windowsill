@@ -1,7 +1,7 @@
 # windowsill
 
 [![selftest](https://github.com/saharkit/windowsill/actions/workflows/selftest.yml/badge.svg)](https://github.com/saharkit/windowsill/actions/workflows/selftest.yml)
-[![coverage](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Fsaharkit%2Fwindowsill%2Fbadges%2Fcoverage-badge.json)](https://github.com/saharkit/windowsill/actions/workflows/selftest.yml)
+[![coverage](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Fsaharkit%2Fwindowsill%2Fbadges%2F.github%2Fcoverage-badge.json)](https://github.com/saharkit/windowsill/actions/workflows/selftest.yml)
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
 The coverage badge is the combined statements-and-branches figure from the Ubuntu coverage artifacts for both plugins; Windows test legs are not part of this number.
