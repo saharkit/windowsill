@@ -1,6 +1,8 @@
 name: selftest
 
-# least-privilege floor (infra#216 lens round): nothing in this workflow spends the token
+# least-privilege floor (infra#216 lens round): the publish-coverage-badge job is the one
+# exception — it holds `contents: write` and only runs on a push to `main`, so a pull_request
+# or merge_group run cannot spend the token; every other job inherits the read-only grant below.
 permissions:
   contents: read
 
@@ -1273,6 +1275,17 @@ jobs:
     name: combined coverage gate
     runs-on: ubuntu-latest
     needs: [coverage, sill-core-coverage]
+    env:
+      # Ratchet: update only to the measured percentage printed by this job after coverage improves.
+      SHELF_COVERAGE_FLOOR: "90"
+    # The measuring job is read-only — the badge push is carved out into publish-coverage-badge,
+    # which is the ONE job in this workflow that needs to spend the token. Exposing `measured`
+    # here lets the publish job consume the gate's verdict without re-deriving it from the
+    # artifact, so the badge can never disagree with the gate.
+    outputs:
+      measured: ${{ steps.compute-coverage.outputs.measured }}
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -1291,6 +1304,7 @@ jobs:
           pattern: coverage-sill-core-*
           path: coverage-data/sill-core
       - name: combine all plugin data and enforce the shelf gate
+        id: compute-coverage
         run: |
           set -euo pipefail
           VOICE=$(find coverage-data/voice-loop -name '.coverage' 2>/dev/null | wc -l)
@@ -1334,7 +1348,7 @@ jobs:
 
           # If the path remap above did NOT collapse the two runners' paths,
           # each source file appears twice.  The combined percentage drops but
-          # can still clear 90 % — the gate passes while measuring the wrong
+          # can still clear the floor — the gate passes while measuring the wrong
           # thing.  Catch that here: fail loudly when any path is duplicated.
           python -m coverage json -o - | python3 -c "
           import json, sys
@@ -1366,7 +1380,88 @@ jobs:
           print(f'OK: {len(normed)} unique source files, no duplicates')
           "
 
-          python -m coverage report --fail-under=90
+          set +e
+          python -m coverage report --fail-under="$SHELF_COVERAGE_FLOOR" | tee /tmp/shelf-coverage-report.txt
+          report_rc=${PIPESTATUS[0]}
+          set -e
+          measured=$(awk '$1 == "TOTAL" {print $NF}' /tmp/shelf-coverage-report.txt | tr -d '%')
+          [ -n "$measured" ] || { echo "FAIL: coverage report did not produce a TOTAL percentage"; exit 1; }
+          echo "shelf coverage: measured=${measured}% floor=${SHELF_COVERAGE_FLOOR}%"
+          {
+            echo "### Shelf coverage (Ubuntu artifacts)"
+            echo
+            echo "- Measured: **${measured}%**"
+            echo "- Floor: **${SHELF_COVERAGE_FLOOR}%**"
+            echo "- Scope: combined statements and branches from the Ubuntu coverage artifacts for voice-loop and sill-core; Windows test legs are excluded."
+          } >> "$GITHUB_STEP_SUMMARY"
+          [ "$report_rc" -eq 0 ] || exit "$report_rc"
+          # The measured number reaches the publish-coverage-badge job via this job output, so the
+          # badge projection can never disagree with the gate that produced it.
+          echo "measured=$measured" >> "$GITHUB_OUTPUT"
+
+  # Carved out of `combined-coverage` so the GITHUB_TOKEN that pushes to the unprotected `badges`
+  # branch is scoped to THIS job alone — `contents: write` is the only permission it holds. Three
+  # guards make it impossible for a badge push to do real harm:
+  #   • `needs: combined-coverage` so the publish step is not given a fabricated percentage.
+  #   • `github.event_name == 'push' && github.ref == 'refs/heads/main'` so a PR or merge_group
+  #     run cannot overwrite the public README's badge with a number main does not have.
+  #   • `needs.combined-coverage.result == 'success'` so a failing gate cannot publish a green
+  #     for a coverage the gate rejected (the gate itself is the source of truth).
+  # The push itself stays non-fatal — a failed push only emits a workflow warning.
+  publish-coverage-badge:
+    name: publish coverage badge to the badges branch
+    runs-on: ubuntu-latest
+    needs: [combined-coverage]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.combined-coverage.result == 'success'
+    env:
+      # Same ratchet value combined-coverage ran the gate against — passed through so the badge
+      # reads against the same floor the gate enforced.
+      SHELF_COVERAGE_FLOOR: "90"
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: write the badges JSON and push it to the unprotected badges branch
+        env:
+          MEASURED: ${{ needs.combined-coverage.outputs.measured }}
+        run: |
+          set -euo pipefail
+          # The artifact is private and expires; shields.io needs an anonymous, durable projection.
+          # Push to the dedicated unprotected badges branch — and only here, on a push to main —
+          # so a PR or merge_group run cannot overwrite the public README's badge with a number
+          # main does not have. The combined .coverage artifact remains the sole source of the
+          # measured number; the job output above carries that single value to this job.
+          badge_dir="$RUNNER_TEMP/windowsill-badges"
+          git fetch origin badges || true
+          if git show-ref --verify --quiet refs/remotes/origin/badges; then
+            git worktree add "$badge_dir" -B badges origin/badges
+          else
+            git worktree add --detach "$badge_dir"
+            git -C "$badge_dir" switch --orphan badges
+            git -C "$badge_dir" rm -rf . >/dev/null 2>&1 || true
+          fi
+          mkdir -p "$badge_dir/.github"
+          badge_tmp="$badge_dir/.github/coverage-badge.json.tmp"
+          python3 - "$badge_tmp" "$MEASURED" <<'PY'
+          import json, os, sys
+          path, measured = sys.argv[1], sys.argv[2]
+          value = int(measured)
+          floor = int(os.environ["SHELF_COVERAGE_FLOOR"])
+          # Red below the gate floor, yellow for the narrow passing band just above it, green with headroom —
+          # the badge must never read yellow-or-green at a coverage the gate rejects.
+          color = "brightgreen" if value >= floor + 5 else "yellow" if value >= floor else "red"
+          with open(path, "w", encoding="utf-8") as fh:
+              json.dump({"schemaVersion": 1, "label": "coverage", "message": f"{value}%", "color": color}, fh)
+              fh.write("\n")
+          PY
+          mv "$badge_tmp" "$badge_dir/.github/coverage-badge.json"
+          git -C "$badge_dir" add .github/coverage-badge.json
+          if ! git -C "$badge_dir" diff --cached --quiet; then
+            git -C "$badge_dir" config user.name "github-actions[bot]"
+            git -C "$badge_dir" config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git -C "$badge_dir" commit -m "ci: update coverage badge"
+            git -C "$badge_dir" push origin HEAD:badges || echo "::warning::coverage badge push to the badges branch failed; the badge was not updated (non-fatal)"
+          fi
 
   # The ONE context the main-protection ruleset requires (infra#216, the night-wards #1538 pattern):
   # an aggregate that needs every real job and reports on EVERY run — `if: always()` means a failed or

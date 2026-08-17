@@ -4,8 +4,8 @@
 #
 # scripts/ is also under coverage measurement with its own (lower, ratcheting) fail-under, enforced
 # separately in CI via `coverage report --include='scripts/*'` — the server's 100% is non-negotiable
-# and never dropped. The per-plugin .coverage is appended into the shelf-level .coverage at the repo
-# root so a combined report can sum across plugins.
+# and never dropped. The combined coverage job downloads this per-plugin .coverage artifact and
+# combines it with sill-core's artifact for the shelf-level report.
 [run]
 branch = True
 source = voice_server, scripts
