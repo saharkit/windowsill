@@ -19,6 +19,7 @@ import http.client
 import importlib.util
 import json
 import os
+import runpy
 import shlex
 import subprocess
 import sys
@@ -1017,3 +1018,28 @@ def test_main_help_is_free_and_exit_0_and_lists_every_flag_it_accepts(monkeypatc
         assert "contour-poll" in out
         for documented in ("--json", "--status", "--help"):
             assert documented in out, f"{documented} is accepted but {flag} does not list it"
+
+
+def test_none_device_is_not_normalized():
+    """A missing device is absent data, not a fast-path value that can demote a service."""
+    assert contour_poll._normalize_device(None) is None
+
+
+def test_load_config_strict_catches_a_missing_registry_dependency(monkeypatch):
+    """The strict wrapper still owns the missing-file fallback if the shared reader raises."""
+    def missing(path, strict=False):
+        assert strict is True
+        raise FileNotFoundError(path)
+
+    monkeypatch.setattr(contour_poll.contracts, "load_config", missing)
+
+    assert contour_poll.load_config("missing.json") == {}
+
+
+def test_script_entrypoint_help_does_not_poll(monkeypatch, capsys):
+    """The executable entry point is a free help path before config is read."""
+    monkeypatch.setattr(contour_poll.sys, "argv", ["contour-poll.py", "--help"])
+    with pytest.raises(SystemExit) as raised:
+        runpy.run_path(str(_POLL_PATH), run_name="__main__")
+
+    assert raised.value.code == 0

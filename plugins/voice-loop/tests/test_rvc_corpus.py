@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import runpy
 import sys
 import wave
 from pathlib import Path
@@ -250,3 +251,13 @@ def test_argv_defaults_to_the_real_one(monkeypatch, corpus, capsys):
 
     assert rvc_corpus.main() == 0
     assert "READY" in capsys.readouterr().out
+
+
+def test_script_entrypoint_reports_a_missing_corpus(monkeypatch):
+    """The executable entry point keeps the documented usage error for a missing corpus."""
+    monkeypatch.setattr(sys, "argv", ["rvc_corpus.py"])
+    monkeypatch.delenv("VOICE_LOOP_CORPUS_DIR", raising=False)
+    with pytest.raises(SystemExit) as raised:
+        runpy.run_path(str(Path(_scripts_dir) / "rvc_corpus.py"), run_name="__main__")
+
+    assert raised.value.code == 2

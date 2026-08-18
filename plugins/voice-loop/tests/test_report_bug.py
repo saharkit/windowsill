@@ -17,10 +17,12 @@ collector reads is under tmp_path — never the live config or state dir.
 
 from __future__ import annotations
 
+import builtins
 import importlib.util
 import json
 import os
 import re
+import runpy
 import stat
 import subprocess
 import urllib.error
@@ -1012,3 +1014,280 @@ def test_an_absent_manifest_is_named_not_guessed(monkeypatch, tmp_path):
     monkeypatch.setattr(report_bug, "_PLUGIN_MANIFEST", str(tmp_path / "plugin.json"))
     versions = report_bug.collect_versions()
     assert versions == {"plugin": "unknown", "plugin_manifest": "absent", "python": report_bug.platform.python_version()}
+
+
+def test_default_runner_is_bounded_and_argv_only(monkeypatch):
+    """The default runner must retain the spawn policy at its own seam.
+
+    L1 gap: this catches a refactor that invokes a shell string, drops the wall-clock bound, or lets
+    ``check=True`` turn an ordinary command result into an unhandled exception.
+    """
+    expected = subprocess.CompletedProcess(["probe"], 0, stdout="", stderr="")
+    calls = {}
+
+    def fake_run(argv, **kwargs):
+        calls.update(argv=argv, **kwargs)
+        return expected
+
+    monkeypatch.setattr(report_bug.subprocess, "run", fake_run)
+    assert report_bug._default_runner(["probe"], 2.5) is expected
+    assert calls == {
+        "argv": ["probe"],
+        "capture_output": True,
+        "text": True,
+        "timeout": 2.5,
+        "check": False,
+    }
+
+
+def test_usernames_ignore_a_failed_passwd_lookup(monkeypatch):
+    """A machine without a passwd entry still gets redacted names from the available inputs."""
+    monkeypatch.setattr(report_bug, "_HOME", "/home/tester")
+    for name in ("USER", "LOGNAME", "USERNAME"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(
+        report_bug.getpass,
+        "getuser",
+        lambda: (_ for _ in ()).throw(RuntimeError("no passwd entry")),
+    )
+
+    assert report_bug.usernames() == ("tester",)
+
+
+def test_redact_does_not_replace_a_root_home(monkeypatch):
+    """The root home is not a user's identity and must not enter the home-collapse path."""
+    monkeypatch.setattr(report_bug, "_HOME", "/")
+    for name in ("USER", "LOGNAME", "USERNAME"):
+        monkeypatch.delenv(name, raising=False)
+
+    assert report_bug.redact("ordinary text") == "ordinary text"
+
+
+def test_a_cut_message_with_no_payload_redacts_only_its_head():
+    """A known log marker at EOF is still metadata, not an empty speech payload."""
+    assert report_bug.scrub_message("text: ") == ("text: ", True)
+
+
+def test_read_log_tail_reports_an_unreadable_source_directory(tmp_path):
+    """A directory at the log path is a verified unreadable source, not a missing log."""
+    result = report_bug.read_log_tail(str(tmp_path))
+
+    assert result["status"] == "unreadable"
+    assert result["read_detail"]
+    assert result["lines"] == []
+    assert result["unclassified"] == 0
+
+
+def test_read_log_tail_records_malformed_utf8(tmp_path):
+    """Replacement-character recovery must be followed by a strict decodability check."""
+    path = tmp_path / "speak.log"
+    path.write_bytes(b"2026-08-03T08:00:00 played rc=0\xff")
+
+    result = report_bug.read_log_tail(str(path))
+
+    assert result["status"] == "malformed"
+    assert "UnicodeDecodeError" in result["read_detail"]
+
+
+@pytest.mark.parametrize(
+    ("error", "status", "detail"),
+    [
+        (FileNotFoundError, "missing", "disappeared"),
+        (OSError, "unreadable", "OSError"),
+    ],
+)
+def test_read_log_tail_distinguishes_a_second_read_failure(error, status, detail, monkeypatch):
+    """A second strict read must not replace the original failure with an incidental cleanup error."""
+    class _Handle:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self):
+            return "2026-08-03T08:00:00 played rc=0\n"
+
+    calls = 0
+
+    def fake_open(path, *args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return _Handle()
+        raise error(path)
+
+    monkeypatch.setattr(builtins, "open", fake_open)
+    result = report_bug.read_log_tail("speak.log")
+
+    assert result["status"] == status
+    assert detail in result["read_detail"]
+
+
+def test_read_json_keeps_a_directory_unreadable_distinct(tmp_path):
+    """Config readers name an unreadable path rather than treating it as malformed JSON."""
+    path = tmp_path / "config.json"
+    path.mkdir()
+
+    loaded, note = report_bug.read_json(str(path))
+    assert loaded == {}
+    assert note.startswith("unreadable (")
+
+
+def test_fetch_health_names_a_missing_endpoint(monkeypatch):
+    """An absent endpoint is a named no-op and must not attempt a network request."""
+    def never(*args, **kwargs):
+        raise AssertionError("a missing endpoint must not be opened")
+
+    monkeypatch.setattr(report_bug.urllib.request, "build_opener", never)
+    assert report_bug.fetch_health("") == {
+        "endpoint": "",
+        "reachable": False,
+        "error": "no endpoint configured",
+    }
+
+
+def test_fetch_health_treats_http_error_as_a_reachable_certificate(monkeypatch):
+    """A 403 proves the handshake completed even though the endpoint was not healthy."""
+    class _Opener:
+        def open(self, request, timeout):
+            raise urllib.error.HTTPError("https://service.example/", 403, "Forbidden", {}, None)
+
+    monkeypatch.setattr(report_bug.urllib.request, "build_opener", lambda handlers: _Opener())
+
+    result = report_bug.fetch_health("https://service.example", 1.0)
+
+    assert result["reachable"] is True
+    assert result["error"] == "HTTP 403"
+
+
+def test_state_inventory_ignores_a_directory_listing_failure(monkeypatch):
+    """A state directory that cannot be listed still yields the explicit missing stream row."""
+    def unreadable(path):
+        raise PermissionError("state directory")
+
+    monkeypatch.setattr(report_bug.os, "listdir", unreadable)
+
+    inventory = report_bug._state_inventory("/state")
+
+    assert inventory[-1] == (
+        report_bug._STREAM_RESULT_ABSENT_NAME,
+        report_bug._STREAM_RESULT_WHAT,
+    )
+
+
+def test_sanitize_bundle_reports_missing_fields_without_a_false_unknown_field():
+    """Schema drift with only a missing field must name that half of the contract."""
+    with pytest.raises(ValueError, match="missing field"):
+        report_bug.sanitize_bundle({"generated_at": "now"})
+
+
+def test_write_bundle_swallow_cleanup_errors_after_replace_failure(tmp_path, monkeypatch):
+    """A cleanup failure must not replace the original disk-full error."""
+    monkeypatch.setattr(report_bug.os, "replace", lambda *args: (_ for _ in ()).throw(OSError("disk full")))
+    monkeypatch.setattr(report_bug.os, "unlink", lambda path: (_ for _ in ()).throw(OSError("cleanup failed")))
+
+    with pytest.raises(OSError, match="disk full"):
+        report_bug.write_bundle(str(tmp_path / "bundle.md"), "body")
+
+
+def test_gh_ready_reports_a_runner_error(monkeypatch):
+    """An unspawnable gh probe is a normal unavailable tier, not a traceback."""
+    monkeypatch.setattr(report_bug.shutil, "which", lambda name: "/usr/bin/gh")
+
+    def runner(argv, timeout):
+        raise OSError("permission denied")
+
+    ready, why = report_bug.gh_ready(runner)
+
+    assert ready is False
+    assert "gh could not be run" in why
+
+
+def test_create_issue_rejects_bytes_that_differ_from_the_artifact(tmp_path):
+    """The transport must refuse to send a body other than the one the user saw."""
+    path = tmp_path / "bundle.md"
+    path.write_text("displayed", encoding="utf-8")
+    artifact = report_bug.ReportArtifact("title", "other bytes")
+
+    assert report_bug.create_issue(artifact, str(path), runner=lambda *args: pytest.fail("must not send")) == (
+        False,
+        "report artifact does not match the bundle file",
+    )
+
+
+def test_create_issue_passes_an_optional_label(tmp_path):
+    """A consent-approved label is passed as an argv token, never shell syntax."""
+    path = tmp_path / "bundle.md"
+    path.write_bytes(b"displayed bytes")
+    artifact = report_bug.ReportArtifact("title", "displayed bytes")
+    calls = []
+
+    def runner(argv, timeout):
+        calls.append((argv, timeout))
+        return subprocess.CompletedProcess(argv, 0, stdout="https://example.invalid/1\n", stderr="")
+
+    assert report_bug.create_issue(artifact, str(path), label="voice-loop", runner=runner) == (
+        True,
+        "https://example.invalid/1",
+    )
+    assert calls[0][0][-2:] == ["--label", "voice-loop"]
+
+
+def test_create_issue_reports_a_runner_oserror():
+    """A failed issue-create spawn is an ordinary transport result."""
+    def runner(argv, timeout):
+        raise OSError("permission denied")
+
+    assert report_bug.create_issue("title", "bundle.md", runner=runner) == (
+        False,
+        "gh could not be run (OSError)",
+    )
+
+
+def test_issue_url_accepts_an_existing_artifact():
+    """An artifact already bound to its displayed body must not be rerendered."""
+    artifact = report_bug.ReportArtifact("redacted title", "redacted body")
+    url = report_bug.issue_url(artifact)
+
+    parsed = urllib.parse.parse_qs(urllib.parse.urlsplit(url).query)
+    assert parsed["title"] == ["redacted title"]
+    assert parsed["body"] == ["redacted body"]
+
+
+def test_issue_url_requires_a_body_for_a_plain_title():
+    """A plain title cannot silently become an issue containing only a title."""
+    with pytest.raises(TypeError, match="body is required"):
+        report_bug.issue_url("title")
+
+
+def test_mailto_url_requires_a_body_for_a_plain_subject():
+    """A plain subject cannot silently become a mail body containing no report."""
+    with pytest.raises(TypeError, match="body is required"):
+        report_bug.mailto_url("bugs@example.invalid", "subject")
+
+
+def test_url_command_prints_a_prefilled_url_for_a_readable_bundle(tmp_path, capsys):
+    """The URL command's success return is part of its CLI contract."""
+    path = tmp_path / "bundle.md"
+    path.write_text("bundle", encoding="utf-8")
+
+    assert report_bug.main(["url", "--title", "title", "--bundle", str(path)]) == 0
+    assert "https://github.com/" in capsys.readouterr().out
+
+
+def test_mailto_command_refuses_an_empty_mailbox(monkeypatch, tmp_path, capsys):
+    """An empty configured mailbox is a user-facing refusal, not an implicit default."""
+    monkeypatch.setenv(report_bug._MAILBOX_ENV, "")
+
+    assert report_bug.main(["mailto", "--title", "title", "--bundle", str(tmp_path / "missing.md")]) == 1
+    assert "no service mailbox" in capsys.readouterr().err
+
+
+def test_script_entrypoint_requires_a_command(monkeypatch):
+    """The executable entry point must not silently accept an empty argv."""
+    monkeypatch.setattr(report_bug.sys, "argv", ["report_bug.py"])
+    with pytest.raises(SystemExit) as raised:
+        runpy.run_path(str(_SCRIPTS / "report_bug.py"), run_name="__main__")
+
+    assert raised.value.code == 2

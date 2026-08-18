@@ -10,8 +10,10 @@ import importlib.machinery
 import importlib.util
 import json
 import os
+import runpy
 from pathlib import Path
 
+import pytest
 
 _SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
 _LOADER = importlib.machinery.SourceFileLoader(
@@ -207,3 +209,63 @@ def test_main_on_windows_returns_nonzero_when_subprocess_spawn_fails(tmp_path, m
     assert _launcher.main() == 1
     captured = capsys.readouterr()
     assert "spawn failed" in captured.err
+
+
+def test_entries_normalize_a_single_object_and_ignore_invalid_install_paths(
+    tmp_path, monkeypatch
+):
+    """The registry reader must keep a valid object entry and reject malformed install paths.
+
+    L1 gap: without the object→single-entry normalization, the later candidate path cannot be
+    reached; without the install-path check, a malformed registry entry could become a crash in
+    ``Path(install_path)`` instead of being ignored.
+    """
+    root = _install(tmp_path, "0.8.0")
+    _write_registry(
+        tmp_path,
+        [{"installPath": 42}, {"installPath": ""}, {"installPath": str(root)}],
+    )
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+
+    assert _launcher._entries(
+        {"plugins": {"voice-loop@windowsill": {"installPath": str(root)}}}
+    ) == [{"installPath": str(root)}]
+    assert _launcher._current_script("posix") == root / "scripts" / "dictate-toggle.sh"
+
+
+def test_current_script_ignores_candidates_without_the_requested_leaf(
+    tmp_path, monkeypatch
+):
+    """A registry pointing at an install without this platform's leaf is not a candidate."""
+    root = _install(tmp_path, "0.8.0")
+    (root / "scripts" / "dictate-toggle.sh").unlink()
+    _write_registry(tmp_path, [{"installPath": str(root)}])
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+
+    assert _launcher._current_script("posix") is None
+
+
+def test_main_execs_reach_the_defensive_return_if_execv_does_not_replace_process(
+    tmp_path, monkeypatch
+):
+    """A successful ``execv`` is normally terminal; a seam returning normally still needs the
+    defensive result rather than falling through to ``None``.
+    """
+    current = _install(tmp_path, "0.8.0")
+    _write_registry(tmp_path, [{"installPath": str(current)}])
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+    monkeypatch.setattr(_launcher.os, "name", "posix")
+    monkeypatch.setattr(_launcher.os, "execv", lambda path, argv: None)
+
+    assert _launcher.main() == 1
+
+
+def test_script_entrypoint_refuses_to_run_without_a_registry(tmp_path, monkeypatch):
+    """The executable entry point is the same fail-closed launcher as the callable seam."""
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+    monkeypatch.setattr(_launcher.sys, "argv", ["voice-loop-dictate"])
+
+    with pytest.raises(SystemExit) as raised:
+        runpy.run_path(str(_SCRIPTS / "voice-loop-dictate"), run_name="__main__")
+
+    assert raised.value.code == 1

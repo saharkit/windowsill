@@ -11,14 +11,14 @@ structurally cannot prove is not claimed here.
 from __future__ import annotations
 
 import importlib.util
+import runpy
 import ssl
 import subprocess
 import urllib.error
 from pathlib import Path
 
-import pytest
-
 import providers
+import pytest
 
 _PROBE_PATH = Path(__file__).resolve().parents[1] / "scripts" / "tls-probe.py"
 _spec = importlib.util.spec_from_file_location("tls_probe", _PROBE_PATH)
@@ -486,3 +486,93 @@ def test_json_output_is_one_parseable_object(capsys):
 def test_help_prints_the_usage_and_exits_clean(capsys):
     assert tls_probe.main(["--help"], ok_prober) == 0
     assert "Usage:" in capsys.readouterr().out
+
+
+def test_empty_config_values_use_the_declared_default():
+    """Null and empty configured values must not probe an invalid endpoint."""
+    assert tls_probe.cfg({"endpoint": None}, "endpoint", "fallback") == "fallback"
+    assert tls_probe.cfg({"endpoint": ""}, "endpoint", "fallback") == "fallback"
+
+
+def test_certificate_chain_classification_has_a_four_reason_bound():
+    """A deeply wrapped ordinary error must stop at the four-link inspection bound."""
+    err = OSError("outer")
+    previous = None
+    for index in range(4):
+        nested = OSError(f"wrapped {index}")
+        if previous is None:
+            err.reason = nested
+        else:
+            previous.reason = nested
+        previous = nested
+
+    assert not tls_probe.is_cert_failure(err)
+
+
+def test_default_prober_bypasses_proxies_and_reads_one_byte(monkeypatch):
+    """The default request is the exact certificate-store probe policy, not a second probe."""
+    calls = {}
+
+    class _Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self, amount):
+            calls["read"] = amount
+            return b"x"
+
+    class _Opener:
+        def open(self, request, timeout):
+            calls["url"] = request.full_url
+            calls["method"] = request.get_method()
+            calls["timeout"] = timeout
+            return _Response()
+
+    monkeypatch.setattr(tls_probe.urllib.request, "build_opener", lambda handlers: _Opener())
+
+    assert tls_probe._default_prober("https://service.example/health", 2.5) is None
+    assert calls == {
+        "url": "https://service.example/health",
+        "method": "GET",
+        "timeout": 2.5,
+        "read": 1,
+    }
+
+
+def test_default_runner_uses_capture_timeout_and_check_false(monkeypatch):
+    """The repair runner keeps the same bounded argv-only spawn policy as the probe."""
+    expected = subprocess.CompletedProcess(["installer"], 0, stdout=b"", stderr=b"")
+    calls = {}
+
+    def fake_run(argv, **kwargs):
+        calls.update(argv=argv, **kwargs)
+        return expected
+
+    monkeypatch.setattr(tls_probe.subprocess, "run", fake_run)
+
+    assert tls_probe._default_runner(["installer"], 3.0) is expected
+    assert calls == {
+        "argv": ["installer"],
+        "capture_output": True,
+        "check": False,
+        "timeout": 3.0,
+    }
+
+
+def test_fix_is_accepted_by_the_cli(monkeypatch, capsys):
+    """The --fix branch is parsed even when the first probe is already green."""
+    monkeypatch.setattr(tls_probe, "remedy", lambda **kwargs: pytest.fail("--fix must reach no remedy on success"))
+    assert tls_probe.main(["--url", "https://x.example/", "--fix"], ok_prober) == 0
+    capsys.readouterr()
+
+
+def test_script_entrypoint_prints_help(monkeypatch):
+    """Running the file directly carries the documented help exit."""
+    monkeypatch.setattr(tls_probe.sys, "argv", ["tls-probe.py", "--help"])
+    with pytest.raises(SystemExit) as raised:
+        runpy.run_path(str(_PROBE_PATH), run_name="__main__")
+
+    assert raised.value.code == 0
