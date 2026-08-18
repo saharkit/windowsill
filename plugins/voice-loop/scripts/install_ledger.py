@@ -145,6 +145,15 @@ def _ledger_lock(path: str) -> Iterator[None]:
         os.makedirs(os.path.dirname(lock_path) or ".", exist_ok=True)
     except OSError:
         pass  # a real failure here surfaces from the open below
+    # O_NOFOLLOW is the atomic, race-free POSIX-side hardening: it fails the
+    # open at the kernel if lock_path is a symlink, so the lock can never be
+    # redirected onto an attacker-chosen file.  Windows has no O_NOFOLLOW —
+    # getattr below degrades the flag to 0 and the open FOLLOWS the symlink —
+    # so reject explicitly up front, on every platform, BEFORE the open runs.
+    # Keep O_NOFOLLOW too: the pre-check + the kernel flag together are what
+    # hold the line on both POSIX and Windows.
+    if os.path.islink(lock_path):
+        raise OSError(f"refusing to lock through symlink at {lock_path!r}")
     flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
     fd = os.open(lock_path, flags, 0o600)
     try:

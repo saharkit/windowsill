@@ -7,8 +7,11 @@ predictable.
 
 from __future__ import annotations
 
+import builtins
+import importlib.util
 import json
 import os
+import runpy
 from datetime import datetime, timezone
 
 import pytest
@@ -82,6 +85,157 @@ class TestFreshStart:
 # ---------------------------------------------------------------------------
 
 
+class TestPlatformAndDefaults:
+    def test_default_clock_is_utc(self):
+        now = install_ledger._default_clock()
+        assert now.tzinfo is timezone.utc
+
+    def test_default_path_uses_xdg_state_home(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+        assert install_ledger._default_ledger_path() == str(tmp_path / "voice-loop" / "install.ledger")
+
+    def test_default_path_falls_back_to_home(self, monkeypatch):
+        monkeypatch.delenv("XDG_STATE_HOME", raising=False)
+        # The expanduser stub is recorded so the test pins both the call AND the
+        # path the code under test asked expanduser to expand — otherwise a
+        # regression changing ~/.local/state to ~/.config would still pass.
+        calls = []
+
+        def record(path):
+            calls.append(path)
+            return "/home/tester/state"
+
+        monkeypatch.setattr(install_ledger.os.path, "expanduser", record)
+        expected = os.path.join("/home/tester/state", "voice-loop", "install.ledger")
+        assert install_ledger._default_ledger_path() == expected
+        assert calls == ["~/.local/state"]
+
+    def test_optional_platform_imports_are_absent(self, monkeypatch):
+        source = os.path.join(_scripts_dir, "install_ledger.py")
+        real_import = builtins.__import__
+
+        def without_platforms(name, *args, **kwargs):
+            if name in {"fcntl", "msvcrt"}:
+                raise ImportError(name)
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", without_platforms)
+        spec = importlib.util.spec_from_file_location("ledger_no_platform", source)
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        assert module.fcntl is None
+        assert module.msvcrt is None
+
+    def test_windows_lock_branch(self, monkeypatch, tmp_path):
+        class FakeMsvcrt:
+            LK_LOCK = 1
+            calls = []
+
+            @classmethod
+            def locking(cls, fd, mode, length):
+                cls.calls.append(("lock", fd, mode, length))
+
+        class FakeFcntl:
+            LOCK_EX = 1
+            LOCK_UN = 2
+
+            def flock(self, *args):
+                raise AssertionError("fcntl branch must not run")
+
+        monkeypatch.setattr(install_ledger, "fcntl", None)
+        monkeypatch.setattr(install_ledger, "msvcrt", FakeMsvcrt)
+        path = str(tmp_path / "ledger")
+        with install_ledger._ledger_lock(path):
+            assert os.path.exists(path + ".lock")
+        assert [call[0] for call in FakeMsvcrt.calls] == ["lock"]
+
+    def test_lock_directory_failure_is_best_effort(self, monkeypatch, tmp_path):
+        path = str(tmp_path / "missing" / "ledger")
+        real_makedirs = install_ledger.os.makedirs
+        monkeypatch.setattr(install_ledger.os, "makedirs", lambda *args, **kwargs: (_ for _ in ()).throw(OSError("blocked")))
+        with pytest.raises(FileNotFoundError):
+            with install_ledger._ledger_lock(path):
+                pass
+        monkeypatch.setattr(install_ledger.os, "makedirs", real_makedirs)
+
+    def test_lock_unlock_and_close_failure_cleanup(self, monkeypatch, tmp_path):
+        class FakeFcntl:
+            LOCK_EX = 1
+            LOCK_UN = 2
+            calls = []
+
+            @classmethod
+            def flock(cls, fd, mode):
+                cls.calls.append((fd, mode))
+
+        monkeypatch.setattr(install_ledger, "fcntl", FakeFcntl)
+        monkeypatch.setattr(install_ledger, "msvcrt", None)
+        path = str(tmp_path / "ledger")
+        with install_ledger._ledger_lock(path):
+            pass
+        assert [mode for _, mode in FakeFcntl.calls] == [FakeFcntl.LOCK_EX, FakeFcntl.LOCK_UN]
+
+    def test_lock_without_platform_locking(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(install_ledger, "fcntl", None)
+        monkeypatch.setattr(install_ledger, "msvcrt", None)
+        path = str(tmp_path / "ledger")
+        with install_ledger._ledger_lock(path):
+            assert os.path.exists(path + ".lock")
+
+    def test_atomic_write_rejects_symlink(self, ledger_path, tmp_path):
+        target = tmp_path / "target"
+        target.write_text("old")
+        os.symlink(target, ledger_path)
+        with pytest.raises(OSError, match="symlink"):
+            install_ledger._atomic_write(ledger_path, "new")
+
+    def test_lock_rejects_symlinked_lock_path(self, monkeypatch, tmp_path):
+        # Sibling of test_atomic_write_rejects_symlink: the lock path is opened
+        # with O_NOFOLLOW so an attacker can't redirect the lock to a chosen
+        # file. A regression that drops the flag would let _ledger_lock follow
+        # the symlink and create-or-open the target as a lockfile — the test
+        # catches that by failing the open with OSError instead.
+        target = tmp_path / "attacker_target"
+        target.write_text("held by attacker")
+        ledger = tmp_path / "ledger"
+        lock = tmp_path / "ledger.lock"
+        os.symlink(target, lock)
+        monkeypatch.setattr(install_ledger, "fcntl", None)
+        monkeypatch.setattr(install_ledger, "msvcrt", None)
+        with pytest.raises(OSError):
+            with install_ledger._ledger_lock(str(ledger)):
+                pass
+
+    def test_lock_symlink_pre_check_fires_before_open(self, monkeypatch, tmp_path):
+        # The islink pre-check is the cross-platform defense — it rejects a
+        # symlinked lock_path BEFORE os.open runs.  O_NOFOLLOW is the POSIX
+        # hardening layered on top; on Windows it does not exist, so without
+        # the pre-check the open FOLLOWS the symlink and redirects the lock
+        # onto an attacker-chosen file.  On POSIX O_NOFOLLOW would mask the
+        # absence of the pre-check by raising on its own, so this test stubs
+        # os.open to assert it is NOT called — if the pre-check is dropped,
+        # the stub is reached and the assertions fail.
+        target = tmp_path / "attacker_target"
+        target.write_text("held by attacker")
+        lock = tmp_path / "ledger.lock"
+        os.symlink(target, lock)
+        monkeypatch.setattr(install_ledger, "fcntl", None)
+        monkeypatch.setattr(install_ledger, "msvcrt", None)
+        opened = []
+        monkeypatch.setattr(
+            os,
+            "open",
+            lambda path, flags, *args, **kwargs: opened.append((path, flags)) or -1,
+        )
+        with pytest.raises(OSError, match="symlink"):
+            with install_ledger._ledger_lock(str(tmp_path / "ledger")):
+                pass
+        assert opened == [], (
+            f"os.open must not run for a symlinked lock_path; saw calls={opened!r}"
+        )
+
+
 class TestStartInstall:
     def test_start_creates_ledger(self, ledger_path, clock):
         result = install_ledger.start_install(ledger_path, clock=clock)
@@ -103,6 +257,19 @@ class TestStartInstall:
         assert raw is not None
         for sid in install_ledger.INSTALL_STEPS:
             assert raw["steps"][sid]["status"] == "pending"
+
+    def test_start_uses_keyword_ledger_path_for_lock(self, tmp_path, clock):
+        # _serialized_mutation resolves the path from kwargs.get('ledger_path')
+        # when no positional arg is supplied — a regression that only handled
+        # the positional branch would still pass every other start_install test
+        # but break callers passing `ledger_path=` as a keyword.
+        keyword_path = str(tmp_path / "keyword.ledger")
+        install_ledger.start_install(ledger_path=keyword_path, clock=clock)
+        # The lock path is the ledger path + ".lock"; if _serialized_mutation
+        # resolved the wrong branch, the lock would sit elsewhere and the file
+        # would never appear at this exact location.
+        assert os.path.exists(keyword_path + ".lock")
+        assert install_ledger.check_state(keyword_path)["state"] == "in_progress"
 
 
 # ---------------------------------------------------------------------------
@@ -152,9 +319,39 @@ class TestStepTracking:
         with pytest.raises(ValueError, match="unknown step"):
             install_ledger.step_done("nonexistent", ledger_path, clock=clock)
 
+    def test_step_begin_without_explicit_path_uses_default_path(self, monkeypatch, tmp_path):
+        path = str(tmp_path / "ledger")
+        fixed = datetime(2026, 8, 5, 12, tzinfo=timezone.utc)
+        monkeypatch.setattr(install_ledger, "_default_ledger_path", lambda: path)
+        monkeypatch.setattr(install_ledger, "_default_clock", lambda: fixed)
+        install_ledger.start_install(path, clock=lambda: fixed)
+        result = install_ledger.step_begin("step-0-probe")
+        assert result["current_step"] == "step-0-probe"
+
+    def test_step_begin_default_clock_branch(self, monkeypatch, tmp_path):
+        path = str(tmp_path / "ledger")
+        fixed = datetime(2026, 8, 5, 12, tzinfo=timezone.utc)
+        monkeypatch.setattr(install_ledger, "_default_ledger_path", lambda: path)
+        monkeypatch.setattr(install_ledger, "_default_clock", lambda: fixed)
+        install_ledger.start_install(path, clock=lambda: fixed)
+        install_ledger.step_begin("step-0-probe")
+        assert install_ledger.read_ledger(path)["steps"]["step-0-probe"]["started_at"] == fixed.isoformat()
+
     def test_step_begin_without_start_raises(self, ledger_path, clock):
         with pytest.raises(RuntimeError, match="no install ledger"):
             install_ledger.step_begin("step-0-probe", ledger_path, clock=clock)
+
+    def test_step_done_uses_default_path_and_clock(self, monkeypatch, tmp_path):
+        path = str(tmp_path / "ledger")
+        fixed = datetime(2026, 8, 5, 12, tzinfo=timezone.utc)
+        monkeypatch.setattr(install_ledger, "_default_ledger_path", lambda: path)
+        monkeypatch.setattr(install_ledger, "_default_clock", lambda: fixed)
+        install_ledger.start_install(path, clock=lambda: fixed)
+        result = install_ledger.step_done("step-0-probe")
+        assert result["completed_steps"] == ["step-0-probe"]
+        # Pin that the patched clock actually drove the timestamp — removing
+        # the patch would change completed_at to "now" instead of fixed.
+        assert install_ledger.read_ledger(path)["steps"]["step-0-probe"]["completed_at"] == fixed.isoformat()
 
     def test_step_done_without_start_raises(self, ledger_path, clock):
         with pytest.raises(RuntimeError, match="no install ledger"):
@@ -269,6 +466,11 @@ class TestResumePath:
 
 
 class TestRestartPath:
+    def test_completed_steps_uses_default_path(self, monkeypatch, tmp_path):
+        path = str(tmp_path / "ledger")
+        monkeypatch.setattr(install_ledger, "_default_ledger_path", lambda: path)
+        assert install_ledger.completed_steps() == []
+
     def test_restart_deletes_ledger(self, ledger_path, clock):
         install_ledger.start_install(ledger_path, clock=clock)
         install_ledger.step_done("step-0-probe", ledger_path, clock=clock)
@@ -285,6 +487,14 @@ class TestRestartPath:
         # Fresh start after restart
         install_ledger.start_install(ledger_path, clock=clock)
         assert install_ledger.completed_steps(ledger_path) == []
+
+    def test_reset_uses_default_path(self, monkeypatch, tmp_path):
+        path = str(tmp_path / "ledger")
+        monkeypatch.setattr(install_ledger, "_default_ledger_path", lambda: path)
+        with open(path, "w") as fh:
+            fh.write("{}")
+        install_ledger.reset_install()
+        assert not os.path.exists(path)
 
     def test_restart_then_complete(self, ledger_path, clock):
         # First run: partial
@@ -328,6 +538,18 @@ class TestCancelPath:
         state = install_ledger.check_state(ledger_path)
         assert state["state"] == "cancelled"
 
+    def test_cancel_uses_default_path_and_clock(self, monkeypatch, tmp_path):
+        path = str(tmp_path / "ledger")
+        fixed = datetime(2026, 8, 5, 12, tzinfo=timezone.utc)
+        monkeypatch.setattr(install_ledger, "_default_ledger_path", lambda: path)
+        monkeypatch.setattr(install_ledger, "_default_clock", lambda: fixed)
+        install_ledger.start_install(path, clock=lambda: fixed)
+        result = install_ledger.cancel_install()
+        assert result["state"] == "cancelled"
+        # Pin that the patched clock drove the cancelled timestamp — without
+        # this, removing the monkeypatch.setattr above would still pass.
+        assert install_ledger.read_ledger(path)["cancelled_at"] == fixed.isoformat()
+
     def test_cancel_requires_ledger(self, ledger_path, clock):
         with pytest.raises(RuntimeError, match="no install ledger"):
             install_ledger.cancel_install(ledger_path, clock=clock)
@@ -357,6 +579,20 @@ class TestCompleteInstall:
         second = install_ledger.finish_install(ledger_path, clock=clock)
         assert second["completed_at"] == first["completed_at"]
 
+    def test_finish_uses_default_path_and_clock(self, monkeypatch, tmp_path):
+        path = str(tmp_path / "ledger")
+        fixed = datetime(2026, 8, 5, 12, tzinfo=timezone.utc)
+        monkeypatch.setattr(install_ledger, "_default_ledger_path", lambda: path)
+        monkeypatch.setattr(install_ledger, "_default_clock", lambda: fixed)
+        install_ledger.start_install(path, clock=lambda: fixed)
+        for sid in install_ledger.INSTALL_STEPS:
+            install_ledger.step_done(sid, path, clock=lambda: fixed)
+        result = install_ledger.finish_install()
+        assert result["state"] == "complete"
+        # Pin that the patched clock drove the completed timestamp — without
+        # this, removing the monkeypatch.setattr above would still pass.
+        assert result["completed_at"] == fixed.isoformat()
+
     def test_check_on_complete_returns_complete(self, ledger_path, clock):
         install_ledger.start_install(ledger_path, clock=clock)
         for sid in install_ledger.INSTALL_STEPS:
@@ -384,6 +620,24 @@ class TestCompleteInstall:
 
 
 class TestAtomicWrite:
+    def test_atomic_write_cleanup_failure_is_ignored(self, ledger_path, monkeypatch):
+        os.makedirs(os.path.dirname(ledger_path), exist_ok=True)
+        real_unlink = os.unlink
+
+        def failing_replace(src, dst):
+            raise OSError("replace failed")
+
+        def failing_unlink(path):
+            if path != ledger_path:
+                raise OSError("cleanup failed")
+            return real_unlink(path)
+
+        monkeypatch.setattr(os, "replace", failing_replace)
+        monkeypatch.setattr(os, "unlink", failing_unlink)
+        with pytest.raises(OSError, match="replace failed"):
+            install_ledger._atomic_write(ledger_path, "content")
+        assert not os.path.exists(ledger_path)
+
     def test_atomic_write_leaves_old_content_on_crash(self, ledger_path, clock, monkeypatch):
         install_ledger.start_install(ledger_path, clock=clock)
         orig = install_ledger.read_ledger(ledger_path)
@@ -442,6 +696,13 @@ class TestAtomicWrite:
 
 
 class TestCLI:
+    def test_cli_default_ledger_path(self, monkeypatch, tmp_path, capsys):
+        monkeypatch.delenv("VOICE_LOOP_INSTALL_LEDGER", raising=False)
+        monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+        rc = install_ledger.main(["install_ledger.py", "check"])
+        assert rc == 0
+        assert json.loads(capsys.readouterr().out) == {"state": "none"}
+
     def test_check_none_exit_0(self, ledger_path, monkeypatch):
         monkeypatch.setenv("VOICE_LOOP_INSTALL_LEDGER", ledger_path)
         rc = install_ledger.main(["install_ledger.py", "check"])
@@ -532,6 +793,36 @@ class TestCLI:
     def test_no_args_exit_2(self):
         rc = install_ledger.main(["install_ledger.py"])
         assert rc == 2
+
+    def test_step_begin_cli_success(self, ledger_path, monkeypatch, capsys):
+        monkeypatch.setenv("VOICE_LOOP_INSTALL_LEDGER", ledger_path)
+        install_ledger.main(["install_ledger.py", "start"])
+        capsys.readouterr()
+        rc = install_ledger.main(["install_ledger.py", "step-begin", "step-0-probe"])
+        assert rc == 0
+        assert json.loads(capsys.readouterr().out)["current_step"] == "step-0-probe"
+
+    def test_finish_cli_incomplete_exits_2(self, ledger_path, monkeypatch, capsys):
+        monkeypatch.setenv("VOICE_LOOP_INSTALL_LEDGER", ledger_path)
+        install_ledger.main(["install_ledger.py", "start"])
+        capsys.readouterr()
+        rc = install_ledger.main(["install_ledger.py", "finish"])
+        assert rc == 2
+        assert json.loads(capsys.readouterr().out)["success"] is False
+
+    def test_cancel_cli_success(self, ledger_path, monkeypatch, capsys):
+        monkeypatch.setenv("VOICE_LOOP_INSTALL_LEDGER", ledger_path)
+        install_ledger.main(["install_ledger.py", "start"])
+        capsys.readouterr()
+        rc = install_ledger.main(["install_ledger.py", "cancel"])
+        assert rc == 0
+        assert json.loads(capsys.readouterr().out)["state"] == "cancelled"
+
+    def test_main_module_execution_exits(self, monkeypatch, capsys):
+        monkeypatch.setattr(sys, "argv", ["install_ledger.py"])
+        with pytest.raises(SystemExit, match="2"):
+            runpy.run_module("install_ledger", run_name="__main__")
+        assert "usage:" in capsys.readouterr().err
 
 
 # ---------------------------------------------------------------------------
@@ -640,6 +931,52 @@ class TestAcceptanceInterruptedThenRestart:
 
 
 class TestRobustness:
+    def test_unreadable_ledger_reports_os_error(self, ledger_path, monkeypatch):
+        real_open = builtins.open
+
+        def blocked(path, *args, **kwargs):
+            if path == ledger_path:
+                raise PermissionError("denied")
+            return real_open(path, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "open", blocked)
+        result = install_ledger.read_ledger(ledger_path)
+        assert result.status == "unreadable"
+        assert result.detail.startswith("PermissionError:")
+
+    def test_non_object_json_is_malformed(self, ledger_path):
+        os.makedirs(os.path.dirname(ledger_path), exist_ok=True)
+        with open(ledger_path, "w") as fh:
+            json.dump([], fh)
+        result = install_ledger.read_ledger(ledger_path)
+        assert result.status == "malformed"
+        assert result.detail == "ledger must be a JSON object"
+
+    def test_check_state_preserves_ledger_without_optional_timestamps(self, ledger_path):
+        os.makedirs(os.path.dirname(ledger_path), exist_ok=True)
+        with open(ledger_path, "w") as fh:
+            json.dump({"state": "complete", "steps": {}}, fh)
+        assert install_ledger.check_state(ledger_path) == {
+            "state": "complete",
+            "completed_steps": [],
+        }
+
+    def test_invalid_state_is_malformed(self, ledger_path):
+        os.makedirs(os.path.dirname(ledger_path), exist_ok=True)
+        with open(ledger_path, "w") as fh:
+            json.dump({"state": "broken", "steps": {}}, fh)
+        result = install_ledger.read_ledger(ledger_path)
+        assert result.status == "malformed"
+        assert "invalid ledger state" in result.detail
+
+    def test_steps_with_non_object_entry_are_malformed(self, ledger_path):
+        os.makedirs(os.path.dirname(ledger_path), exist_ok=True)
+        with open(ledger_path, "w") as fh:
+            json.dump({"state": "none", "steps": {"step-0-probe": []}}, fh)
+        result = install_ledger.read_ledger(ledger_path)
+        assert result.status == "malformed"
+        assert result.detail == "ledger steps must be an object of objects"
+
     def test_corrupt_ledger_treated_as_none(self, ledger_path):
         ledger_path.encode()  # ensure it's a string
         os.makedirs(os.path.dirname(ledger_path), exist_ok=True)
@@ -755,6 +1092,13 @@ class TestStartRefusesDamagedLedger:
         with open(ledger_path, "rb") as fh:
             assert fh.read() == payload  # the evidence survived, byte for byte
 
+    def test_require_ledger_refuses_damaged_ledger(self, ledger_path):
+        os.makedirs(os.path.dirname(ledger_path), exist_ok=True)
+        with open(ledger_path, "w") as fh:
+            fh.write("{broken")
+        with pytest.raises(RuntimeError, match="is malformed"):
+            install_ledger._require_ledger(ledger_path)
+
     def test_start_refuses_unreadable_ledger(self, ledger_path):
         # A directory where the ledger should be forces the unreadable read status.
         # Mutation gap: without the refusal the call raises a bare OSError from
@@ -773,6 +1117,29 @@ class TestStartRefusesDamagedLedger:
         install_ledger.reset_install(ledger_path)
         result = install_ledger.start_install(ledger_path, clock=clock)
         assert result["state"] == "in_progress"
+
+    def test_start_auto_restarts_cancelled_ledger(self, ledger_path, clock):
+        install_ledger.start_install(ledger_path, clock=clock)
+        install_ledger.cancel_install(ledger_path, clock=clock)
+        clock.advance(10)
+        result = install_ledger.start_install(ledger_path, clock=clock)
+        assert result["state"] == "in_progress"
+        assert result["started_at"] == "2026-08-05T12:00:10+00:00"
+
+    def test_start_uses_default_path_and_clock_when_not_injected(self, monkeypatch, tmp_path):
+        fixed = datetime(2026, 8, 5, 12, tzinfo=timezone.utc)
+        path = str(tmp_path / "ledger")
+        monkeypatch.setattr(install_ledger, "_default_ledger_path", lambda: path)
+        monkeypatch.setattr(install_ledger, "_default_clock", lambda: fixed)
+        result = install_ledger.start_install()
+        assert result["started_at"] == fixed.isoformat()
+
+    def test_write_ledger_uses_default_clock(self, ledger_path, monkeypatch):
+        fixed = datetime(2026, 8, 5, 12, tzinfo=timezone.utc)
+        monkeypatch.setattr(install_ledger, "_default_clock", lambda: fixed)
+        os.makedirs(os.path.dirname(ledger_path), exist_ok=True)
+        install_ledger.write_ledger(ledger_path, {"state": "none", "steps": {}})
+        assert install_ledger.read_ledger(ledger_path)["updated_at"] == fixed.isoformat()
 
     def test_cli_start_exits_2_with_error_shape(self, ledger_path, monkeypatch, capsys):
         # Composition: the refusal reaches the operator through the module's existing
