@@ -96,8 +96,19 @@ class TestPlatformAndDefaults:
 
     def test_default_path_falls_back_to_home(self, monkeypatch):
         monkeypatch.delenv("XDG_STATE_HOME", raising=False)
-        monkeypatch.setattr(install_ledger.os.path, "expanduser", lambda path: "/home/tester/state")
-        assert install_ledger._default_ledger_path() == "/home/tester/state/voice-loop/install.ledger"
+        # The expanduser stub is recorded so the test pins both the call AND the
+        # path the code under test asked expanduser to expand — otherwise a
+        # regression changing ~/.local/state to ~/.config would still pass.
+        calls = []
+
+        def record(path):
+            calls.append(path)
+            return "/home/tester/state"
+
+        monkeypatch.setattr(install_ledger.os.path, "expanduser", record)
+        expected = os.path.join("/home/tester/state", "voice-loop", "install.ledger")
+        assert install_ledger._default_ledger_path() == expected
+        assert calls == ["~/.local/state"]
 
     def test_optional_platform_imports_are_absent(self, monkeypatch):
         source = os.path.join(_scripts_dir, "install_ledger.py")
@@ -165,23 +176,6 @@ class TestPlatformAndDefaults:
             pass
         assert [mode for _, mode in FakeFcntl.calls] == [FakeFcntl.LOCK_EX, FakeFcntl.LOCK_UN]
 
-    def test_windows_lock_unlock_branch(self, monkeypatch, tmp_path):
-        class FakeMsvcrt:
-            LK_LOCK = 1
-            LK_UNLCK = 2
-            calls = []
-
-            @classmethod
-            def locking(cls, fd, mode, length):
-                cls.calls.append((fd, mode, length))
-
-        monkeypatch.setattr(install_ledger, "fcntl", None)
-        monkeypatch.setattr(install_ledger, "msvcrt", FakeMsvcrt)
-        path = str(tmp_path / "ledger")
-        with install_ledger._ledger_lock(path):
-            pass
-        assert [mode for _, mode, _ in FakeMsvcrt.calls] == [FakeMsvcrt.LK_LOCK]
-
     def test_lock_without_platform_locking(self, monkeypatch, tmp_path):
         monkeypatch.setattr(install_ledger, "fcntl", None)
         monkeypatch.setattr(install_ledger, "msvcrt", None)
@@ -195,6 +189,23 @@ class TestPlatformAndDefaults:
         os.symlink(target, ledger_path)
         with pytest.raises(OSError, match="symlink"):
             install_ledger._atomic_write(ledger_path, "new")
+
+    def test_lock_rejects_symlinked_lock_path(self, monkeypatch, tmp_path):
+        # Sibling of test_atomic_write_rejects_symlink: the lock path is opened
+        # with O_NOFOLLOW so an attacker can't redirect the lock to a chosen
+        # file. A regression that drops the flag would let _ledger_lock follow
+        # the symlink and create-or-open the target as a lockfile — the test
+        # catches that by failing the open with OSError instead.
+        target = tmp_path / "attacker_target"
+        target.write_text("held by attacker")
+        ledger = tmp_path / "ledger"
+        lock = tmp_path / "ledger.lock"
+        os.symlink(target, lock)
+        monkeypatch.setattr(install_ledger, "fcntl", None)
+        monkeypatch.setattr(install_ledger, "msvcrt", None)
+        with pytest.raises(OSError):
+            with install_ledger._ledger_lock(str(ledger)):
+                pass
 
 
 class TestStartInstall:
@@ -218,6 +229,19 @@ class TestStartInstall:
         assert raw is not None
         for sid in install_ledger.INSTALL_STEPS:
             assert raw["steps"][sid]["status"] == "pending"
+
+    def test_start_uses_keyword_ledger_path_for_lock(self, tmp_path, clock):
+        # _serialized_mutation resolves the path from kwargs.get('ledger_path')
+        # when no positional arg is supplied — a regression that only handled
+        # the positional branch would still pass every other start_install test
+        # but break callers passing `ledger_path=` as a keyword.
+        keyword_path = str(tmp_path / "keyword.ledger")
+        install_ledger.start_install(ledger_path=keyword_path, clock=clock)
+        # The lock path is the ledger path + ".lock"; if _serialized_mutation
+        # resolved the wrong branch, the lock would sit elsewhere and the file
+        # would never appear at this exact location.
+        assert os.path.exists(keyword_path + ".lock")
+        assert install_ledger.check_state(keyword_path)["state"] == "in_progress"
 
 
 # ---------------------------------------------------------------------------
@@ -297,6 +321,9 @@ class TestStepTracking:
         install_ledger.start_install(path, clock=lambda: fixed)
         result = install_ledger.step_done("step-0-probe")
         assert result["completed_steps"] == ["step-0-probe"]
+        # Pin that the patched clock actually drove the timestamp — removing
+        # the patch would change completed_at to "now" instead of fixed.
+        assert install_ledger.read_ledger(path)["steps"]["step-0-probe"]["completed_at"] == fixed.isoformat()
 
     def test_step_done_without_start_raises(self, ledger_path, clock):
         with pytest.raises(RuntimeError, match="no install ledger"):
@@ -491,6 +518,9 @@ class TestCancelPath:
         install_ledger.start_install(path, clock=lambda: fixed)
         result = install_ledger.cancel_install()
         assert result["state"] == "cancelled"
+        # Pin that the patched clock drove the cancelled timestamp — without
+        # this, removing the monkeypatch.setattr above would still pass.
+        assert install_ledger.read_ledger(path)["cancelled_at"] == fixed.isoformat()
 
     def test_cancel_requires_ledger(self, ledger_path, clock):
         with pytest.raises(RuntimeError, match="no install ledger"):
@@ -531,6 +561,9 @@ class TestCompleteInstall:
             install_ledger.step_done(sid, path, clock=lambda: fixed)
         result = install_ledger.finish_install()
         assert result["state"] == "complete"
+        # Pin that the patched clock drove the completed timestamp — without
+        # this, removing the monkeypatch.setattr above would still pass.
+        assert result["completed_at"] == fixed.isoformat()
 
     def test_check_on_complete_returns_complete(self, ledger_path, clock):
         install_ledger.start_install(ledger_path, clock=clock)
