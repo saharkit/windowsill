@@ -207,6 +207,34 @@ class TestPlatformAndDefaults:
             with install_ledger._ledger_lock(str(ledger)):
                 pass
 
+    def test_lock_symlink_pre_check_fires_before_open(self, monkeypatch, tmp_path):
+        # The islink pre-check is the cross-platform defense — it rejects a
+        # symlinked lock_path BEFORE os.open runs.  O_NOFOLLOW is the POSIX
+        # hardening layered on top; on Windows it does not exist, so without
+        # the pre-check the open FOLLOWS the symlink and redirects the lock
+        # onto an attacker-chosen file.  On POSIX O_NOFOLLOW would mask the
+        # absence of the pre-check by raising on its own, so this test stubs
+        # os.open to assert it is NOT called — if the pre-check is dropped,
+        # the stub is reached and the assertions fail.
+        target = tmp_path / "attacker_target"
+        target.write_text("held by attacker")
+        lock = tmp_path / "ledger.lock"
+        os.symlink(target, lock)
+        monkeypatch.setattr(install_ledger, "fcntl", None)
+        monkeypatch.setattr(install_ledger, "msvcrt", None)
+        opened = []
+        monkeypatch.setattr(
+            os,
+            "open",
+            lambda path, flags, *args, **kwargs: opened.append((path, flags)) or -1,
+        )
+        with pytest.raises(OSError, match="symlink"):
+            with install_ledger._ledger_lock(str(tmp_path / "ledger")):
+                pass
+        assert opened == [], (
+            f"os.open must not run for a symlinked lock_path; saw calls={opened!r}"
+        )
+
 
 class TestStartInstall:
     def test_start_creates_ledger(self, ledger_path, clock):
