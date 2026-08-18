@@ -922,8 +922,9 @@ def test_the_mailto_command_sends_to_the_default_address(monkeypatch, tmp_path, 
     bundle = tmp_path / "b.md"
     bundle.write_text("## bundle\n")
     assert report_bug.main(["mailto", "--title", "t", "--bundle", str(bundle)]) == 0
-    out = capsys.readouterr().out
-    assert "mailto:reports@saharkit.com" in urllib.parse.unquote(out)
+    out = urllib.parse.unquote(capsys.readouterr().out)
+    parsed = urllib.parse.urlsplit(out.strip())
+    assert (parsed.scheme, parsed.path) == ("mailto", "reports@saharkit.com")
 
 
 def test_the_gh_command_does_not_send_when_gh_is_not_ready(monkeypatch, capsys):
@@ -1273,7 +1274,8 @@ def test_url_command_prints_a_prefilled_url_for_a_readable_bundle(tmp_path, caps
     path.write_text("bundle", encoding="utf-8")
 
     assert report_bug.main(["url", "--title", "title", "--bundle", str(path)]) == 0
-    assert "https://github.com/" in capsys.readouterr().out
+    parsed = urllib.parse.urlsplit(capsys.readouterr().out.strip())
+    assert (parsed.scheme, parsed.netloc, parsed.path) == ("https", "github.com", "/saharkit/windowsill/issues/new")
 
 
 def test_mailto_command_refuses_an_empty_mailbox(monkeypatch, tmp_path, capsys):
