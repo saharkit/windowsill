@@ -644,3 +644,125 @@ class TestTls:
             wsclient.connect("wss://127.0.0.1:1/v1/listen", {}, connector=connector, timeout=1.0)
         assert made, "a wss URL did not reach tls_context()"
         assert made[0].minimum_version >= ssl.TLSVersion.TLSv1_2  # and it is the floored one
+
+
+class TestFailureWalls:
+    """Small failure-path seams that must not turn an unreadable peer into a silent client."""
+
+    def test_send_error_marks_the_connection_closed(self):
+        """A send failure must be typed and close the connection for later cleanup."""
+        class BrokenSocket:
+            def sendall(self, payload):
+                raise OSError("send failed")
+
+        ws = wsclient.WebSocket(BrokenSocket())
+        with pytest.raises(wsclient.WebSocketError, match="send failed"):
+            ws.send_binary(b"audio")
+        assert ws.closed is True
+
+    def test_poll_returns_frames_already_buffered_before_reading(self):
+        """A buffered frame must not make a non-blocking poll wait on the socket."""
+        ws = wsclient.WebSocket(None, server_frame(wsclient.OP_TEXT, b"ready"))
+        assert ws.poll(0.0) == [(wsclient.OP_TEXT, b"ready")]
+
+    def test_a_closed_connection_does_not_attempt_a_read(self):
+        """Once closed, polling is a quiet no-op rather than a second network operation."""
+        class MustNotRead:
+            def settimeout(self, timeout):
+                raise AssertionError("a closed client must not touch its socket")
+
+            def recv(self, size):
+                raise AssertionError("a closed client must not touch its socket")
+
+        ws = wsclient.WebSocket(MustNotRead(), leftover=b"")
+        ws.closed = True
+        assert ws.poll(0.0) == []
+
+    def test_read_oserror_is_typed_and_closes_the_connection(self):
+        """A socket read error is a client failure, not a timeout-shaped silence."""
+        class BrokenRead:
+            def settimeout(self, timeout):
+                pass
+
+            def recv(self, size):
+                raise OSError("read failed")
+
+        ws = wsclient.WebSocket(BrokenRead())
+        with pytest.raises(wsclient.WebSocketError, match="read failed"):
+            ws._fill(0.0)
+        assert ws.closed is True
+
+    def test_a_partial_127_bit_length_header_waits_for_the_rest(self):
+        """The client must not parse a declared 64-bit length before all ten bytes arrive."""
+        ws = wsclient.WebSocket(None, bytes([0x82, 127, 0, 0, 0, 0, 0, 0, 0]))
+        assert ws._drain_buffer() == []
+        assert ws._buf == bytes([0x82, 127, 0, 0, 0, 0, 0, 0, 0])
+
+    def test_close_swallows_send_and_socket_close_errors(self):
+        """Cleanup is best effort even when both the close frame and socket close fail."""
+        class BrokenClose:
+            def sendall(self, payload):
+                raise OSError("close send failed")
+
+            def close(self):
+                raise OSError("socket close failed")
+
+        ws = wsclient.WebSocket(BrokenClose())
+        ws.close()
+        assert ws.closed is True
+
+    def test_handshake_read_oserror_is_one_websocket_error(self):
+        """A failure while reading response headers must retain the websocket error type."""
+        class BrokenRead:
+            def settimeout(self, timeout):
+                pass
+
+            def sendall(self, payload):
+                pass
+
+            def recv(self, size):
+                raise OSError("headers failed")
+
+            def close(self):
+                pass
+
+        with pytest.raises(wsclient.WebSocketError, match="handshake failed"):
+            wsclient.connect("ws://api.example/v1/listen", {}, connector=lambda *args: BrokenRead())
+
+    def test_handshake_peer_closing_before_headers_is_not_accepted(self):
+        """An empty handshake response is not a valid upgrade, even though read returned."""
+        class EmptyRead:
+            def settimeout(self, timeout):
+                pass
+
+            def sendall(self, payload):
+                pass
+
+            def recv(self, size):
+                return b""
+
+            def close(self):
+                pass
+
+        with pytest.raises(wsclient.WebSocketError, match="during the handshake"):
+            wsclient.connect("ws://api.example/v1/listen", {}, connector=lambda *args: EmptyRead())
+
+    def test_handshake_malformed_line_without_colon_is_ignored(self):
+        """A header line that cannot be split is not evidence of a second header."""
+        key = "key"
+        accept = wsclient._accept_token(key)
+        head = (
+            b"HTTP/1.1 101 Switching Protocols\r\n"
+            b"not-a-header\r\n"
+            b"Upgrade: websocket\r\n"
+            b"Sec-WebSocket-Accept: " + accept.encode("ascii") + b"\r\n\r\n"
+        )
+        wsclient._check_handshake(head, key)
+
+    def test_quietly_close_swallows_socket_errors(self):
+        """A socket that cannot be closed must not mask the original protocol error."""
+        class BrokenClose:
+            def close(self):
+                raise OSError("close failed")
+
+        wsclient._quietly_close(BrokenClose())

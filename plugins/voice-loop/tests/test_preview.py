@@ -20,10 +20,12 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import runpy
 import sys
 import types
 from pathlib import Path
 
+import pytest
 
 _PREVIEW_PATH = Path(__file__).resolve().parents[1] / "scripts" / "preview.py"
 _preview_spec = importlib.util.spec_from_file_location("_preview_under_test", _PREVIEW_PATH)
@@ -355,3 +357,37 @@ def test_window_is_configured_topmost_and_almost_opaque(monkeypatch) -> None:
     assert root.bg == "#1e1e1e"
     # mainloop was reached — the event loop entered, however briefly in the no-state-file path.
     assert root.mainloop_called is True
+
+
+def test_alpha_failure_is_best_effort(monkeypatch, tmp_path) -> None:
+    """A window manager that rejects alpha transparency must not take the overlay down.
+
+    L1 gap: this is the documented best-effort seam; losing the optional translucency cannot be
+    allowed to prevent the preview from polling its state file.
+    """
+    fake = _install_fake_tkinter(monkeypatch)
+    state = tmp_path / "preview.json"
+    state.write_text("{}", encoding="utf-8")
+    root = _FakeRoot()
+    original_attributes = root.attributes
+
+    def attributes(*args, **kwargs):
+        if args and args[0] == "-alpha":
+            root.attributes_calls.append(args)
+            raise fake.TclError("alpha unavailable")
+        return original_attributes(*args, **kwargs)
+
+    root.attributes = attributes
+    fake.Tk = lambda: root
+    assert preview.main(["preview.py", str(state)]) == 0
+    assert root.mainloop_called is True
+    assert ("-alpha", 0.88) in root.attributes_calls
+
+
+def test_script_entrypoint_returns_the_missing_path_error(monkeypatch):
+    """Executing the file itself still carries the required state-path refusal."""
+    monkeypatch.setattr(preview.sys, "argv", ["preview.py"])
+    with pytest.raises(SystemExit) as raised:
+        runpy.run_path(str(_PREVIEW_PATH), run_name="__main__")
+
+    assert raised.value.code == 1
