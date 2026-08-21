@@ -30,9 +30,43 @@ jobs:
       - name: plugin manifests are valid JSON
         run: |
           for f in .claude-plugin/marketplace.json plugins/voice-loop/.claude-plugin/plugin.json \
-                   plugins/voice-loop/hooks/hooks.json plugins/sill-core/.claude-plugin/plugin.json; do
+                   plugins/voice-loop/hooks/hooks.json plugins/sill-core/.claude-plugin/plugin.json \
+                   plugins/agent-handbook/.claude-plugin/plugin.json plugins/agent-handbook/hooks/hooks.json; do
             python3 -c "import json,sys; json.load(open(sys.argv[1]))" "$f" || exit 1
           done
+
+      - name: agent-handbook standing rules actually emit
+        run: |
+          set -euo pipefail
+          # This script runs on every session start of everyone who installs the plugin, and by
+          # design it fails silently — so without this step a renamed file or a broken strip ships
+          # as a no-op nobody notices.
+          out=$(node plugins/agent-handbook/hooks/emit-standing-rules.js)
+          [ -n "$out" ] || { echo "the emitter produced nothing"; exit 1; }
+          printf '%s' "$out" | grep -q "Stop when the stopping condition is met" \
+            || { echo "a standing rule went missing from the emitted text"; exit 1; }
+          printf '%s' "$out" | grep -q "From the agent-handbook plugin" \
+            || { echo "the provenance line went missing"; exit 1; }
+          # The front-matter strip fails OPEN: when it does not match, the YAML ships to every
+          # session. These four are the ordinary edits that break the match.
+          printf '%s' "$out" | grep -q "keep-coding-instructions" \
+            && { echo "front matter leaked into the emitted context"; exit 1; }
+          src=plugins/agent-handbook/output-styles/flagellant-rule.md
+          cp "$src" /tmp/style-orig.md
+          trap 'cp /tmp/style-orig.md "$src"' EXIT
+          for mangle in bom blank fence crlf; do
+            case "$mangle" in
+              bom)   printf '\xef\xbb\xbf' > "$src"; cat /tmp/style-orig.md >> "$src" ;;
+              blank) printf '\n\n' > "$src"; cat /tmp/style-orig.md >> "$src" ;;
+              fence) sed '0,/^---$/s//--- /' /tmp/style-orig.md > "$src" ;;
+              crlf)  sed 's/$/\r/' /tmp/style-orig.md > "$src" ;;
+            esac
+            got=$(node plugins/agent-handbook/hooks/emit-standing-rules.js)
+            printf '%s' "$got" | grep -q "keep-coding-instructions" \
+              && { echo "front matter leaked after a $mangle edit"; exit 1; }
+            [ -n "$got" ] || { echo "emitter went silent after a $mangle edit"; exit 1; }
+          done
+          echo "emitter holds against bom, leading blank, fence whitespace and crlf"
 
       - name: selftest.sh argument branches (no server needed)
         run: |

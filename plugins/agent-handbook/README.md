@@ -66,7 +66,8 @@ It carries three sentences' worth of standing instruction:
 
 **How it reaches you, and the one trade worth knowing.** By default it arrives through a
 `SessionStart` hook: the plugin prints the rule and Claude Code puts that text into the session's
-context, again after a compact or a resume. It takes nothing from you and it composes — every other
+context. The same event is documented for a resume and a compact, so it should return in a long
+session — that is the documented contract; what was measured here is the startup case. It takes nothing from you and it composes — every other
 plugin's standing rules arrive alongside it.
 
 The obvious alternative is an *output style*, which Claude Code appends to its own system prompt.
@@ -80,6 +81,14 @@ mode is the silent removal of somebody else's rule is the wrong default.
 So the style ships **unforced**. Select it deliberately if you want the rule in the system prompt
 and are content to give up whatever output style you had chosen; the hook already delivers the same
 text, from the same file, without asking for anything.
+
+**One precondition, and it is why the style is worth keeping rather than a duplicate.** The hook runs
+`node`, so it needs `node` on your PATH. That is the case if you installed Claude Code with npm; it
+is **not** guaranteed with the native installer, which bundles its own runtime. If `node` is missing
+the hook simply does not deliver, and — because a standing rule must never break a session start —
+it does so quietly. Confirm with `claude --debug hooks`, which prints `Hook SessionStart:startup
+(SessionStart) success:` followed by the rule text when it worked. The output style needs no runtime
+at all, so it is the path that still works when the hook cannot run.
 
 Two limits belong here rather than in your surprise. Neither path reaches separately spawned
 subagents — a fork of the main conversation inherits, a spawned agent does not. And a skill was
