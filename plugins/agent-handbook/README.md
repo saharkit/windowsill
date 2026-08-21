@@ -1,4 +1,4 @@
-# engineering-method
+# agent-handbook
 
 Instruments for **judging your own work** — architecture decisions, planning, the general rules that
 hold whatever you happen to be building. Not a framework, not a linter, not code that runs in your
@@ -54,7 +54,7 @@ walk mistaken for a certificate is worse than no walk.
 
 ```
 /plugin marketplace add saharkit/windowsill
-/plugin install engineering-method@windowsill
+/plugin install agent-handbook@windowsill
 ```
 
 Then invoke a skill by name — `/target-world-walk` — or simply describe the situation, since each

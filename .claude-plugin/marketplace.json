@@ -57,16 +57,17 @@
       "source": "./plugins/sill-core"
     },
     {
-      "name": "engineering-method",
-      "description": "Engineering method as invocable skills: instruments you use to judge your own work — architecture decisions, planning, the general rules that hold whatever you are building. Nothing here is tied to a language, a stack or a framework, and nothing installs a runtime, calls a network or needs hardware. Its instruments include `/target-world-walk`, which derives what a plan needs by replaying one concrete unit of work through the system you intend to have, instead of auditing the tickets you already wrote.",
+      "name": "agent-handbook",
+      "description": "A handbook you hand to your agent: teaching material for the general judgement calls — architecture decisions, planning, the rules that hold whatever is being built. Nothing here is tied to a language, a stack or a framework, and nothing installs a runtime, calls a network or needs hardware. Its subjects include `/target-world-walk`, which derives what a plan needs by replaying one concrete unit of work through the system you intend to have, instead of auditing the tickets you already wrote.",
       "version": "0.2.0",
       "author": {
         "name": "Sahar"
       },
-      "homepage": "https://github.com/saharkit/windowsill/tree/main/plugins/engineering-method",
+      "homepage": "https://github.com/saharkit/windowsill/tree/main/plugins/agent-handbook",
       "license": "MIT",
       "keywords": [
-        "engineering",
+        "agent",
+        "handbook",
         "method",
         "architecture",
         "planning",
@@ -74,11 +75,10 @@
         "completeness",
         "gap-analysis",
         "roadmap",
-        "prioritisation",
         "skill"
       ],
       "category": "productivity",
-      "source": "./plugins/engineering-method"
+      "source": "./plugins/agent-handbook"
     }
   ]
 }
