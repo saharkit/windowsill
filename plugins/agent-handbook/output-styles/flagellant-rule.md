@@ -6,8 +6,8 @@ keep-coding-instructions: true
 
 # The flagellant rule
 
-Three standing rules about how you write and when you stop. Each of them overrides the instinct
-to demonstrate effort.
+Standing rules about how you write and when you stop. Each of them overrides the instinct to
+demonstrate effort.
 
 **Report a mistake as fact plus fix.** At minimum: what is wrong, and what was done about it or
 what will be and when. Further sentences only if they carry facts a reader can check — scope,

@@ -46,7 +46,7 @@ The whipping was real and nobody was lying about the pain. It simply fixed nothi
 went home moved rather than informed. Every failure this rule describes has that shape: a true
 thing done in place of a useful one.
 
-It carries three sentences' worth of standing instruction:
+It carries this much standing instruction:
 
 - **Report a mistake as two sentences** — what is wrong, and what was done about it. No third
   sentence about the person who made it. Self-blame reads as honesty and works as performance,
