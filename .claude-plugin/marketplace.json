@@ -58,7 +58,7 @@
     },
     {
       "name": "engineering-method",
-      "description": "Engineering method as invocable skills: instruments you use to judge your own work — architecture decisions, planning, the general rules that hold whatever you are building. Nothing here is tied to a language, a stack or a framework, and nothing installs a runtime, calls a network or needs hardware. It carries `/target-world-walk`, which derives what a plan needs by replaying one concrete unit of work through the system you intend to have, instead of auditing the tickets you already wrote.",
+      "description": "Engineering method as invocable skills: instruments you use to judge your own work — architecture decisions, planning, the general rules that hold whatever you are building. Nothing here is tied to a language, a stack or a framework, and nothing installs a runtime, calls a network or needs hardware. Its instruments include `/target-world-walk`, which derives what a plan needs by replaying one concrete unit of work through the system you intend to have, instead of auditing the tickets you already wrote.",
       "version": "0.2.0",
       "author": {
         "name": "Sahar"
