@@ -55,6 +55,28 @@
       ],
       "category": "utility",
       "source": "./plugins/sill-core"
+    },
+    {
+      "name": "target-world-walk",
+      "description": "Derive what a plan needs by replaying one concrete unit of work through the system you intend to have, instead of auditing the tickets you already wrote. The forward companion to a backward carrier audit, which is blind by construction to anything the plan never named. Refuses a goal that points at a tracker item, classifies every need as covered, partial, missing or oral, and runs an ordering pass before anything is filed.",
+      "version": "0.1.0",
+      "author": {
+        "name": "Sahar"
+      },
+      "homepage": "https://github.com/saharkit/windowsill/tree/main/plugins/target-world-walk",
+      "license": "MIT",
+      "keywords": [
+        "planning",
+        "portfolio",
+        "completeness",
+        "backlog",
+        "gap-analysis",
+        "roadmap",
+        "prioritisation",
+        "skill"
+      ],
+      "category": "productivity",
+      "source": "./plugins/target-world-walk"
     }
   ]
 }
