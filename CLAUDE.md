@@ -11,10 +11,19 @@ saharkit/windowsill`). **The root belongs to the shelf; each plugin owns its own
 directory and nothing else at the top level.
 
 Root-level, and this is the whole list (every tracked entry): `README.md` (the catalog),
-`ACHIEVEMENTS.md` (the milestone ledger), `.claude-plugin/marketplace.json` (what `marketplace add`
-reads), `.github/` (shared CI), `plugins/` (one directory per plugin), `tales/` (story content, not
-a plugin — the told tales, the `canon/` core of universe-model laws and the entity registry, and
-`CONTRIBUTING.md` for tales), `LICENSE`, `.gitignore`, `.claude/`, this file.
+`ACHIEVEMENTS.md` (the milestone ledger), `PRIVACY.md` (what the plugins do and do not collect,
+checked against the code), `PUBLISHING.md`, `docs/` (**the public face** — the GitHub Pages site: the
+front page, its Russian twin, and one page per plugin written for a stranger),
+`.claude-plugin/marketplace.json` (what `marketplace add` reads), `.github/` (shared CI), `plugins/`
+(one directory per plugin), `tales/` (story content, not a plugin — the told tales, the `canon/` core
+of universe-model laws and the entity registry, and `CONTRIBUTING.md` for tales), `LICENSE`,
+`.gitignore`, `.gitattributes`, `.claude/`, this file.
+
+**This list being complete is load-bearing, not tidiness.** A review brief is assembled from it, so a
+root entry missing here is invisible to the lens reading it. That is not hypothetical: on #245 two
+lenses were briefed from this paragraph while it omitted `docs/`, and neither could see that the change
+left the Pages front pages saying something no longer true. Adding a root entry means adding it here in
+the same change.
 
 A plugin's **version lives in `plugins/<name>/.claude-plugin/plugin.json`** — that is the source.
 It is recorded in **three** places in all: that manifest, its mirror in
@@ -22,7 +31,11 @@ It is recorded in **three** places in all: that manifest, its mirror in
 three must agree, and **nothing in CI checks that they do** — a bump that misses one is caught by a
 reviewer or not at all. Do not add a fourth site (this file deliberately names no version number).
 
-On the shelf today: **`plugins/voice-loop`** — two-way voice for Claude Code.
+What is on the shelf is **not written here.** `.claude-plugin/marketplace.json` is the machine's
+answer and the root `README.md` catalog table is the reader's; both are updated by the change that
+adds or removes a plugin. A sentence in this file naming today's plugins would be a fourth place to
+keep in step — and it was one, and it was wrong from the day `sill-core` landed until this line
+replaced it.
 
 ## Stack, per plugin tree
 
