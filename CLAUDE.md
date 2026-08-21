@@ -11,10 +11,11 @@ saharkit/windowsill`). **The root belongs to the shelf; each plugin owns its own
 directory and nothing else at the top level.
 
 Root-level, and this is the whole list (every tracked entry): `README.md` (the catalog),
-`ACHIEVEMENTS.md` (the milestone ledger), `PRIVACY.md` (what the plugins do and do not collect,
-checked against the code), `PUBLISHING.md`, `docs/` (**the public face** — the GitHub Pages site: the
-front page, its Russian twin, and one page per plugin written for a stranger),
-`.claude-plugin/marketplace.json` (what `marketplace add` reads), `.github/` (shared CI), `plugins/`
+`ACHIEVEMENTS.md` (the milestone ledger), `PRIVACY.md` (what the plugins do and do not collect),
+`PUBLISHING.md` (where the shelf can be listed, and what each venue requires), `docs/` (**the public
+face** — the GitHub Pages site, served from this directory; what it contains at any moment is its own
+business and is not enumerated here), `.claude-plugin/` (holds `marketplace.json`, what
+`marketplace add` reads), `.github/` (shared CI), `plugins/`
 (one directory per plugin), `tales/` (story content, not a plugin — the told tales, the `canon/` core
 of universe-model laws and the entity registry, and `CONTRIBUTING.md` for tales), `LICENSE`,
 `.gitignore`, `.gitattributes`, `.claude/`, this file.
@@ -33,9 +34,9 @@ reviewer or not at all. Do not add a fourth site (this file deliberately names n
 
 What is on the shelf is **not written here.** `.claude-plugin/marketplace.json` is the machine's
 answer and the root `README.md` catalog table is the reader's; both are updated by the change that
-adds or removes a plugin. A sentence in this file naming today's plugins would be a fourth place to
-keep in step — and it was one, and it was wrong from the day `sill-core` landed until this line
-replaced it.
+adds or removes a plugin. A sentence in this file naming today's plugins would be a **third** place to
+keep in step, kept by hand, updated by nothing — and it was one, and it had been false for some time
+before this line replaced it.
 
 ## Stack, per plugin tree
 
