@@ -60,23 +60,32 @@ It carries three sentences' worth of standing instruction:
 
 | file | what it is |
 |---|---|
-| [`output-styles/flagellant-rule.md`](output-styles/flagellant-rule.md) | the rule itself, in the form that actually applies without being invoked |
+| [`hooks/hooks.json`](hooks/hooks.json) + [`hooks/emit-standing-rules.js`](hooks/emit-standing-rules.js) | how it reaches you by default — a `SessionStart` hook that puts the rule into context, and re-puts it there on compact and resume |
+| [`output-styles/flagellant-rule.md`](output-styles/flagellant-rule.md) | the rule's text, and an output style you may select if you want it in the system prompt instead |
 | [`flagellant-rule.md`](flagellant-rule.md) | why each part is there, the exception that keeps facts from being stripped as apology, and what the rule deliberately cannot do |
 
-**How it reaches you, and what that costs.** It ships as an *output style*, which Claude Code appends
-to its own system prompt, and it is marked to apply automatically whenever this plugin is enabled.
-That is the only documented mechanism that puts standing text in front of the model on every turn: a
-skill preloads its description and not its body, and its automatic activation is a per-turn judgement
-rather than a guarantee — fine for an instrument, wrong for a rule that must not be missed. Three
-consequences belong here rather than in your surprise:
+**How it reaches you, and the one trade worth knowing.** By default it arrives through a
+`SessionStart` hook: the plugin prints the rule and Claude Code puts that text into the session's
+context, again after a compact or a resume. It takes nothing from you and it composes — every other
+plugin's standing rules arrive alongside it.
 
-- it **overrides an output style you selected yourself**;
-- if several enabled plugins force a style, **the first one loaded wins** — they do not combine;
-- it reaches the main conversation and **not** separately spawned subagents.
+The obvious alternative is an *output style*, which Claude Code appends to its own system prompt.
+That is strictly the stronger position: a system prompt cannot be crowded out the way context can.
+It is not the default for one measured reason. **Forced output styles do not compose.** Install two
+plugins that both force one and only the first loaded takes effect — the second's rule is simply
+absent, with no warning at install time and none at run time. Both plugins report themselves
+healthy. For a handbook that promises more methods on the same terms, a mechanism whose failure
+mode is the silent removal of somebody else's rule is the wrong default.
 
-It is written to sit *on top of* Claude Code's normal engineering behaviour rather than replace it.
-If you would rather not give up your own output style, the same text pasted into your `CLAUDE.md`
-does the same job by hand, and composes with everything else.
+So the style ships **unforced**. Select it deliberately if you want the rule in the system prompt
+and are content to give up whatever output style you had chosen; the hook already delivers the same
+text, from the same file, without asking for anything.
+
+Two limits belong here rather than in your surprise. Neither path reaches separately spawned
+subagents — a fork of the main conversation inherits, a spawned agent does not. And a skill was
+considered and rejected: only a skill's *description* is preloaded, its body arrives on invocation,
+and automatic activation is a per-turn judgement rather than a guarantee. That is right for an
+instrument you reach for and wrong for a rule that must not be missed.
 
 ### Why the two are shipped together
 
