@@ -1,9 +1,12 @@
 # agent-handbook
 
-Instruments for **judging your own work** — architecture decisions, planning, the general rules that
+Material for **judging your own work** — architecture decisions, planning, the general rules that
 hold whatever you happen to be building. Not a framework, not a linter, not code that runs in your
-project: each one is a skill you invoke when you want a second way of looking at something you have
-already decided.
+project.
+
+It holds two kinds of thing, and the difference matters. An **instrument** is something you reach
+for at a moment, and it waits until you do. A **standing rule** is something you want in force at
+all times, so it is not invoked at all — it applies from the moment the plugin is enabled.
 
 Nothing here is tied to a language, a stack or a build system. Nothing installs a runtime, opens a
 network connection or needs hardware.
@@ -36,6 +39,53 @@ Each file is written to stand alone. Neither links to the other or to anything o
 is deliberate: the method travels, and a reader who receives one of them has everything that file
 claims to give. This README is the only place the two are named together.
 
+### The flagellant rule — a standing rule, not an instrument
+
+Named for the sixteenth-century penitents who walked town to town whipping themselves in public.
+The whipping was real and nobody was lying about the pain. It simply fixed nothing, and the crowd
+went home moved rather than informed. Every failure this rule describes has that shape: a true
+thing done in place of a useful one.
+
+It carries three sentences' worth of standing instruction:
+
+- **Report a mistake as two sentences** — what is wrong, and what was done about it. No third
+  sentence about the person who made it. Self-blame reads as honesty and works as performance,
+  because the apology buries the fact.
+- **Stop when the stopping condition is met.** *Be thorough* is unfalsifiable: nobody can ever
+  demonstrate having complied, so the only safe reading is *do more*, and re-reading a thing does
+  not change it. The whip is in the instructions, not in the character — which is the good news,
+  because instructions can be rewritten.
+- **Spend care where a mistake cannot be taken back.** Caution is a budget, not a virtue. Sorting
+  work by reversibility once, in writing, replaces every vague instruction to be careful.
+
+| file | what it is |
+|---|---|
+| [`output-styles/flagellant-rule.md`](output-styles/flagellant-rule.md) | the rule itself, in the form that actually applies without being invoked |
+| [`flagellant-rule.md`](flagellant-rule.md) | why each part is there, the exception that keeps facts from being stripped as apology, and what the rule deliberately cannot do |
+
+**How it reaches you, and what that costs.** It ships as an *output style*, which Claude Code appends
+to its own system prompt, and it is marked to apply automatically whenever this plugin is enabled.
+That is the only documented mechanism that puts standing text in front of the model on every turn: a
+skill preloads its description and not its body, and its automatic activation is a per-turn judgement
+rather than a guarantee — fine for an instrument, wrong for a rule that must not be missed. Three
+consequences belong here rather than in your surprise:
+
+- it **overrides an output style you selected yourself**;
+- if several enabled plugins force a style, **the first one loaded wins** — they do not combine;
+- it reaches the main conversation and **not** separately spawned subagents.
+
+It is written to sit *on top of* Claude Code's normal engineering behaviour rather than replace it.
+If you would rather not give up your own output style, the same text pasted into your `CLAUDE.md`
+does the same job by hand, and composes with everything else.
+
+### Why the two are shipped together
+
+The walk exists to find what is **missing**. If finding something missing means blame, nobody walks
+honestly — they bring a tidier plan instead, which is precisely the failure the walk was built to
+catch, arriving through the front door. And without a method that produces a real standard, *stop
+apologising* is only permission to do less. One supplies the standard; the other makes it safe to
+meet.
+
 **Reach for it** before committing to a batch of work; when one large item is fanned out into slices
 and you want to know whether the slices cover the path; or whenever someone asks whether the plan is
 sufficient — which is a question the plan itself cannot answer.
@@ -57,8 +107,9 @@ walk mistaken for a certificate is worse than no walk.
 /plugin install agent-handbook@windowsill
 ```
 
-Then invoke a skill by name — `/target-world-walk` — or simply describe the situation, since each
-skill's description covers the moments it is for.
+Then invoke the instrument by name — `/target-world-walk` — or simply describe the situation, since
+its description covers the moments it is for. The flagellant rule needs no invocation; it is in force
+from the moment the plugin is enabled.
 
 Nothing to configure, no runtime, no hardware, no network.
 
