@@ -58,8 +58,8 @@
     },
     {
       "name": "agent-handbook",
-      "description": "A handbook you hand to your agent: teaching material for the general judgement calls — architecture decisions, planning, the rules that hold whatever is being built. Nothing here is tied to a language, a stack or a framework, and nothing installs a runtime, calls a network or needs hardware. Its subjects include `/target-world-walk`, which derives what a plan needs by replaying one concrete unit of work through the system you intend to have, instead of auditing the tickets you already wrote.",
-      "version": "0.2.0",
+      "description": "A handbook you hand to your agent: material for the general judgement calls — architecture decisions, planning, the rules that hold whatever is being built. Nothing here is tied to a language, a stack or a framework, and nothing installs a runtime, calls a network or needs hardware. It holds two kinds of thing: an instrument you reach for at a moment — `/target-world-walk`, which derives what a plan needs by replaying one concrete unit of work through the system you intend to have — and a standing rule that is never invoked at all, the flagellant rule, which reports a mistake as fact plus fix rather than apology, stops when the stopping condition is met instead of re-checking finished work, and spends care where an error cannot be taken back. The standing rule ships as an output style that applies automatically and overrides a style you selected yourself.",
+      "version": "0.3.0",
       "author": {
         "name": "Sahar"
       },
@@ -75,7 +75,11 @@
         "completeness",
         "gap-analysis",
         "roadmap",
-        "skill"
+        "skill",
+        "output-style",
+        "stop-conditions",
+        "code-review",
+        "prompt-engineering"
       ],
       "category": "productivity",
       "source": "./plugins/agent-handbook"
