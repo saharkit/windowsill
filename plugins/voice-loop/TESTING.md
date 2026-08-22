@@ -54,11 +54,18 @@ What makes 100% honest rather than decorative:
 
 ### The hook scripts — shellcheck, a pytest for the pure parts, and a real invocation
 
-There is deliberately **no line-coverage number for the hook scripts** (and `speak.py` is *not*
-under the 100% gate above — that gate is scoped to `server/voice_server.py`). Line coverage is not
-a meaningful metric for glue that spends its life calling players, recorders, `wl-copy` and
+There is deliberately **no line-coverage number for the hook scripts** (`speak.py` and
+`speak.sh`); the 100% gate above is scoped to `server/voice_server.py`. Line coverage is not a
+meaningful metric for glue that spends its life calling players, recorders, `wl-copy` and
 `ydotool`: such code can be 100% "covered" by mocks and still fail on the only thing that matters —
-the real runtime. So the guarantee is layered differently:
+the real runtime. So the guarantee is layered differently. The `scripts/` ratchet
+(`coverage report --include='scripts/*' --fail-under=80`, ratcheting upward) is what
+actually gates the dictation-toggle (`scripts/dictate.py`) and the dictation-opinion modules;
+`speak.py`'s own clauses sit beside the 100% gate and run under the same `tests/test_speak.py`.
+On the Linux CI job, `scripts/dictate.py` is held at 100% by an **enumerated allow-list of
+exactly three `pragma: no cover` markers**, each on a Windows-`ctypes` body — `_pid_alive`,
+`_win_console_ctrl_c`, and `_win_pid_is_recorder` — and a `TestPragmaCount` test asserts the
+count cannot quietly grow. So the guarantee is layered differently:
 
 1. `bash -n` and **shellcheck** (`-S warning`) on every script, every commit; the speak logic
    itself is Python (stdlib-only `scripts/speak.py`, launched by a thin `speak.sh`);
