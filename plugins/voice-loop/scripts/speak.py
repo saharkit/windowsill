@@ -783,7 +783,7 @@ def acquire_lock(grace=()):
         # locking, and the handle must remain open for the whole read/claim/synthesis/playback
         # sequence just as the POSIX flock handle does.
         fh.seek(0, os.SEEK_END)  # pragma: windows-only - msvcrt byte-range seed; POSIX flock is reach-tested elsewhere
-        if fh.tell() == 0:
+        if fh.tell() == 0:  # pragma: windows-only - cascade covers the seed-byte branch on Linux where msvcrt is unreachable
             fh.write(b"\\0")
             fh.flush()
 
@@ -793,7 +793,7 @@ def acquire_lock(grace=()):
         try:
             if windows_lock:
                 fh.seek(0)  # pragma: windows-only - msvcrt byte-range acquire; POSIX flock is reach-tested elsewhere
-                msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+                msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)  # pragma: windows-only - the msvcrt locking call itself; the inner if is the only path that reaches it
             elif fcntl is not None:
                 fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
             else:
@@ -1139,9 +1139,9 @@ def _windows_process_is_live(pid: int) -> bool:
         kernel32.CloseHandle.argtypes = (ctypes.c_void_p,)  # pragma: windows-only - see WinDLL above
         kernel32.CloseHandle.restype = ctypes.c_int  # pragma: windows-only - see WinDLL above
         handle = kernel32.OpenProcess(0x00100000, False, pid)  # SYNCHRONIZE  # pragma: windows-only - see WinDLL above
-        if not handle:
+        if not handle:  # pragma: windows-only - cascade covers the access-denied arm on Linux
             return ctypes.get_last_error() == 5  # access denied still means the process exists  # pragma: windows-only - see WinDLL above
-        try:
+        try:  # pragma: windows-only - cascade covers the wait-and-close arm on Linux
             return kernel32.WaitForSingleObject(handle, 0) == 0x102  # WAIT_TIMEOUT  # pragma: windows-only - see WinDLL above
         finally:
             kernel32.CloseHandle(handle)  # pragma: windows-only - see WinDLL above

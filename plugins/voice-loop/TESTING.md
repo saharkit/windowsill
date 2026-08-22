@@ -54,11 +54,19 @@ What makes 100% honest rather than decorative:
 
 ### The hook scripts — shellcheck, a pytest for the pure parts, and a real invocation
 
-There is deliberately **no line-coverage number for the hook scripts** (and `speak.py` is *not*
-under the 100% gate above — that gate is scoped to `server/voice_server.py`). Line coverage is not
-a meaningful metric for glue that spends its life calling players, recorders, `wl-copy` and
-`ydotool`: such code can be 100% "covered" by mocks and still fail on the only thing that matters —
-the real runtime. So the guarantee is layered differently:
+There is deliberately **no line-coverage number for most of the hook scripts** (the rest of
+`scripts/` — `dictate.py`, `contour_poll.py`, `doctor.py`, `report_bug.py`, `install_ledger.py`,
+`preview.py`, `rvc_corpus.py`, `tls-probe.py`, `wsclient.py`, the `voice-loop-dictate` entry point
+— sit under the ratcheting `scripts/*` 80%-and-up gate in `selftest.yml`, not under the 100% one).
+`speak.py` itself is the deliberate exception (#156 B2): the play-back / no-play / give-up paths
+and the cloud-TTS error-document branch are pinned in a way mocks would not catch, and they earn
+the 100% gate that the server also carries; the Windows-only statements that are unreachable on
+Linux (the `msvcrt` byte-range lock and the `ctypes.WinDLL` process probe) are excluded by the
+registered `pragma: windows-only` marker in `.coveragerc` and pinned by a marker-count test so a
+silent grow/shrink of that allow-list cannot drift unnoticed behind a green 100%. Line coverage is
+not a meaningful metric for the rest of the glue that spends its life calling players, recorders,
+`wl-copy` and `ydotool`: such code can be 100% "covered" by mocks and still fail on the only thing
+that matters — the real runtime. So the guarantee is layered differently:
 
 1. `bash -n` and **shellcheck** (`-S warning`) on every script, every commit; the speak logic
    itself is Python (stdlib-only `scripts/speak.py`, launched by a thin `speak.sh`);

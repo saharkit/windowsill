@@ -12,7 +12,7 @@ _COVERAGERC = _ROOT / "plugins" / "voice-loop" / ".coveragerc"
 # a regression that REMOVES a marker fails the marker-presence assert first, but if the marker
 # is also removed from the .coveragerc registration, this test catches it as the registered-marker
 # assertion below.
-_WINDOWS_ONLY_MARKERS_IN_SPEAK_PY = 16
+_WINDOWS_ONLY_MARKERS_IN_SPEAK_PY = 20
 
 
 def test_cmd_launchers_are_declared_for_crlf_checkout():

@@ -81,9 +81,15 @@ queue's `merge_group` ref, and manual:
   display names, which is why the ruleset must not point at them).
 - **`coverage` job** — `cd plugins/voice-loop && pytest --cov=voice_server --cov-report=term-missing
   --cov-fail-under=100`, on Python **3.10, 3.11, 3.12 and 3.13**. `.coveragerc` sets `branch = True`,
-  so the 100% is **statements *and* branches**. It is **scoped to `server/voice_server.py`**: the hook
-  scripts are deliberately *not* under it (they are proven by real invocation instead — see
-  `plugins/voice-loop/TESTING.md`).
+  so the 100% is **statements *and* branches**. It is **scoped to `server/voice_server.py`** for the
+  pytest half; **`scripts/speak.py` is the one hook script that ALSO carries a 100% gate** — added
+  as a separate `coverage report --include='scripts/speak.py' --fail-under=100` step (B2 of #156)
+  on the same `.coverage` artifact pytest just wrote. Windows-only statements in `speak.py` that
+  the Linux matrix cannot reach (the `msvcrt` byte-range lock, the `ctypes.WinDLL` process probe)
+  are excluded by the registered `pragma: windows-only` marker in `.coveragerc`, and the marker
+  count is pinned by a test so the allow-list cannot silently grow or shrink. The remaining hook
+  scripts are deliberately *not* under a 100% gate — they are proven by real invocation instead
+  (see `plugins/voice-loop/TESTING.md`).
 - **`loopback` job** — ubuntu/Russian and macOS/English lanes. Starts the **real server** and then
   runs **real-invocation smokes**: the `selftest.sh` TTS→STT loopback at `--strict --threshold 0.7`;
   the Stop-hook contract (asserts `via=stream` and `chunks>1`, so a silent regression to the blob
