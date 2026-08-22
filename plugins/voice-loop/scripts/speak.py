@@ -203,7 +203,7 @@ try:
 except ImportError:    fcntl = None  # type: ignore[assignment]
 
 try:
-    import msvcrt
+    import msvcrt  # pragma: windows-only - msvcrt is the Windows MSVCRT; on Linux this is the ImportError arm
 except ImportError:    msvcrt = None  # type: ignore[assignment]
 
 
@@ -772,7 +772,7 @@ def acquire_lock(grace=()):
     (one blocked python per tool call), that no takeover can supersede and no echo guard can stop —
     it holds no entry in ``playing.pid`` while it waits. Losing costs it nothing, because it has
     claimed nothing and the next firing is one tool call away."""
-    windows_lock = msvcrt is not None and os.name == "nt"
+    windows_lock = msvcrt is not None and os.name == "nt"  # pragma: windows-only - whole guard; on Linux the POSIX fcntl branch is taken
     try:
         fh = open(_LOCK_PATH, "a+b" if windows_lock else "w", encoding=None if windows_lock else "utf-8")
     except OSError:
@@ -782,8 +782,8 @@ def acquire_lock(grace=()):
         # msvcrt.locking is the native advisory byte-range lock.  The byte must exist before
         # locking, and the handle must remain open for the whole read/claim/synthesis/playback
         # sequence just as the POSIX flock handle does.
-        fh.seek(0, os.SEEK_END)
-        if fh.tell() == 0:
+        fh.seek(0, os.SEEK_END)  # pragma: windows-only - msvcrt byte-range seed; POSIX flock is reach-tested elsewhere
+        if fh.tell() == 0:  # pragma: windows-only - cascade covers the seed-byte branch on Linux where msvcrt is unreachable
             fh.write(b"\\0")
             fh.flush()
 
@@ -792,8 +792,8 @@ def acquire_lock(grace=()):
             time.sleep(pause)
         try:
             if windows_lock:
-                fh.seek(0)
-                msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+                fh.seek(0)  # pragma: windows-only - msvcrt byte-range acquire; POSIX flock is reach-tested elsewhere
+                msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)  # pragma: windows-only - the msvcrt locking call itself; the inner if is the only path that reaches it
             elif fcntl is not None:
                 fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
             else:
@@ -811,7 +811,7 @@ def release_lock(lock) -> None:
     if lock is None:
         return
     try:
-        if msvcrt is not None and os.name == "nt" and not isinstance(lock, _NoLock):
+        if msvcrt is not None and os.name == "nt" and not isinstance(lock, _NoLock):  # pragma: windows-only - msvcrt byte-range release
             lock.seek(0)
             msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
         elif fcntl is not None and not isinstance(lock, _NoLock):
@@ -1131,20 +1131,20 @@ def _windows_process_is_live(pid: int) -> bool:
     import ctypes
 
     try:
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        kernel32.OpenProcess.argtypes = (ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32)
-        kernel32.OpenProcess.restype = ctypes.c_void_p
-        kernel32.WaitForSingleObject.argtypes = (ctypes.c_void_p, ctypes.c_uint32)
-        kernel32.WaitForSingleObject.restype = ctypes.c_uint32
-        kernel32.CloseHandle.argtypes = (ctypes.c_void_p,)
-        kernel32.CloseHandle.restype = ctypes.c_int
-        handle = kernel32.OpenProcess(0x00100000, False, pid)  # SYNCHRONIZE
-        if not handle:
-            return ctypes.get_last_error() == 5  # access denied still means the process exists
-        try:
-            return kernel32.WaitForSingleObject(handle, 0) == 0x102  # WAIT_TIMEOUT
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # pragma: windows-only - ctypes.WinDLL raises AttributeError on Linux; the except arm returns False
+        kernel32.OpenProcess.argtypes = (ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32)  # pragma: windows-only - see WinDLL above
+        kernel32.OpenProcess.restype = ctypes.c_void_p  # pragma: windows-only - see WinDLL above
+        kernel32.WaitForSingleObject.argtypes = (ctypes.c_void_p, ctypes.c_uint32)  # pragma: windows-only - see WinDLL above
+        kernel32.WaitForSingleObject.restype = ctypes.c_uint32  # pragma: windows-only - see WinDLL above
+        kernel32.CloseHandle.argtypes = (ctypes.c_void_p,)  # pragma: windows-only - see WinDLL above
+        kernel32.CloseHandle.restype = ctypes.c_int  # pragma: windows-only - see WinDLL above
+        handle = kernel32.OpenProcess(0x00100000, False, pid)  # SYNCHRONIZE  # pragma: windows-only - see WinDLL above
+        if not handle:  # pragma: windows-only - cascade covers the access-denied arm on Linux
+            return ctypes.get_last_error() == 5  # access denied still means the process exists  # pragma: windows-only - see WinDLL above
+        try:  # pragma: windows-only - cascade covers the wait-and-close arm on Linux
+            return kernel32.WaitForSingleObject(handle, 0) == 0x102  # WAIT_TIMEOUT  # pragma: windows-only - see WinDLL above
         finally:
-            kernel32.CloseHandle(handle)
+            kernel32.CloseHandle(handle)  # pragma: windows-only - see WinDLL above
     except (OSError, AttributeError):
         return False
 

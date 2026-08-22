@@ -3127,3 +3127,436 @@ def test_contour_alert_is_not_transliterated_for_english_voice(state, monkeypatc
     # The English text is unchanged — no transliteration fired
     assert "Voice contour:" in spoken[0]
     assert "rvc" in spoken[0]
+
+
+# --- B2 round: the per-table coverage targets that the previous round left missing -------------
+
+
+def test_wait_out_playback_logs_the_deadline_and_returns_text_unchanged(state, monkeypatch):
+    """Mutation gap: the deadline branch returns the SAME text it was handed and a 'hook deadline
+    reached' log line — losing either is the difference between the caller logging a clean give-up
+    and the caller logging that give-up over a text that has already been wiped."""
+    monkeypatch.setattr(speak, "playback_is_live", lambda: True)  # wedge the player forever
+    monkeypatch.setattr(speak.time, "monotonic", lambda: 1000.0)  # the deadline is already past
+    text = speak.wait_out_playback(
+        lambda: None,
+        lambda value: bool(value),
+        "the stale read",
+        deadline=999.0,  # any value < the monotonic above
+    )
+    assert text == "the stale read"
+    assert "hook deadline reached while waiting for playback" in _speak_log(state)
+
+
+def test_wait_out_flush_logs_the_deadline_and_returns_text_unchanged(state, monkeypatch):
+    """Mutation gap: the deadline branch in wait_out_flush returns the text unchanged and the
+    deadline-reached log line — exactly the contract the playback sibling has."""
+    monkeypatch.setattr(speak.time, "monotonic", lambda: 1000.0)  # deadline is already past
+
+    def stat(path):
+        return _FakeStat(20, 5)  # the file is GROWING, so the loop would otherwise keep polling
+
+    text = speak.wait_out_flush(
+        "transcript.jsonl",
+        lambda: None,
+        lambda value: bool(value),
+        "the stale read",
+        (10, 5),
+        stat=stat,
+        deadline=999.0,  # any value < the monotonic above
+    )
+    assert text == "the stale read"
+    assert "hook deadline reached while waiting for transcript" in _speak_log(state)
+
+
+def test_synthesize_returns_none_and_logs_misconfiguration_when_builder_raises(state, opener):
+    """Mutation gap: a builder that refuses a misconfiguration (an unset ElevenLabs voice) must
+    turn the ValueError into a 'cloud tts misconfigured' log line and a None return — the request
+    is never built, the network is never touched, and the failure is diagnosable."""
+    fake = opener(b"")  # body never read, but install the opener so we can prove no request fires
+    s = speak.resolve_settings(
+        {"tts": {"backend": "cloud", "cloud": {"provider": "elevenlabs"}}}, "Linux"
+    )
+    assert speak.synthesize("hi", s, "sk-secret") is None
+    assert fake.requests == []  # the builder refused; the request was never built
+    assert "cloud tts misconfigured" in _speak_log(state)
+
+
+def test_synthesize_logs_an_empty_body_and_returns_none(state, opener):
+    """Mutation gap: an empty body (a server that returned 200 with no bytes) is dropped, not
+    played — the empty-synthesis log line is what a reader uses to distinguish it from a server
+    that simply could not be reached."""
+    opener(b"")
+    s = speak.resolve_settings(
+        {"tts": {"backend": "cloud", "cloud": {"provider": "elevenlabs", "voice_id": "v123"}}}, "Linux"
+    )
+    assert speak.synthesize("hi", s, "sk-secret") is None
+    assert "empty synthesis from https://api.elevenlabs.io" in _speak_log(state)
+
+
+def test_synthesize_logs_an_error_document_body_and_returns_none(state, opener):
+    """Mutation gap: a body starting with '{' or '[' is a JSON error document, NOT audio — the
+    log line that names it is the only thing a reader sees when the cloud starts returning
+    'rate limited' or 'voice not found' as the response body."""
+    opener(b'{"error": "voice not found"}')
+    s = speak.resolve_settings(
+        {"tts": {"backend": "cloud", "cloud": {"provider": "elevenlabs", "voice_id": "v123"}}}, "Linux"
+    )
+    assert speak.synthesize("hi", s, "sk-secret") is None
+    log = _speak_log(state)
+    assert "synthesis returned an error document" in log
+    assert "voice not found" in log
+
+
+def test_post_returns_the_error_body_when_the_server_returns_an_http_error(monkeypatch):
+    """Mutation gap: _post turns an HTTPError into the error body itself — that body is the
+    diagnosis, so the caller can hand it to the JSON-error-document path; without it the caller
+    only sees the status line. The second arm (b"") covers the case where even err.read()
+    itself raises — the body is unrecoverable, the call returns empty bytes, the caller drops."""
+
+    class _FakeErr(speak.urllib.error.HTTPError):
+        def __init__(self, body: bytes) -> None:
+            super().__init__("http://example/", 500, "Server Error", {}, io.BytesIO(body))
+            self._body = body
+
+        def read(self) -> bytes:
+            return self._body
+
+    class _BodyRaisingErr(speak.urllib.error.HTTPError):
+        def __init__(self) -> None:
+            super().__init__("http://example/", 500, "Server Error", {}, None)
+
+        def read(self) -> bytes:
+            raise OSError("the body itself is unreadable")
+
+    class _RaisingOpener:
+        def __init__(self, exc) -> None:
+            self._exc = exc
+
+        def open(self, request, timeout=None):
+            raise self._exc
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc_info):
+            return False
+
+    # 1. The body is returned verbatim — the caller can match it as an error document
+    monkeypatch.setattr(
+        speak.urllib.request,
+        "build_opener",
+        lambda *h: _RaisingOpener(_FakeErr(b'{"error": "rate limited"}')),
+    )
+    body = speak._post("http://example/", {}, {"text": "hi"}, 1.0)
+    assert body == b'{"error": "rate limited"}'
+
+    # 2. The empty-bytes arm when err.read() itself raises
+    monkeypatch.setattr(
+        speak.urllib.request, "build_opener", lambda *h: _RaisingOpener(_BodyRaisingErr())
+    )
+    body = speak._post("http://example/", {}, {"text": "hi"}, 1.0)
+    assert body == b""
+
+
+def test_post_unreachable_host_returns_none(state, monkeypatch):
+    """Mutation gap: a URLError is the host/errno case, NEVER the body — the log line must name
+    the reason (which is the diagnostic), and the return is None so the caller can tell it apart
+    from an empty body."""
+
+    class _UnreachableOpener:
+        def open(self, request, timeout=None):
+            raise speak.urllib.error.URLError(ConnectionRefusedError(111, "Connection refused"))
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc_info):
+            return False
+
+    monkeypatch.setattr(speak.urllib.request, "build_opener", lambda *h: _UnreachableOpener())
+    assert speak._post("http://example/", {}, {"text": "hi"}, 1.0) is None
+    assert "synthesis unreachable" in _speak_log(state)
+
+
+@pytest.mark.skipif(not hasattr(os, "killpg"), reason="process-group signalling needs os.killpg, which Windows does not have")
+def test_on_sigterm_swallows_proc_terminate_errors(monkeypatch):
+    """Mutation gap: a process whose terminate() raises OSError (it has already exited, or the
+    handle was lost to PID reuse) must not kill the cleanup chain — the handler swallows it."""
+
+    class _Dying:
+        def poll(self):
+            return None  # still running, so terminate() is attempted
+
+        def terminate(self):
+            raise OSError(3, "No such process")
+
+    monkeypatch.setattr(speak.os, "_exit", lambda code: None)
+    speak._live["proc"] = _Dying()
+    speak._live["stream"] = None
+    speak._live["files"] = set()
+    try:
+        speak._on_sigterm(signal.SIGTERM, None)  # must not raise
+    finally:
+        speak._live["proc"] = None
+
+
+def test_on_sigterm_swallows_stream_close_errors(monkeypatch):
+    """Mutation gap: a stream whose close() raises OSError (the handle is already closed, the
+    socket has been ripped out under us) must not kill the cleanup chain."""
+
+    class _DyingStream:
+        def close(self):
+            raise OSError(9, "Bad file descriptor")
+
+    monkeypatch.setattr(speak.os, "_exit", lambda code: None)
+    speak._live["proc"] = None
+    speak._live["stream"] = _DyingStream()
+    speak._live["files"] = set()
+    try:
+        speak._on_sigterm(signal.SIGTERM, None)  # must not raise
+    finally:
+        speak._live.pop("stream", None)
+
+
+@pytest.mark.skipif(not hasattr(os, "killpg"), reason="process-group signalling needs os.killpg, which Windows does not have")
+def test_on_sigterm_signals_the_process_group_when_pgid_is_live(monkeypatch):
+    """Mutation gap: a live pgid child is signalled via killpg so the player inside the shell
+    receives the signal regardless of exec or wrapper depth."""
+    killpg_calls: list[tuple[int, int]] = []
+    monkeypatch.setattr(speak.os, "killpg", lambda pgid, sig: killpg_calls.append((pgid, sig)))
+    monkeypatch.setattr(speak.os, "_exit", lambda code: None)
+
+    class _Live:
+        def poll(self):
+            return None  # still running — terminate will be called
+
+        def terminate(self):
+            pass
+
+    speak._live["proc"] = _Live()
+    speak._live["pgid"] = 777
+    try:
+        speak._on_sigterm(signal.SIGTERM, None)
+        assert killpg_calls == [(777, signal.SIGTERM)]
+    finally:
+        speak._live["proc"] = None
+        speak._live.pop("pgid", None)
+
+
+@pytest.mark.skipif(not hasattr(os, "killpg"), reason="process-group signalling needs os.killpg, which Windows does not have")
+def test_on_sigterm_swallows_killpg_errors_for_already_exited_groups(monkeypatch):
+    """Mutation gap: a process-group child that has already exited (race between the proc and
+    the group) raises ProcessLookupError, and the handler swallows it — otherwise the hook
+    itself dies on the cleanup it owns."""
+    monkeypatch.setattr(speak.os, "killpg", lambda pgid, sig: (_ for _ in ()).throw(ProcessLookupError(3, "No such process")))
+    monkeypatch.setattr(speak.os, "_exit", lambda code: None)
+
+    class _Live:
+        def poll(self):
+            return None
+
+        def terminate(self):
+            pass
+
+    speak._live["proc"] = _Live()
+    speak._live["pgid"] = 888
+    try:
+        speak._on_sigterm(signal.SIGTERM, None)  # must not raise
+    finally:
+        speak._live["proc"] = None
+        speak._live.pop("pgid", None)
+
+
+def test_on_sigterm_closes_the_stream_when_one_is_open(monkeypatch):
+    """Mutation gap: an open stream socket is closed so the next read returns immediately rather
+    than blocking a follow-up firing on a closed but-unclosed handle."""
+
+    class _Stream:
+        def __init__(self) -> None:
+            self.closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+    stream = _Stream()
+    monkeypatch.setattr(speak.os, "_exit", lambda code: None)
+    speak._live["proc"] = None  # no proc, the proc branch is skipped
+    speak._live["stream"] = stream
+    try:
+        speak._on_sigterm(signal.SIGTERM, None)
+        assert stream.closed is True
+    finally:
+        speak._live.pop("stream", None)
+
+
+def test_on_sigterm_swallows_unlink_errors_for_already_gone_temp_files(monkeypatch):
+    """Mutation gap: a temp file that was already removed (a parallel cleanup raced us) raises
+    OSError on unlink — the handler swallows it, because the goal is that the file is gone,
+    not that we got to remove it ourselves."""
+
+    def unlink(path):
+        raise OSError(2, "No such file or directory")
+
+    monkeypatch.setattr(speak.os, "_exit", lambda code: None)
+    monkeypatch.setattr(speak.os, "unlink", unlink)
+    speak._live["proc"] = None
+    speak._live["stream"] = None
+    speak._live["files"] = set()
+    speak._live["files"].add("/tmp/already-gone-1")
+    speak._live["files"].add("/tmp/already-gone-2")
+    try:
+        speak._on_sigterm(signal.SIGTERM, None)  # must not raise
+    finally:
+        speak._live["files"] = set()
+
+
+def test_contour_alert_is_logged_when_no_lock_can_be_acquired(state, monkeypatch):
+    """Mutation gap: a contour that loses the eager lock (another firing holds it) leaves the
+    alert UNANNOUNCED and logs the 'left unannounced' line — without it the next firing would
+    not know there is still work to do."""
+    _contour_status(state, [_DEMOTED])
+    spoken = _record_speech(monkeypatch)
+    monkeypatch.setattr(speak, "acquire_lock", lambda *grace: None)  # another firing holds it
+    speak.contour_check({"speak": {"eager": True}}, 0.0)
+    assert spoken == []
+    assert not (state / "contour-announced").exists()
+    assert "another firing is speaking" in _speak_log(state)
+    assert "left unannounced" in _speak_log(state)
+
+
+def test_contour_already_announced_logs_only_when_there_was_something_to_announce(state, monkeypatch):
+    """Mutation gap: the dedup's positive mark is logged ONLY when there are alerts to be quiet
+    ABOUT — every quiet turn owes the log silence, and a regression that logged unconditionally
+    would add a line per tool call forever."""
+    _contour_status(state, [_DEMOTED])
+    spoken = _record_speech(monkeypatch)
+    speak.contour_check({}, 0.0)  # first time: voiced
+    log_after_first = _speak_log(state)
+    speak.contour_check({}, 0.0)  # second time: dedup, must log the positive mark
+    log_after_second = _speak_log(state)
+    assert "already announced" in log_after_second
+    assert "already announced" not in log_after_first
+    # A quiet turn: NO alert file at all, NO log line about dedup
+    (state / "contour-announced").unlink()  # start fresh
+    (state / "contour.json").unlink()
+    log_before = _speak_log(state)
+    speak.contour_check({}, 0.0)
+    log_after = _speak_log(state)
+    assert log_after == log_before  # no line added
+
+
+def test_contour_degrade_reason_is_logged_once_on_a_turn_that_speaks(state, monkeypatch):
+    """Mutation gap: a lock that degraded to _NoLock has a reason that belongs to THIS turn's
+    speech, not to a firing that found nothing new — a firing that speaks logs the reason,
+    a firing that does not speak does not."""
+
+    class _StubNoLock(speak._NoLock):
+        def __init__(self) -> None:
+            super().__init__(reason="speaking lock is unsupported on this platform — proceeding unlocked")
+
+    monkeypatch.setattr(speak, "acquire_lock", lambda *grace: _StubNoLock())
+    _contour_status(state, [_DEMOTED])
+    spoken = _record_speech(monkeypatch)
+    speak.contour_check({}, 0.0)
+    assert len(spoken) == 1  # it actually spoke — the reason rides THAT turn
+    assert "proceeding unlocked" in _speak_log(state)
+
+
+def test_contour_no_player_leaves_the_alert_unannounced_to_be_retried(state, monkeypatch):
+    """Mutation gap: a failed delivery re-arms — the key stays unannounced, so the next firing
+    tries again for as long as the condition holds. Announcing-before-delivery would make a dead
+    speech server the ONE condition this hook could never report."""
+
+    class _DyingPlayer(_NullPlayer):
+        def poll(self) -> int | None:
+            return 1  # player crashed
+
+    _contour_status(state, [_DEMOTED])
+    monkeypatch.setattr(speak, "_get", lambda url, timeout: None)  # blob path
+    monkeypatch.setattr(speak.subprocess, "Popen", lambda argv, **kwargs: _DyingPlayer())
+    speak.contour_check({}, 0.0)
+    assert not (state / "contour-announced").exists()
+    assert "the page reached no player" in _speak_log(state)
+
+
+def test_windows_process_is_live_returns_false_on_linux_for_any_pid(monkeypatch):
+    """Mutation gap: ctypes.WinDLL does not exist on Linux, so the AttributeError is caught and
+    the function returns False — without the catch, importing speak on Linux would raise."""
+    assert speak._windows_process_is_live(1) is False
+    assert speak._windows_process_is_live(0) is False
+    assert speak._windows_process_is_live(99999) is False
+
+
+def test_main_guard_swallows_an_unexpected_exception_and_exits_zero(state, monkeypatch):
+    """Mutation gap: the __main__ guard is the hook's last line of defence — a top-level
+    exception must be caught, logged with a truncated repr, and the process must exit 0.
+    speak.sh swallows the exit code, so an exit 1 here would still LOOK like a clean hook from
+    outside, but the log line is what makes the failure diagnosable.
+
+    Drove via subprocess so the guard's own module scope is the one that runs; the subprocess's
+    rc is the guard's contract. The pytest-side .coverage file already covers the guard lines
+    via the in-process runpy path; this test pins the subprocess contract so a regression to
+    're-raise the exception' is caught even if the coverage merge misses it."""
+    rc = subprocess.run(
+        [sys.executable, str(_SPEAK_PATH)],
+        env={**os.environ, "VOICE_LOOP_CONFIG": str(state / "config.json"), "PATH": os.environ.get("PATH", "")},
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        timeout=10,
+    )
+    # The guard catches whatever entry() raised and exits 0 — speak.sh sees a clean exit.
+    assert rc.returncode == 0
+    # The diagnostic is structural: the guard catches Exception, logs a truncated repr, and exits 0.
+    source = _SPEAK_PATH.read_text(encoding="utf-8")
+    guard_block = source[source.rfind('if __name__ == "__main__":'):]
+    assert "except Exception:" in guard_block
+    assert "unexpected error:" in guard_block
+    assert "sys.exit(0)" in guard_block
+
+
+def test_main_guard_runs_under_runpy_for_coverage(state, monkeypatch):
+    """The guard is run in-process by runpy so the .coverage file measures it; a structural
+    assertion pins the same catch/log/exit-0 contract from this side.
+
+    Two cases drive both arms of the inner `except Exception:`:
+    - the happy log() call (covers 2580-2585, 2587)
+    - a log() call that itself raises (covers 2585-2586 — the swallow-nothing path)
+
+    runpy loads speak.py fresh; module-level monkeypatching on the speak instance is bypassed.
+    The seams the new module walks through are `sys.exit` (a module attribute, but `sys` is the
+    same module object everywhere) and `os.open` (a free function — same everywhere too)."""
+    import runpy as _runpy
+
+    captured: list[int] = []
+
+    def fake_exit(code=0):
+        captured.append(code)
+        raise SystemExit(code)
+
+    # Patch `sys.exit` so the new module's `sys.exit(0)` lands here, not the real one.
+    monkeypatch.setattr(sys, "exit", fake_exit)
+
+    # Case 1 — happy log() call. Make entry() raise so the outer except catches it.
+    sys.modules.pop("__main__", None)
+    captured.clear()
+    try:
+        _runpy.run_path(str(_SPEAK_PATH), run_name="__main__")
+    except SystemExit:
+        pass
+    assert captured == [0]
+
+    # Case 2 — log() itself raises. Patch os.path.exists to throw a non-OSError — log() already
+    # catches OSError internally, so only a different exception type escapes to the guard's
+    # inner except (lines 2585-2586).
+    def explode_path(*args, **kwargs):
+        raise RuntimeError("a log-failure the inner OSError swallow cannot catch")
+
+    monkeypatch.setattr(os.path, "exists", explode_path)
+    captured.clear()
+    sys.modules.pop("__main__", None)
+    try:
+        _runpy.run_path(str(_SPEAK_PATH), run_name="__main__")
+    except SystemExit:
+        pass
+    assert captured == [0]  # the guard's sys.exit(0) still lands — even when log() dies
