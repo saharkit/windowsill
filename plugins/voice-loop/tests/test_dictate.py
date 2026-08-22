@@ -59,6 +59,7 @@ def state(monkeypatch, tmp_path):
     monkeypatch.setattr(dictate, "_STREAM_PID_PATH", str(tmp_path / "dictate-stream.pid"))
     monkeypatch.setattr(dictate, "_STREAM_RESULT_PATH", str(tmp_path / "dictate-stream.json"))
     monkeypatch.setattr(dictate, "_PREVIEW_PATH", str(tmp_path / "dictate-preview.json"))
+    monkeypatch.setattr(dictate, "_LAST_SPOKEN_PATH", str(tmp_path / "last-spoken"))
     return tmp_path
 
 
