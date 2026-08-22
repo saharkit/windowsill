@@ -59,6 +59,11 @@ def state(monkeypatch, tmp_path):
     monkeypatch.setattr(dictate, "_STREAM_PID_PATH", str(tmp_path / "dictate-stream.pid"))
     monkeypatch.setattr(dictate, "_STREAM_RESULT_PATH", str(tmp_path / "dictate-stream.json"))
     monkeypatch.setattr(dictate, "_PREVIEW_PATH", str(tmp_path / "dictate-preview.json"))
+    # `_LAST_SPOKEN_PATH` is computed at module load from `_STATE_DIR`, so the per-test monkeypatch
+    # on the latter does not reach it. Without an explicit re-point, a leak from the live
+    # `~/.local/state/voice-loop/last-spoken` can satisfy the belt-and-suspenders echo guard against
+    # any mocked transcript that happens to match what the assistant just said out loud.
+    monkeypatch.setattr(dictate, "_LAST_SPOKEN_PATH", str(tmp_path / "last-spoken"))
     return tmp_path
 
 

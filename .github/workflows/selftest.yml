@@ -279,6 +279,9 @@ jobs:
           echo "::group::scripts coverage gate (ratcheting from 80%)"
           python -m coverage report --include='scripts/*' --fail-under=80
           echo "::endgroup::"
+          echo "::group::scripts/speak.py coverage gate (B2 of #156, 100%)"
+          python -m coverage report --include='scripts/speak.py' --fail-under=100
+          echo "::endgroup::"
 
       # The plugin's own .coverage is what gets uploaded — the same file pytest just wrote, with
       # nothing in between touching it.  Previously this job also ran `coverage combine --append`
