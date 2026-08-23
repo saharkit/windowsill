@@ -69,8 +69,9 @@ plain prose (not silently inherited from `.coveragerc`). The disclosure is by cl
 | **total** | **19** | |
 
 A regression that adds an exclusion WITHOUT updating this table fails the suite's source-text
-pin (`TestPinnedPragmaList`, `TestPragmaCount`) and fails the README operator that reads this
-paragraph. A regression that removes a marker without retiring its body, however, fails the gate
+pin (`TestPinnedPragmaList`, `TestPragmaCount`,
+`test_contracts_py_windows_only_marker_count_is_exactly_the_allow_list`) and fails the README
+operator that reads this paragraph. A regression that removes a marker without retiring its body, however, fails the gate
 directly — the per-file coverage report then names the line.
 
 `speak.py` itself carries a separate 100% gate of its own (#156 B2): the play-back / no-play /
