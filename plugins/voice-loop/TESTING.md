@@ -55,9 +55,10 @@ What makes 100% honest rather than decorative:
 ### The hook scripts — shellcheck, a pytest for the pure parts, and a real invocation
 
 There is deliberately **no line-coverage number for most of the hook scripts** (the rest of
-`scripts/` — `dictate.py`, `contour_poll.py`, `doctor.py`, `report_bug.py`, `install_ledger.py`,
-`preview.py`, `rvc_corpus.py`, `tls-probe.py`, `wsclient.py`, the `voice-loop-dictate` entry point
-— sit under the ratcheting `scripts/*` 80%-and-up gate in `selftest.yml`, not under the 100% one).
+`scripts/` — `dictate.py`, `contour_poll.py`, `contracts.py`, `doctor.py`, `providers.py`,
+`report_bug.py`, `install_ledger.py`, `preview.py`, `rvc_corpus.py`, `tls-probe.py`, `wsclient.py`,
+the `voice-loop-dictate` entry point — sit under the ratcheting `scripts/*` 80%-and-up gate in
+`selftest.yml`, not under the 100% one).
 `speak.py` itself is the deliberate exception (#156 B2): the play-back / no-play / give-up paths
 and the cloud-TTS error-document branch are pinned in a way mocks would not catch, and they earn
 the 100% gate that the server also carries; the platform-only statements that are unreachable on
