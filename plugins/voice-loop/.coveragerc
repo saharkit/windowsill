@@ -4,9 +4,11 @@
 #
 # scripts/ is also under coverage measurement, enforced via TWO separate CI gates so a regression
 # in one scope cannot hide behind another's threshold:
-#   • `coverage report --include='scripts/*' --fail-under=80` (ratcheting; only moves upward) for
-#     the hook scripts (dictate.py, speak.py, report_bug.py, tls-probe.py) — proven in parallel by
-#     real invocation, so the gate exists to keep regression pressure on the helper surface.
+#   • `coverage report --include='scripts/*' --fail-under=100` (100% of what is measurable on a
+#     Linux runner; the exclusions are disclosed by class in TESTING.md, not silently inherited
+#     from this file) for the hook scripts (dictate.py, speak.py, report_bug.py, tls-probe.py) —
+#     proven in parallel by real invocation, so the gate exists to keep regression pressure on the
+#     helper surface.
 #   • `coverage report --include='scripts/doctor.py' --fail-under=100` for the diagnose tool the
 #     user runs first when something is wrong, so it cannot be the broken thing they hit.
 # The server's 100% is non-negotiable and never dropped. The combined coverage job downloads this

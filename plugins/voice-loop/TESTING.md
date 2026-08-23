@@ -54,26 +54,48 @@ What makes 100% honest rather than decorative:
 
 ### The hook scripts — shellcheck, a pytest for the pure parts, and a real invocation
 
-There is deliberately **no line-coverage number for most of the hook scripts** (the rest of
-`scripts/` — `dictate.py`, `contour_poll.py`, `contracts.py`, `doctor.py`, `providers.py`,
-`report_bug.py`, `install_ledger.py`, `preview.py`, `rvc_corpus.py`, `tls-probe.py`, `wsclient.py`,
-the `voice-loop-dictate` entry point — sit under the ratcheting `scripts/*` 80%-and-up gate in
-`selftest.yml`, not under the 100% one).
-`speak.py` itself is the deliberate exception (#156 B2): the play-back / no-play / give-up paths
-and the cloud-TTS error-document branch are pinned in a way mocks would not catch, and they earn
-the 100% gate that the server also carries; the platform-only statements that are unreachable on
-Linux (the Windows-only `msvcrt` byte-range lock, the `ctypes.WinDLL` process probe, and the
-Windows-only no-`killpg` arm of `_kill_process_group`; plus the macOS-only `_ps_cmdline_of` helper
-that wraps `ps -p`) are excluded by the registered `pragma: windows-only` and `pragma: macos-only`
-markers in `.coveragerc` and pinned by marker-count tests so a silent grow or shrink of either
-allow-list cannot drift unnoticed behind a green 100%. On `scripts/dictate.py` specifically, the
-upper bound is held in place by **an enumerated allow-list of exactly three `pragma: no cover`
-markers** — each on a Windows-`ctypes` body (`_pid_alive`, `_win_console_ctrl_c`,
-`_win_pid_is_recorder`) — and `TestPragmaCount` asserts the count cannot quietly grow; a new
-exclusion without a doc update fails the suite. Line coverage is not a meaningful metric for the
-glue that spends its life calling players, recorders, `wl-copy` and `ydotool`: such code can be
-100% "covered" by mocks and still fail on the only thing that matters — the real runtime. The hook
-side earns its guarantee on a separate axis, so it gets a numbered list:
+`scripts/*` itself is gated at **100% of what is measurable on a Linux runner** in `selftest.yml`
+(after #156 C moved the floor from 80 to 100); the rest of `scripts/` — `dictate.py`,
+`contour_poll.py`, `contracts.py`, `doctor.py`, `providers.py`, `report_bug.py`,
+`install_ledger.py`, `preview.py`, `rvc_corpus.py`, `tls-probe.py`, `wsclient.py`, the
+`voice-loop-dictate` entry point — sits under that gate, and the exclusions are NAMED HERE in
+plain prose (not silently inherited from `.coveragerc`). The disclosure is by class:
+
+| marker class | count | where |
+|---|---|---|
+| `pragma: no cover` | **6** | `dictate.py` 3, `doctor.py` 3 |
+| `pragma: windows-only` | **12** | `speak.py` 11, `contracts.py` 1 |
+| `pragma: macos-only` | **1** | `speak.py` 1 |
+| **total** | **19** | |
+
+A regression that adds an exclusion WITHOUT updating this table fails the suite's source-text
+pin (`TestPinnedPragmaList`, `TestPragmaCount`) and fails the README operator that reads this
+paragraph. A regression that removes a marker without retiring its body, however, fails the gate
+directly — the per-file coverage report then names the line.
+
+`speak.py` itself carries a separate 100% gate of its own (#156 B2): the play-back / no-play /
+give-up paths and the cloud-TTS error-document branch are pinned in a way mocks would not catch,
+and they earn the 100% gate that the server also carries; the platform-only statements that are
+unreachable on Linux (the Windows-only `msvcrt` byte-range lock, the `ctypes.WinDLL` process
+probe, and the Windows-only no-`killpg` arm of `_kill_process_group`; plus the macOS-only
+`_ps_cmdline_of` helper that wraps `ps -p`) are excluded by the registered `pragma:
+windows-only` and `pragma: macos-only` markers in `.coveragerc` and pinned by marker-count tests
+so a silent grow or shrink of either allow-list cannot drift unnoticed behind a green 100%. On
+`scripts/dictate.py` specifically, the upper bound is held in place by **an enumerated allow-list
+of exactly three `pragma: no cover` markers** — each on a Windows-`ctypes` body (`_pid_alive`,
+`_win_console_ctrl_c`, `_win_pid_is_recorder`) — and `TestPragmaCount` asserts the count cannot
+quietly grow; a new exclusion without a doc update fails the suite. The `contracts.py`
+`windows-only` marker (1 entry, on `_windows_process_is_live`) is the new addition under this
+ticket; it is a `ctypes.WinDLL("kernel32")` handle probe that a Linux runner cannot reach by
+construction, and the exclusion is the standing ruling applied rather than a CI lane bought.
+
+The `scripts/*` floor at 100% does NOT say "100% of every line" — it says "100% of what is
+measurable on a Linux runner". Coverage IS still a meaningful metric for the GLUE that calls
+players, recorders, `wl-copy` and `ydotool`: the fixture-shaping unit tests live in `tests/` and
+the real-runtime proof comes from the loopback job beside it. Line coverage is not the WHOLE
+metric for any of these scripts — it is the floor that keeps regression pressure on the helper
+surface, and the disclosure above names every line it does not measure. The hook side earns its
+guarantee on a separate axis, so it gets a numbered list:
 
 1. `bash -n` and **shellcheck** (`-S warning`) on every script, every commit; the speak logic
    itself is Python (stdlib-only `scripts/speak.py`, launched by a thin `speak.sh`);

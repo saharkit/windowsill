@@ -1,10 +1,11 @@
 """The bounds on /convert: decoded size, missing duration, queue, timeout, overflow race.
 
 The RVC service lives at rvc/serve/rvc_server.py — operator tooling outside the plugin's runtime
-coverage gates (server/ 100% and scripts/ 80%, neither of which covers rvc/). These tests sit at
-the function tier because the decisions live there (`_convert_sync` validates and admits; the
-chunk loop checks the deadline; `load_with_fallback` pre-builds the overflow) — standing up a
-real FastAPI server to test validation logic would be a tier-2 cost for a tier-1 answer (L6).
+coverage gates (server/ 100% and scripts/ 100%-of-measurable, neither of which covers rvc/).
+These tests sit at the function tier because the decisions live there (`_convert_sync` validates
+and admits; the chunk loop checks the deadline; `load_with_fallback` pre-builds the overflow) —
+standing up a real FastAPI server to test validation logic would be a tier-2 cost for a tier-1
+answer (L6).
 
 Each test cites the gap it closes: a behaviour that would survive uncaught without it. Per L3,
 the refusal decisions are authority surfaces — showing the service REFUSING is mandatory. We
