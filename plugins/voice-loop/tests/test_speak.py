@@ -4090,8 +4090,9 @@ def test_reap_records_played_chunk_and_unlinks_wav(state, monkeypatch):
     os.close(fds)
     os.write(fds, b"x") if False else None  # noqa: E272 - placeholder; mkstemp already wrote 0 bytes
     speak._live["files"].add(wav)
-    fake = FakePlayerProcess(FakeClock(), 0.0)
-    fake.returncode = 0
+    monkeypatch.setattr(
+        speak.subprocess, "Popen", lambda argv, **kw: FakePlayerProcess(FakeClock(), 0.0)
+    )
     # Drive the loop body for a single chunk, then assert the post-loop reap ran cleanly.
     s = speak.resolve_settings({}, "Linux")
     result = speak._play_stream(iter([b"wav-payload"]), s, time.monotonic())
