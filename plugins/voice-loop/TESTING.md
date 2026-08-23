@@ -70,7 +70,7 @@ should fail only on a real regression, not on coverage jitter), and the per-file
 **measured** property — a coverage report run alongside the suite reports it; it is not a
 mechanical CI gate. So the layering is: a hard 80% floor catches regressions; a measured 100%
 on `dictate.py` plus the named pragma list pin the upper bound; and `TestPragmaCount` keeps the
-allow-list from growing without a doc update.
+allow-list from growing without a doc update. The hook-side guarantee is layered differently:
 
 1. `bash -n` and **shellcheck** (`-S warning`) on every script, every commit; the speak logic
    itself is Python (stdlib-only `scripts/speak.py`, launched by a thin `speak.sh`);

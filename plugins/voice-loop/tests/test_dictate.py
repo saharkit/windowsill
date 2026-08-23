@@ -4411,6 +4411,22 @@ def test_run_stream_session_drain_loop_holds_until_socket_closed(state, monkeypa
     assert result["status"] == "ok"
 
 
+def test_win_console_ctrl_c_posix_fallthrough_returns_false():
+    """Line 1445: the trailing ``return False`` after the ``if os.name == "nt":`` body. On the
+    Linux CI host (os.name == "posix"), this is the branch every call takes — direct-call
+    without monkeypatching anything proves the no-op contract."""
+
+    assert dictate._win_console_ctrl_c(1234) is False
+
+
+def test_win_pid_is_recorder_posix_fallthrough_returns_false():
+    """Line 1528: the trailing ``return False`` after the ``if os.name == "nt":`` body. Same
+    shape as ``_win_console_ctrl_c``: on Linux the no-op fallthrough is the only branch
+    reachable, and a direct call exercises it deterministically."""
+
+    assert dictate._win_pid_is_recorder(1234, "arecord") is False
+
+
 class TestPragmaCount:
     """The enumerated allow-list: exactly three ``pragma: no cover`` markers, all on Windows-ctypes
     bodies, nowhere else in the file. A count > 3 means a new exclusion slipped in undocumented; a
@@ -4460,6 +4476,10 @@ class TestMainGuard:
         # whole hermeticity story: with no recorder resolvable, start_recording's first branch
         # logs and returns 1 — no Popen, no sound, no microphone.
         monkeypatch.setattr(dictate.shutil, "which", lambda name: None)
+        # Stub stop_speak_playback too: the no-pidfile branch fires a real `pkill -f
+        # voice-loop-speak` against the host's processes, which is neither hermetic nor scoped
+        # to the test fixture. (Pre-existing pattern — see test_dictate.py:1662.)
+        monkeypatch.setattr(dictate, "stop_speak_playback", lambda: None)
 
         with pytest.raises(SystemExit) as excinfo:
             runpy.run_path(str(Path(dictate.__file__)), run_name="__main__")
@@ -4498,7 +4518,11 @@ class TestMainGuard:
         end = start
         while end + 1 < len(lines) and lines[end + 1].strip() != "":
             end += 1
-        guard_src = "\n".join(lines[start : end + 1]) + "\n"
+        # Prepend `start` newlines so the compiled source's line 1 corresponds to file line
+        # ``start + 1`` — coverage reads the filename and tracks real file lines, not the sliced
+        # source's line numbers, so without this padding the except body is painted onto lines 1-9
+        # of ``dictate.py`` while the real guard text at lines 2555-2563 stays uncovered.
+        guard_src = "\n" * start + "\n".join(lines[start : end + 1]) + "\n"
 
         namespace = {
             "__name__": "__main__",
@@ -5086,6 +5110,9 @@ def test_start_recording_no_recorder_logs_and_notes_on_mac_or_linux(monkeypatch,
     monkeypatch.setattr(dictate, "note", lambda message, system: notes.append(message))
     monkeypatch.setattr(dictate, "log", lambda message: log_calls.append(message))
     monkeypatch.setattr(dictate, "resolve_recorder", lambda *a, **kw: "")
+    # Stub stop_speak_playback: no pidfile in the state fixture would otherwise drive a real
+    # `pkill -f voice-loop-speak` against the host's process table.
+    monkeypatch.setattr(dictate, "stop_speak_playback", lambda: None)
     s = dictate.resolve_settings({"dictate": {"recorder": "auto"}}, "Linux")
     pidfile_fd = dictate.claim_pidfile()
     assert pidfile_fd is not None
@@ -5111,6 +5138,10 @@ def test_start_recording_no_recorder_windows_notes_with_ffmpeg_hint(monkeypatch,
         lambda *a, **kw: [] if a[0] == "ffmpeg" else None,  # the falsy return signals no argv
     )
     monkeypatch.setattr(dictate, "_discover_dshow_mic", lambda: "")
+    # Stub stop_speak_playback: even on this Windows branch the no-pidfile path is checked by
+    # the host's `os.name` (always "posix" on the Linux CI runner), so the pkill fallback
+    # would otherwise fire here.
+    monkeypatch.setattr(dictate, "stop_speak_playback", lambda: None)
     s = dictate.resolve_settings({"dictate": {"recorder": "ffmpeg"}}, "Windows")
     pidfile_fd = dictate.claim_pidfile()
     assert pidfile_fd is not None
@@ -5132,6 +5163,9 @@ def test_start_recording_popen_oserror_swallows_and_returns_one(monkeypatch, sta
         raise OSError("Exec format error")
 
     monkeypatch.setattr(dictate.subprocess, "Popen", refuse_popen)
+    # Stub stop_speak_playback: no pidfile in the state fixture would otherwise drive a real
+    # `pkill -f voice-loop-speak` against the host's process table.
+    monkeypatch.setattr(dictate, "stop_speak_playback", lambda: None)
     s = dictate.resolve_settings(
         {"dictate": {"recorder": "arecord", "clipboard": "xclip"}}, "Linux"
     )
@@ -5289,6 +5323,9 @@ def test_main_state_dir_failure_is_silence(monkeypatch, state):
         raise OSError("EROFS")
 
     monkeypatch.setattr(dictate.os, "makedirs", refuse_makedirs)
+    # Stub stop_speak_playback: the test reaches start_recording via main(); no pidfile in the
+    # state fixture would otherwise drive a real `pkill -f voice-loop-speak` against the host.
+    monkeypatch.setattr(dictate, "stop_speak_playback", lambda: None)
     cfg_path = state / "config.json"
     cfg_path.write_text("{}", encoding="utf-8")
     monkeypatch.setenv("VOICE_LOOP_CONFIG", str(cfg_path))
