@@ -2072,6 +2072,32 @@ def pid_looks_like_stream_holder(pid: int, read_cmdline=_cmdline_of, platform_id
     return "speak.py" in cmdline and STREAM_HOLDER_ARG in cmdline
 
 
+def pid_is_stream_holder_to_signal(
+    pid: int,
+    read_cmdline=_cmdline_of,
+    read_ps_cmdline=_ps_cmdline_of,
+    platform_id: str = sys.platform,
+) -> bool:
+    """Kill-side PID-identity gate — the call site SIGTERMs the pid, so a recycled PID pointing at an
+    unrelated process would terminate it. Identity must be ESTABLISHED, never assumed. Linux uses
+    ``/proc/<pid>/cmdline``; macOS shells ``ps`` (no shell, no signal); everything else returns False
+    unconditionally — Windows has no cheap identity read and the holder path is short-circuited there
+    anyway (``_connect_stream_holder`` checks ``hasattr(socket, 'AF_UNIX')`` first), so never signalling
+    is free. A ``None`` cmdline is False: a vanished or unreadable process is never killed.
+
+    Distinct from :func:`pid_looks_like_stream_holder`, which gates the WARM-REUSE decision at a
+    different cost profile (a false positive there costs a bad socket, which the next line checks)."""
+    if platform_id.startswith("linux"):
+        cmdline = read_cmdline(pid)
+    elif platform_id == "darwin":
+        cmdline = read_ps_cmdline(pid)
+    else:
+        return False
+    if cmdline is None:
+        return False
+    return "speak.py" in cmdline and STREAM_HOLDER_ARG in cmdline
+
+
 def cloud_streaming_wanted(s: dict) -> bool:
     """True when the cloud path should try the resident websocket: streaming opted in AND the
     configured provider's entry actually carries a streaming variant. A config that asks streaming
@@ -2083,6 +2109,7 @@ def cloud_streaming_wanted(s: dict) -> bool:
 
 def ensure_stream_holder(
     s: dict, *, popen=subprocess.Popen, sleep=time.sleep, clock=time.monotonic,
+    holder_guard=pid_is_stream_holder_to_signal,
 ) -> bool:
     """Make sure a resident holder matching THESE settings is running and bound. True when one is (or
     was just made) live; False when one could not be readied in time (the caller uses the blob path
@@ -2095,7 +2122,7 @@ def ensure_stream_holder(
     pid, pid_digest = _read_stream_holder_pid()
     if pid is not None and pid_looks_like_stream_holder(pid) and pid_digest == digest:
         return True  # a warm socket for exactly these settings
-    if pid is not None and pid_looks_like_stream_holder(pid):
+    if pid is not None and holder_guard(pid):
         try:
             os.kill(pid, signal.SIGTERM)
         except (ProcessLookupError, PermissionError):

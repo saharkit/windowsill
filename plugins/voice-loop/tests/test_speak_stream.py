@@ -295,6 +295,64 @@ def test_the_holder_pid_guard_reads_cmdline_for_the_argv_marker():
     assert speak.pid_looks_like_stream_holder(1, read_cmdline=lambda pid: None, platform_id="darwin") is True
 
 
+def test_the_kill_side_holder_pid_guard_refuses_when_identity_cannot_be_established():
+    """The kill-side guard gates a SIGTERM — a recycled PID pointing at an unrelated process would
+    terminate it. The guard MUST return False (i.e. refuse to authorise the kill) when identity
+    cannot be established: Windows has no cheap identity read; a vanished or unreadable process
+    returns ``None`` from the cmdline reader; an unknown platform returns False. Only Linux with a
+    readable /proc and macOS with a readable ``ps`` output that match the argv marker authorise."""
+
+    good = f"python3 /path/speak.py {speak.STREAM_HOLDER_ARG} abc123"
+    bad = "some other process"
+
+    # Linux: identity via /proc/<pid>/cmdline
+    assert speak.pid_is_stream_holder_to_signal(1, read_cmdline=lambda pid: good, platform_id="linux") is True
+    assert speak.pid_is_stream_holder_to_signal(1, read_cmdline=lambda pid: bad, platform_id="linux") is False
+    assert speak.pid_is_stream_holder_to_signal(1, read_cmdline=lambda pid: None, platform_id="linux") is False
+
+    # macOS: identity via `ps -p <pid> -o command=` (shells no shell, signals nothing)
+    assert speak.pid_is_stream_holder_to_signal(1, read_ps_cmdline=lambda pid: good, platform_id="darwin") is True
+    assert speak.pid_is_stream_holder_to_signal(1, read_ps_cmdline=lambda pid: bad, platform_id="darwin") is False
+    assert speak.pid_is_stream_holder_to_signal(1, read_ps_cmdline=lambda pid: None, platform_id="darwin") is False
+
+    # Windows: no cheap identity read — refuse unconditionally, never signal.
+    # The real call site is short-circuited there by the AF_UNIX check in _connect_stream_holder, so
+    # returning False is free; this test asserts the FAIL-CLOSED contract even if a future caller
+    # forgets to short-circuit.
+    assert speak.pid_is_stream_holder_to_signal(1, read_cmdline=lambda pid: good, platform_id="win32") is False
+    assert speak.pid_is_stream_holder_to_signal(1, read_ps_cmdline=lambda pid: good, platform_id="win32") is False
+
+
+def test_ensure_stream_holder_does_not_signal_when_kill_guard_refuses(holder_state, monkeypatch):
+    """The kill-side guard is fail-closed: when it cannot establish identity, ``os.kill`` MUST NOT be
+    called — a recycled PID pointing at an unrelated process would terminate it. The guard is patched
+    to refuse; a stale digest still drives the kill-path branch; a fake ``os.kill`` records any call;
+    the assertion proves nothing was signalled."""
+
+    digest = speak.stream_settings_digest(_settings())
+    speak._write_stream_holder_pid(os.getpid(), "stale")  # wrong digest -> the kill branch fires
+
+    class P:
+        pid = 99999
+
+    killed: list = []
+    monkeypatch.setattr(speak.os, "kill", lambda pid, sig: killed.append((pid, sig)))
+
+    def fake_popen(argv, **kw):
+        speak._write_stream_holder_pid(P.pid, argv[-1])
+        open(speak._STREAM_HOLDER_SOCK, "w").close()
+        return P()
+
+    # The kill-side guard refuses: regardless of what /proc would actually read, this pid is not
+    # proven to be the holder, so no signal may fire.
+    monkeypatch.setattr(speak, "pid_is_stream_holder_to_signal", lambda pid, **kw: False)
+    # The warm-reuse guard is a separate call at line 2096 and must not gate the kill decision; it is
+    # left at its default — its real /proc read would also refuse on this runner, which is exactly
+    # the point of the test.
+    assert speak.ensure_stream_holder(_settings(), popen=fake_popen, sleep=lambda _: None, clock=lambda: 0.0) is True
+    assert killed == []  # the guard refused; no signal was sent
+
+
 # --- ensure_stream_holder: warm reuse, stale respawn, spawn failure ------------------------------
 
 
@@ -351,7 +409,7 @@ def test_a_live_holder_with_a_matching_digest_is_reused(holder_state):
         speak.pid_looks_like_stream_holder = original
 
 
-def test_a_stale_digest_stops_the_old_holder_and_respawns(holder_state):
+def test_a_stale_digest_stops_the_old_holder_and_respawns(holder_state, monkeypatch):
     """A settings edit is a reconnect trigger: the holder for the OLD digest is SIGTERM'd and a new
     one spawned with the new settings. The kill and the spawn are both observable here."""
     killed = []
@@ -368,23 +426,19 @@ def test_a_stale_digest_stops_the_old_holder_and_respawns(holder_state):
 
     spawned = []
     speak._write_stream_holder_pid(4321, "an-old-digest")
-    speak.pid_looks_like_stream_holder = lambda pid, **kw: True
-    original_kill = os.kill
-
-    def fake_kill(pid, sig):
-        killed.append((pid, sig))
-
-    os.kill = fake_kill
-    try:
-        assert speak.ensure_stream_holder(_settings(), popen=fake_popen, sleep=lambda _: None, clock=lambda: 0.0)
-    finally:
-        os.kill = original_kill
-        speak.pid_looks_like_stream_holder = speak.pid_looks_like_stream_holder  # restore (no-op self-assign guard)
+    monkeypatch.setattr(os, "kill", lambda pid, sig: killed.append((pid, sig)))
+    assert speak.ensure_stream_holder(
+        _settings(),
+        popen=fake_popen,
+        sleep=lambda _: None,
+        clock=lambda: 0.0,
+        holder_guard=lambda pid, **kw: True,
+    )
     assert killed == [(4321, speak.signal.SIGTERM)]
     assert spawned and spawned[0][-1] == speak.stream_settings_digest(_settings())
 
 
-def test_a_spawn_failure_falls_back_to_the_blob_path(holder_state):
+def test_a_spawn_failure_falls_back_to_the_blob_path(holder_state, monkeypatch):
     """A holder that will not start must not stall a turn: ensure returns False and the caller uses
     the blob path for that one turn."""
     speak._write_stream_holder_pid(4321, "stale")  # forces a spawn attempt
@@ -392,11 +446,8 @@ def test_a_spawn_failure_falls_back_to_the_blob_path(holder_state):
     def boom(argv, **kw):
         raise OSError("nope")
 
-    speak.pid_looks_like_stream_holder = lambda pid, **kw: False
-    try:
-        assert speak.ensure_stream_holder(_settings(), popen=boom, sleep=lambda _: None, clock=lambda: 0.0) is False
-    finally:
-        del speak.pid_looks_like_stream_holder  # restore the real function
+    monkeypatch.setattr(speak, "pid_looks_like_stream_holder", lambda pid, **kw: False)
+    assert speak.ensure_stream_holder(_settings(), popen=boom, sleep=lambda _: None, clock=lambda: 0.0) is False
 
 
 # --- run_holder_main: refuse fast, before any socket ---------------------------------------------
@@ -949,16 +1000,18 @@ def test_ensure_stream_holder_handles_a_stale_holder_already_gone(holder_state, 
         open(speak._STREAM_HOLDER_SOCK, "w").close()
         return P()
 
-    speak.pid_looks_like_stream_holder = lambda pid, **kw: True
-    try:
-        assert speak.ensure_stream_holder(_settings(), popen=fake_popen, sleep=lambda _: None, clock=lambda: 0.0)
-    finally:
-        del speak.pid_looks_like_stream_holder
+    assert speak.ensure_stream_holder(
+        _settings(),
+        popen=fake_popen,
+        sleep=lambda _: None,
+        clock=lambda: 0.0,
+        holder_guard=lambda pid, **kw: True,
+    )
     assert killed == [(speak.os.getpid(), speak.signal.SIGTERM)]
     assert spawned  # the respawn still happened
 
 
-def test_ensure_stream_holder_times_out_when_holder_never_binds(holder_state, monkeypatch):
+def test_ensure_stream_holder_times_out_when_holder_never_binds(holder_state):
     """The holder was spawned but never bound the socket (crashed in prime, lost the pidfile) —
     the wait-loop hits its deadline and the turn uses the blob path."""
     digest = speak.stream_settings_digest(_settings())
@@ -980,11 +1033,8 @@ def test_ensure_stream_holder_times_out_when_holder_never_binds(holder_state, mo
     def fake_clock():
         return clocks[len(sleep_calls) - 1] if sleep_calls else clocks[0]
 
-    speak.pid_looks_like_stream_holder = lambda pid, **kw: True
-    try:
-        result = speak.ensure_stream_holder(_settings(), popen=fake_popen, sleep=fake_sleep, clock=fake_clock)
-    finally:
-        del speak.pid_looks_like_stream_holder
+    # holder_guard=False disables the kill branch entirely so the wait loop is what we observe here
+    result = speak.ensure_stream_holder(_settings(), popen=fake_popen, sleep=fake_sleep, clock=fake_clock, holder_guard=lambda pid, **kw: False)
     assert result is False  # the wait ran out — caller uses the blob path
     assert sleep_calls  # the wait loop actually slept
 
