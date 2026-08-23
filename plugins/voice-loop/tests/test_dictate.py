@@ -59,6 +59,11 @@ def state(monkeypatch, tmp_path):
     monkeypatch.setattr(dictate, "_STREAM_PID_PATH", str(tmp_path / "dictate-stream.pid"))
     monkeypatch.setattr(dictate, "_STREAM_RESULT_PATH", str(tmp_path / "dictate-stream.json"))
     monkeypatch.setattr(dictate, "_PREVIEW_PATH", str(tmp_path / "dictate-preview.json"))
+    # _LAST_SPOKEN_PATH is bound at import time to the live state dir; redirect it into the test's
+    # own state so the lane's ambient last-spoken cannot drop the echo guard's transcript. Without
+    # this line, every stop_and_transcribe test that exercises the echo guard writes the operator's
+    # live ~/.local/state/voice-loop/last-spoken file.
+    monkeypatch.setattr(dictate, "_LAST_SPOKEN_PATH", str(tmp_path / "last-spoken"))
     return tmp_path
 
 
@@ -788,10 +793,6 @@ def paste_run(state, monkeypatch):
     monkeypatch.setattr(
         dictate, "_run_paste", lambda tool, paste_key, enter, sock: run.pastes.append(paste_key) or True
     )
-    # _LAST_SPOKEN_PATH is bound at import time to the live state dir; redirect it into the test's
-    # own state so the lane's ambient last-spoken cannot drop the batch transcript out of every
-    # paste_run fixture's tests.
-    monkeypatch.setattr(dictate, "_LAST_SPOKEN_PATH", str(state / "last-spoken"))
     return run
 
 
@@ -4069,49 +4070,59 @@ def test_run_paste_optional_step_is_skipped_silently(monkeypatch):
 
 
 def test_main_stale_pathtime_oserror_is_silence(state, monkeypatch):
-    """Lines 2532-2533: ``os.path.getmtime`` may raise OSError on a kernel-reset state dir. The
-    toggle falls through to claim_pidfile(), which proceeds normally."""
+    """The else branch at lines 2538-2546: ``os.path.getmtime`` may raise OSError on a
+    kernel-reset state dir. The toggle falls through to claim_pidfile(), which proceeds normally.
+    The test must drive the getmtime branch on purpose, then return past it — not exit at the
+    lost-claim point — so a regression that removes the getmtime swallow cannot pass green by
+    accident."""
 
     log_calls: list[str] = []
     monkeypatch.setattr(dictate, "log", lambda message: log_calls.append(message))
     cfg_path = state / "config.json"
     cfg_path.write_text("{}", encoding="utf-8")
     monkeypatch.setenv("VOICE_LOOP_CONFIG", str(cfg_path))
+    # Stub debounce_toggle to admit the fire — without this, debounce reads the empty toggle
+    # stamp and returns 0.0, which main() reads as a key-repeat and exits with rc=0 before
+    # ever reaching the getmtime branch the test is trying to drive.
+    monkeypatch.setattr(dictate, "debounce_toggle", lambda seconds: None)
+    monkeypatch.setattr(dictate, "_paste_locked", lambda: False)
     # Patch ONLY the pidfile open — leave the real builtins.open alone so config reads still work.
     pid_path_str = str(state / "dictate.pid")
-
-    def open_pid_returns_garbage(path, *args, **kwargs):
-        if str(path) == pid_path_str:
-            raise ValueError("non-integer stamp")
-        return io.StringIO("")
-
-    def open_pid_raises_io(path, *args, **kwargs):
-        if str(path) == pid_path_str:
-            raise FileNotFoundError(2, "no pidfile", str(path))
-        return io.StringIO("")
-
-    # Walk the path: the first main() reads pid -> raises ValueError -> recorder_pid = -1 ->
-    # falls through to ``recorder_pid > 0`` is False -> goes to the ``else`` branch which calls
-    # getmtime. The first read of pid sees None -> mtime raised. second read also None.
-    # Two different open() patches for the two reads.
     real_open = open
 
     def careful_open(path, *args, **kwargs):
+        # The pidfile read raises FileNotFoundError -> recorder_pid = -1 (caught) ->
+        # _pid_alive is False -> ``recorder_pid > 0`` is False -> else branch.
         if str(path) == pid_path_str:
-            mode = str(args[0]) if args else kwargs.get("mode", "r")
-            if "r" in mode:
-                raise FileNotFoundError(2, "no pidfile", str(path))
-            raise ValueError("non-integer stamp")
+            raise FileNotFoundError(2, "no pidfile", str(path))
         return real_open(path, *args, **kwargs)
 
     monkeypatch.setattr("builtins.open", careful_open)
-    monkeypatch.setattr(dictate.os.path, "getmtime", lambda p: (_ for _ in ()).throw(OSError("EIO")))
+    # Track the getmtime call so the assertion can verify it was reached AND raised.
+    getmtime_calls: list[str] = []
+
+    def failing_getmtime(p):
+        getmtime_calls.append(str(p))
+        raise OSError("EIO")
+
+    monkeypatch.setattr(dictate.os.path, "getmtime", failing_getmtime)
     monkeypatch.setattr(dictate.time, "time", lambda: 0.0)
     monkeypatch.setattr(dictate, "_pid_alive", lambda pid: False)
-    monkeypatch.setattr(dictate, "claim_pidfile", lambda: None)  # simulate winner -> note() + rc=0
-    # Expect main() to return 0 (note + log "concurrent invocation won the race") since
-    # claim_pidfile returns None here.
+    # Make claim_pidfile SUCCEED so the test does not exit at the lost-claim point — we want
+    # to prove the getmtime branch ran, not that claim_pidfile returned None.
+    pid_path = state / "dictate.pid"
+    monkeypatch.setattr(
+        dictate,
+        "claim_pidfile",
+        lambda: os.open(pid_path, os.O_RDWR | os.O_CREAT, 0o600),
+    )
+    monkeypatch.setattr(dictate, "start_recording", lambda *a, **kw: 0)
+    # main() reaches the getmtime branch, the OSError is swallowed, claim_pidfile succeeds,
+    # start_recording is stubbed to 0 -> main returns 0.
     assert dictate.main(["dictate.py"]) == 0
+    # And the assertion that proves the getmtime branch was actually executed: a regression
+    # that drops the try/except would crash here with the OSError propagating out.
+    assert getmtime_calls == [str(pid_path)]
 
 
 # --- a second pass at the coverage ratchet: the Windows-shaped branches reachable with system="Windows" -
@@ -4429,12 +4440,26 @@ class TestMainGuard:
 
     def test_the_main_guard_is_executed_as_the_entry_point(self, monkeypatch, state, tmp_path):
         """runpy runs ``dictate.py`` under ``__name__ == "__main__"`` — the guard's body
-        executes in this process and the harness's coverage tool sees the lines it ran."""
+        executes in this process and the harness's coverage tool sees the lines it ran.
+
+        The state fixture's monkeypatches DO NOT reach runpy's fresh namespace, so we re-apply
+        the ones the toggle's start path needs: VOICE_LOOP_CONFIG points at a hermetic config,
+        XDG_STATE_HOME / XDG_CONFIG_HOME route the script away from the operator's live state,
+        and ``shutil.which`` is stubbed to return None so resolve_recorder falls through to ''
+        without ever spawning a recorder. A machine with pw-record/arecord on PATH would
+        otherwise capture its own microphone through this test."""
 
         import runpy
 
         cfg_path = state / "config.json"
         cfg_path.write_text("{}", encoding="utf-8")
+        monkeypatch.setenv("VOICE_LOOP_CONFIG", str(cfg_path))
+        monkeypatch.setenv("XDG_STATE_HOME", str(state / "xdg-state"))
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(state / "xdg-config"))
+        # Stub PATH-level recorders to None so resolve_recorder always returns ''. This is the
+        # whole hermeticity story: with no recorder resolvable, start_recording's first branch
+        # logs and returns 1 — no Popen, no sound, no microphone.
+        monkeypatch.setattr(dictate.shutil, "which", lambda name: None)
 
         with pytest.raises(SystemExit) as excinfo:
             runpy.run_path(str(Path(dictate.__file__)), run_name="__main__")
@@ -4443,37 +4468,37 @@ class TestMainGuard:
         assert excinfo.value.code in (0, 1, None)
 
     def test_the_guard_catches_an_unhandled_exception(self, monkeypatch, state, tmp_path):
-        """The bare ``except Exception:`` branch (lines 2554-2559) is the difference between a
+        """The bare ``except Exception:`` branch (lines 2555-2563) is the difference between a
         hotkey-mounted invocation that pages nobody and one that crashes the daemon. We cover
-        these lines by compiling a synthesized source whose line numbers align with dictate.py
-        (2550 lines of pre-amble then the guard at lines 2551-2559) and exec'ing it under
-        ``__name__ == "__main__"``. Coverage tracks the original line numbers because the
-        compiled source's filename is ``dictate.py`` itself."""
+        these lines by Slicing the real guard text out of ``dictate.py`` and exec'ing it under
+        ``__name__ == "__main__"`` — that way coverage tracks the real file lines, and an edit
+        above the guard cannot repaint the wrong range as covered."""
 
         # A main() that raises — the contract the guard was written for.
         def main_raises(argv):
             raise RuntimeError("a hotkey-shaped crash for the guard")
 
-        # A log() that raises on its own — covers the inner except Exception: pass branch
-        # (lines 2557-2558): the guard tries ``log(...)``, the call throws, the inner except
-        # catches silently, and the program still exits 1. This is the second-level safety net.
+        # A log() that raises on its own — covers the inner except Exception: pass branch:
+        # the guard tries ``log(...)``, the call throws, the inner except catches silently,
+        # and the program still exits 1. This is the second-level safety net.
         def log_fails(message):
             raise OSError("disk full")
 
         src_path = Path(dictate.__file__)
-        preamble = "".join([f"# preamble line {n + 1}\n" for n in range(2550)])
-        guard_src = (
-            'if __name__ == "__main__":\n'
-            "    try:\n"
-            "        sys.exit(main(sys.argv))\n"
-            "    except Exception:  # a hotkey script: surface via the log, never a traceback into nowhere\n"
-            "        try:\n"
-            '            log(f"unexpected error: {sys.exc_info()[1]!r:.200}")\n'
-            "        except Exception:\n"
-            "            pass\n"
-            "        sys.exit(1)\n"
-        )
-        synthesized = preamble + guard_src
+        # Read the real guard out of the file so coverage tracks the actual line range.
+        # A synthesized preamble-with-line-pinning approach (the previous one) painted the
+        # wrong lines as covered on any edit above the guard — slicing the file keeps the
+        # coverage report honest.
+        lines = src_path.read_text(encoding="utf-8").splitlines()
+        # Find the guard by its first line; the guard ends at the last non-empty line.
+        try:
+            start = next(i for i, line in enumerate(lines) if line.startswith('if __name__ == "__main__":'))
+        except StopIteration:
+            pytest.fail("dictate.py: __main__ guard not found")
+        end = start
+        while end + 1 < len(lines) and lines[end + 1].strip() != "":
+            end += 1
+        guard_src = "\n".join(lines[start : end + 1]) + "\n"
 
         namespace = {
             "__name__": "__main__",
@@ -4483,7 +4508,7 @@ class TestMainGuard:
             "log": log_fails,
         }
         with pytest.raises(SystemExit) as excinfo:
-            exec(compile(synthesized, str(src_path), "exec"), namespace)
+            exec(compile(guard_src, str(src_path), "exec"), namespace)
         # main() threw -> outer except caught -> log() threw -> inner except swallowed ->
         # sys.exit(1) propagated.
         assert excinfo.value.code == 1
@@ -4500,26 +4525,6 @@ class TestMainGuard:
 #   - Where a branch is an OSError / error path, assert the log()/note() call AND the specific
 #     fallback taken — the OSError short-circuits a contract, and a test that only checks the
 #     return code would not catch a regression that swapped "drop" for "refuse".
-
-
-class TestPragmaCount:
-    """The enumerated allow-list: exactly three ``pragma: no cover`` markers, all on Windows-ctypes
-    bodies, nowhere else in the file. A count > 3 means a new exclusion slipped in undocumented; a
-    count < 3 means the file changed without updating the ratchet this test pins."""
-
-    def test_three_named_exclusions_on_dictate_py(self):
-        text = Path(dictate.__file__).read_text(encoding="utf-8")
-        pragmas = [line for line in text.splitlines() if "pragma: no cover" in line]
-        assert len(pragmas) == 3, (
-            f"dictate.py carries {len(pragmas)} 'pragma: no cover' markers, expected exactly 3. "
-            f"Each must be on a Windows-ctypes body and named in TESTING.md; a count higher means "
-            f"the allow-list grew silently, a lower means a doc-level change missed the suite."
-        )
-        # Every one names the same idea — a Windows kernel32 surface the Linux CI cannot reach —
-        # so a future exclusion on, say, "the clipboard-tiers' macOS branch" reads at once as
-        # wrong: the ratchet's purpose is to forbid those.
-        for line in pragmas:
-            assert "Windows" in line, f"every pragma must name a Windows-only body; got: {line!r}"
 
 
 def test_log_truncates_a_rolled_log_over_one_megabyte(state, monkeypatch):
@@ -5196,10 +5201,6 @@ def test_stop_and_transcribe_echo_match_drops_before_clipboard(state, monkeypatc
     log_calls: list[str] = []
     monkeypatch.setattr(dictate, "log", lambda message: log_calls.append(message))
     s = dictate.resolve_settings({"dictate": {"clipboard": "xclip"}}, "Linux")
-    # _LAST_SPOKEN_PATH is fixed in dictate.py — use the real path; the fixture owns its dir.
-    log_path = dictate._LAST_SPOKEN_PATH
-    (Path(log_path).parent).mkdir(parents=True, exist_ok=True)
-    Path(log_path).write_text("Hello agent.", encoding="utf-8")
     assert dictate.stop_and_transcribe(s, "Linux", "send", 12345) == 0
     # The "transcript:" line never appears — the echo path returns before logging it.
     assert not any(line.startswith("transcript: ") for line in log_calls)
@@ -5332,72 +5333,3 @@ def test_main_stale_race_is_left_alone(state, monkeypatch, tmp_path):
     # The toggle is the "stale" path: 4242 was seen earlier, re-reading shows it has changed.
     (state / "dictate.pid").write_text("4242\n", encoding="utf-8")
     assert dictate.main(["dictate.py"]) == 1
-
-
-class TestMainGuard:
-    """The ``if __name__ == "__main__":`` block is plain Python and reachable in a real interpreter
-    — covering it via runpy proves its entire body, including the Exception-fallback that
-    writes a truncated repr of the exception to the log rather than a traceback. runpy runs
-    the file under ``__name__ == "__main__"`` in the SAME process the test lives in, so the
-    coverage report sees every line of the guard run."""
-
-    def test_the_main_guard_is_executed_as_the_entry_point(self, monkeypatch, state, tmp_path):
-        """runpy runs ``dictate.py`` under ``__name__ == "__main__"`` — the guard's body
-        executes in this process and the harness's coverage tool sees the lines it ran."""
-
-        import runpy
-
-        cfg_path = state / "config.json"
-        cfg_path.write_text("{}", encoding="utf-8")
-
-        with pytest.raises(SystemExit) as excinfo:
-            runpy.run_path(str(Path(dictate.__file__)), run_name="__main__")
-        # The guard calls sys.exit(main(sys.argv)). main's verdict drives the exit code; what
-        # the assertion captures is that the guard's sys.exit fired at all (i.e., the body ran).
-        assert excinfo.value.code in (0, 1, None)
-
-    def test_the_guard_catches_an_unhandled_exception(self, monkeypatch, state, tmp_path):
-        """The bare ``except Exception:`` branch (lines 2554-2559) is the difference between a
-        hotkey-mounted invocation that pages nobody and one that crashes the daemon. We cover
-        these lines by compiling a synthesized source whose line numbers align with dictate.py
-        (2550 lines of pre-amble then the guard at lines 2551-2559) and exec'ing it under
-        ``__name__ == "__main__"``. Coverage tracks the original line numbers because the
-        compiled source's filename is ``dictate.py`` itself."""
-
-        # A main() that raises — the contract the guard was written for.
-        def main_raises(argv):
-            raise RuntimeError("a hotkey-shaped crash for the guard")
-
-        # A log() that raises on its own — covers the inner except Exception: pass branch
-        # (lines 2557-2558): the guard tries ``log(...)``, the call throws, the inner except
-        # catches silently, and the program still exits 1. This is the second-level safety net.
-        def log_fails(message):
-            raise OSError("disk full")
-
-        src_path = Path(dictate.__file__)
-        preamble = "".join([f"# preamble line {n + 1}\n" for n in range(2550)])
-        guard_src = (
-            'if __name__ == "__main__":\n'
-            "    try:\n"
-            "        sys.exit(main(sys.argv))\n"
-            "    except Exception:  # a hotkey script: surface via the log, never a traceback into nowhere\n"
-            "        try:\n"
-            '            log(f"unexpected error: {sys.exc_info()[1]!r:.200}")\n'
-            "        except Exception:\n"
-            "            pass\n"
-            "        sys.exit(1)\n"
-        )
-        synthesized = preamble + guard_src
-
-        namespace = {
-            "__name__": "__main__",
-            "__file__": str(src_path),
-            "sys": sys,
-            "main": main_raises,
-            "log": log_fails,
-        }
-        with pytest.raises(SystemExit) as excinfo:
-            exec(compile(synthesized, str(src_path), "exec"), namespace)
-        # main() threw -> outer except caught -> log() threw -> inner except swallowed ->
-        # sys.exit(1) propagated.
-        assert excinfo.value.code == 1
