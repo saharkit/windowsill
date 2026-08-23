@@ -264,12 +264,14 @@ jobs:
       # their paths (testpaths, pythonpath, coverage source) are relative to it, so the suite is
       # invoked from there rather than from the repo root.
       #
-      # Coverage measures both the server and the scripts (dictate.py, speak.py, report_bug.py,
-      # tls-probe.py). The server's 100% branch-coverage gate is non-negotiable and never dropped;
-      # the scripts gate starts at 80% and ratchets upward. Both are enforced via separate
-      # `coverage report --include` calls so a script regression cannot block on the server bar
-      # and a server regression cannot hide behind a script's lower threshold.
-      - name: pytest with coverage gates (server 100%, scripts 80% ratcheting)
+      # Coverage measures the server, the helper scripts (dictate.py, speak.py, report_bug.py,
+      # tls-probe.py), and the diagnose tool (scripts/doctor.py). Three independent gates are
+      # enforced via separate `coverage report --include` calls so a regression in one scope cannot
+      # hide behind another's threshold: ``server/voice_server*`` at 100% (branch + statement,
+      # non-negotiable and never dropped), ``scripts/*`` at 80% with a ratchet that only moves
+      # upward, and ``scripts/doctor.py`` at 100% (the diagnose tool the user runs first when
+      # something is wrong cannot be the broken thing they hit).
+      - name: pytest with coverage gates (server 100%, scripts 80% ratcheting, doctor.py 100%)
         working-directory: plugins/voice-loop
         run: |
           pytest --cov --cov-report=term-missing

@@ -81,9 +81,13 @@ queue's `merge_group` ref, and manual:
   display names, which is why the ruleset must not point at them).
 - **`coverage` job** — `cd plugins/voice-loop && pytest --cov=voice_server --cov-report=term-missing
   --cov-fail-under=100`, on Python **3.10, 3.11, 3.12 and 3.13**. `.coveragerc` sets `branch = True`,
-  so the 100% is **statements *and* branches**. It is **scoped to `server/voice_server.py`**: the hook
-  scripts are deliberately *not* under it (they are proven by real invocation instead — see
-  `plugins/voice-loop/TESTING.md`).
+  so the 100% is **statements *and* branches**. The job enforces three gates via separate
+  `coverage report --include` calls so a regression in one scope cannot hide behind another's
+  threshold: **`server/voice_server.py` at 100% (non-negotiable, never dropped)**,
+  **`scripts/*` at 80% with a ratchet that only moves upward** (the hook scripts are proven by real
+  invocation — see `plugins/voice-loop/TESTING.md` — so this gate exists to keep regression
+  pressure on the helper surface), and **`scripts/doctor.py` at 100%** (the diagnose tool the
+  user runs first when something is wrong, so it cannot itself be the broken thing they hit).
 - **`loopback` job** — ubuntu/Russian and macOS/English lanes. Starts the **real server** and then
   runs **real-invocation smokes**: the `selftest.sh` TTS→STT loopback at `--strict --threshold 0.7`;
   the Stop-hook contract (asserts `via=stream` and `chunks>1`, so a silent regression to the blob
