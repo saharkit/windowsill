@@ -4442,6 +4442,17 @@ def test_win_pid_is_recorder_posix_fallthrough_returns_false():
     assert dictate._win_pid_is_recorder(1234, "arecord") is False
 
 
+def test_win_pid_is_recorder_plain_guard_returns_false():
+    """Line 1487: the plain-Python guard at the top of ``_win_pid_is_recorder`` — non-positive
+    pid or empty recorder must short-circuit before the cached ctypes / WinDLL block runs. The
+    guard sits before ``if os.name == "nt":`` on purpose: a malformed pid cannot reach
+    ``OpenProcess`` even when the host happens to be Windows."""
+
+    assert dictate._win_pid_is_recorder(0, "arecord") is False
+    assert dictate._win_pid_is_recorder(-1, "arecord") is False
+    assert dictate._win_pid_is_recorder(1234, "") is False
+
+
 class TestPragmaCount:
     """The enumerated allow-list: exactly three ``pragma: no cover`` markers, all on Windows-ctypes
     bodies, nowhere else in the file. A count > 3 means a new exclusion slipped in undocumented; a
@@ -4491,10 +4502,19 @@ class TestMainGuard:
         # whole hermeticity story: with no recorder resolvable, start_recording's first branch
         # logs and returns 1 — no Popen, no sound, no microphone.
         monkeypatch.setattr(dictate.shutil, "which", lambda name: None)
-        # Stub stop_speak_playback too: the no-pidfile branch fires a real `pkill -f
-        # voice-loop-speak` against the host's processes, which is neither hermetic nor scoped
-        # to the test fixture. (Pre-existing pattern — see test_dictate.py:1662.)
-        monkeypatch.setattr(dictate, "stop_speak_playback", lambda: None)
+        # Patch dictate.subprocess.run: this is the SHARED subprocess module (runpy's fresh
+        # namespace imports the same subprocess), so the stub DOES cross runpy's fresh module
+        # dict — patching dictate.stop_speak_playback instead does NOT, because runpy binds a
+        # new module object and the test's monkeypatch.setattr writes only to the imported
+        # dictate. The pkill fallback in stop_speak_playback (no pidfile) would otherwise fire a
+        # real `pkill -f voice-loop-speak` against the host's process table on a machine without
+        # a _SPEAK_PID_PATH (the state fixture redirects it into tmp_path, where no file exists).
+        # The stub returns a benign CompletedProcess so any subprocess.run call (pkill, ffmpeg
+        # probes that survived the which() stub) is a silent no-op.
+        monkeypatch.setattr(
+            dictate.subprocess, "run",
+            lambda *a, **kw: type("C", (), {"returncode": 0, "stderr": b""})(),
+        )
 
         with pytest.raises(SystemExit) as excinfo:
             runpy.run_path(str(Path(dictate.__file__)), run_name="__main__")
@@ -4524,10 +4544,16 @@ class TestMainGuard:
         monkeypatch.setenv("XDG_STATE_HOME", str(state / "xdg-state"))
         monkeypatch.setenv("XDG_CONFIG_HOME", str(state / "xdg-config"))
         # Same hermeticity as the sibling test: no recorder resolvable, so resolve_recorder
-        # falls through to '' and the toggle's start path never spawns Popen; stop_speak_playback
-        # is stubbed so the no-pidfile branch does not fire a real pkill against the host.
+        # falls through to '' and the toggle's start path never spawns Popen. Stub the SHARED
+        # subprocess.run (runpy imports the same subprocess module, so the patch crosses
+        # runpy's fresh namespace); the no-pidfile pkill branch in stop_speak_playback is the
+        # real risk on this code path — a host running speak playback during the suite would
+        # otherwise see its live playback SIGTERMed.
         monkeypatch.setattr(dictate.shutil, "which", lambda name: None)
-        monkeypatch.setattr(dictate, "stop_speak_playback", lambda: None)
+        monkeypatch.setattr(
+            dictate.subprocess, "run",
+            lambda *a, **kw: type("C", (), {"returncode": 0, "stderr": b""})(),
+        )
         # main() calls ``platform.system()`` at line 2476 with no try/except around it — a
         # RuntimeError here is the contract the guard was written for: hotkey-shaped crash,
         # the daemon must not see a traceback.
