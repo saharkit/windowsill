@@ -200,7 +200,8 @@ except ImportError:
 
 try:
     import fcntl
-except ImportError:    fcntl = None  # pragma: windows-only - fcntl is the POSIX fcntl; on Windows this is the ImportError arm
+except ImportError:  # pragma: windows-only - cascade covers the entire ImportError arm; `import fcntl` is POSIX stdlib that cannot fail on Linux
+    fcntl = None
 
 try:
     import msvcrt  # pragma: windows-only - msvcrt is the Windows MSVCRT; on Linux this is the ImportError arm
@@ -778,12 +779,12 @@ def acquire_lock(grace=()):
     except OSError:
         return _NoLock(reason=f"the lockfile {_LOCK_PATH} could not be opened")
 
-    if windows_lock:
+    if windows_lock:  # pragma: windows-only - cascade covers the msvcrt byte-range lock setup body; on Linux `import msvcrt` fails so windows_lock is False
         # msvcrt.locking is the native advisory byte-range lock.  The byte must exist before
         # locking, and the handle must remain open for the whole read/claim/synthesis/playback
         # sequence just as the POSIX flock handle does.
-        fh.seek(0, os.SEEK_END)  # pragma: windows-only - msvcrt byte-range seed; POSIX flock is reach-tested elsewhere
-        if fh.tell() == 0:  # pragma: windows-only - cascade covers the seed-byte branch on Linux where msvcrt is unreachable
+        fh.seek(0, os.SEEK_END)
+        if fh.tell() == 0:
             fh.write(b"\\0")
             fh.flush()
 
@@ -791,14 +792,14 @@ def acquire_lock(grace=()):
         if pause is not None:
             time.sleep(pause)
         try:
-            if windows_lock:
-                fh.seek(0)  # pragma: windows-only - msvcrt byte-range acquire; POSIX flock is reach-tested elsewhere
-                msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)  # pragma: windows-only - the msvcrt locking call itself; the inner if is the only path that reaches it
+            if windows_lock:  # pragma: windows-only - cascade covers the msvcrt byte-range acquire body; on Linux windows_lock is False so the elif fcntl branch always runs
+                fh.seek(0)
+                msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
             elif fcntl is not None:
                 fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            else:
-                fh.close()  # pragma: windows-only - no-fcntl arm is unreachable on POSIX; the Linux fcntl branch above always wins
-                return _NoLock(reason="speaking lock is unsupported on this platform — proceeding unlocked; speech may overlap")  # pragma: windows-only - same
+            else:  # pragma: windows-only - no-fcntl arm is unreachable on Linux; the elif above always wins because `import fcntl` succeeds on POSIX
+                fh.close()
+                return _NoLock(reason="speaking lock is unsupported on this platform — proceeding unlocked; speech may overlap")
             return fh
         except OSError:
             continue
@@ -1130,21 +1131,21 @@ def _windows_process_is_live(pid: int) -> bool:
     """Probe a Windows process without ``os.kill(pid, 0)`` (which terminates on Windows)."""
     import ctypes
 
-    try:
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # pragma: windows-only - ctypes.WinDLL raises AttributeError on Linux; the except arm returns False
-        kernel32.OpenProcess.argtypes = (ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32)  # pragma: windows-only - see WinDLL above
-        kernel32.OpenProcess.restype = ctypes.c_void_p  # pragma: windows-only - see WinDLL above
-        kernel32.WaitForSingleObject.argtypes = (ctypes.c_void_p, ctypes.c_uint32)  # pragma: windows-only - see WinDLL above
-        kernel32.WaitForSingleObject.restype = ctypes.c_uint32  # pragma: windows-only - see WinDLL above
-        kernel32.CloseHandle.argtypes = (ctypes.c_void_p,)  # pragma: windows-only - see WinDLL above
-        kernel32.CloseHandle.restype = ctypes.c_int  # pragma: windows-only - see WinDLL above
-        handle = kernel32.OpenProcess(0x00100000, False, pid)  # SYNCHRONIZE  # pragma: windows-only - see WinDLL above
-        if not handle:  # pragma: windows-only - cascade covers the access-denied arm on Linux
-            return ctypes.get_last_error() == 5  # access denied still means the process exists  # pragma: windows-only - see WinDLL above
-        try:  # pragma: windows-only - cascade covers the wait-and-close arm on Linux
-            return kernel32.WaitForSingleObject(handle, 0) == 0x102  # WAIT_TIMEOUT  # pragma: windows-only - see WinDLL above
-        finally:
-            kernel32.CloseHandle(handle)  # pragma: windows-only - see WinDLL above
+    try:  # pragma: windows-only - the outer cascade covers 1135-1146 (the entire try body and the nested try's body); on Linux `ctypes.WinDLL("kernel32")` raises AttributeError, the except arm returns False
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.argtypes = (ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32)
+        kernel32.OpenProcess.restype = ctypes.c_void_p
+        kernel32.WaitForSingleObject.argtypes = (ctypes.c_void_p, ctypes.c_uint32)
+        kernel32.WaitForSingleObject.restype = ctypes.c_uint32
+        kernel32.CloseHandle.argtypes = (ctypes.c_void_p,)
+        kernel32.CloseHandle.restype = ctypes.c_int
+        handle = kernel32.OpenProcess(0x00100000, False, pid)  # SYNCHRONIZE
+        if not handle:
+            return ctypes.get_last_error() == 5  # access denied still means the process exists
+        try:
+            return kernel32.WaitForSingleObject(handle, 0) == 0x102  # WAIT_TIMEOUT
+        finally:  # pragma: windows-only - the finally clause is not covered by the outer try's cascade (the try-body cascade excludes 1135-1146, but the finally-body needs its own marker); on Linux this arm never runs because the outer try raises AttributeError before reaching the nested try/finally
+            kernel32.CloseHandle(handle)
     except (OSError, AttributeError):
         return False
 
@@ -1197,10 +1198,10 @@ def playback_is_live() -> bool:
     Process-group children (``tts.command``) are checked by pg-leader existence alone — no identity
     guard is needed because the ``"pg"`` marker in the pidfile IS the identity record."""
     for pid in _recorded_pids():
-        if sys.platform == "win32":  # pragma: windows-only - sys.platform is hard-coded to "linux" on the matrix; the POSIX os.kill branch below is the one that runs
-            if pid_looks_like_speak(pid):  # pragma: windows-only - cascade covers the entire win32 arm above
-                return True  # pragma: windows-only - cascade covers the entire win32 arm above
-            continue  # pragma: windows-only - cascade covers the entire win32 arm above
+        if sys.platform == "win32":  # pragma: windows-only - sys.platform is hard-coded to "linux" on the matrix; the POSIX os.kill branch below is the one that runs. The cascade covers the entire win32 arm (1202-1204 below).
+            if pid_looks_like_speak(pid):
+                return True
+            continue
         try:
             os.kill(pid, 0)
         except OSError:
