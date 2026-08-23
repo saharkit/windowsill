@@ -3848,6 +3848,7 @@ def test_pid_alive_posix_refuses_permission_error_as_alive(monkeypatch):
     assert dictate._pid_alive(1234) is True
 
 
+@pytest.mark.skipif(os.name != "posix", reason="POSIX signal-0 probe only")
 def test_pid_alive_posix_refuses_oserror_as_dead(monkeypatch):
     """The POSIX arm of _pid_alive: an OSError that is NEITHER ProcessLookupError NOR
     PermissionError — typically a kernel ESRCH — is reported as dead."""
@@ -3859,6 +3860,7 @@ def test_pid_alive_posix_refuses_oserror_as_dead(monkeypatch):
     assert dictate._pid_alive(1234) is False
 
 
+@pytest.mark.skipif(os.name != "posix", reason="POSIX signal-0 probe only")
 def test_pid_alive_posix_processlookuperror_is_dead(monkeypatch):
     """The POSIX arm of _pid_alive: ESRCH (no such process) is reported as dead — the standard
     case for a pidfile whose process is gone."""
@@ -4180,6 +4182,7 @@ def test_parse_dshow_audio_devices_returns_empty_after_a_video_header_seen(state
     assert dictate._parse_dshow_audio_devices(no_audio) == ""
 
 
+@pytest.mark.skipif(os.name != "posix", reason="POSIX signal-0 probe only")
 def test_pid_alive_posix_default_path_returns_true_after_successful_kill():
     """The HAPPY POSIX arm of _pid_alive (lines 1386-1390): os.kill(pid, 0) succeeds and the
     function returns True. Tested without monkeypatching anything — a pid in the test process
