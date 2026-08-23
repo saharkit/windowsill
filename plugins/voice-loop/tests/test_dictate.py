@@ -17,6 +17,7 @@ import importlib.util
 import io
 import json
 import os
+import signal
 import socket
 import struct
 import subprocess
@@ -3837,6 +3838,7 @@ def test_transcribe_command_logs_and_returns_empty_when_stderr_is_empty(monkeypa
     assert captured_stderr == []  # the empty-stderr gate worked
 
 
+@pytest.mark.skipif(os.name != "posix", reason="POSIX signal-0 probe only")
 def test_pid_alive_posix_refuses_permission_error_as_alive(monkeypatch):
     """The POSIX arm of _pid_alive: a permission error means the pid EXISTS and we lack the right
     to signal it. Returning True — alive — is the same answer the Windows-kernel arm returns on
@@ -4039,6 +4041,9 @@ def test_stop_and_transcribe_auto_paste_path_completes(state, monkeypatch, tmp_p
     monkeypatch.setattr(dictate.os, "kill", lambda pid, sig: None)
     monkeypatch.setattr(dictate.time, "sleep", lambda seconds: None)
     monkeypatch.setattr(dictate, "note", lambda message, system: None)
+    # Stub the clipboard subprocess.run — the function reaches the clipboard command loop after
+    # the auto-paste path, and a host without xclip would otherwise surface as a real 1 here.
+    monkeypatch.setattr(dictate.subprocess, "run", lambda argv, **kw: None)
     # pre-record a successful paste — _run_paste returns True
     monkeypatch.setattr(dictate, "_run_paste", lambda *a, **kw: True)
     monkeypatch.setattr(dictate, "current_focus", lambda system: "Claude Code")
@@ -4291,7 +4296,9 @@ def test_start_recording_preview_path_runs(monkeypatch, state):
         pid = 9999
 
     monkeypatch.setattr(dictate.subprocess, "Popen", lambda argv, **kw: FakeProc())
-    s = dictate.resolve_settings({}, "Linux")
+    # Pin the recorder explicitly so a host without pw-record/arecord/ffmpeg does not surface as
+    # the "no recorder found" branch — same shape as the resolved-recorder tests above (line 4271).
+    s = dictate.resolve_settings({"dictate": {"recorder": "arecord"}}, "Linux")
     s["preview"] = True
     pidfile_fd = dictate.claim_pidfile()
     assert pidfile_fd is not None
@@ -4329,6 +4336,7 @@ def test_stop_and_transcribe_windows_clipboard_writes_utf16le_bom(state, monkeyp
     assert captured_inputs[0] == expected
 
 
+@pytest.mark.skipif(dictate.fcntl is None, reason="POSIX flock only")
 def test_debounce_toggle_flock_returns_none(state, monkeypatch):
     """Lines 2109->2116: when the lock-held-by-another signal raises OSError, the function
     logs and returns 0.0 (the verdict that says "treat this as a same-instant refire").
@@ -4906,6 +4914,7 @@ def test_finish_stream_worker_swallows_a_race_to_a_recycled_pid(state, monkeypat
     assert dictate.finish_stream_worker() == "hi"
 
 
+@pytest.mark.skipif(not hasattr(signal, "SIGKILL"), reason="signal.SIGKILL absent on this platform")
 def test_finish_stream_worker_hard_kill_for_a_worker_that_outstayed_its_bound(
     state, monkeypatch
 ):
@@ -5027,6 +5036,7 @@ def test_run_stream_session_recording_read_failure_degrades_with_reason(state):
     assert "the recording could not be read" in result["reason"]
 
 
+@pytest.mark.skipif(dictate.fcntl is None, reason="POSIX flock only")
 def test_debounce_toggle_lock_contention_returns_zero(state, monkeypatch):
     """Two near-simultaneous hotkey fires both call flock — one wins, the other reads the lock
     as held and returns 0.0 (which main() then re-reads as 'age 0, verdict dropped'). The
@@ -5203,7 +5213,9 @@ def test_start_recording_streaming_path_runs_when_configured(monkeypatch, state)
     # streaming_wanted now true — without changing the resolve_settings default.
     monkeypatch.setattr(dictate, "streaming_wanted", lambda s: True)
 
-    s = dictate.resolve_settings({}, "Linux")
+    # Pin the recorder explicitly so a host without pw-record/arecord/ffmpeg does not surface as
+    # the "no recorder found" branch.
+    s = dictate.resolve_settings({"dictate": {"recorder": "arecord"}}, "Linux")
     pidfile_fd = dictate.claim_pidfile()
     assert pidfile_fd is not None
     assert dictate.start_recording(s, "Linux", pidfile_fd) == 0
