@@ -1351,7 +1351,8 @@ class TestReadConfigValidObjectHappyPath:
 
         result = doctor.read_config(str(config_path))
         assert result.status == "unreadable"
-        assert "IsADirectoryError" in result.detail
+        # A directory open raises IsADirectoryError on POSIX and PermissionError on Windows; the class name is not assertable, the path is.
+        assert str(config_path) in result.detail
 
     def test_missing_file_returns_missing(self, tmp_path: Path) -> None:
         """An absent config file returns ``status='missing'`` with the path in the detail.
@@ -1387,7 +1388,8 @@ class TestReadLedgerExceptBranches:
 
         result = doctor.read_ledger(str(state_home))
         assert result.status == "unreadable"
-        assert "IsADirectoryError" in result.detail
+        # A directory open raises IsADirectoryError on POSIX and PermissionError on Windows; the class name is not assertable, the path is.
+        assert str(state_home / "voice-loop" / "install.ledger") in result.detail
 
     def test_malformed_json_returns_malformed(self, tmp_path: Path) -> None:
         """Invalid JSON in ``install.ledger`` returns ``status='malformed'``.
@@ -1460,7 +1462,8 @@ class TestReadLogsHappyPath:
 
         result = doctor.read_logs(str(state_home))
         assert result.source_status["speak.log"] == "unreadable"
-        assert "IsADirectoryError" in result.source_details["speak.log"]
+        # A directory open raises IsADirectoryError on POSIX and PermissionError on Windows; the class name is not assertable, the path is.
+        assert str(state_home / "voice-loop" / "speak.log") in result.source_details["speak.log"]
         assert result.source_status["dictate.log"] == "missing"
         assert result.status == "degraded"
 
