@@ -200,7 +200,7 @@ except ImportError:
 
 try:
     import fcntl
-except ImportError:    fcntl = None  # type: ignore[assignment]
+except ImportError:    fcntl = None  # pragma: windows-only - fcntl is the POSIX fcntl; on Windows this is the ImportError arm
 
 try:
     import msvcrt  # pragma: windows-only - msvcrt is the Windows MSVCRT; on Linux this is the ImportError arm
@@ -797,8 +797,8 @@ def acquire_lock(grace=()):
             elif fcntl is not None:
                 fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
             else:
-                fh.close()
-                return _NoLock(reason="speaking lock is unsupported on this platform — proceeding unlocked; speech may overlap")
+                fh.close()  # pragma: windows-only - no-fcntl arm is unreachable on POSIX; the Linux fcntl branch above always wins
+                return _NoLock(reason="speaking lock is unsupported on this platform — proceeding unlocked; speech may overlap")  # pragma: windows-only - same
             return fh
         except OSError:
             continue
@@ -1197,10 +1197,10 @@ def playback_is_live() -> bool:
     Process-group children (``tts.command``) are checked by pg-leader existence alone — no identity
     guard is needed because the ``"pg"`` marker in the pidfile IS the identity record."""
     for pid in _recorded_pids():
-        if sys.platform == "win32":
-            if pid_looks_like_speak(pid):
-                return True
-            continue
+        if sys.platform == "win32":  # pragma: windows-only - sys.platform is hard-coded to "linux" on the matrix; the POSIX os.kill branch below is the one that runs
+            if pid_looks_like_speak(pid):  # pragma: windows-only - cascade covers the entire win32 arm above
+                return True  # pragma: windows-only - cascade covers the entire win32 arm above
+            continue  # pragma: windows-only - cascade covers the entire win32 arm above
         try:
             os.kill(pid, 0)
         except OSError:

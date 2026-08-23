@@ -3498,9 +3498,18 @@ def test_main_guard_swallows_an_unexpected_exception_and_exits_zero(state, monke
     rc is the guard's contract. The pytest-side .coverage file already covers the guard lines
     via the in-process runpy path; this test pins the subprocess contract so a regression to
     're-raise the exception' is caught even if the coverage merge misses it."""
+    # speak.py resolves _STATE_DIR at module load from $XDG_STATE_HOME (defaulting to
+    # ~/.local/state/voice-loop). Without an explicit override here, the subprocess would stamp
+    # hook-last-fired, append to the live speak.log, and may makedirs the operator's real state
+    # dir — the same live-state leak class this PR closes for _LAST_SPOKEN_PATH in test_dictate.py.
     rc = subprocess.run(
         [sys.executable, str(_SPEAK_PATH)],
-        env={**os.environ, "VOICE_LOOP_CONFIG": str(state / "config.json"), "PATH": os.environ.get("PATH", "")},
+        env={
+            **os.environ,
+            "VOICE_LOOP_CONFIG": str(state / "config.json"),
+            "PATH": os.environ.get("PATH", ""),
+            "XDG_STATE_HOME": str(state),
+        },
         stdin=subprocess.DEVNULL,
         capture_output=True,
         timeout=10,
