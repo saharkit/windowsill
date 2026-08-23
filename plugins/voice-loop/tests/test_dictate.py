@@ -3969,6 +3969,9 @@ def test_stop_and_transcribe_echo_guard_reads_last_spoken_failure(state, monkeyp
         return real_open(path, *args, **kwargs)
 
     monkeypatch.setattr("builtins.open", careful_open)
+    # Echo guard does not fire (last-spoken is unreadable), so the function reaches the clipboard
+    # commands loop; fake xclip so a host without it installed does not surface as a real 1.
+    monkeypatch.setattr(dictate.subprocess, "run", lambda argv, **kw: None)
     s = dictate.resolve_settings({"dictate": {"clipboard": "xclip"}}, "Linux")
     # assert rc == 0 — the function carries the transcript to the clipboard anyway.
     assert dictate.stop_and_transcribe(s, "Linux", "send", 12345) == 0
@@ -4017,6 +4020,10 @@ def test_stop_and_transcribe_last_wav_rename_failure_is_swallowed(state, monkeyp
         return real_replace(src, dst)
 
     monkeypatch.setattr(dictate.os, "replace", selective_replace)
+    # Echo guard does not fire (transcript does not match any last-spoken); the function reaches
+    # the clipboard commands loop, so fake xclip — a host without it installed would otherwise
+    # surface here as a real 1 from the subprocess.run OSError.
+    monkeypatch.setattr(dictate.subprocess, "run", lambda argv, **kw: None)
     s = dictate.resolve_settings({"dictate": {"clipboard": "xclip"}}, "Linux")
     assert dictate.stop_and_transcribe(s, "Linux", "send", 12345) == 0
 
