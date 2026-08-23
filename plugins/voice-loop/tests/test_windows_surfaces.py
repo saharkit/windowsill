@@ -5,6 +5,18 @@ from pathlib import Path
 
 _ROOT = Path(__file__).resolve().parents[3]
 _SCRIPTS = _ROOT / "plugins" / "voice-loop" / "scripts"
+_COVERAGERC = _ROOT / "plugins" / "voice-loop" / ".coveragerc"
+
+# B2 (#156): the count of `# pragma: windows-only` markers in scripts/speak.py at this sha.
+# A regression that ADDS a marker without bumping this literal silently grows the allow-list;
+# a regression that REMOVES a marker fails the marker-presence assert first, but if the marker
+# is also removed from the .coveragerc registration, this test catches it as the registered-marker
+# assertion below.
+_WINDOWS_ONLY_MARKERS_IN_SPEAK_PY = 11
+# Sister allow-list for the macOS-only code path (`_ps_cmdline_of`, the macOS `ps` helper): the
+# token is registered in `.coveragerc` and the marker count is pinned by the same kind of test.
+# A regression that ADDS a marker without bumping this literal silently grows the macOS allow-list.
+_MACOS_ONLY_MARKERS_IN_SPEAK_PY = 1
 
 
 def test_cmd_launchers_are_declared_for_crlf_checkout():
@@ -34,3 +46,50 @@ def test_platform_prose_names_native_windows_consistently():
     for path in paths:
         text = path.read_text(encoding="utf-8")
         assert "native windows" in text.lower()
+
+
+def test_speak_py_windows_only_marker_count_is_exactly_the_allow_list():
+    """Mutation gap: adding a `pragma: windows-only` marker widens the allow-list and a future
+    refactor that removes the marker (and re-exposes the line) has no other witness. Pinning the
+    count here means a silent grow or shrink of the allow-list fails this test before it can
+    drift unnoticed behind a green 100%."""
+    text = (_SCRIPTS / "speak.py").read_text(encoding="utf-8")
+    actual = text.count("pragma: windows-only")
+    assert actual == _WINDOWS_ONLY_MARKERS_IN_SPEAK_PY, (
+        f"scripts/speak.py carries {actual} `pragma: windows-only` markers; "
+        f"this test pins the count at {_WINDOWS_ONLY_MARKERS_IN_SPEAK_PY}. "
+        f"Update the literal here AND in the PR body together — the marker must remain "
+        f"registered as a coverage exclusion (see test_coveragerc_registers_windows_only_marker) "
+        f"and the count must be reflected in the B2 PR description."
+    )
+
+
+def test_coveragerc_registers_windows_only_marker():
+    """Mutation gap: removing `pragma: windows-only` from .coveragerc's exclude_lines makes the
+    marker just a comment — coverage still runs the line, the file drops to <100%, and the per-file
+    CI gate added for B2 fails without telling the reader WHY. Pin the registration here so a
+    marker added to speak.py cannot be left unregistered."""
+    text = _COVERAGERC.read_text(encoding="utf-8")
+    assert "pragma: windows-only" in text
+
+
+def test_speak_py_macos_only_marker_count_is_exactly_the_allow_list():
+    """Mutation gap: same shape as the windows-only pin. The macOS token has one marker in
+    speak.py — `_ps_cmdline_of`, the macOS `ps -p` helper. A drift here either grows the
+    allow-list (silently) or removes the marker (and re-exposes the function body)."""
+    text = (_SCRIPTS / "speak.py").read_text(encoding="utf-8")
+    actual = text.count("pragma: macos-only")
+    assert actual == _MACOS_ONLY_MARKERS_IN_SPEAK_PY, (
+        f"scripts/speak.py carries {actual} `pragma: macos-only` markers; "
+        f"this test pins the count at {_MACOS_ONLY_MARKERS_IN_SPEAK_PY}. "
+        f"Update the literal here AND in the PR body together — the marker must remain "
+        f"registered as a coverage exclusion."
+    )
+
+
+def test_coveragerc_registers_macos_only_marker():
+    """Mutation gap: same shape as the windows-only registration test. The macOS token must
+    be present in `.coveragerc`'s exclude_lines, otherwise the marker is just a comment and
+    coverage still tries to measure the body — which on Linux always fails."""
+    text = _COVERAGERC.read_text(encoding="utf-8")
+    assert "pragma: macos-only" in text

@@ -21,3 +21,5 @@ show_missing = True
 skip_covered = False
 exclude_lines =
     pragma: no cover
+    pragma: windows-only
+    pragma: macos-only

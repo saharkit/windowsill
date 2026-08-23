@@ -200,10 +200,11 @@ except ImportError:
 
 try:
     import fcntl
-except ImportError:    fcntl = None  # type: ignore[assignment]
+except ImportError:  # pragma: windows-only - cascade covers the entire ImportError arm; `import fcntl` is POSIX stdlib that cannot fail on Linux
+    fcntl = None
 
 try:
-    import msvcrt
+    import msvcrt  # pragma: windows-only - msvcrt is the Windows MSVCRT; on Linux this is the ImportError arm
 except ImportError:    msvcrt = None  # type: ignore[assignment]
 
 
@@ -212,7 +213,7 @@ def _kill_process_group(pgid: int, sig: int) -> None:
     killpg = getattr(os, "killpg", None)
     if killpg is not None:
         killpg(pgid, sig)
-    else:
+    else:  # pragma: windows-only - cascade covers the no-killpg arm (217-221): Windows has no POSIX process groups, so this branch is the Windows-only path; on Linux `os.killpg` is always non-None
         # Windows has no POSIX process groups; the direct child is the session's
         # process boundary and is terminated by the caller's Popen handle.
         proc = _live.get("proc")
@@ -772,13 +773,13 @@ def acquire_lock(grace=()):
     (one blocked python per tool call), that no takeover can supersede and no echo guard can stop —
     it holds no entry in ``playing.pid`` while it waits. Losing costs it nothing, because it has
     claimed nothing and the next firing is one tool call away."""
-    windows_lock = msvcrt is not None and os.name == "nt"
+    windows_lock = msvcrt is not None and os.name == "nt"  # pragma: windows-only - whole guard; on Linux the POSIX fcntl branch is taken
     try:
         fh = open(_LOCK_PATH, "a+b" if windows_lock else "w", encoding=None if windows_lock else "utf-8")
     except OSError:
         return _NoLock(reason=f"the lockfile {_LOCK_PATH} could not be opened")
 
-    if windows_lock:
+    if windows_lock:  # pragma: windows-only - cascade covers the msvcrt byte-range lock setup body; on Linux `import msvcrt` fails so windows_lock is False
         # msvcrt.locking is the native advisory byte-range lock.  The byte must exist before
         # locking, and the handle must remain open for the whole read/claim/synthesis/playback
         # sequence just as the POSIX flock handle does.
@@ -791,12 +792,12 @@ def acquire_lock(grace=()):
         if pause is not None:
             time.sleep(pause)
         try:
-            if windows_lock:
+            if windows_lock:  # pragma: windows-only - cascade covers the msvcrt byte-range acquire body; on Linux windows_lock is False so the elif fcntl branch always runs
                 fh.seek(0)
                 msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
             elif fcntl is not None:
                 fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            else:
+            else:  # pragma: windows-only - no-fcntl arm is unreachable on Linux; the elif above always wins because `import fcntl` succeeds on POSIX
                 fh.close()
                 return _NoLock(reason="speaking lock is unsupported on this platform — proceeding unlocked; speech may overlap")
             return fh
@@ -811,7 +812,7 @@ def release_lock(lock) -> None:
     if lock is None:
         return
     try:
-        if msvcrt is not None and os.name == "nt" and not isinstance(lock, _NoLock):
+        if msvcrt is not None and os.name == "nt" and not isinstance(lock, _NoLock):  # pragma: windows-only - msvcrt byte-range release
             lock.seek(0)
             msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
         elif fcntl is not None and not isinstance(lock, _NoLock):
@@ -1110,7 +1111,7 @@ def _clear_pidfile() -> None:
 _cmdline_of = contracts._cmdline_of
 
 
-def _ps_cmdline_of(pid: int) -> str | None:
+def _ps_cmdline_of(pid: int) -> str | None:  # pragma: macos-only - cascade covers the entire function body (1116-1127); on Linux the macOS `ps` invocation is unreachable and pid_looks_like_speak's non-linux arm short-circuits to True
     """Read a macOS command line without signalling a process or invoking a shell."""
     try:
         result = subprocess.run(
@@ -1130,7 +1131,7 @@ def _windows_process_is_live(pid: int) -> bool:
     """Probe a Windows process without ``os.kill(pid, 0)`` (which terminates on Windows)."""
     import ctypes
 
-    try:
+    try:  # pragma: windows-only - the outer cascade covers 1135-1146 (the entire try body and the nested try's body); on Linux `ctypes.WinDLL("kernel32")` raises AttributeError, the except arm returns False
         kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
         kernel32.OpenProcess.argtypes = (ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32)
         kernel32.OpenProcess.restype = ctypes.c_void_p
@@ -1143,7 +1144,7 @@ def _windows_process_is_live(pid: int) -> bool:
             return ctypes.get_last_error() == 5  # access denied still means the process exists
         try:
             return kernel32.WaitForSingleObject(handle, 0) == 0x102  # WAIT_TIMEOUT
-        finally:
+        finally:  # pragma: windows-only - the finally clause is not covered by the outer try's cascade (the try-body cascade excludes 1135-1146, but the finally-body needs its own marker); on Linux this arm never runs because the outer try raises AttributeError before reaching the nested try/finally
             kernel32.CloseHandle(handle)
     except (OSError, AttributeError):
         return False
@@ -1197,7 +1198,7 @@ def playback_is_live() -> bool:
     Process-group children (``tts.command``) are checked by pg-leader existence alone — no identity
     guard is needed because the ``"pg"`` marker in the pidfile IS the identity record."""
     for pid in _recorded_pids():
-        if sys.platform == "win32":
+        if sys.platform == "win32":  # pragma: windows-only - sys.platform is hard-coded to "linux" on the matrix; the POSIX os.kill branch below is the one that runs. The cascade covers the entire win32 arm (1202-1204 below).
             if pid_looks_like_speak(pid):
                 return True
             continue
@@ -2071,6 +2072,32 @@ def pid_looks_like_stream_holder(pid: int, read_cmdline=_cmdline_of, platform_id
     return "speak.py" in cmdline and STREAM_HOLDER_ARG in cmdline
 
 
+def pid_is_stream_holder_to_signal(
+    pid: int,
+    read_cmdline=_cmdline_of,
+    read_ps_cmdline=_ps_cmdline_of,
+    platform_id: str = sys.platform,
+) -> bool:
+    """Kill-side PID-identity gate — the call site SIGTERMs the pid, so a recycled PID pointing at an
+    unrelated process would terminate it. Identity must be ESTABLISHED, never assumed. Linux uses
+    ``/proc/<pid>/cmdline``; macOS shells ``ps`` (no shell, no signal); everything else returns False
+    unconditionally — Windows has no cheap identity read and the holder path is short-circuited there
+    anyway (``_connect_stream_holder`` checks ``hasattr(socket, 'AF_UNIX')`` first), so never signalling
+    is free. A ``None`` cmdline is False: a vanished or unreadable process is never killed.
+
+    Distinct from :func:`pid_looks_like_stream_holder`, which gates the WARM-REUSE decision at a
+    different cost profile (a false positive there costs a bad socket, which the next line checks)."""
+    if platform_id.startswith("linux"):
+        cmdline = read_cmdline(pid)
+    elif platform_id == "darwin":
+        cmdline = read_ps_cmdline(pid)
+    else:
+        return False
+    if cmdline is None:
+        return False
+    return "speak.py" in cmdline and STREAM_HOLDER_ARG in cmdline
+
+
 def cloud_streaming_wanted(s: dict) -> bool:
     """True when the cloud path should try the resident websocket: streaming opted in AND the
     configured provider's entry actually carries a streaming variant. A config that asks streaming
@@ -2082,6 +2109,7 @@ def cloud_streaming_wanted(s: dict) -> bool:
 
 def ensure_stream_holder(
     s: dict, *, popen=subprocess.Popen, sleep=time.sleep, clock=time.monotonic,
+    holder_guard=pid_is_stream_holder_to_signal,
 ) -> bool:
     """Make sure a resident holder matching THESE settings is running and bound. True when one is (or
     was just made) live; False when one could not be readied in time (the caller uses the blob path
@@ -2094,7 +2122,7 @@ def ensure_stream_holder(
     pid, pid_digest = _read_stream_holder_pid()
     if pid is not None and pid_looks_like_stream_holder(pid) and pid_digest == digest:
         return True  # a warm socket for exactly these settings
-    if pid is not None and pid_looks_like_stream_holder(pid):
+    if pid is not None and holder_guard(pid):
         try:
             os.kill(pid, signal.SIGTERM)
         except (ProcessLookupError, PermissionError):

@@ -295,6 +295,64 @@ def test_the_holder_pid_guard_reads_cmdline_for_the_argv_marker():
     assert speak.pid_looks_like_stream_holder(1, read_cmdline=lambda pid: None, platform_id="darwin") is True
 
 
+def test_the_kill_side_holder_pid_guard_refuses_when_identity_cannot_be_established():
+    """The kill-side guard gates a SIGTERM — a recycled PID pointing at an unrelated process would
+    terminate it. The guard MUST return False (i.e. refuse to authorise the kill) when identity
+    cannot be established: Windows has no cheap identity read; a vanished or unreadable process
+    returns ``None`` from the cmdline reader; an unknown platform returns False. Only Linux with a
+    readable /proc and macOS with a readable ``ps`` output that match the argv marker authorise."""
+
+    good = f"python3 /path/speak.py {speak.STREAM_HOLDER_ARG} abc123"
+    bad = "some other process"
+
+    # Linux: identity via /proc/<pid>/cmdline
+    assert speak.pid_is_stream_holder_to_signal(1, read_cmdline=lambda pid: good, platform_id="linux") is True
+    assert speak.pid_is_stream_holder_to_signal(1, read_cmdline=lambda pid: bad, platform_id="linux") is False
+    assert speak.pid_is_stream_holder_to_signal(1, read_cmdline=lambda pid: None, platform_id="linux") is False
+
+    # macOS: identity via `ps -p <pid> -o command=` (shells no shell, signals nothing)
+    assert speak.pid_is_stream_holder_to_signal(1, read_ps_cmdline=lambda pid: good, platform_id="darwin") is True
+    assert speak.pid_is_stream_holder_to_signal(1, read_ps_cmdline=lambda pid: bad, platform_id="darwin") is False
+    assert speak.pid_is_stream_holder_to_signal(1, read_ps_cmdline=lambda pid: None, platform_id="darwin") is False
+
+    # Windows: no cheap identity read — refuse unconditionally, never signal.
+    # The real call site is short-circuited there by the AF_UNIX check in _connect_stream_holder, so
+    # returning False is free; this test asserts the FAIL-CLOSED contract even if a future caller
+    # forgets to short-circuit.
+    assert speak.pid_is_stream_holder_to_signal(1, read_cmdline=lambda pid: good, platform_id="win32") is False
+    assert speak.pid_is_stream_holder_to_signal(1, read_ps_cmdline=lambda pid: good, platform_id="win32") is False
+
+
+def test_ensure_stream_holder_does_not_signal_when_kill_guard_refuses(holder_state, monkeypatch):
+    """The kill-side guard is fail-closed: when it cannot establish identity, ``os.kill`` MUST NOT be
+    called — a recycled PID pointing at an unrelated process would terminate it. The guard is patched
+    to refuse; a stale digest still drives the kill-path branch; a fake ``os.kill`` records any call;
+    the assertion proves nothing was signalled."""
+
+    digest = speak.stream_settings_digest(_settings())
+    speak._write_stream_holder_pid(os.getpid(), "stale")  # wrong digest -> the kill branch fires
+
+    class P:
+        pid = 99999
+
+    killed: list = []
+    monkeypatch.setattr(speak.os, "kill", lambda pid, sig: killed.append((pid, sig)))
+
+    def fake_popen(argv, **kw):
+        speak._write_stream_holder_pid(P.pid, argv[-1])
+        open(speak._STREAM_HOLDER_SOCK, "w").close()
+        return P()
+
+    # The kill-side guard refuses: regardless of what /proc would actually read, this pid is not
+    # proven to be the holder, so no signal may fire.
+    monkeypatch.setattr(speak, "pid_is_stream_holder_to_signal", lambda pid, **kw: False)
+    # The warm-reuse guard is a separate call at line 2096 and must not gate the kill decision; it is
+    # left at its default — its real /proc read would also refuse on this runner, which is exactly
+    # the point of the test.
+    assert speak.ensure_stream_holder(_settings(), popen=fake_popen, sleep=lambda _: None, clock=lambda: 0.0) is True
+    assert killed == []  # the guard refused; no signal was sent
+
+
 # --- ensure_stream_holder: warm reuse, stale respawn, spawn failure ------------------------------
 
 
@@ -304,6 +362,33 @@ def holder_state(monkeypatch, tmp_path):
     monkeypatch.setattr(speak, "_STREAM_HOLDER_PID", str(tmp_path / "holder.pid"))
     monkeypatch.setattr(speak, "_STREAM_HOLDER_SOCK", str(tmp_path / "holder.sock"))
     return tmp_path
+
+
+@pytest.fixture
+def state(monkeypatch, tmp_path):
+    """The speak hook's whole state dir lives in tmp_path — the same fixture test_speak.py uses
+    for the .coverage file to measure the holder/serve code paths against."""
+    monkeypatch.setattr(speak, "_STATE_DIR", str(tmp_path))
+    monkeypatch.setattr(speak, "_LOG_PATH", str(tmp_path / "speak.log"))
+    return tmp_path
+
+
+@pytest.fixture
+def socket_pair():
+    """A connected socket pair (a, b) — the holder's per-turn connection is a, the client
+    speaks on b. Closes both when the test finishes."""
+    a, b = socket.socketpair()
+    try:
+        yield a, b
+    finally:
+        try:
+            a.close()
+        except OSError:
+            pass
+        try:
+            b.close()
+        except OSError:
+            pass
 
 
 def test_a_live_holder_with_a_matching_digest_is_reused(holder_state):
@@ -324,7 +409,7 @@ def test_a_live_holder_with_a_matching_digest_is_reused(holder_state):
         speak.pid_looks_like_stream_holder = original
 
 
-def test_a_stale_digest_stops_the_old_holder_and_respawns(holder_state):
+def test_a_stale_digest_stops_the_old_holder_and_respawns(holder_state, monkeypatch):
     """A settings edit is a reconnect trigger: the holder for the OLD digest is SIGTERM'd and a new
     one spawned with the new settings. The kill and the spawn are both observable here."""
     killed = []
@@ -341,23 +426,19 @@ def test_a_stale_digest_stops_the_old_holder_and_respawns(holder_state):
 
     spawned = []
     speak._write_stream_holder_pid(4321, "an-old-digest")
-    speak.pid_looks_like_stream_holder = lambda pid, **kw: True
-    original_kill = os.kill
-
-    def fake_kill(pid, sig):
-        killed.append((pid, sig))
-
-    os.kill = fake_kill
-    try:
-        assert speak.ensure_stream_holder(_settings(), popen=fake_popen, sleep=lambda _: None, clock=lambda: 0.0)
-    finally:
-        os.kill = original_kill
-        speak.pid_looks_like_stream_holder = speak.pid_looks_like_stream_holder  # restore (no-op self-assign guard)
+    monkeypatch.setattr(os, "kill", lambda pid, sig: killed.append((pid, sig)))
+    assert speak.ensure_stream_holder(
+        _settings(),
+        popen=fake_popen,
+        sleep=lambda _: None,
+        clock=lambda: 0.0,
+        holder_guard=lambda pid, **kw: True,
+    )
     assert killed == [(4321, speak.signal.SIGTERM)]
     assert spawned and spawned[0][-1] == speak.stream_settings_digest(_settings())
 
 
-def test_a_spawn_failure_falls_back_to_the_blob_path(holder_state):
+def test_a_spawn_failure_falls_back_to_the_blob_path(holder_state, monkeypatch):
     """A holder that will not start must not stall a turn: ensure returns False and the caller uses
     the blob path for that one turn."""
     speak._write_stream_holder_pid(4321, "stale")  # forces a spawn attempt
@@ -365,11 +446,8 @@ def test_a_spawn_failure_falls_back_to_the_blob_path(holder_state):
     def boom(argv, **kw):
         raise OSError("nope")
 
-    speak.pid_looks_like_stream_holder = lambda pid, **kw: False
-    try:
-        assert speak.ensure_stream_holder(_settings(), popen=boom, sleep=lambda _: None, clock=lambda: 0.0) is False
-    finally:
-        del speak.pid_looks_like_stream_holder  # restore the real function
+    monkeypatch.setattr(speak, "pid_looks_like_stream_holder", lambda pid, **kw: False)
+    assert speak.ensure_stream_holder(_settings(), popen=boom, sleep=lambda _: None, clock=lambda: 0.0) is False
 
 
 # --- run_holder_main: refuse fast, before any socket ---------------------------------------------
@@ -712,3 +790,628 @@ def test_run_holder_serves_a_turn_and_self_exits_when_its_listener_closes(monkey
     # the holder cleaned up after itself: pidfile and socket file gone
     assert not os.path.exists(str(tmp_path / "h.pid"))
     assert not os.path.exists(str(tmp_path / "h.sock"))
+
+
+# --- coverage for the residual branches on linux -----------------------------------------------
+# The branches below each had ONE path exercised by the tests above; the other arm is just as
+# load-bearing (a held socket that closed mid-prime, a pidfile that was empty or only one token,
+# a unix-socket platform without AF_UNIX, the loop's keepalive / idle-exit / accept-OSError paths).
+# They round out the B2 coverage without inventing new behaviour.
+
+
+def test_prime_swallows_a_drain_error(state, holder_state):
+    """A prime whose drain raises (the vendor hung up before the throwaway line finished) is
+    non-fatal: the socket is dropped so the next line reconnects, and the holder continues serving.
+    The error path lives inside the try/except in prime — send_text must succeed for the error to
+    be raised by the drain itself."""
+    holder = speak.TtsStreamHolder(
+        _ENTRY, _settings(), "key", clock=lambda: 0.0,
+    )
+    # the FIRST poll returns a close frame, the SECOND is irrelevant — the close ends the drain
+    # with TtsStreamClosed, which prime's try/except catches alongside WebSocketError/OSError.
+    holder._ws = FakeWs([[(wsclient.OP_CLOSE, b"")]])
+    holder._last_send = 0.0
+    holder.prime()  # must not raise
+    assert holder._ws is None  # dropped — the next ensure_open reconnects
+    log = (state / "speak.log").read_text(encoding="utf-8")
+    assert "stream holder priming failed" in log
+
+
+def test_prime_swallows_a_deadline_exceeded_drain(state, holder_state):
+    """A prime whose drain finds nothing before its deadline is the same shape: it raises
+    TtsStreamClosed, prime logs and drops the socket. The clock returns 0 for the first two
+    prime-side reads (so the deadline is the natural 15 s) and then jumps past the deadline
+    so the drain's first while check fails immediately."""
+    reads = [0]
+
+    def advancing_clock():
+        reads[0] += 1
+        return 0.0 if reads[0] <= 2 else 1000.0
+
+    holder = speak.TtsStreamHolder(
+        _ENTRY, _settings(), "key", clock=advancing_clock,
+    )
+    holder._ws = FakeWs([[], [], []])  # never answers
+    holder._last_send = 0.0
+    holder.prime()  # must not raise
+    assert holder._ws is None
+
+
+def test_drain_skips_non_text_opcodes_and_unrecognized_fragments():
+    """_drain_until_final is a generator over ws.poll(): non-text opcodes are skipped (binary /
+    ping / pong frames don't carry audio), and a fragment the registry cannot parse yields None
+    (skipped, not failed). The is_final-only control frame ends the line cleanly."""
+    holder = speak.TtsStreamHolder(
+        _ENTRY, _settings(), "key", clock=lambda: 0.0,
+    )
+    holder._ws = FakeWs(
+        [
+            [(1, b"\x00\x01"), (wsclient.OP_TEXT, json.dumps({"not": "audio shape"}).encode())],
+            [(wsclient.OP_TEXT, _audio_msg(b"\x01\x02"))],
+            [(wsclient.OP_TEXT, json.dumps({"isFinal": True}).encode())],
+        ]
+    )
+    holder._last_send = 0.0
+    assert list(holder.synthesize_line("hi", deadline=999.0)) == [b"\x01\x02"]
+
+
+def test_keepalive_is_a_noop_when_socket_is_closed_or_last_send_is_none():
+    """keepalive_if_due short-circuits when there is no live socket OR no frame has ever been
+    sent (a freshly constructed holder before ensure_open has run)."""
+    holder = speak.TtsStreamHolder(_ENTRY, _settings(), "key", clock=lambda: 100.0)
+    # _ws is None, _last_send is None — both guards fire
+    holder.keepalive_if_due()  # must not raise, must not try to send
+    # also: a closed socket
+    holder._ws = FakeWs([], closed=True)
+    holder._last_send = 0.0
+    holder.keepalive_if_due()
+
+
+def test_holder_close_swallows_oserror():
+    """A close that raises OSError (the socket is already gone) is tolerated so the holder's
+    shutdown path is exception-safe."""
+    holder = speak.TtsStreamHolder(_ENTRY, _settings(), "key", clock=lambda: 0.0)
+
+    class BrokenWs(FakeWs):
+        def close(self):
+            raise OSError("already closed by peer")
+
+    holder._ws = BrokenWs([])
+    holder.close()  # must not raise
+    assert holder._ws is None
+
+
+def test_write_stream_holder_pid_is_noop_when_atomic_write_fails(holder_state):
+    """_write_stream_holder_pid runs through _atomic_write_text; a denied fs leaves the global
+    record untouched so the generation-fence (which compares against _stream_holder_pid_record)
+    stays consistent."""
+    def deny_replace(src, dst):
+        raise OSError("replace denied")
+
+    original_record = speak._stream_holder_pid_record
+    speak._stream_holder_pid_record = None
+    original_replace = speak.os.replace
+    speak.os.replace = deny_replace
+    try:
+        speak._write_stream_holder_pid(12345, "digest-xyz")
+    finally:
+        speak.os.replace = original_replace
+        speak._stream_holder_pid_record = original_record
+    # the global record was NOT updated — a holder that thinks it wrote the pidfile but didn't
+    # would falsely pass the generation fence otherwise
+    assert speak._stream_holder_pid_record is None
+
+
+def test_read_stream_holder_pid_handles_unreadable_file(holder_state):
+    """A pidfile we cannot open at all is the 'no holder' answer — (None, ''), not an exception."""
+    holder_state  # the fixture scopes the state dir
+    # remove the fixture's pidfile to force the OSError on read
+    if os.path.exists(speak._STREAM_HOLDER_PID):
+        os.unlink(speak._STREAM_HOLDER_PID)
+    speak._stream_holder_pid_record = None
+    # make the read fail by pointing the path at a directory
+    os.makedirs(speak._STREAM_HOLDER_PID + ".dir")
+    speak._STREAM_HOLDER_PID = speak._STREAM_HOLDER_PID + ".dir"
+    try:
+        assert speak._read_stream_holder_pid() == (None, "")
+    finally:
+        speak._STREAM_HOLDER_PID = str(holder_state / "holder.pid")
+
+
+def test_read_stream_holder_pid_rejects_malformed_records(holder_state):
+    """A pidfile that does not parse as `pid digest` (single token, or a non-numeric first token)
+    is treated as 'no holder': a stale holder is not trusted on shape alone."""
+    with open(speak._STREAM_HOLDER_PID, "w", encoding="utf-8") as fh:
+        fh.write("not-a-pid")
+    assert speak._read_stream_holder_pid() == (None, "")
+    with open(speak._STREAM_HOLDER_PID, "w", encoding="utf-8") as fh:
+        fh.write("11111")
+    assert speak._read_stream_holder_pid() == (None, "")
+
+
+def test_clear_stream_holder_pid_swallow_path(holder_state):
+    """When the pidfile IS ours (we wrote it) and the unlink itself raises OSError, _clear returns
+    False (the cleanup didn't happen) but does not raise. The global record IS still cleared —
+    the caller re-installs on next use."""
+    original_record = speak._stream_holder_pid_record
+    speak._write_stream_holder_pid(54321, "digest-clear")
+    assert speak._stream_holder_pid_record is not None
+
+    def deny(path):
+        raise OSError("denied")
+
+    original_unlink = speak.os.unlink
+    speak.os.unlink = deny
+    try:
+        result = speak._clear_stream_holder_pid()
+    finally:
+        speak.os.unlink = original_unlink
+        speak._stream_holder_pid_record = original_record
+    assert result is False  # the cleanup didn't happen
+    # the global is still cleared — this process's view of "is the pidfile mine" is now false
+    assert speak._stream_holder_pid_record is None
+
+
+def test_stream_holder_pid_is_ours_returns_false_when_no_record(holder_state):
+    """A fresh process that never wrote a pidfile has _stream_holder_pid_record = None — the
+    generation fence is never satisfied for a record that does not exist."""
+    original = speak._stream_holder_pid_record
+    speak._stream_holder_pid_record = None
+    try:
+        assert speak._stream_holder_pid_is_ours() is False
+    finally:
+        speak._stream_holder_pid_record = original
+
+
+def test_stream_holder_pid_is_ours_swallow_unreadable(holder_state):
+    """The pidfile cannot be read at all (an OSError on open) -> the fence returns False rather
+    than raising into a holder exit path that has nothing to recover."""
+    # point at a path that cannot be opened as a file
+    os.makedirs(speak._STREAM_HOLDER_PID + ".dir")
+    speak._STREAM_HOLDER_PID = speak._STREAM_HOLDER_PID + ".dir"
+    speak._stream_holder_pid_record = "123 digest"  # non-empty, but unreadable
+    try:
+        assert speak._stream_holder_pid_is_ours() is False
+    finally:
+        speak._STREAM_HOLDER_PID = str(holder_state / "holder.pid")
+        speak._stream_holder_pid_record = None
+
+
+def test_ensure_stream_holder_handles_a_stale_holder_already_gone(holder_state, monkeypatch):
+    """The SIGTERM is best-effort: a holder that died between the pidfile check and the kill
+    raises ProcessLookupError, which we swallow."""
+    digest = speak.stream_settings_digest(_settings())
+    speak._write_stream_holder_pid(os.getpid(), "stale")  # the digest is wrong -> respawn
+
+    def fake_kill(pid, sig):
+        raise ProcessLookupError
+
+    killed: list = []
+    monkeypatch.setattr(speak.os, "kill", lambda pid, sig: killed.append((pid, sig)) or fake_kill(pid, sig))
+
+    spawned: list = []
+
+    class P:
+        pid = 12345
+
+    def fake_popen(argv, **kw):
+        spawned.append(argv)
+        speak._write_stream_holder_pid(P.pid, argv[-1])
+        open(speak._STREAM_HOLDER_SOCK, "w").close()
+        return P()
+
+    assert speak.ensure_stream_holder(
+        _settings(),
+        popen=fake_popen,
+        sleep=lambda _: None,
+        clock=lambda: 0.0,
+        holder_guard=lambda pid, **kw: True,
+    )
+    assert killed == [(speak.os.getpid(), speak.signal.SIGTERM)]
+    assert spawned  # the respawn still happened
+
+
+def test_ensure_stream_holder_times_out_when_holder_never_binds(holder_state):
+    """The holder was spawned but never bound the socket (crashed in prime, lost the pidfile) —
+    the wait-loop hits its deadline and the turn uses the blob path."""
+    digest = speak.stream_settings_digest(_settings())
+    speak._write_stream_holder_pid(os.getpid(), "stale")  # wrong digest -> respawn
+
+    class P:
+        pid = 99999
+
+    sleep_calls: list[float] = []
+
+    def fake_popen(argv, **kw):
+        return P()
+
+    def fake_sleep(seconds):
+        sleep_calls.append(seconds)
+        # advance the clock past the deadline by reporting each call
+    clocks = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]
+
+    def fake_clock():
+        return clocks[len(sleep_calls) - 1] if sleep_calls else clocks[0]
+
+    # holder_guard=False disables the kill branch entirely so the wait loop is what we observe here
+    result = speak.ensure_stream_holder(_settings(), popen=fake_popen, sleep=fake_sleep, clock=fake_clock, holder_guard=lambda pid, **kw: False)
+    assert result is False  # the wait ran out — caller uses the blob path
+    assert sleep_calls  # the wait loop actually slept
+
+
+@pytest.mark.skipif(not hasattr(socket, "AF_UNIX"), reason="the resident holder is a Unix-domain socket; Windows short-circuits to the blob path")
+def test_connect_stream_holder_swallows_socket_error(state, holder_state, monkeypatch, tmp_path):
+    """A socket that refuses (or any OSError in connect/sendall/shutdown) is logged and turned
+    into None — the same answer as a holder that is not there. The half-opened socket is closed
+    best-effort (the inner try/except)."""
+    sock_path = str(tmp_path / "nope.sock")
+    monkeypatch.setattr(speak, "_STREAM_HOLDER_SOCK", sock_path)
+    monkeypatch.setattr(speak, "ensure_stream_holder", lambda s, **kw: True)
+
+    class FlakyConn:
+        def settimeout(self, t):
+            pass
+
+        def connect(self, path):
+            raise OSError("refused")
+
+        def close(self):
+            raise OSError("already closed")
+
+    monkeypatch.setattr(speak.socket, "socket", lambda *a, **kw: FlakyConn())
+    assert speak._connect_stream_holder("hi", _settings(timeout=1.0)) is None
+    assert "could not reach the holder" in (state / "speak.log").read_text(encoding="utf-8")
+
+
+def test_connect_stream_holder_short_circuits_when_no_af_unix(monkeypatch):
+    """The AF_UNIX availability check is FIRST in _connect_stream_holder — without it, Windows
+    would never reach ensure_stream_holder, which calls _bind_unix_listener, which raises.
+    We patch the imported socket module's AF_UNIX attribute to None and confirm
+    ensure_stream_holder is never called (its absence is the short-circuit)."""
+    # Remove AF_UNIX from the imported socket module — hasattr(socket, 'AF_UNIX') becomes False
+    monkeypatch.delattr(speak.socket, "AF_UNIX", raising=False)
+
+    def must_not_call(*a, **kw):
+        raise AssertionError("the AF_UNIX short-circuit must run BEFORE ensure_stream_holder")
+
+    monkeypatch.setattr(speak, "ensure_stream_holder", must_not_call)
+    assert speak._connect_stream_holder("hi", _settings()) is None
+
+
+def test_send_all_swallows_oserror():
+    """A send on a closed peer raises OSError; _send_all swallows it so the holder's loop can
+    keep going rather than dying on a flaky client."""
+    class FlakyConn:
+        def sendall(self, data):
+            raise OSError("broken pipe")
+
+    speak._send_all(FlakyConn(), b"hello")  # must not raise
+
+
+def test_serve_stream_connection_handles_empty_request(socket_pair):
+    """A line that arrived empty (no text field) emits a single 'end' event with zero chunks —
+    no holder.synthesize_line call, no degrade event. The contract is silence, not error."""
+    a, b = socket_pair
+    holder = speak.TtsStreamHolder(_ENTRY, _settings(), "key", clock=lambda: 0.0)
+    holder._ws = FakeWs([[]])  # the holder is never asked to do anything
+    holder._last_send = 0.0
+    thread = threading.Thread(target=speak._serve_stream_connection, args=(a, holder, _settings()))
+    thread.start()
+    b.sendall(b'{"text": "   "}\n')
+    b.shutdown(socket.SHUT_WR)
+    received = b""
+    while b"event: end" not in received:
+        try:
+            chunk = b.recv(65536)
+        except socket.timeout:
+            break
+        if not chunk:
+            break
+        received += chunk
+    thread.join(timeout=3.0)
+    assert b"event: end" in received
+    assert b'"chunks": 0' in received
+
+
+def test_serve_stream_connection_handles_unparseable_request(socket_pair):
+    """A request that does not parse as JSON is treated as empty: same end-with-zero-chunks shape.
+    A request that parses but is not a dict (e.g. an array) is also empty."""
+    a, b = socket_pair
+    holder = speak.TtsStreamHolder(_ENTRY, _settings(), "key", clock=lambda: 0.0)
+    holder._ws = FakeWs([[]])
+    holder._last_send = 0.0
+    thread = threading.Thread(target=speak._serve_stream_connection, args=(a, holder, _settings()))
+    thread.start()
+    b.sendall(b"this is not json\n")
+    b.shutdown(socket.SHUT_WR)
+    received = b""
+    while b"event: end" not in received:
+        try:
+            chunk = b.recv(65536)
+        except socket.timeout:
+            break
+        if not chunk:
+            break
+        received += chunk
+    thread.join(timeout=3.0)
+    assert b"event: end" in received
+
+
+def test_bind_unix_listener_raises_when_af_unix_absent(monkeypatch, tmp_path):
+    """A platform without AF_UNIX (Windows) raises OSError so the caller's catch in run_holder
+    can log 'could not bind its socket' and exit 1. The pre-bind unlink is also exercised."""
+    # patch the attribute speak reads so hasattr(socket, 'AF_UNIX') returns False
+    monkeypatch.delattr(speak.socket, "AF_UNIX", raising=False)
+    if not hasattr(speak.socket, "AF_UNIX"):  # sanity
+        with pytest.raises(OSError, match="Unix-domain sockets"):
+            speak._bind_unix_listener(str(tmp_path / "x.sock"))
+
+
+def test_run_holder_returns_1_when_bind_fails(state, monkeypatch):
+    """bind_socket raising OSError is the "could not bind" path: log + clear pidfile + return 1,
+    not an exception. The pidfile is cleared so ensure_stream_holder's next attempt can spawn
+    fresh."""
+    monkeypatch.setattr(speak, "_STREAM_HOLDER_PID", str(state / "h.pid"))
+    monkeypatch.setattr(speak, "_STREAM_HOLDER_SOCK", str(state / "h.sock"))
+    speak._write_stream_holder_pid(os.getpid(), "deadbeef")
+    assert os.path.exists(speak._STREAM_HOLDER_PID)
+
+    def bind_fail(path):
+        raise OSError("address already in use")
+
+    rc = speak.run_holder(
+        _settings(), _ENTRY, "key", "deadbeef",
+        connect=lambda url, headers, timeout: FakeWs([]),
+        clock=lambda: 0.0,
+        sleep=lambda _: None,
+        bind_socket=bind_fail,
+    )
+    assert rc == 1
+    assert not os.path.exists(speak._STREAM_HOLDER_PID)
+    log = (state / "speak.log").read_text(encoding="utf-8")
+    assert "could not bind its socket" in log
+
+
+def test_run_holder_exits_when_accept_raises_oserror(monkeypatch, tmp_path):
+    """A OSError on accept() (the listener was closed externally) breaks the loop, the finally
+    cleans up, and the function returns 0. Prime is skipped so the fake ws cannot hang the test."""
+    sock_path = str(tmp_path / "h.sock")
+    monkeypatch.setattr(speak, "_STREAM_HOLDER_SOCK", sock_path)
+    monkeypatch.setattr(speak, "_STREAM_HOLDER_PID", str(tmp_path / "h.pid"))
+
+    accept_count = [0]
+
+    class ErroringListener:
+        def settimeout(self, t):
+            pass
+
+        def accept(self):
+            accept_count[0] += 1
+            raise OSError("listener closed")
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(speak.TtsStreamHolder, "prime", lambda self: None)
+
+    rc = speak.run_holder(
+        _settings(), _ENTRY, "key", "deadbeef",
+        connect=lambda url, headers, timeout: FakeWs([]),
+        clock=lambda: 0.0,
+        sleep=lambda _: None,
+        bind_socket=lambda path: ErroringListener(),
+    )
+    assert rc == 0
+    assert accept_count[0] >= 1  # the OSError path was exercised
+
+
+def test_run_holder_idle_exits_when_keepalive_loop_never_quiet(monkeypatch, tmp_path):
+    """The idle-exit path (clock - last_activity >= STREAM_HOLDER_IDLE_EXIT). STREAM_HOLDER_IDLE_EXIT
+    is 0 so the very first accept-timeout satisfies the condition; prime is skipped to keep the
+    test off the websocket drain loop."""
+    sock_path = str(tmp_path / "h.sock")
+    monkeypatch.setattr(speak, "_STREAM_HOLDER_SOCK", sock_path)
+    monkeypatch.setattr(speak, "_STREAM_HOLDER_PID", str(tmp_path / "h.pid"))
+    monkeypatch.setattr(speak, "STREAM_HOLDER_IDLE_EXIT", 0.0)
+    monkeypatch.setattr(speak, "STREAM_KEEPALIVE_SECONDS", 0.0)
+
+    class TimeoutListener:
+        def settimeout(self, t):
+            pass
+
+        def accept(self):
+            raise socket.timeout
+
+        def close(self):
+            pass
+
+    # prime would hang waiting on a fake ws that never answers; skip it so the loop is reachable.
+    monkeypatch.setattr(speak.TtsStreamHolder, "prime", lambda self: None)
+
+    rc = speak.run_holder(
+        _settings(), _ENTRY, "key", "deadbeef",
+        connect=lambda url, headers, timeout: FakeWs([]),
+        clock=lambda: 0.0,
+        sleep=lambda _: None,
+        bind_socket=lambda path: TimeoutListener(),
+    )
+    assert rc == 0
+    assert not os.path.exists(sock_path)
+
+
+def test_run_holder_keepalive_arm_continues_when_idle_exit_far(monkeypatch, tmp_path):
+    """Lines 2238-2239 + 2231->2252: when listener.accept() raises socket.timeout but the
+    idle-exit deadline is far away (clock stays flat so clock() - last_activity stays below
+    STREAM_HOLDER_IDLE_EXIT), the loop calls holder.keepalive_if_due() and `continue`s. Distinct
+    from the idle-exit arm at 2235-2237 which logs and breaks (covered by
+    test_run_holder_idle_exits_when_keepalive_loop_never_quiet). The handler we trip from
+    keepalive_if_due is the SIGTERM handler the loop just registered — calling it is what sets
+    stopping["now"] = True, and the very next while-check takes the 2231->2252 branch (exit by
+    CONDITION, not by break)."""
+    sock_path = str(tmp_path / "h.sock")
+    monkeypatch.setattr(speak, "_STREAM_HOLDER_SOCK", sock_path)
+    monkeypatch.setattr(speak, "_STREAM_HOLDER_PID", str(tmp_path / "h.pid"))
+    # huge deadline so the idle-exit arm never fires — this test exercises the KEEPALIVE arm.
+    monkeypatch.setattr(speak, "STREAM_HOLDER_IDLE_EXIT", 3600.0)
+    monkeypatch.setattr(speak, "STREAM_KEEPALIVE_SECONDS", 0.0)
+
+    # Capture the signal handlers run_holder registers, so keepalive_if_due can trip stopping.
+    captured_handlers: list = []
+    real_signal = speak.signal.signal
+    def _capture(sig, handler):
+        captured_handlers.append(handler)
+        return real_signal(sig, handler)
+    monkeypatch.setattr(speak.signal, "signal", _capture)
+
+    class TimeoutListener:
+        def settimeout(self, t):
+            pass
+
+        def accept(self):
+            raise socket.timeout
+
+        def close(self):
+            pass
+
+    keepalive_calls = [0]
+
+    def trip_handler_keepalive(self):
+        keepalive_calls[0] += 1
+        # After keepalive fires once, set stopping["now"] = True via the captured SIGTERM handler
+        # so the next while-check takes the exit-by-condition branch (2231->2252).
+        captured_handlers[0](speak.signal.SIGTERM, None)
+
+    # prime would hang on a fake ws; skip it so the loop is reachable.
+    monkeypatch.setattr(speak.TtsStreamHolder, "prime", lambda self: None)
+    monkeypatch.setattr(speak.TtsStreamHolder, "keepalive_if_due", trip_handler_keepalive)
+
+    rc = speak.run_holder(
+        _settings(), _ENTRY, "key", "deadbeef",
+        connect=lambda url, headers, timeout: FakeWs([]),
+        clock=lambda: 0.0,
+        sleep=lambda _: None,
+        bind_socket=lambda path: TimeoutListener(),
+    )
+    assert rc == 0
+    assert keepalive_calls[0] >= 1, "keepalive_if_due must fire when the idle-exit deadline is far"
+
+
+def test_run_holder_swallows_per_turn_conn_close_error(monkeypatch, tmp_path):
+    """Lines 2248-2249: the inner finally closes the per-turn conn; if conn.close() raises
+    OSError (the conn was already torn down by a signal or by the peer), the exception is
+    swallowed so the next iteration's accept() still runs and last_activity bookkeeping is
+    kept honest."""
+    sock_path = str(tmp_path / "h.sock")
+    monkeypatch.setattr(speak, "_STREAM_HOLDER_SOCK", sock_path)
+    monkeypatch.setattr(speak, "_STREAM_HOLDER_PID", str(tmp_path / "h.pid"))
+
+    class CloseRaisingConn:
+        def close(self):
+            raise OSError("conn already torn down")
+
+    accept_calls = [0]
+
+    class OneConnThenOseError:
+        def settimeout(self, t):
+            pass
+
+        def accept(self):
+            accept_calls[0] += 1
+            if accept_calls[0] == 1:
+                return (CloseRaisingConn(), None)
+            # Second accept raises OSError — the existing test_run_holder_exits_when_accept_raises_oserror
+            # covers the 2240-2241 `break` arm; we use it here as a clean way to exit the loop AFTER
+            # the inner finally has already swallowed conn.close()'s OSError.
+            raise OSError("listener torn down")
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(speak.TtsStreamHolder, "prime", lambda self: None)
+    # _serve_stream_connection's body calls conn.makefile() etc.; our fake conn doesn't have those,
+    # so substitute a no-op serve — the inner finally's conn.close() (the line under test) still runs.
+    monkeypatch.setattr(speak, "_serve_stream_connection", lambda conn, holder, s, *, clock: None)
+
+    rc = speak.run_holder(
+        _settings(), _ENTRY, "key", "deadbeef",
+        connect=lambda url, headers, timeout: FakeWs([]),
+        clock=lambda: 0.0,
+        sleep=lambda _: None,
+        bind_socket=lambda path: OneConnThenOseError(),
+    )
+    assert rc == 0
+    assert accept_calls[0] >= 1
+
+
+def test_run_holder_swallows_listener_close_error_in_outer_finally(monkeypatch, tmp_path):
+    """Lines 2255-2256: the outer finally closes the listener; if listener.close() raises
+    OSError (e.g., the unix domain socket file was already unlinked), the exception is swallowed
+    so _holder_exit_cleanup still runs. The loop itself exits via the existing 2240-2241 accept-
+    OSError break arm (covered by test_run_holder_exits_when_accept_raises_oserror) so this test
+    does not double up on the keepalive or condition-exit branches."""
+    sock_path = str(tmp_path / "h.sock")
+    monkeypatch.setattr(speak, "_STREAM_HOLDER_SOCK", sock_path)
+    monkeypatch.setattr(speak, "_STREAM_HOLDER_PID", str(tmp_path / "h.pid"))
+
+    class ListenerCloseRaises:
+        def settimeout(self, t):
+            pass
+
+        def accept(self):
+            raise OSError("listener torn down externally")
+
+        def close(self):
+            raise OSError("listener close already failed once")
+
+    monkeypatch.setattr(speak.TtsStreamHolder, "prime", lambda self: None)
+
+    rc = speak.run_holder(
+        _settings(), _ENTRY, "key", "deadbeef",
+        connect=lambda url, headers, timeout: FakeWs([]),
+        clock=lambda: 0.0,
+        sleep=lambda _: None,
+        bind_socket=lambda path: ListenerCloseRaises(),
+    )
+    assert rc == 0
+
+
+def test_run_holder_main_refuses_when_clear_text_policy_rejects(state, monkeypatch, tmp_path):
+    """The endpoint-policy (#215) check in run_holder_main runs after key+provider, and a
+    clear-text credential over a non-local host is refused before the loop starts."""
+    cfg = tmp_path / "config.json"
+    cfg.write_text(json.dumps({
+        "tts": {"backend": "cloud", "cloud": {"provider": "elevenlabs", "streaming": True}}
+    }))
+    monkeypatch.setenv("VOICE_LOOP_CONFIG", str(cfg))
+    monkeypatch.setenv("VOICE_LOOP_TTS_API_KEY", "k")
+
+    # monkeypatch the policy seam to refuse — without it the real resolver would either allow
+    # localhost or run into the real network
+    monkeypatch.setattr(speak, "_clear_text_refusal", lambda s: "cloud tts refused: http on a remote host")
+    assert speak.run_holder_main("deadbeef") == 1
+    log = (state / "speak.log").read_text(encoding="utf-8")
+    assert "cloud tts refused" in log
+
+
+def test_run_holder_main_folds_speed_into_voice_settings(state, monkeypatch, tmp_path):
+    """The last step before run_holder: speed is folded into voice_settings so the BOS carries
+    it on the held socket's first frame. Without this, a config-level speed knob never reaches
+    the websocket."""
+    cfg = tmp_path / "config.json"
+    cfg.write_text(json.dumps({"tts": {"backend": "cloud", "cloud": {"provider": "elevenlabs", "streaming": True}}}))
+    monkeypatch.setenv("VOICE_LOOP_CONFIG", str(cfg))
+    monkeypatch.setenv("VOICE_LOOP_TTS_API_KEY", "k")
+
+    captured: dict = {}
+
+    def fake_run_holder(s, entry, key, digest):
+        captured["voice_settings"] = s["voice_settings"]
+        captured["digest"] = digest
+        return 0
+
+    # stub the policy seam so run_holder_main doesn't try to read the real network
+    monkeypatch.setattr(speak, "_clear_text_refusal", lambda s: None)
+    monkeypatch.setattr(speak, "run_holder", fake_run_holder)
+    assert speak.run_holder_main("deadbeef") == 0
+    # speed was folded into voice_settings — the BOS will carry it
+    assert captured["voice_settings"] == {"speed": 1.0}

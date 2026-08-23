@@ -54,21 +54,26 @@ What makes 100% honest rather than decorative:
 
 ### The hook scripts — shellcheck, a pytest for the pure parts, and a real invocation
 
-There is deliberately **no line-coverage number for the hook scripts** (`speak.py` and
-`speak.sh`); the 100% gate above is scoped to `server/voice_server.py`. Line coverage is not a
-meaningful metric for glue that spends its life calling players, recorders, `wl-copy` and
-`ydotool`: such code can be 100% "covered" by mocks and still fail on the only thing that matters —
-the real runtime. So the guarantee is layered differently. The `scripts/` ratchet
-(`coverage report --include='scripts/*' --fail-under=80`, ratcheting upward) is what
-actually gates the dictation-toggle (`scripts/dictate.py`) and the dictation-opinion modules;
-`speak.py`'s own clauses sit beside the 100% gate and run under the same `tests/test_speak.py`.
-The scripts gate is `fail-under=80` (deliberately loose: the ratchet should fail only on a real
-regression, not on coverage jitter). On `scripts/dictate.py` specifically, the upper bound is
-held in place by **an enumerated allow-list of exactly three `pragma: no cover` markers** — each
-on a Windows-`ctypes` body (`_pid_alive`, `_win_console_ctrl_c`, `_win_pid_is_recorder`) — and
-`TestPragmaCount` asserts the count cannot quietly grow; a new exclusion without a doc update
-fails the suite. The hook side earns its guarantee on a separate axis, so it gets a numbered
-list:
+There is deliberately **no line-coverage number for most of the hook scripts** (the rest of
+`scripts/` — `dictate.py`, `contour_poll.py`, `contracts.py`, `doctor.py`, `providers.py`,
+`report_bug.py`, `install_ledger.py`, `preview.py`, `rvc_corpus.py`, `tls-probe.py`, `wsclient.py`,
+the `voice-loop-dictate` entry point — sit under the ratcheting `scripts/*` 80%-and-up gate in
+`selftest.yml`, not under the 100% one).
+`speak.py` itself is the deliberate exception (#156 B2): the play-back / no-play / give-up paths
+and the cloud-TTS error-document branch are pinned in a way mocks would not catch, and they earn
+the 100% gate that the server also carries; the platform-only statements that are unreachable on
+Linux (the Windows-only `msvcrt` byte-range lock, the `ctypes.WinDLL` process probe, and the
+Windows-only no-`killpg` arm of `_kill_process_group`; plus the macOS-only `_ps_cmdline_of` helper
+that wraps `ps -p`) are excluded by the registered `pragma: windows-only` and `pragma: macos-only`
+markers in `.coveragerc` and pinned by marker-count tests so a silent grow or shrink of either
+allow-list cannot drift unnoticed behind a green 100%. On `scripts/dictate.py` specifically, the
+upper bound is held in place by **an enumerated allow-list of exactly three `pragma: no cover`
+markers** — each on a Windows-`ctypes` body (`_pid_alive`, `_win_console_ctrl_c`,
+`_win_pid_is_recorder`) — and `TestPragmaCount` asserts the count cannot quietly grow; a new
+exclusion without a doc update fails the suite. Line coverage is not a meaningful metric for the
+glue that spends its life calling players, recorders, `wl-copy` and `ydotool`: such code can be
+100% "covered" by mocks and still fail on the only thing that matters — the real runtime. The hook
+side earns its guarantee on a separate axis, so it gets a numbered list:
 
 1. `bash -n` and **shellcheck** (`-S warning`) on every script, every commit; the speak logic
    itself is Python (stdlib-only `scripts/speak.py`, launched by a thin `speak.sh`);
