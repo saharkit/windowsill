@@ -12,7 +12,11 @@ _COVERAGERC = _ROOT / "plugins" / "voice-loop" / ".coveragerc"
 # a regression that REMOVES a marker fails the marker-presence assert first, but if the marker
 # is also removed from the .coveragerc registration, this test catches it as the registered-marker
 # assertion below.
-_WINDOWS_ONLY_MARKERS_IN_SPEAK_PY = 10
+_WINDOWS_ONLY_MARKERS_IN_SPEAK_PY = 11
+# Sister allow-list for the macOS-only code path (`_ps_cmdline_of`, the macOS `ps` helper): the
+# token is registered in `.coveragerc` and the marker count is pinned by the same kind of test.
+# A regression that ADDS a marker without bumping this literal silently grows the macOS allow-list.
+_MACOS_ONLY_MARKERS_IN_SPEAK_PY = 1
 
 
 def test_cmd_launchers_are_declared_for_crlf_checkout():
@@ -67,3 +71,25 @@ def test_coveragerc_registers_windows_only_marker():
     marker added to speak.py cannot be left unregistered."""
     text = _COVERAGERC.read_text(encoding="utf-8")
     assert "pragma: windows-only" in text
+
+
+def test_speak_py_macos_only_marker_count_is_exactly_the_allow_list():
+    """Mutation gap: same shape as the windows-only pin. The macOS token has one marker in
+    speak.py — `_ps_cmdline_of`, the macOS `ps -p` helper. A drift here either grows the
+    allow-list (silently) or removes the marker (and re-exposes the function body)."""
+    text = (_SCRIPTS / "speak.py").read_text(encoding="utf-8")
+    actual = text.count("pragma: macos-only")
+    assert actual == _MACOS_ONLY_MARKERS_IN_SPEAK_PY, (
+        f"scripts/speak.py carries {actual} `pragma: macos-only` markers; "
+        f"this test pins the count at {_MACOS_ONLY_MARKERS_IN_SPEAK_PY}. "
+        f"Update the literal here AND in the PR body together — the marker must remain "
+        f"registered as a coverage exclusion."
+    )
+
+
+def test_coveragerc_registers_macos_only_marker():
+    """Mutation gap: same shape as the windows-only registration test. The macOS token must
+    be present in `.coveragerc`'s exclude_lines, otherwise the marker is just a comment and
+    coverage still tries to measure the body — which on Linux always fails."""
+    text = _COVERAGERC.read_text(encoding="utf-8")
+    assert "pragma: macos-only" in text

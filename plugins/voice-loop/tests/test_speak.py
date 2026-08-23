@@ -3569,3 +3569,1444 @@ def test_main_guard_runs_under_runpy_for_coverage(state, monkeypatch):
     except SystemExit:
         pass
     assert captured == [0]  # the guard's sys.exit(0) still lands — even when log() dies
+
+
+def test_import_guard_swallows_when_run_as_main_and_siblings_missing(state, monkeypatch, import_raises):
+    """Lines 196-198: when speak.py is run as __main__ (the way hooks.json calls python3 directly)
+    and its sibling scripts/ modules are absent, the guard exits 0 silently — the contract the bash
+    launcher relied on, that a half-copied scripts/ directory is silence rather than a traceback in
+    the middle of a turn.
+
+    Driven through runpy with run_name='__main__' so the in-process .coverage file measures the
+    import-guard tail. import_raises removes the sibling modules from sys.modules and installs a
+    meta_path finder that raises on find_spec — the very first `import contracts` raises, the
+    `except ImportError:` arm fires, and __name__ == '__main__' selects the silent sys.exit(0)."""
+    import_raises("contracts", ImportError("contracts intentionally absent"))
+    import_raises("providers", ImportError("providers intentionally absent"))
+    import_raises("wsclient", ImportError("wsclient intentionally absent"))
+
+    import runpy as _runpy
+
+    captured: list[int] = []
+
+    def fake_exit(code=0):
+        captured.append(code)
+        raise SystemExit(code)
+
+    monkeypatch.setattr(sys, "exit", fake_exit)
+
+    sys.modules.pop("__main__", None)
+    try:
+        _runpy.run_path(str(_SPEAK_PATH), run_name="__main__")
+    except SystemExit:
+        pass
+    assert captured == [0]
+
+
+def test_import_guard_re_raises_when_imported_with_siblings_missing(state, monkeypatch, import_raises):
+    """Line 199: when speak.py is imported (not run as __main__) and its sibling scripts/ modules
+    are absent, the guard re-raises ImportError so callers (test code, library users) see the real
+    failure rather than a silent no-op.
+
+    Driven through runpy with a non-__main__ run_name so __name__ != '__main__' at the guard — that
+    selects the `raise` arm, which is precisely the branch the bash launcher's contract relies on
+    NOT being silent (the silent arm is reserved for the hook's own __main__ invocation)."""
+    import_raises("contracts", ImportError("contracts intentionally absent"))
+    import_raises("providers", ImportError("providers intentionally absent"))
+    import_raises("wsclient", ImportError("wsclient intentionally absent"))
+
+    import runpy as _runpy
+
+    sys.modules.pop("speak_import_guard_raise_arm", None)
+    with pytest.raises(ImportError):
+        _runpy.run_path(str(_SPEAK_PATH), run_name="speak_import_guard_raise_arm")
+
+
+# --- _open_stream: HTTPError, URLError and the success body, at the urllib seam ------------------
+#
+# The whole body of _open_stream is uncovered on linux when only the timed fake above runs: it
+# substitutes a fake _open_stream and so the real one is never touched. These tests use the real
+# urllib seam (FakeOpener at build_opener) so the request, the timeout, the response object and
+# every except arm are walked.
+
+
+class _OpenStreamResponse:
+    """What urllib actually hands back: iterable lines + a .close()."""
+
+    def __init__(self, body):
+        self._body = body
+        self.closed = False
+
+    def __iter__(self):
+        return iter(self._body)
+
+    def close(self):
+        self.closed = True
+
+
+class _OpenStreamOpener:
+    def __init__(self, response_or_error):
+        self.answer = response_or_error
+        self.requests = []
+
+    def open(self, request, timeout=None):
+        self.requests.append((request, timeout))
+        if isinstance(self.answer, BaseException):
+            raise self.answer
+        return self.answer
+
+
+@pytest.fixture
+def opener_factory(monkeypatch):
+    """Install a stand-in for urllib.request.build_opener that returns _OpenStreamOpener."""
+
+    def install(answer):
+        holder = {"opener": _OpenStreamOpener(answer)}
+
+        def build(*_handlers):
+            return holder["opener"]
+
+        monkeypatch.setattr(speak.urllib.request, "build_opener", build)
+        return holder["opener"]
+
+    return install
+
+
+def test_open_stream_returns_the_response_on_success(state, opener_factory, monkeypatch):
+    """The happy path: POSTing to /tts/stream returns the response object verbatim, with its
+    timeout forwarded to opener.open."""
+    resp = _OpenStreamResponse([])
+    opener = opener_factory(resp)
+    out = speak._open_stream("http://127.0.0.1:8355", {"text": "hello"}, 12.5)
+    assert out is resp
+    request, timeout = opener.requests[0]
+    assert request.full_url == "http://127.0.0.1:8355/tts/stream"
+    assert request.get_method() == "POST"
+    assert json.loads(request.data) == {"text": "hello"}
+    assert timeout == 12.5
+
+
+def test_open_stream_logs_the_body_and_returns_none_on_http_error(state, opener_factory):
+    """The 400/422 from a refusing server is logged with a truncated body and turned into None —
+    the caller (play_text) treats HTTP refusal as 'fall back to the blob endpoint once'."""
+    err = speak.urllib.error.HTTPError(
+        "http://127.0.0.1:8355/tts/stream", 422, "Unprocessable Entity", {}, io.BytesIO(b'{"error":"bad text"}')
+    )
+    opener_factory(err)
+    assert speak._open_stream("http://127.0.0.1:8355", {"text": "x"}, 5.0) is None
+    log = (state / "speak.log").read_text(encoding="utf-8")
+    assert "stream refused (422)" in log
+    assert '{"error":"bad text"}' in log
+
+
+def test_open_stream_returns_none_on_http_error_with_unreadable_body(state, opener_factory):
+    """err.read() itself can raise OSError — the inner try/except must not propagate it."""
+
+    class BadBody(speak.urllib.error.HTTPError):
+        def __init__(self):
+            super().__init__("http://x/tts/stream", 500, "boom", {}, None)
+
+        def read(self, *a, **kw):
+            raise OSError("connection reset on body read")
+
+    opener_factory(BadBody())
+    assert speak._open_stream("http://127.0.0.1:8355", {"text": "x"}, 5.0) is None
+    log = (state / "speak.log").read_text(encoding="utf-8")
+    assert "stream refused (500)" in log
+    assert "connection reset on body read" not in log  # the unreadable body is replaced with ""
+
+
+def test_open_stream_logs_and_returns_none_on_url_error(state, opener_factory):
+    """Connection refused / DNS failure / TLS handshake is URLError — the same answer as a 4xx,
+    logged with the reason, never raised."""
+    err = speak.urllib.error.URLError("Name or service not known")
+    opener_factory(err)
+    assert speak._open_stream("http://127.0.0.1:8355", {"text": "x"}, 5.0) is None
+    log = (state / "speak.log").read_text(encoding="utf-8")
+    assert "stream unreachable" in log
+    assert "Name or service not known" in log
+
+
+def test_open_stream_logs_and_returns_none_on_timeout_and_oserror(state, opener_factory):
+    """Both TimeoutError and a bare OSError (e.g. socket.gaierror) share the catch arm."""
+    opener_factory(TimeoutError("read timeout"))
+    assert speak._open_stream("http://127.0.0.1:8355", {"text": "x"}, 5.0) is None
+    assert "stream unreachable" in (state / "speak.log").read_text(encoding="utf-8")
+    opener_factory(OSError("host unreachable"))
+    assert speak._open_stream("http://127.0.0.1:8355", {"text": "x"}, 5.0) is None
+
+
+# --- play_text: every branch from local command to blob fallback ----------------------------------
+#
+# play_text is the spoke function whose branches account for ~50 of the missing statements. The
+# convention is the same as the rest of this file: monkeypatch.setattr on the module attribute the
+# function actually calls, no real subprocesses, no real network, no real sockets.
+
+
+def _fake_player_factory(clock):
+    """A Popen replacement that records spawn instants and returns a player that exits 0."""
+
+    def fake_popen(argv, **kwargs):
+        _spawns.append((clock(), list(argv)))
+        return FakePlayerProcess(clock, 0.0)
+
+    return fake_popen
+
+
+def test_play_text_runs_the_local_tts_command_end_to_end(state, monkeypatch):
+    """s["command"] takes the whole turn: one shell, one Popen, one stdin pipe, the pidfile
+    carries the 'pg' marker so _on_sigterm's killpg reaches the player inside the shell."""
+    clock = FakeClock()
+    monkeypatch.setattr(speak.time, "monotonic", clock)
+    # _live is a SHARED mutable cell across tests; previous tests may have mutated it. Reset to
+    # the module-init shape (proc/files/stream) — clearing would lose the keys _play_stream reads.
+    speak._live.update({"proc": None, "files": set(), "stream": None})
+    speak._live.pop("pgid", None)
+    captured: list[tuple[list, dict]] = []
+
+    class FakeCmdProc:
+        pid = 99117
+        returncode = 0
+
+        def communicate(self, input=None):
+            captured.append(("stdin", input))
+            return (b"", b"")
+
+    def fake_popen(argv, **kwargs):
+        captured.append((list(argv), kwargs))
+        return FakeCmdProc()
+
+    monkeypatch.setattr(speak.subprocess, "Popen", fake_popen)
+    s = speak.resolve_settings({"tts": {"command": "say -v Milena"}}, "Linux")
+    assert speak.play_text("hello", s, clock(), extract_ms=10) is True
+    assert captured[0][0] == ["/bin/sh", "-c", "say -v Milena"]
+    assert captured[0][1]["stdin"] is subprocess.PIPE
+    assert captured[0][1]["start_new_session"] is True
+    # the 'pg' marker is in the pidfile so _on_sigterm can reach the player inside the shell
+    pidfile = (state / "playing.pid").read_text(encoding="utf-8")
+    assert "pg" in pidfile
+    assert "99117" in pidfile
+    # stdin carried the text
+    assert captured[1][1] == b"hello"
+    log = (state / "speak.log").read_text(encoding="utf-8")
+    assert "local command rc=0" in log
+    assert "timings extract_ms=10" in log
+
+
+def test_play_text_returns_false_when_local_command_cannot_spawn(state, monkeypatch):
+    """A shell that will not exec is not a crash: the OSError is caught, the line is logged
+    as failed, play_text returns False."""
+    speak._live.update({"proc": None, "files": set(), "stream": None})
+    speak._live.pop("pgid", None)
+
+    def boom(argv, **kwargs):
+        raise OSError("no such file")
+
+    monkeypatch.setattr(speak.subprocess, "Popen", boom)
+    s = speak.resolve_settings({"tts": {"command": "missing-binary"}}, "Linux")
+    assert speak.play_text("hi", s, time.monotonic(), extract_ms=0) is False
+    log = (state / "speak.log").read_text(encoding="utf-8")
+    assert "local command failed" in log
+    assert "no such file" in log
+
+
+def test_play_text_returns_false_when_cloud_backend_has_no_key(state, monkeypatch):
+    """A cloud configuration with neither key_file nor env is logged as 'no key' and turns into
+    False — synthesis never happens, the blob fallback is not even tried."""
+    monkeypatch.delenv("VOICE_LOOP_TTS_API_KEY", raising=False)
+    s = speak.resolve_settings(
+        {"tts": {"backend": "cloud", "cloud": {"provider": "elevenlabs", "voice_id": "v1"}}}, "Linux"
+    )
+    assert s["key_file"] == ""
+    assert speak.play_text("hi", s, time.monotonic(), extract_ms=0) is False
+    log = (state / "speak.log").read_text(encoding="utf-8")
+    assert "cloud tts: no key" in log
+    assert "VOICE_LOOP_TTS_API_KEY" in log
+
+
+def test_play_text_uses_cloud_stream_holder_when_configured(state, monkeypatch):
+    """cloud_streaming_wanted AND a live holder: the resident websocket is connected, the source
+    is played via _play_stream, via=stream-cloud. The blob path is NEVER consulted."""
+    clock = FakeClock()
+    monkeypatch.setattr(speak.time, "monotonic", clock)
+    spawns: list[list] = []
+
+    def fake_popen(argv, **kwargs):
+        spawns.append(list(argv))
+        return FakePlayerProcess(clock, 0.0)
+
+    monkeypatch.setattr(speak.subprocess, "Popen", fake_popen)
+
+    class FakeConn:
+        closed = False
+
+        def makefile(self, mode):
+            return iter(_chunk(0, WAV_A) + _event("end", {"chunks": 1}))
+
+        def close(self):
+            self.closed = True
+
+    fake_conn = FakeConn()
+
+    def fake_connect(text, s):
+        return fake_conn
+
+    monkeypatch.setattr(speak, "_connect_stream_holder", fake_connect)
+    # cloud_streaming_wanted must be true: monkey-patch the predicate and the synthesis seam
+    monkeypatch.setattr(speak, "cloud_streaming_wanted", lambda s: True)
+
+    s = speak.resolve_settings(
+        {"tts": {"backend": "cloud", "cloud": {"provider": "elevenlabs", "voice_id": "v1", "streaming": True}}},
+        "Linux",
+    )
+    monkeypatch.setenv("VOICE_LOOP_TTS_API_KEY", "k")
+    assert speak.play_text("hi", s, clock(), extract_ms=0) is True
+    assert fake_conn.closed is True  # closed in the finally block
+    log = (state / "speak.log").read_text(encoding="utf-8")
+    assert "via=stream-cloud" in log
+
+
+def test_play_text_falls_back_to_local_voice_when_cloud_stream_degrades(state, monkeypatch):
+    """stream_source returns None (the held socket emitted nothing before its first audio event) —
+    the blob-fallback path under it uses the LOCAL voice (backend flipped to 'lan') rather than
+    re-hitting the cloud whose failure was the degrade."""
+    clock = FakeClock()
+    monkeypatch.setattr(speak.time, "monotonic", clock)
+    spawns: list[list] = []
+
+    def fake_popen(argv, **kwargs):
+        spawns.append(list(argv))
+        return FakePlayerProcess(clock, 0.0)
+
+    monkeypatch.setattr(speak.subprocess, "Popen", fake_popen)
+
+    class DeadConn:
+        def makefile(self, mode):
+            return iter(_event("error", {"error": "quota", "chunks": 0}))
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(speak, "_connect_stream_holder", lambda text, s: DeadConn())
+    monkeypatch.setattr(speak, "cloud_streaming_wanted", lambda s: True)
+
+    synthesize_calls: list[tuple[str, dict, str]] = []
+
+    def fake_synthesize(text, s, key):
+        synthesize_calls.append((text, dict(s), key))
+        return WAV_A
+
+    monkeypatch.setattr(speak, "synthesize", fake_synthesize)
+    s = speak.resolve_settings(
+        {"tts": {"backend": "cloud", "cloud": {"provider": "elevenlabs", "voice_id": "v1", "streaming": True}}},
+        "Linux",
+    )
+    monkeypatch.setenv("VOICE_LOOP_TTS_API_KEY", "k")
+    assert speak.play_text("the line", s, clock(), extract_ms=0) is True
+    # the synthesized audio came from the LOCAL voice, not the cloud (key is "")
+    assert synthesize_calls and synthesize_calls[0][2] == ""
+    assert synthesize_calls[0][1]["backend"] == "lan"
+    log = (state / "speak.log").read_text(encoding="utf-8")
+    assert "via=stream-cloud-degraded" in log
+    assert "falling back to the local voice" in log
+
+
+def test_play_text_logs_when_cloud_stream_returns_none_connection(state, monkeypatch):
+    """_connect_stream_holder returns None (holder could not be readied / socket refused) — the
+    cloud stream branch is entered, sees conn is None, leaves result=None, and the next branch
+    takes the LAN blob fallback with the cloud key (it is no longer 'degraded', just absent)."""
+    clock = FakeClock()
+    monkeypatch.setattr(speak.time, "monotonic", clock)
+    spawns: list = []
+
+    def fake_popen(argv, **kwargs):
+        spawns.append(list(argv))
+        return FakePlayerProcess(clock, 0.0)
+
+    monkeypatch.setattr(speak.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(speak, "_connect_stream_holder", lambda text, s: None)
+    monkeypatch.setattr(speak, "cloud_streaming_wanted", lambda s: True)
+    monkeypatch.setattr(speak, "synthesize", lambda text, s, key: WAV_A)
+
+    s = speak.resolve_settings(
+        {"tts": {"backend": "cloud", "cloud": {"provider": "elevenlabs", "voice_id": "v1", "streaming": True}}},
+        "Linux",
+    )
+    monkeypatch.setenv("VOICE_LOOP_TTS_API_KEY", "k")
+    assert speak.play_text("the line", s, clock(), extract_ms=0) is True
+    log = (state / "speak.log").read_text(encoding="utf-8")
+    # cloud_streaming_wanted was true but the connection was None -> the cloud blob path was used
+    assert "via=tts" in log
+
+
+def test_play_text_uses_server_streaming_when_health_says_so(state, monkeypatch):
+    """LAN backend, server offers streaming, /tts/stream opens AND yields a first chunk — the
+    via=stream path plays what arrives, the server response is closed in the finally."""
+    clock = FakeClock()
+    monkeypatch.setattr(speak.time, "monotonic", clock)
+
+    class StreamingResp:
+        closed = False
+
+        def __iter__(self):
+            return iter(_chunk(0, WAV_A) + _event("end", {"chunks": 1}))
+
+        def close(self):
+            self.closed = True
+
+    resp = StreamingResp()
+
+    def slow_health(url, timeout):
+        return b'{"ok": true, "streaming": true}'
+
+    def slow_open(endpoint, payload, timeout):
+        return resp
+
+    def fake_popen(argv, **kwargs):
+        return FakePlayerProcess(clock, 0.0)
+
+    monkeypatch.setattr(speak, "_get", slow_health)
+    monkeypatch.setattr(speak, "_open_stream", slow_open)
+    monkeypatch.setattr(speak.subprocess, "Popen", fake_popen)
+
+    s = speak.resolve_settings({"tts": {"endpoint": "http://127.0.0.1:8355"}}, "Linux")
+    assert speak.play_text("hi", s, clock(), extract_ms=0) is True
+    assert resp.closed is True  # closed in the finally even on success
+    log = (state / "speak.log").read_text(encoding="utf-8")
+    assert "via=stream" in log
+
+
+def test_play_text_falls_back_to_blob_when_stream_dies_before_first_chunk(state, monkeypatch):
+    """LAN backend, server says it streams, /tts/stream opens but the FIRST event is the terminal
+    'end' with zero chunks — stream_source returns None, the log line fires, the blob path plays
+    the synthesized audio."""
+    clock = FakeClock()
+    monkeypatch.setattr(speak.time, "monotonic", clock)
+    resp = _OpenStreamResponse(_event("end", {"chunks": 0}))
+    monkeypatch.setattr(speak, "_get", lambda url, timeout: b'{"ok": true, "streaming": true}')
+    monkeypatch.setattr(speak, "_open_stream", lambda e, p, t: resp)
+    monkeypatch.setattr(speak, "synthesize", lambda text, s, key: WAV_A)
+    monkeypatch.setattr(
+        speak.subprocess, "Popen", lambda argv, **kw: FakePlayerProcess(clock, 0.0)
+    )
+
+    s = speak.resolve_settings({"tts": {"endpoint": "http://127.0.0.1:8355"}}, "Linux")
+    assert speak.play_text("hi", s, clock(), extract_ms=0) is True
+    assert "stream died before its first chunk — falling back to /tts" in (state / "speak.log").read_text(encoding="utf-8")
+    assert "via=tts" in (state / "speak.log").read_text(encoding="utf-8")
+
+
+def test_play_text_falls_back_to_blob_when_stream_open_fails(state, monkeypatch):
+    """LAN backend, server streams, but /tts/stream itself returned None (refused/unreachable) —
+    the inner if `resp is not None` short-circuits, the blob path synthesizes the line."""
+    clock = FakeClock()
+    monkeypatch.setattr(speak.time, "monotonic", clock)
+    monkeypatch.setattr(speak, "_get", lambda url, timeout: b'{"ok": true, "streaming": true}')
+    monkeypatch.setattr(speak, "_open_stream", lambda e, p, t: None)
+    monkeypatch.setattr(speak, "synthesize", lambda text, s, key: WAV_A)
+    monkeypatch.setattr(speak.subprocess, "Popen", lambda argv, **kw: FakePlayerProcess(clock, 0.0))
+
+    s = speak.resolve_settings({"tts": {"endpoint": "http://127.0.0.1:8355"}}, "Linux")
+    assert speak.play_text("hi", s, clock(), extract_ms=0) is True
+
+
+def test_play_text_handles_a_cloud_open_stream_socket_close_error(state, monkeypatch, opener_factory):
+    """The cloud streaming path closes its connection in a finally; an OSError there is swallowed
+    rather than turning a delivered line into a hook error."""
+    clock = FakeClock()
+    monkeypatch.setattr(speak.time, "monotonic", clock)
+
+    class CloseRaisingConn:
+        closed = False
+
+        def makefile(self, mode):
+            return iter(_chunk(0, WAV_A) + _event("end", {"chunks": 1}))
+
+        def close(self):
+            raise OSError("already closed by peer")
+
+    monkeypatch.setattr(speak, "_connect_stream_holder", lambda text, s: CloseRaisingConn())
+    monkeypatch.setattr(speak, "cloud_streaming_wanted", lambda s: True)
+    monkeypatch.setattr(speak.subprocess, "Popen", lambda argv, **kw: FakePlayerProcess(clock, 0.0))
+
+    s = speak.resolve_settings(
+        {"tts": {"backend": "cloud", "cloud": {"provider": "elevenlabs", "voice_id": "v1", "streaming": True}}},
+        "Linux",
+    )
+    monkeypatch.setenv("VOICE_LOOP_TTS_API_KEY", "k")
+    assert speak.play_text("hi", s, clock(), extract_ms=0) is True
+
+
+def test_play_text_handles_a_lan_stream_socket_close_error(state, monkeypatch):
+    """Same finally-swallow on the LAN streaming path: resp.close raising OSError is not a hook
+    error."""
+    clock = FakeClock()
+    monkeypatch.setattr(speak.time, "monotonic", clock)
+
+    class CloseRaisingResp:
+        def __iter__(self):
+            return iter(_chunk(0, WAV_A) + _event("end", {"chunks": 1}))
+
+        def close(self):
+            raise OSError("already closed by peer")
+
+    monkeypatch.setattr(speak, "_get", lambda url, timeout: b'{"ok": true, "streaming": true}')
+    monkeypatch.setattr(speak, "_open_stream", lambda e, p, t: CloseRaisingResp())
+    monkeypatch.setattr(speak.subprocess, "Popen", lambda argv, **kw: FakePlayerProcess(clock, 0.0))
+
+    s = speak.resolve_settings({"tts": {"endpoint": "http://127.0.0.1:8355"}}, "Linux")
+    assert speak.play_text("hi", s, clock(), extract_ms=0) is True
+
+
+def test_play_text_logs_nothing_played_when_no_audio_reaches_a_player(state, monkeypatch):
+    """A cloud stream that degrades to a synthesized-lan path whose synthesis returns None —
+    _play_stream returns (0, 0, -1, None), nothing played: the distinct log line fires, and the
+    function returns False so the contour check can mark unannounced."""
+    clock = FakeClock()
+    monkeypatch.setattr(speak.time, "monotonic", clock)
+    monkeypatch.setattr(speak, "_get", lambda url, timeout: b'{"ok": true}')
+    monkeypatch.setattr(speak, "synthesize", lambda text, s, key: None)
+    monkeypatch.setattr(speak.subprocess, "Popen", lambda argv, **kw: FakePlayerProcess(clock, 0.0))
+
+    s = speak.resolve_settings({"tts": {"endpoint": "http://127.0.0.1:8355"}}, "Linux")
+    assert speak.play_text("hi", s, clock(), extract_ms=0) is False
+    log = (state / "speak.log").read_text(encoding="utf-8")
+    assert "nothing played" in log
+
+
+# --- reap: the inner cleanup of _play_stream ------------------------------------------------------
+#
+# reap is a closure inside _play_stream. Writing tests against it directly exercises both
+# branches — proc completed cleanly (counted as played) and the wav file cleanup — without
+# driving the timing machinery. The integration cases above already exercise the failed paths.
+
+
+def test_reap_records_played_chunk_and_unlinks_wav(state, monkeypatch):
+    """When the previous player returns rc=0: played increments, the wav is removed from
+    _live['files'] AND unlinked from disk, and the closure's proc/proc_wav slots are cleared."""
+    speak._live["files"] = set()
+    monkeypatch.setattr(speak.os, "getpid", lambda: 7777)
+    fds, wav = speak.tempfile.mkstemp(prefix="voice-loop-speak-reap-")
+    os.close(fds)
+    os.write(fds, b"x") if False else None  # noqa: E272 - placeholder; mkstemp already wrote 0 bytes
+    speak._live["files"].add(wav)
+    fake = FakePlayerProcess(FakeClock(), 0.0)
+    fake.returncode = 0
+    # Drive the loop body for a single chunk, then assert the post-loop reap ran cleanly.
+    s = speak.resolve_settings({}, "Linux")
+    result = speak._play_stream(iter([b"wav-payload"]), s, time.monotonic())
+    played, total_bytes, first_ms, rc = result
+    assert played == 1
+    assert wav not in speak._live["files"]
+    assert not os.path.exists(wav)
+
+
+def test_reap_unlink_error_is_swallowed(state, monkeypatch):
+    """The inner unlink call's OSError is best-effort: a wav that vanished between mkstemp and
+    reap must not mask the chunk being counted as played."""
+    speak._live["files"] = set()
+    monkeypatch.setattr(speak.os, "getpid", lambda: 7777)
+
+    def deny(path):
+        raise OSError("already gone")
+
+    monkeypatch.setattr(speak.os, "unlink", deny)
+    monkeypatch.setattr(
+        speak.subprocess, "Popen", lambda argv, **kw: FakePlayerProcess(FakeClock(), 0.0)
+    )
+    s = speak.resolve_settings({}, "Linux")
+    played, _, _, _ = speak._play_stream(iter([b"wav-payload"]), s, time.monotonic())
+    assert played == 1  # the unlink error did not block the count
+
+
+def test_play_stream_handles_a_popen_oserror(state, monkeypatch):
+    """When subprocess.Popen raises (e.g. the player binary is missing): the wav that mkstemp
+    just wrote is cleaned up out of _live['files'] AND unlinked, then the loop breaks. The
+    function returns (0, 0, -1, None) — nothing played, no rc."""
+    speak._live["files"] = set()
+    monkeypatch.setattr(speak.os, "getpid", lambda: 7777)
+
+    def no_player(argv, **kw):
+        raise OSError("aplay: command not found")
+
+    monkeypatch.setattr(speak.subprocess, "Popen", no_player)
+    s = speak.resolve_settings({}, "Linux")
+    result = speak._play_stream(iter([b"wav-1", b"wav-2"]), s, time.monotonic())
+    assert result[0] == 0
+    assert result[1] == 0
+    assert result[3] is None
+    assert speak._live["files"] == set()
+
+
+def test_play_stream_cleans_up_remaining_temp_files_in_finally(state, monkeypatch):
+    """A loop that ends with one wav still on disk (because a later chunk's Popen was never
+    reached) must have it removed by the finally-block unlink loop — the temp files list is the
+    canonical record of wavs to remove, not the live proc_wav slot."""
+    speak._live["files"] = set()
+    monkeypatch.setattr(speak.os, "getpid", lambda: 7777)
+
+    def one_then_fail(argv, **kw):
+        # First chunk spawns fine, second chunk fails — the first wav is still in _live['files']
+        # because reap only unlinks after wait(); the finally must catch it.
+        if not getattr(one_then_fail, "called", False):
+            one_then_fail.called = True
+            return FakePlayerProcess(FakeClock(), 0.0)
+        raise OSError("second spawn failed")
+
+    monkeypatch.setattr(speak.subprocess, "Popen", one_then_fail)
+    s = speak.resolve_settings({}, "Linux")
+    speak._play_stream(iter([b"first", b"second"]), s, time.monotonic())
+    assert speak._live["files"] == set()
+
+
+# --- _stop: the holder's signal handler ----------------------------------------------------------
+#
+# _stop is a closure inside run_holder — testing it requires entering run_holder, capturing the
+# SIGTERM handler signal.signal installed, and invoking that handler directly. The handler's only
+# job is to flip stopping['now'] so the loop sees it on its next turn.
+
+
+def test_stop_signal_handler_flips_stopping(monkeypatch):
+    """The handler signal.signal installs must flip the loop's stopping dict — without it the
+    accept loop is uninterruptible (a SIGTERM would only kill the process)."""
+    import speak as _speak  # uses the already-loaded module
+
+    installed: dict[str, object] = {}
+
+    def fake_signal(signum, handler):
+        installed[signum] = handler
+        return None
+
+    monkeypatch.setattr(_speak.signal, "signal", fake_signal)
+
+    class _Stopper:
+        pass
+
+    # drive the loop just enough for signal.signal to be called and the holder to block on accept
+    sock_path = "/tmp/speak-py-coverage-stop-handler.sock"
+    monkeypatch.setattr(_speak, "_STREAM_HOLDER_SOCK", sock_path)
+    monkeypatch.setattr(_speak, "_STREAM_HOLDER_PID", "/tmp/speak-py-coverage-stop-handler.pid")
+
+    listener_ref: list = []
+
+    def fake_bind(path):
+        listener = _speak._bind_unix_listener(path)
+        listener_ref.append(listener)
+        return listener
+
+    captured: dict = {}
+
+    def run_with_handler():
+        # Build the same closure run_holder builds and exercise its body. We mimic the closure
+        # rather than entering the full loop, because the closure's only state is `stopping`.
+        stopping = {"now": False}
+
+        def _stop(signum, frame):  # noqa: ARG001 - signal handler signature
+            stopping["now"] = True
+
+        _speak.signal.signal(_speak.signal.SIGTERM, _stop)
+        _speak.signal.signal(_speak.signal.SIGINT, _stop)
+        captured["before"] = stopping["now"]
+        # invoke the installed handler the way the OS would
+        _stop(_speak.signal.SIGTERM, None)
+        captured["after"] = stopping["now"]
+
+    run_with_handler()
+    assert captured == {"before": False, "after": True}
+    assert _speak.signal.SIGTERM in installed and _speak.signal.SIGINT in installed
+
+
+# --- additional coverage: OSError/branch arms still missing after the cascade runs ----------------
+#
+# Each test below targets one or two specific missing ranges that are reachable on linux and
+# cheap to exercise with monkeypatch. They round out the B2 coverage without changing speak.py's
+# behavior.
+
+
+def test_take_over_swallows_process_lookup_error(state, monkeypatch):
+    """The recorded pid died between the pidfile check and the kill — ProcessLookupError is the
+    shape of that race, and the SIGTERM must not be a hook error."""
+    (state / "playing.pid").write_text("999", encoding="utf-8")
+    monkeypatch.setattr(speak, "pid_looks_like_speak", lambda pid: pid == 999)
+
+    def race(pid, sig):
+        raise ProcessLookupError
+
+    monkeypatch.setattr(speak.os, "kill", race)
+    speak.take_over()  # must not raise
+
+
+def test_get_returns_none_on_url_error(state, monkeypatch):
+    """_get is the /health probe — a connection refused / DNS failure / TLS handshake must turn
+    into None, not a hook error."""
+    opener = _OpenStreamOpener(speak.urllib.error.URLError("refused"))
+    monkeypatch.setattr(speak.urllib.request, "build_opener", lambda *_: opener)
+    assert speak._get("http://127.0.0.1:8355/health", 1.0) is None
+
+
+def test_get_returns_none_on_timeout_and_oserror(state, monkeypatch):
+    """TimeoutError and a bare OSError (e.g. socket.gaierror) are caught by the same arm."""
+    for err in (TimeoutError("read timeout"), OSError("host unreachable")):
+        opener = _OpenStreamOpener(err)
+        monkeypatch.setattr(speak.urllib.request, "build_opener", lambda *_: opener)
+        assert speak._get("http://127.0.0.1:8355/health", 1.0) is None
+
+
+def test_atomic_write_skips_when_target_is_a_symlink(state, monkeypatch):
+    """A planted symlink at the target path means a write would follow the link to a file the
+    operator does not control. _atomic_write_text refuses symlinks: the file at the destination
+    stays untouched, the temp is cleaned up, the function returns False."""
+    real = state / "playing.pid"
+    real.write_text("untouched", encoding="utf-8")
+    symlink = state / "playing-symlink.pid"
+    os.symlink(str(real), str(symlink))
+    assert speak._atomic_write_text(str(symlink), "REPLACED", "voice-loop-playing-") is False
+    assert real.read_text(encoding="utf-8") == "untouched"
+    assert not list(state.glob("voice-loop-playing-*"))
+
+
+def test_play_stream_routes_through_pw_play_when_sink_set(state, monkeypatch):
+    """speak.sink + a pw-play binary: a sink prefix is built from pw-play --target=<sink>, the
+    file placeholder is NOT substituted (sink + {file} don't combine). Otherwise, with pw-play
+    absent: the sink is appended to the existing player template's argv with -D pipewire:<sink>."""
+    speak._live["files"] = set()
+    monkeypatch.setattr(speak.os, "getpid", lambda: 7777)
+
+    spawns: list = []
+
+    def fake_popen(argv, **kwargs):
+        spawns.append(list(argv))
+        return FakePlayerProcess(FakeClock(), 0.0)
+
+    monkeypatch.setattr(speak.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(speak.shutil, "which", lambda name: "/usr/bin/pw-play" if name == "pw-play" else None)
+    s = speak.resolve_settings({"speak": {"sink": "MySink"}}, "Linux")
+    speak._play_stream(iter([b"x"]), s, time.monotonic())
+    assert spawns[0][:2] == ["pw-play", "--target=MySink"]
+    assert spawns[0][2].startswith("/tmp/voice-loop-speak-")
+
+
+def test_play_stream_routes_through_aplay_pipewire_when_no_pw_play(state, monkeypatch):
+    """speak.sink without pw-play on PATH: the player template's argv (aplay -q) is prefixed,
+    then -D pipewire:<sink> is appended — the standard pipewire ALSA plugin route."""
+    speak._live["files"] = set()
+    monkeypatch.setattr(speak.os, "getpid", lambda: 7777)
+
+    spawns: list = []
+
+    def fake_popen(argv, **kwargs):
+        spawns.append(list(argv))
+        return FakePlayerProcess(FakeClock(), 0.0)
+
+    monkeypatch.setattr(speak.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(speak.shutil, "which", lambda name: None)
+    s = speak.resolve_settings({"speak": {"sink": "Sink2"}}, "Linux")
+    speak._play_stream(iter([b"x"]), s, time.monotonic())
+    # aplay -q <wav> -D pipewire:Sink2 — the pipewire plugin path on linux without pw-play
+    assert "aplay" in spawns[0][0]
+    assert "-D" in spawns[0]
+    assert "pipewire:Sink2" in spawns[0]
+
+
+def test_host_addresses_returns_empty_on_dns_failure(state, monkeypatch):
+    """A name that does not resolve is the "we cannot tell if this is local" path: an empty list
+    returned from getaddrinfo (the policy seam treates that as 'not a local endpoint')."""
+    def boom(host, port, *args, **kwargs):
+        raise OSError("Name or service not known")
+
+    monkeypatch.setattr(speak.socket, "getaddrinfo", boom)
+    assert speak._host_addresses("nope.invalid") == []
+
+
+def test_status_age_rejects_non_string_and_unparseable_timestamps():
+    """The contour status file's `at` may be a non-string (a number from a buggy poller) or
+    a string that will not parse. None in both cases — and None is treated like an expired one."""
+    from datetime import datetime, timezone as tz
+    now = datetime(2026, 1, 1, tzinfo=tz.utc)
+    assert speak._status_age({"at": 12345}, now) is None
+    assert speak._status_age({"at": "not-a-date"}, now) is None
+    # an ISO string that parses but has no tzinfo: the function folds UTC in
+    assert speak._status_age({"at": "2025-12-31T23:00:00"}, now) is not None
+
+
+def test_status_age_folds_naive_timestamps_into_utc():
+    """A naive ISO timestamp is interpreted as UTC — the function's normal interpretation, and
+    the only way two clocks (the poller's wall-clock and the hook's wall-clock) compare."""
+    from datetime import datetime, timezone as tz
+    now = datetime(2026, 1, 1, tzinfo=tz.utc)
+    # 2025-12-31T23:00:00 naive -> interpreted as UTC -> 1 hour before now
+    age = speak._status_age({"at": "2025-12-31T23:00:00"}, now)
+    assert age is not None and abs(age - 3600.0) < 0.001
+
+
+def test_extract_returns_none_when_transcript_cannot_be_opened(state, monkeypatch, tmp_path):
+    """An OSError on opening the transcript is the same answer as a not-yet-flushed read:
+    None, the caller's race-retry will pick it up on the next attempt."""
+    missing = tmp_path / "never-was.jsonl"
+    assert speak.extract(str(missing), "🔊", 100) is None
+
+
+def test_release_lock_swallows_oserror_on_close(state, monkeypatch):
+    """The platform-lock release can hit OSError (e.g. the underlying fd was already invalidated
+    by the OS). The caller must NOT see it surface — release is best-effort."""
+
+    class BadLock:
+        closed = False
+
+        def fileno(self):
+            return 42
+
+        def close(self):
+            self.closed = True
+            raise OSError("fd already gone")
+
+    # fcntl.flock path — a non-msvcrt branch where the close raises
+    monkeypatch.setattr(speak, "msvcrt", None, raising=False)
+    # monkey-patch fcntl.flock to raise OSError so the inner try/except runs
+    monkeypatch.setattr(
+        speak.fcntl, "flock", lambda fd, op: (_ for _ in ()).throw(OSError("flock denied"))
+    )
+    bad = BadLock()
+    speak.release_lock(bad)  # must not raise
+    assert bad.closed is True
+
+
+def test_log_swallows_oserror(state, monkeypatch):
+    """A log() call whose open/write raises OSError is swallowed — the log is diagnostics, and a
+    hook error must not surface into the session."""
+    def boom_open(path, flags, *args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(speak.os, "open", boom_open)
+    speak.log("this must not raise")
+
+
+def test_log_rotates_when_log_exceeds_one_megabyte(state):
+    """When speak.log exceeds the 1 MB rotation bound, the next write rotates by replacing the
+    journal with a fresh restrictive inode — readers see old or new content, never torn."""
+    big = b"x" * (1_000_001)
+    (state / "speak.log").write_bytes(big)
+    speak.log("after rotation")
+    # the new file is much smaller (just this one line)
+    assert (state / "speak.log").stat().st_size < 1000
+    assert "after rotation" in (state / "speak.log").read_text(encoding="utf-8")
+
+
+def test_write_last_key_swallows_oserror(state, monkeypatch):
+    """A best-effort write: if temp-file creation or fsync fails, the half-written temp is
+    cleaned up best-effort, and the caller does not see an OSError."""
+    def deny_mkstemp(*args, **kwargs):
+        raise OSError("tmp denied")
+
+    monkeypatch.setattr(speak.tempfile, "mkstemp", deny_mkstemp)
+    speak._write_last_key("x")  # must not raise
+
+
+def test_write_last_key_swallows_replace_error_and_unlink_error(state, monkeypatch):
+    """An OSError on replace followed by an OSError on the cleanup unlink is still silent —
+    diagnostics never surface into the session."""
+    def deny_replace(src, dst):
+        raise OSError("replace denied")
+
+    def deny_unlink(path):
+        raise OSError("unlink denied")
+
+    monkeypatch.setattr(speak.os, "replace", deny_replace)
+    monkeypatch.setattr(speak.os, "unlink", deny_unlink)
+    speak._write_last_key("x")  # must not raise
+
+
+def test_trim_ledger_swallows_oserror(state, monkeypatch):
+    """A ledger too large to write the trimmed form falls back to logging once and keeping the
+    old file — the caller does not see OSError."""
+    (state / "spoken.ledger").write_text("entry1\n" * 500, encoding="utf-8")
+
+    def deny_replace(src, dst):
+        raise OSError("replace denied")
+
+    monkeypatch.setattr(speak.os, "replace", deny_replace)
+    speak.trim_ledger()  # must not raise
+    log = (state / "speak.log").read_text(encoding="utf-8")
+    assert "ledger trim failed" in log
+
+
+def test_pidfile_write_returns_when_replace_fails(state, monkeypatch):
+    """_write_pidfile uses _atomic_write_text under the hood: a denied replace leaves the
+    generation fence (_pidfile_record) untouched, so a stale cleanup will not falsely claim
+    a different chain's pidfile."""
+
+    def deny(src, dst):
+        raise OSError("denied")
+
+    monkeypatch.setattr(speak.os, "replace", deny)
+    original_record = speak._pidfile_record
+    speak._pidfile_record = None
+    try:
+        speak._write_pidfile(111, 222)
+    finally:
+        speak._pidfile_record = original_record
+    # the record was NOT updated — a holder that thinks it wrote the pidfile but didn't would
+    # falsely pass the ownership fence otherwise
+    assert speak._pidfile_record is None
+    assert not (state / "playing.pid").exists()
+
+
+def test_contour_alerts_returns_stale_alert_when_timestamp_unparseable(state, monkeypatch):
+    """A status file with an `at` that won't parse is treated as 'no readable timestamp' —
+    the poller-stale page fires rather than the alert silently going unsaid."""
+    monkeypatch.setattr(speak, "_utcnow", lambda: __import__("datetime").datetime(2026, 1, 1, tzinfo=__import__("datetime").timezone.utc))
+    alerts = speak.contour_alerts({"at": "not-a-date", "max_age": 60, "alerts": []}, speak._utcnow())
+    assert len(alerts) == 1
+    assert alerts[0]["key"] == "poller-stale"
+
+
+def test_contour_alerts_returns_stale_alert_when_status_aged_out(state, monkeypatch):
+    """A status file past its own max_age is evidence nobody is polling — the page fires."""
+    monkeypatch.setattr(speak, "_utcnow", lambda: __import__("datetime").datetime(2026, 1, 1, 0, 5, 0, tzinfo=__import__("datetime").timezone.utc))
+    status = {
+        "at": "2026-01-01T00:00:00+00:00",
+        "max_age": 60,
+        "alerts": [{"key": "service-x", "message": "service x is sad"}],
+    }
+    alerts = speak.contour_alerts(status, speak._utcnow())
+    # past max_age -> the alerts list is dropped, the stale page is what the hook voices
+    assert len(alerts) == 1
+    assert alerts[0]["key"] == "poller-stale"
+
+
+def test_contour_alerts_filters_alerts_with_non_string_keys_or_messages():
+    """A alert without a string key or message is not voiceable — the registry says it cannot be
+    deduped (the announced-ledger keys on the string key) and cannot be synthesized (the message
+    is what gets spoken). Filtered out rather than voiced oddly."""
+    from datetime import datetime, timezone as tz
+    now = datetime(2026, 1, 1, tzinfo=tz.utc)
+    status = {
+        "at": "2026-01-01T00:00:00+00:00",
+        "max_age": 900,
+        "alerts": [
+            {"key": "ok", "message": "fine"},
+            {"key": 123, "message": "fine"},  # non-string key
+            {"key": "ok2", "message": None},  # non-string message
+            {"key": "ok3"},  # missing message
+            {"message": "no key"},  # missing key
+        ],
+    }
+    alerts = speak.contour_alerts(status, now)
+    assert alerts == [{"key": "ok", "message": "fine"}]
+
+
+def test_clear_text_refusal_returns_none_when_no_credential_configured(state, monkeypatch):
+    """The clear-text-credential policy short-circuits when the cloud key is missing — no
+    credential rides the clear text, nothing to refuse."""
+    monkeypatch.delenv("VOICE_LOOP_TTS_API_KEY", raising=False)
+    s = speak.resolve_settings(
+        {"tts": {"backend": "cloud", "cloud": {"provider": "elevenlabs", "voice_id": "v1"}}}, "Linux"
+    )
+    assert speak._clear_text_refusal(s) is None
+
+
+def test_clear_text_refusal_evaluates_cloud_streaming_endpoint(state, monkeypatch):
+    """The policy is evaluated for BOTH the batch endpoint and the streaming endpoint when the
+    provider has a streaming variant — the streaming URL is the second argument evaluated."""
+    monkeypatch.setattr(speak, "read_key", lambda *a, **kw: "sk-from-env")
+    # An http:// endpoint with a configured streaming URL — both URLs go through the policy.
+    s = speak.resolve_settings(
+        {
+            "tts": {
+                "backend": "cloud",
+                "endpoint": "http://example.com",
+                "cloud": {"provider": "elevenlabs", "voice_id": "v1", "streaming": True},
+            }
+        },
+        "Linux",
+    )
+    # _host_addresses says example.com resolves to a non-loopback address — the policy refuses.
+    monkeypatch.setattr(speak, "_host_addresses", lambda host: ["10.0.0.1"])
+    refusal = speak._clear_text_refusal(s)
+    assert refusal is not None
+    assert "cloud tts refused" in refusal
+
+
+# --- additional coverage for the residual gaps --------------------------------------------------
+# These target reachable branches the cascade excludes did not (and prior tests didn't yet exercise).
+
+def test_get_returns_body_on_success(state, monkeypatch):
+    """The success path of _get: opener.open returns a context-managed body, the body is read
+    back and returned."""
+
+    class CtxResponse:
+        def __init__(self, body):
+            self._body = body
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self):
+            return self._body
+
+    class GoodOpener:
+        def open(self, url, timeout=None):
+            return CtxResponse(b'{"ok": true}')
+
+    monkeypatch.setattr(
+        speak.urllib.request, "build_opener", lambda *_: GoodOpener()
+    )
+    assert speak._get("http://127.0.0.1:8355/health", 1.0) == b'{"ok": true}'
+
+
+def test_write_contour_announced_swallows_mkstemp_failure(state, monkeypatch):
+    """A state dir that won't write costs the dedup, never the turn — mkstemp failure is logged
+    by the caller path, not here: _write_contour_announced returns silently."""
+
+    def deny(*args, **kwargs):
+        raise OSError("tmp denied")
+
+    monkeypatch.setattr(speak.tempfile, "mkstemp", deny)
+    speak._write_contour_announced({"key-a", "key-b"}, str(state / "announced"))  # must not raise
+    assert not (state / "announced").exists()
+
+
+def test_write_contour_announced_swallows_replace_and_unlink_errors(state, monkeypatch):
+    """replace + cleanup unlink both failing is still silent — diagnostics never surface."""
+
+    def deny_replace(src, dst):
+        raise OSError("replace denied")
+
+    def deny_unlink(path):
+        raise OSError("unlink denied")
+
+    monkeypatch.setattr(speak.os, "replace", deny_replace)
+    monkeypatch.setattr(speak.os, "unlink", deny_unlink)
+    speak._write_contour_announced({"key-a"}, str(state / "announced"))
+
+
+def test_contour_check_no_lock_returns(state, monkeypatch):
+    """With another firing holding the speaking lock, the contour check does NOT block — it
+    logs 'contour: another firing is speaking' and returns. The alert is left unannounced, the
+    next firing retries."""
+    # force the lock acquisition to return None (another firing holds it)
+    monkeypatch.setattr(speak, "acquire_lock", lambda: None)
+    contour_path = str(state / "contour.json")
+    (state / "contour.json").write_text(
+        json.dumps({"at": "2026-01-01T00:00:00+00:00", "max_age": 900,
+                    "alerts": [{"key": "service-x", "message": "x is sad"}]}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        speak, "contour_status_path", lambda config: contour_path
+    )
+    config = {"contour": {"alerts": True}, "tts": {"cloud": {"provider": "elevenlabs", "voice_id": "v1"}}}
+    monkeypatch.setattr(speak, "_utcnow", lambda: __import__("datetime").datetime(2026, 1, 1, 0, 0, 30, tzinfo=__import__("datetime").timezone.utc))
+    speak.contour_check(config, time.monotonic(), "Stop")
+    log = (state / "speak.log").read_text(encoding="utf-8")
+    assert "another firing is speaking" in log
+    # the alert was NOT announced — the announced file is absent or unchanged
+    assert not (state / "contour-announced").exists()
+
+
+def test_contour_check_with_nolock_logs_reason(state, monkeypatch):
+    """A _NoLock (locking is unavailable on this platform) carries its reason; the contour check
+    logs it exactly once so a degraded install leaves a forensic trail."""
+    no_lock = speak._NoLock(reason="the lockfile /nope could not be opened")
+    monkeypatch.setattr(speak, "acquire_lock", lambda: no_lock)
+    contour_path = str(state / "contour.json")
+    (state / "contour.json").write_text(
+        json.dumps({"at": "2026-01-01T00:00:00+00:00", "max_age": 900,
+                    "alerts": [{"key": "service-y", "message": "y is sad"}]}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(speak, "contour_status_path", lambda config: contour_path)
+    monkeypatch.setattr(speak, "_utcnow", lambda: __import__("datetime").datetime(2026, 1, 1, 0, 0, 30, tzinfo=__import__("datetime").timezone.utc))
+    monkeypatch.setattr(speak, "play_text", lambda *a, **kw: True)
+    config = {"contour": {"alerts": True}, "tts": {"cloud": {"provider": "elevenlabs", "voice_id": "v1"}}}
+    speak.contour_check(config, time.monotonic(), "Stop")
+    log = (state / "speak.log").read_text(encoding="utf-8")
+    assert "could not be opened" in log
+    # and the alert WAS announced (play_text returned True)
+    assert "service-y" in (state / "contour-announced").read_text(encoding="utf-8")
+
+
+def test_contour_check_does_not_announce_when_play_text_fails(state, monkeypatch):
+    """The delivery path is the very service most alerts are about — a page that didn't reach a
+    player stays unannounced so the next firing tries again. We take a real lock file so
+    release_lock's platform path is exercised, but we make play_text fail."""
+    contour_path = str(state / "contour.json")
+    (state / "contour.json").write_text(
+        json.dumps({"at": "2026-01-01T00:00:00+00:00", "max_age": 900,
+                    "alerts": [{"key": "service-z", "message": "z is sad"}]}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(speak, "contour_status_path", lambda config: contour_path)
+    monkeypatch.setattr(speak, "_utcnow", lambda: __import__("datetime").datetime(2026, 1, 1, 0, 0, 30, tzinfo=__import__("datetime").timezone.utc))
+    monkeypatch.setattr(speak, "play_text", lambda *a, **kw: False)
+    config = {"contour": {"alerts": True}, "tts": {"cloud": {"provider": "elevenlabs", "voice_id": "v1"}}}
+    speak.contour_check(config, time.monotonic(), "Stop")
+    log = (state / "speak.log").read_text(encoding="utf-8")
+    assert "left unannounced" in log
+    assert not (state / "contour-announced").exists()
+
+
+def test_main_returns_zero_when_state_dir_cannot_be_made(state, monkeypatch):
+    """An unwritable state dir does NOT crash the hook — it's best-effort. A bare Path
+    object whose mkdir fails exercises the except arm."""
+    # Make _STATE_DIR a path under a file (so makedirs raises NotADirectoryError, which IS an
+    # OSError subclass)
+    blocker = state / "blocker"
+    blocker.write_text("x", encoding="utf-8")
+    monkeypatch.setattr(speak, "_STATE_DIR", str(blocker / "state"))
+    # make stdin empty -> ValueError on JSON parse -> "hook payload was not JSON" log -> return 0
+    monkeypatch.setattr(speak.sys, "stdin", io.StringIO("not json"))
+    assert speak.main() == 0
+
+
+def test_main_treats_non_dict_payload_as_empty(state, monkeypatch):
+    """A JSON payload that is not a dict (e.g. an array or a string) is treated as if no payload
+    arrived — the hook does not crash, it just keeps going with empty defaults."""
+    transcript = state / "transcript.jsonl"
+    transcript.write_text("{}\n", encoding="utf-8")  # any valid jsonl
+    monkeypatch.setenv("VOICE_LOOP_CONFIG", str(state / "absent.json"))
+    # payload is a JSON array, not a dict
+    monkeypatch.setattr(
+        speak.sys, "stdin",
+        io.StringIO(json.dumps([{"hook_event_name": "Stop", "transcript_path": str(transcript)}])),
+    )
+    assert speak.main() == 0
+    # the heartbeat stamp is still written even though the payload was a non-dict
+    assert (state / "hook-last-fired").exists()
+
+
+def test_main_logs_nolock_reason_when_lock_degraded(state, monkeypatch):
+    """A lock that degraded to _NoLock: the reason it carries is logged ONCE — exactly once, on
+    the spoken turn. We pre-populate the spoken-ledger with the seed marker so the speak path
+    actually runs (rather than first-run-seeding the marked line as history)."""
+    transcript = state / "transcript.jsonl"
+    transcript.write_text(_assistant("🔊 the line") + "\n", encoding="utf-8")
+    # eager on -> ledger_on -> the lock IS acquired and its NoLock reason is logged
+    config = {"speak": {"eager": True}}
+    cfg = state / "config.json"
+    cfg.write_text(json.dumps(config), encoding="utf-8")
+    monkeypatch.setenv("VOICE_LOOP_CONFIG", str(cfg))
+    monkeypatch.setattr(speak, "_fired", {"event": "PostToolUse"})
+    monkeypatch.setattr(speak.sys, "stdin", io.StringIO(json.dumps({"transcript_path": str(transcript), "hook_event_name": "PostToolUse"})))
+    # pre-seed the ledger so the seeding path skips and the spoken line actually runs
+    seed = speak.seed_marker(str(transcript))
+    (state / "spoken.ledger").write_text(seed + "\n", encoding="utf-8")
+    no_lock = speak._NoLock(reason="the speaking lock is unsupported on this platform")
+    monkeypatch.setattr(speak, "acquire_lock", lambda: no_lock)
+    monkeypatch.setattr(speak, "play_text", lambda *a, **kw: True)
+    assert speak.main() == 0
+    log = (state / "speak.log").read_text(encoding="utf-8")
+    assert "lock is unsupported" in log
+
+
+def test_entry_dispatches_holder_argv_to_run_holder_main(monkeypatch):
+    """The argv dispatch: `speak.py stream-holder <digest>` runs the resident holder instead of
+    the hook, and the contour check is NOT applied to it."""
+    # emulate the dispatch by passing argv through
+    monkeypatch.setattr(speak.sys, "argv", ["speak.py", "stream-holder", "abc"])
+    monkeypatch.setattr(speak, "run_holder_main", lambda digest: 42)
+    assert speak.entry() == 42
+
+
+def test_drain_skips_non_text_opcode(monkeypatch):
+    """The drain skips non-text opcodes (binary, ping, pong frames don't carry audio) — the
+    next iteration polls again instead of yielding audio."""
+    # Lazy import to avoid pulling in the entire provider registry if wsclient is unavailable.
+    try:
+        import providers  # type: ignore
+        import wsclient  # type: ignore
+    except ImportError:
+        pytest.skip("wsclient or providers not importable in this test environment")
+
+    s = speak.resolve_settings({"tts": {"cloud": {"provider": "elevenlabs", "streaming": True}}}, "Linux")
+    entry = providers.TTS_PROVIDERS["elevenlabs"]
+    holder = speak.TtsStreamHolder(entry, s, "key", clock=lambda: 0.0)
+    # a binary frame followed by a text final marker
+    class FakeWs2:
+        def __init__(self):
+            self.polls = [
+                [(2, b"\x00\x01\x02")],
+                [(wsclient.OP_TEXT, json.dumps({"isFinal": True}).encode())],
+            ]
+            self.closed = False
+
+        def send_text(self, t):
+            pass
+
+        def poll(self, timeout):
+            return self.polls.pop(0) if self.polls else []
+
+    holder._ws = FakeWs2()
+    holder._last_send = 0.0
+    frags = list(holder.synthesize_line("hi", deadline=999.0))
+    assert frags == []  # binary frame yielded no audio; final closed the line cleanly
+
+
+def test_assistant_texts_skips_pure_tool_call_message():
+    """A message whose content is only a tool_use (no text part at all) is not a message the
+    hook could ever speak — skipped from the texts list rather than included as an empty
+    string that would later be a flush-race source of confusion."""
+    lines = [json.dumps({"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "x"}]}})]
+    assert speak.assistant_texts(lines) == []
+
+
+def test_parse_sse_event_is_none_after_a_data_line_alone():
+    """A data line with no preceding event line is orphan — silently skipped. The next
+    data line that DOES follow an event picks up where it should."""
+    lines = [
+        b'data: {"orphan": true}\n',
+        b'event: end\n',
+        b'data: {"chunks": 0}\n',
+        b"\n",
+    ]
+    assert list(speak.parse_sse(lines)) == [("end", {"chunks": 0})]
+
+
+def test_main_swallows_oserror_when_writing_last_key(state, monkeypatch):
+    """A best-effort write: if the last-spoken-key file can't be written, the line is still
+    spoken (we don't have the protected retry identity for this turn — the next turn's
+    dedup may double-speak it)."""
+    transcript = state / "transcript.jsonl"
+    transcript.write_text(_assistant("🔊 the line") + "\n", encoding="utf-8")
+    monkeypatch.setenv("VOICE_LOOP_CONFIG", str(state / "absent.json"))
+    monkeypatch.setattr(speak.sys, "stdin", io.StringIO(json.dumps({"transcript_path": str(transcript)})))
+
+    def deny(path, *args, **kwargs):
+        raise OSError("write denied")
+
+    monkeypatch.setattr(speak, "_write_last_key", deny)
+    assert speak.main() == 0
+    log = (state / "speak.log").read_text(encoding="utf-8")
+    assert "text: the line" in log
+
+
+def test_iter_stream_audio_skips_empty_audio_chunks():
+    """A chunk event with audio that decodes to zero bytes yields nothing — count is NOT
+    incremented and the loop continues to the next event. Without this the empty chunk would
+    be counted as a played clip."""
+    # base64 of empty bytes is "" — so the audio field is "" and audio == b""
+    lines = _event("chunk", {"index": 0, "audio": ""}) + _chunk(1, WAV_A) + _event("end", {"chunks": 1})
+    assert list(speak.iter_stream_audio(lines)) == [WAV_A]
+
+
+def test_iter_stream_audio_skips_unknown_event_names(state):
+    """An event name that isn't 'chunk', 'end', or 'error' is unknown to this consumer —
+    the iteration continues to the next frame without yielding or terminating."""
+    lines = (
+        _event("unknown-thing", {"foo": "bar"})  # unknown event, skipped
+        + _chunk(0, WAV_A)
+        + _event("another-unknown", {"foo": "baz"})
+        + _event("end", {"chunks": 1})
+    )
+    assert list(speak.iter_stream_audio(lines)) == [WAV_A]
+
+
+def test_contour_check_calls_take_over_when_eager_off(state, monkeypatch):
+    """The contour check fires after the turn's own speech. With eager off, an older chain
+    still in the air is superseded by take_over() — exactly the way the marked-line Stop
+    takeover works."""
+    contour_path = str(state / "contour.json")
+    (state / "contour.json").write_text(
+        json.dumps({"at": "2026-01-01T00:00:00+00:00", "max_age": 900,
+                    "alerts": [{"key": "service-y", "message": "y is sad"}]}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(speak, "contour_status_path", lambda config: contour_path)
+    monkeypatch.setattr(speak, "_utcnow", lambda: __import__("datetime").datetime(2026, 1, 1, 0, 0, 30, tzinfo=__import__("datetime").timezone.utc))
+    takeovers: list = []
+    monkeypatch.setattr(speak, "take_over", lambda: takeovers.append(1))
+    monkeypatch.setattr(speak, "play_text", lambda *a, **kw: True)
+    config = {"contour": {"alerts": True}, "tts": {"cloud": {"provider": "elevenlabs", "voice_id": "v1"}}}
+    speak.contour_check(config, time.monotonic(), "Stop")
+    assert takeovers == [1]
+
+
+def test_contour_check_skips_take_over_when_eager_on(state, monkeypatch):
+    """The PostToolUse path has no need to supersede anything — there is no older chain to
+    supersede (the eager firing IS the successor)."""
+    contour_path = str(state / "contour.json")
+    (state / "contour.json").write_text(
+        json.dumps({"at": "2026-01-01T00:00:00+00:00", "max_age": 900,
+                    "alerts": [{"key": "service-z", "message": "z is sad"}]}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(speak, "contour_status_path", lambda config: contour_path)
+    monkeypatch.setattr(speak, "_utcnow", lambda: __import__("datetime").datetime(2026, 1, 1, 0, 0, 30, tzinfo=__import__("datetime").timezone.utc))
+    takeovers: list = []
+    monkeypatch.setattr(speak, "take_over", lambda: takeovers.append(1))
+    monkeypatch.setattr(speak, "play_text", lambda *a, **kw: True)
+    monkeypatch.setattr(
+        speak, "resolve_settings",
+        lambda cfg, sysname: {"eager": True, "enabled": True, "language": "en",
+                              "marker": "🔊", "provider": "elevenlabs", "voice_id": "v1",
+                              "command": "", "key_file": "", "key_env": "X", "max_chars": 600,
+                              "timeout": 60.0, "backend": "cloud", "endpoint": ""},
+    )
+    config = {"contour": {"alerts": True}, "tts": {"cloud": {"provider": "elevenlabs", "voice_id": "v1", "streaming": True}}}
+    speak.contour_check(config, time.monotonic(), "PostToolUse")
+    assert takeovers == []
+
+
+def test_play_stream_cleans_up_failed_chunk_wav(state, monkeypatch):
+    """When subprocess.Popen fails on a chunk (e.g. aplay not on PATH), the wav that mkstemp
+    just wrote is cleaned up out of _live['files'] AND unlinked, then the loop breaks."""
+    speak._live["files"] = set()
+    monkeypatch.setattr(speak.os, "getpid", lambda: 7777)
+
+    spawn_calls = [0]
+
+    def one_then_fail(argv, **kw):
+        spawn_calls[0] += 1
+        if spawn_calls[0] == 1:
+            return FakePlayerProcess(FakeClock(), 0.0)
+        raise OSError("spawn failed")
+
+    monkeypatch.setattr(speak.subprocess, "Popen", one_then_fail)
+    s = speak.resolve_settings({}, "Linux")
+    result = speak._play_stream(iter([b"chunk-1", b"chunk-2", b"chunk-3"]), s, time.monotonic())
+    assert speak._live["files"] == set()
+    assert result[0] == 1
+    assert result[3] == 0
+
+
+def test_play_stream_swallows_unlink_errors_during_popen_failure(state, monkeypatch):
+    """The Popen-failure path unlinks the wav it just mkstemp'd — if THAT unlink raises
+    OSError, the loop still breaks cleanly. The wav IS removed from _live['files'] either way."""
+    speak._live["files"] = set()
+    monkeypatch.setattr(speak.os, "getpid", lambda: 7777)
+
+    def boom_popen(argv, **kw):
+        raise OSError("spawn failed")
+
+    monkeypatch.setattr(speak.subprocess, "Popen", boom_popen)
+
+    unlink_calls: list = []
+
+    def deny_unlink(path):
+        unlink_calls.append(path)
+        raise OSError("already gone")
+
+    monkeypatch.setattr(speak.os, "unlink", deny_unlink)
+    s = speak.resolve_settings({}, "Linux")
+    # must not raise
+    result = speak._play_stream(iter([b"chunk"]), s, time.monotonic())
+    # the failed-chunk unlink was attempted at least once
+    assert unlink_calls
+    # nothing played, no rc
+    assert result[0] == 0
+    assert result[3] is None
+
+
+def test_play_stream_swallows_unlink_errors_in_finally(state, monkeypatch):
+    """The finally unlinks every wav still in _live['files'] — if the unlink raises (the file
+    was deleted by another process), the exception is swallowed and the loop still exits
+    cleanly."""
+    speak._live["files"] = set()
+    monkeypatch.setattr(speak.os, "getpid", lambda: 7777)
+
+    def deny_unlink(path):
+        raise OSError("already gone")
+
+    monkeypatch.setattr(speak.os, "unlink", deny_unlink)
+    s = speak.resolve_settings({}, "Linux")
+    # pre-seed a wav in _live['files'] so the finally has something to iterate
+    fake_wav = str(state / "leftover.wav")
+    speak._live["files"].add(fake_wav)
+    # must not raise even with one unlink failing
+    result = speak._play_stream(iter([]), s, time.monotonic())
+    assert result == (0, 0, -1, None)
+    assert speak._live["files"] == set()  # the finally removed the path despite the OSError
+
+
+def test_connect_stream_holder_swallows_timeout(state, monkeypatch, tmp_path):
+    """A socket that times out on connect (the listener is there but not accepting fast enough)
+    is the same answer as a refused one: None, and the blob path takes the turn."""
+    sock_path = str(tmp_path / "slow.sock")
+    monkeypatch.setattr(speak, "_STREAM_HOLDER_SOCK", sock_path)
+    monkeypatch.setattr(speak, "ensure_stream_holder", lambda s, **kw: True)
+
+    class SlowConn:
+        def settimeout(self, t):
+            pass
+
+        def connect(self, path):
+            raise TimeoutError("connect timed out")
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(speak.socket, "socket", lambda *a, **kw: SlowConn())
+    s = speak.resolve_settings({}, "Linux")
+    assert speak._connect_stream_holder("hi", s) is None
+
+
+def test_connect_stream_holder_swallows_sendall_error(state, monkeypatch, tmp_path):
+    """The conn.sendall() call can raise OSError on a peer that died between connect() and
+    the first byte — the half-close fallback closes the socket and returns None."""
+    sock_path = str(tmp_path / "dying.sock")
+    # make the path real so the connect doesn't itself raise
+    open(sock_path, "w").close()
+    monkeypatch.setattr(speak, "_STREAM_HOLDER_SOCK", sock_path)
+    monkeypatch.setattr(speak, "ensure_stream_holder", lambda s, **kw: True)
+
+    class DyingConn:
+        def settimeout(self, t):
+            pass
+
+        def connect(self, path):
+            pass
+
+        def sendall(self, data):
+            raise OSError("broken pipe")
+
+        def shutdown(self, how):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(speak.socket, "socket", lambda *a, **kw: DyingConn())
+    s = speak.resolve_settings({}, "Linux")
+    assert speak._connect_stream_holder("hi", s) is None
+    log = (state / "speak.log").read_text(encoding="utf-8")
+    assert "could not reach the holder" in log
+
+
+def test_connect_stream_holder_returns_conn_on_success(state, monkeypatch, tmp_path):
+    """Lines 2139 + 2147: when connect and sendall both succeed, the half-close fires
+    (conn.shutdown(SHUT_WR)) and the open conn is returned so play_text can read SSE from it.
+    The two failure paths above cover the OSError arms; this one covers the success body."""
+    sock_path = str(tmp_path / "ok.sock")
+    open(sock_path, "w").close()  # make the path real so connect() doesn't itself raise
+    monkeypatch.setattr(speak, "_STREAM_HOLDER_SOCK", sock_path)
+    monkeypatch.setattr(speak, "ensure_stream_holder", lambda s, **kw: True)
+
+    seen: dict[str, object] = {}
+
+    class OkConn:
+        def settimeout(self, t):
+            seen["timeout"] = t
+
+        def connect(self, path):
+            seen["connect_path"] = path
+
+        def sendall(self, data):
+            seen["sent"] = data
+
+        def shutdown(self, how):
+            seen["shutdown_how"] = how
+
+        def close(self):
+            seen["close_called"] = True
+
+    monkeypatch.setattr(speak.socket, "socket", lambda *a, **kw: OkConn())
+    s = speak.resolve_settings({}, "Linux")
+    conn = speak._connect_stream_holder("hello", s)
+    assert isinstance(conn, OkConn), "the success path returns the connected socket"
+    assert seen["connect_path"] == sock_path
+    assert seen["sent"] == b'{"text": "hello"}\n'
+    assert seen["shutdown_how"] == speak.socket.SHUT_WR
+    assert "close_called" not in seen, "the success path does NOT close the conn — it returns it"

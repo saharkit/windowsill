@@ -213,7 +213,7 @@ def _kill_process_group(pgid: int, sig: int) -> None:
     killpg = getattr(os, "killpg", None)
     if killpg is not None:
         killpg(pgid, sig)
-    else:
+    else:  # pragma: windows-only - cascade covers the no-killpg arm (217-221): Windows has no POSIX process groups, so this branch is the Windows-only path; on Linux `os.killpg` is always non-None
         # Windows has no POSIX process groups; the direct child is the session's
         # process boundary and is terminated by the caller's Popen handle.
         proc = _live.get("proc")
@@ -1111,7 +1111,7 @@ def _clear_pidfile() -> None:
 _cmdline_of = contracts._cmdline_of
 
 
-def _ps_cmdline_of(pid: int) -> str | None:
+def _ps_cmdline_of(pid: int) -> str | None:  # pragma: macos-only - cascade covers the entire function body (1116-1127); on Linux the macOS `ps` invocation is unreachable and pid_looks_like_speak's non-linux arm short-circuits to True
     """Read a macOS command line without signalling a process or invoking a shell."""
     try:
         result = subprocess.run(

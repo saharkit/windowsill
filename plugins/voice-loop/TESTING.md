@@ -60,10 +60,12 @@ There is deliberately **no line-coverage number for most of the hook scripts** (
 — sit under the ratcheting `scripts/*` 80%-and-up gate in `selftest.yml`, not under the 100% one).
 `speak.py` itself is the deliberate exception (#156 B2): the play-back / no-play / give-up paths
 and the cloud-TTS error-document branch are pinned in a way mocks would not catch, and they earn
-the 100% gate that the server also carries; the Windows-only statements that are unreachable on
-Linux (the `msvcrt` byte-range lock and the `ctypes.WinDLL` process probe) are excluded by the
-registered `pragma: windows-only` marker in `.coveragerc` and pinned by a marker-count test so a
-silent grow/shrink of that allow-list cannot drift unnoticed behind a green 100%. Line coverage is
+the 100% gate that the server also carries; the platform-only statements that are unreachable on
+Linux (the Windows-only `msvcrt` byte-range lock, the `ctypes.WinDLL` process probe, and the
+Windows-only no-`killpg` arm of `_kill_process_group`; plus the macOS-only `_ps_cmdline_of` helper
+that wraps `ps -p`) are excluded by the registered `pragma: windows-only` and `pragma: macos-only`
+markers in `.coveragerc` and pinned by marker-count tests so a silent grow or shrink of either
+allow-list cannot drift unnoticed behind a green 100%. Line coverage is
 not a meaningful metric for the rest of the glue that spends its life calling players, recorders,
 `wl-copy` and `ydotool`: such code can be 100% "covered" by mocks and still fail on the only thing
 that matters — the real runtime. So the guarantee is layered differently:
