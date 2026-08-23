@@ -989,6 +989,7 @@ def test_ensure_stream_holder_times_out_when_holder_never_binds(holder_state, mo
     assert sleep_calls  # the wait loop actually slept
 
 
+@pytest.mark.skipif(not hasattr(socket, "AF_UNIX"), reason="the resident holder is a Unix-domain socket; Windows short-circuits to the blob path")
 def test_connect_stream_holder_swallows_socket_error(state, holder_state, monkeypatch, tmp_path):
     """A socket that refuses (or any OSError in connect/sendall/shutdown) is logged and turned
     into None — the same answer as a holder that is not there. The half-opened socket is closed

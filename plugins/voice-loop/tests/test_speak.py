@@ -4266,6 +4266,7 @@ def test_atomic_write_skips_when_target_is_a_symlink(state, monkeypatch):
     assert not list(state.glob("voice-loop-playing-*"))
 
 
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="pw-play is a PipeWire client; Windows has no PipeWire to route audio into")
 def test_play_stream_routes_through_pw_play_when_sink_set(state, monkeypatch):
     """speak.sink + a pw-play binary: a sink prefix is built from pw-play --target=<sink>, the
     file placeholder is NOT substituted (sink + {file} don't combine). Otherwise, with pw-play
@@ -4284,7 +4285,9 @@ def test_play_stream_routes_through_pw_play_when_sink_set(state, monkeypatch):
     s = speak.resolve_settings({"speak": {"sink": "MySink"}}, "Linux")
     speak._play_stream(iter([b"x"]), s, time.monotonic())
     assert spawns[0][:2] == ["pw-play", "--target=MySink"]
-    assert spawns[0][2].startswith("/tmp/voice-loop-speak-")
+    # tempfile.mkstemp puts the wav in /tmp on Linux but %TEMP% on Windows; the basename is
+    # the load-bearing contract (the prefix passed to mkstemp), not the parent directory.
+    assert os.path.basename(spawns[0][2]).startswith("voice-loop-speak-")
 
 
 def test_play_stream_routes_through_aplay_pipewire_when_no_pw_play(state, monkeypatch):
@@ -4347,6 +4350,7 @@ def test_extract_returns_none_when_transcript_cannot_be_opened(state, monkeypatc
     assert speak.extract(str(missing), "🔊", 100) is None
 
 
+@pytest.mark.skipif(speak.fcntl is None, reason="the fcntl.flock path is the Linux release; Windows uses msvcrt.locking")
 def test_release_lock_swallows_oserror_on_close(state, monkeypatch):
     """The platform-lock release can hit OSError (e.g. the underlying fd was already invalidated
     by the OS). The caller must NOT see it surface — release is best-effort."""
@@ -4944,6 +4948,7 @@ def test_connect_stream_holder_swallows_timeout(state, monkeypatch, tmp_path):
     assert speak._connect_stream_holder("hi", s) is None
 
 
+@pytest.mark.skipif(not hasattr(speak.socket, "AF_UNIX"), reason="the resident holder is a Unix-domain socket; Windows short-circuits to the blob path")
 def test_connect_stream_holder_swallows_sendall_error(state, monkeypatch, tmp_path):
     """The conn.sendall() call can raise OSError on a peer that died between connect() and
     the first byte — the half-close fallback closes the socket and returns None."""
@@ -4976,6 +4981,7 @@ def test_connect_stream_holder_swallows_sendall_error(state, monkeypatch, tmp_pa
     assert "could not reach the holder" in log
 
 
+@pytest.mark.skipif(not hasattr(speak.socket, "AF_UNIX"), reason="the resident holder is a Unix-domain socket; Windows short-circuits to the blob path")
 def test_connect_stream_holder_returns_conn_on_success(state, monkeypatch, tmp_path):
     """Lines 2139 + 2147: when connect and sendall both succeed, the half-close fires
     (conn.shutdown(SHUT_WR)) and the open conn is returned so play_text can read SSE from it.
