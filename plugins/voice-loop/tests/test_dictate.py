@@ -5471,7 +5471,10 @@ class TestScriptsFloorCoverage:
         it is absent — the only branch on this line is "the platform exposes no descriptor chmod"
         and the answer is silence."""
 
-        monkeypatch.setattr(dictate.os, "fchmod", None)
+        # ``raising=False`` because ``os.fchmod`` is POSIX-only and is genuinely absent on
+        # Windows — on POSIX the patch pins it to None so the `if chmod is not None:` branch is
+        # the one exercised; on Windows the absence IS the branch's input and must stay absent.
+        monkeypatch.setattr(dictate.os, "fchmod", None, raising=False)
         # A real fd is unnecessary — the branch is reached BEFORE any syscall: ``getattr(os,
         # "fchmod", None)`` returns None, so the `if chmod is not None:` short-circuits.
         dictate._secure_chmod(0, 0o600)  # does not raise
@@ -5527,10 +5530,15 @@ class TestScriptsFloorCoverage:
         monkeypatch.setattr(dictate.os, "name", "nt")
         # If the branch were missing, this would raise (pkill is not installed everywhere, and
         # os.getuid() is not implemented on Windows). The branch's job is to NOT reach that code.
+        # ``raising=False`` because ``os.getuid`` is POSIX-only and is genuinely absent on
+        # Windows: on POSIX the throwing lambda is what the test would catch the regression via;
+        # on Windows the absence is the input the branch is written for, and the function body
+        # would surface it as an AttributeError if the early-return were ever removed.
         monkeypatch.setattr(
             dictate.os,
             "getuid",
             lambda: (_ for _ in ()).throw(OSError("os.getuid is not available on Windows")),
+            raising=False,
         )
         dictate.stop_speak_playback()  # does not raise
 
