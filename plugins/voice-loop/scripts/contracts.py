@@ -144,7 +144,7 @@ def _ps_cmdline_of(pid: int) -> str | None:
     return result.stdout.decode("utf-8", "replace").strip() or None
 
 
-def _windows_process_is_live(pid: int) -> bool:
+def _windows_process_is_live(pid: int) -> bool:  # pragma: windows-only — Windows-kernel32-handle probe; unreachable on the Linux CI job
     """Probe a Windows process without os.kill(pid, 0)."""
     import ctypes
 

@@ -13,6 +13,13 @@ _COVERAGERC = _ROOT / "plugins" / "voice-loop" / ".coveragerc"
 # is also removed from the .coveragerc registration, this test catches it as the registered-marker
 # assertion below.
 _WINDOWS_ONLY_MARKERS_IN_SPEAK_PY = 11
+# Sister allow-list for `scripts/contracts.py`: one `pragma: windows-only` marker on
+# `_windows_process_is_live`, a `ctypes.WinDLL("kernel32")` handle probe a Linux runner cannot
+# reach. The token is registered in `.coveragerc` and the marker count is pinned by the same
+# kind of test. A regression that ADDS a marker without bumping this literal silently grows
+# the allow-list; a regression that REMOVES it (and re-exposes the ctypes body) has no other
+# witness on Linux.
+_WINDOWS_ONLY_MARKERS_IN_CONTRACTS_PY = 1
 # Sister allow-list for the macOS-only code path (`_ps_cmdline_of`, the macOS `ps` helper): the
 # token is registered in `.coveragerc` and the marker count is pinned by the same kind of test.
 # A regression that ADDS a marker without bumping this literal silently grows the macOS allow-list.
@@ -61,6 +68,24 @@ def test_speak_py_windows_only_marker_count_is_exactly_the_allow_list():
         f"Update the literal here AND in the PR body together — the marker must remain "
         f"registered as a coverage exclusion (see test_coveragerc_registers_windows_only_marker) "
         f"and the count must be reflected in the B2 PR description."
+    )
+
+
+def test_contracts_py_windows_only_marker_count_is_exactly_the_allow_list():
+    """Mutation gap: same shape as the speak.py pin. contracts.py carries one
+    `pragma: windows-only` marker on `_windows_process_is_live`, a `ctypes.WinDLL("kernel32")`
+    handle probe that a Linux runner cannot reach by construction. A drift here either grows the
+    allow-list (silently, behind a green 100%) or removes the marker (and re-exposes the ctypes
+    body, which has no other witness on Linux). TESTING.md's exclusion table names the count;
+    pinning the literal here keeps that claim true."""
+    text = (_SCRIPTS / "contracts.py").read_text(encoding="utf-8")
+    actual = text.count("pragma: windows-only")
+    assert actual == _WINDOWS_ONLY_MARKERS_IN_CONTRACTS_PY, (
+        f"scripts/contracts.py carries {actual} `pragma: windows-only` markers; "
+        f"this test pins the count at {_WINDOWS_ONLY_MARKERS_IN_CONTRACTS_PY}. "
+        f"Update the literal here AND TESTING.md's exclusion table together — the marker must "
+        f"remain registered as a coverage exclusion "
+        f"(see test_coveragerc_registers_windows_only_marker)."
     )
 
 

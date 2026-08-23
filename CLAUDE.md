@@ -88,8 +88,9 @@ queue's `merge_group` ref, and manual:
   **`scripts/doctor.py`** (round #156 B1 — the diagnose tool the user runs first when something is
   wrong, so it cannot itself be the broken thing they hit) and **`scripts/speak.py`** (B2 of #156 —
   the play-back / no-play / give-up paths and the cloud-TTS error-document branch are pinned in a
-  way mocks would not catch). The ratcheting 80%-and-up gate is `scripts/*`. Windows-only
-  statements in `speak.py` that the Linux matrix cannot reach (the `msvcrt` byte-range lock, the
+  way mocks would not catch). The `scripts/*` gate sits at 100% of what is measurable on a Linux
+  runner; the exclusions are disclosed in `plugins/voice-loop/TESTING.md`. Windows-only statements
+  in `speak.py` that the Linux matrix cannot reach (the `msvcrt` byte-range lock, the
   `ctypes.WinDLL` process probe) and the macOS-only `_ps_cmdline_of` helper that wraps `ps -p` are
   excluded by the registered `pragma: windows-only` and `pragma: macos-only` markers in
   `.coveragerc`, and the marker counts are pinned by tests so the allow-lists cannot silently grow
