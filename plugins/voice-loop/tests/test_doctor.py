@@ -15,8 +15,10 @@ Acceptance criteria from the brief:
 
 from __future__ import annotations
 
+import builtins
 import json
 import os
+import runpy
 import sys
 from pathlib import Path
 from typing import Any
@@ -1128,3 +1130,645 @@ class TestWindowsPrerequisites:
         assert fake_account not in evidence_blob, (
             f"account name leaked into platform evidence: {evidence_blob}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Round B1 — drive the remaining uncovered lines and branches up to 100%
+# ---------------------------------------------------------------------------
+#
+# Round #156 B1 ("scripts/doctor.py to 100% — 90% today, 25 statements and 9
+# partial branches left") measured the module at 90% at commit 92abf86 and
+# rechecked the inputs as unchanged at a6d2292. The table of gaps is anchored
+# at specific line numbers in ``scripts/doctor.py``; each method below names
+# which row it closes. Where a row names one line, the test exercises the
+# wider region around it: a test that crosses a branch also executes the
+# statement on the side the coverage tool counts.
+
+
+_SCRIPTS_DIR = _plugin_root / "scripts"
+_DOCTOR_PATH = _SCRIPTS_DIR / "doctor.py"
+
+
+class TestResolveVersionDirIterdirRaises:
+    """Row 1 — ``_resolve_version_dir`` returns ``plugin_dir`` when ``iterdir`` raises."""
+
+    def test_iterdir_raises_oserror_returns_plugin_dir(
+        self, monkeypatch, tmp_path: Path
+    ) -> None:
+        """The best-effort guard catches a non-iteration-safe plugin_dir and returns it.
+
+        Gap: the catch exists so a permission error inside a cache layout cannot
+        crash the doctor; without it a read-only cache directory would propagate
+        PermissionError and the diagnosis tool itself would fail to start.
+        """
+        plugin_dir = tmp_path / "plugin"
+        plugin_dir.mkdir()
+
+        def raising_iterdir(self, *args, **kwargs):  # noqa: ARG001
+            raise OSError("permission denied")
+
+        monkeypatch.setattr(Path, "iterdir", raising_iterdir)
+
+        assert doctor._resolve_version_dir(plugin_dir) == plugin_dir
+
+
+class TestRemoveIncidentSymlinkIsSymlinkRaises:
+    """Row 2 — ``_remove_incident_symlink`` swallows an ``is_symlink`` raise."""
+
+    def test_is_symlink_raises_oserror_returns_silently(
+        self, monkeypatch, tmp_path: Path
+    ) -> None:
+        """A flaky FS that cannot stat the wrong path is still a clean no-op.
+
+        Gap: the cleanup is best-effort — a regression to ``raise`` would
+        prevent ``/doctor`` from completing on hosts where the wrong path
+        is unreadable; this pins the silent return.
+        """
+        voice_root = tmp_path / "voice-loop" / "0.7.0"
+        voice_root.mkdir(parents=True)
+
+        def raising_is_symlink(self, *args, **kwargs):  # noqa: ARG001
+            raise OSError("stat failed")
+
+        monkeypatch.setattr(Path, "is_symlink", raising_is_symlink)
+        monkeypatch.setattr(doctor, "_plugin_root", lambda: voice_root)
+
+        # Must not raise.
+        doctor._remove_incident_symlink()
+
+
+class TestIsStoreStubRealpathRaises:
+    """Row 3 — ``_is_store_stub`` still recognises a Store stub when ``realpath`` raises."""
+
+    def test_realpath_raises_oserror_still_recognises_stub(
+        self, monkeypatch
+    ) -> None:
+        """A realpath failure must not promote the Store stub into "real".
+
+        Gap: a host where ``os.path.realpath`` is locked down (or returns an
+        error on a redirected path) would otherwise mis-classify the stub as
+        a real interpreter; this pins that the un-resolved path still goes
+        through the parent-name check.
+        """
+        monkeypatch.setattr(
+            "doctor.os.path.realpath",
+            lambda path: (_ for _ in ()).throw(OSError("realpath failed")),
+        )
+        stub = (
+            "C:\\Users\\me\\AppData\\Local\\Microsoft\\WindowsApps\\"
+            "python3.exe"
+        )
+        assert doctor._is_store_stub(stub) is True
+
+
+class TestRedactWindowsPathLegacyFallbackLastButOne:
+    """Row 5 — the legacy ``Users`` fallback returns the path unchanged.
+
+    When the account segment is already the last-but-one part, the fallback
+    guard (``users_index + 1 >= len(parts) - 1``) returns the path verbatim
+    rather than re-emitting a stray ``<user>`` placeholder that the caller
+    did not authorise.
+    """
+
+    def test_account_already_last_but_one_is_returned_unchanged(
+        self, monkeypatch
+    ) -> None:
+        """``C:\\Users\\alice`` (the account IS the last-but-one part) is returned as-is.
+
+        Gap: the guard prevents the fallback from overwriting an already-
+        terminal segment with ``<user>``; a regression that lifted the guard
+        would corrupt every short Users path the operator hands to /report-bug.
+        """
+        monkeypatch.delenv("USERPROFILE", raising=False)
+        monkeypatch.delenv("HOMEDRIVE", raising=False)
+        monkeypatch.delenv("HOMEPATH", raising=False)
+
+        # ``C:\\Users\\alice`` parses to ``("C:\\", "Users", "alice")`` —
+        # users_index is 1, and 1 + 1 == len(parts) - 1 == 2, so the guard
+        # fires and the path is returned unchanged.
+        assert doctor._redact_windows_path(r"C:\Users\alice") == r"C:\Users\alice"
+
+
+class TestPython3FindingStubOnPathButNotFirst:
+    """Row 6 — a Store stub on PATH that is NOT the first ``python3`` still fires.
+
+    When ``shutil.which`` already returns a real ``python3`` but a stub also
+    sits somewhere on PATH, the finding fires the "also on PATH" branch
+    (lines 464-468) so the user knows a PATH reorder could resurface the trap.
+    """
+
+    def test_stub_on_path_but_not_first_fires_also_on_path_branch(self) -> None:
+        """First is real, second is the Store stub → the "also on PATH" wording fires.
+
+        Gap: the second decision fires only when ``stub_paths`` is non-empty
+        while ``first_is_stub`` is False; the mirror (first_is_stub is True)
+        is already covered beside it, so this one is the asymmetry that
+        confirms ``first_is_stub`` was checked.
+        """
+
+        def fake_which(name: str) -> str | None:
+            if name == "python3":
+                return "C:\\Python311\\python3.exe"
+            if name == "python":
+                return "C:\\Python311\\python.exe"
+            return None
+
+        result = doctor._check_python_interpreter(
+            platform="win32",
+            which=fake_which,
+            where=lambda: [
+                "C:\\Python311\\python3.exe",
+                "C:\\Users\\me\\AppData\\Local\\Microsoft\\WindowsApps\\"
+                "python3.exe",
+            ],
+        )
+        assert result is not None
+        assert result["key"] == "python3_is_store_stub"
+        assert "also on PATH" in result["title"]
+        assert result["evidence"]["python3_is_stub"] is False
+        # The first-path redaction survives the second-decision branch too.
+        assert result["evidence"]["python3_first_path"] == "C:\\Python311\\python3.exe"
+
+
+class TestReadConfigValidObjectHappyPath:
+    """Row 7 — ``read_config`` returns ``DiagnosticData(status='ok')`` for a JSON object."""
+
+    def test_valid_object_round_trips_with_ok_status(
+        self, tmp_path: Path
+    ) -> None:
+        """A well-formed JSON object file is read back as a successful DiagnosticData.
+
+        Gap: every existing test for ``read_config`` monkeypatched it out, so
+        the happy path (and every branch below it) was silently uncovered —
+        a JSON parser regression could not surface in /doctor's verdict.
+        """
+        config_path = tmp_path / "config.json"
+        payload = {"speak": {"enabled": True}, "dictate": {"auto_paste": True}}
+        config_path.write_text(json.dumps(payload), encoding="utf-8")
+
+        result = doctor.read_config(str(config_path))
+        assert result.status == "ok"
+        assert dict(result) == payload
+
+    def test_malformed_json_returns_malformed_status(self, tmp_path: Path) -> None:
+        """Invalid JSON returns ``status='malformed'`` with the exception name in the detail.
+
+        Gap: the malformed-JSON branch (lines 621-622 in read_ledger, and the
+        mirror at 605-606 in read_config) was uncovered — a JSON parser that
+        raised the wrong exception type would silently return ``status='ok'``.
+        """
+        config_path = tmp_path / "config.json"
+        config_path.write_text("{this is not valid json", encoding="utf-8")
+
+        result = doctor.read_config(str(config_path))
+        assert result.status == "malformed"
+        assert "JSONDecodeError" in result.detail
+
+    def test_non_object_json_returns_malformed(self, tmp_path: Path) -> None:
+        """A JSON list at the top level returns ``malformed`` — ``read_config`` promises an object.
+
+        Gap: the ``isinstance(loaded, dict)`` guard was uncovered; a regression
+        to ``loaded = json.loads(...)`` without that guard would let /doctor
+        index into a list and raise inside the diagnose engine.
+        """
+        config_path = tmp_path / "config.json"
+        config_path.write_text("[1, 2, 3]", encoding="utf-8")
+
+        result = doctor.read_config(str(config_path))
+        assert result.status == "malformed"
+        assert "expected JSON object" in result.detail
+
+    def test_unreadable_file_returns_unreadable(self, tmp_path: Path) -> None:
+        """An ``OSError`` other than ``FileNotFoundError`` returns ``status='unreadable'``.
+
+        Gap: the ``OSError`` arm of ``read_config`` was uncovered — a host
+        where the config file became unreadable for any reason other than
+        "missing" would otherwise return the wrong verdict.
+        """
+        # The file is a directory, so open raises IsADirectoryError (an OSError).
+        config_path = tmp_path / "config.json"
+        config_path.mkdir()
+
+        result = doctor.read_config(str(config_path))
+        assert result.status == "unreadable"
+        # str(OSError) renders the filename via repr(), so Windows backslashes come back doubled and the
+        # exception class differs by platform — assert the basename, which both renderings share.
+        assert config_path.name in result.detail
+
+    def test_missing_file_returns_missing(self, tmp_path: Path) -> None:
+        """An absent config file returns ``status='missing'`` with the path in the detail.
+
+        Gap: the ``FileNotFoundError`` arm of ``read_config`` was the only
+        exception branch the round did not already exercise via a sibling
+        test — ``read_ledger``'s missing arm is exercised by the existing
+        ``test_missing_engine_emits_diagnosis_json`` fixture, so this pins
+        the read_config mirror.
+        """
+        missing_path = tmp_path / "absent.json"
+
+        result = doctor.read_config(str(missing_path))
+        assert result.status == "missing"
+        assert str(missing_path) in result.detail
+        assert "does not exist" in result.detail
+
+
+class TestReadLedgerExceptBranches:
+    """Round B1 extensions — cover the two ``read_ledger`` exception arms."""
+
+    def test_unreadable_file_returns_unreadable(self, tmp_path: Path) -> None:
+        """``read_ledger`` mirrors ``read_config``: a directory-as-file raises ``unreadable``.
+
+        Gap: lines 619-620 in ``scripts/doctor.py`` were uncovered alongside
+        the read_config arms — the OSError branches share the same reasoning
+        as row 7 and are required for the module to hit 100%.
+        """
+        state_home = tmp_path / "state"
+        (state_home / "voice-loop").mkdir(parents=True)
+        # Replace install.ledger with a directory so open raises IsADirectoryError.
+        (state_home / "voice-loop" / "install.ledger").mkdir()
+
+        result = doctor.read_ledger(str(state_home))
+        assert result.status == "unreadable"
+        # str(OSError) renders the filename via repr(), so Windows backslashes come back doubled and the
+        # exception class differs by platform — assert the basename, which both renderings share.
+        assert "install.ledger" in result.detail
+
+    def test_malformed_json_returns_malformed(self, tmp_path: Path) -> None:
+        """Invalid JSON in ``install.ledger`` returns ``status='malformed'``.
+
+        Gap: lines 621-622 were uncovered — a corrupted ledger would
+        otherwise crash with ``json.JSONDecodeError`` instead of being
+        surfaced as a structured verdict for /doctor.
+        """
+        state_home = tmp_path / "state"
+        (state_home / "voice-loop").mkdir(parents=True)
+        (state_home / "voice-loop" / "install.ledger").write_text(
+            "{not valid", encoding="utf-8"
+        )
+
+        result = doctor.read_ledger(str(state_home))
+        assert result.status == "malformed"
+        assert "JSONDecodeError" in result.detail
+
+
+class TestReadLogsHappyPath:
+    """Round B1 extensions — cover the ``read_logs`` happy path and first-open OSError arm."""
+
+    def test_readable_logs_return_ok_status_with_tail(
+        self, tmp_path: Path
+    ) -> None:
+        """A populated ``speak.log`` is read successfully and the tail is preserved.
+
+        Gap: lines 650-652 were uncovered — every existing read_logs test
+        fed in a missing path, so the happy path itself (file present,
+        content read, lines truncated to ``tail_lines``) was untested.
+        """
+        state_home = tmp_path / "state"
+        log_dir = state_home / "voice-loop"
+        log_dir.mkdir(parents=True)
+        speak_log = log_dir / "speak.log"
+        dictate_log = log_dir / "dictate.log"
+        # More than tail_lines lines so the truncation actually has work to do.
+        for log in (speak_log, dictate_log):
+            # Two lines per log is enough; the speak truncation gets its
+            # work from a separate, longer fixture below.
+            log.write_text("line a\nline b\n", encoding="utf-8")
+        speak_log.write_text(
+            "\n".join(f"line {i}" for i in range(80)) + "\n",
+            encoding="utf-8",
+        )
+
+        result = doctor.read_logs(str(state_home), tail_lines=10)
+        # Both logs present and valid → overall status is ok.
+        assert result.status == "ok"
+        assert result.source_status["speak.log"] == "ok"
+        assert result.source_status["dictate.log"] == "ok"
+        assert len(result["speak.log"]) == 10
+        assert result["speak.log"][-1] == "line 79"
+
+    def test_first_open_raises_oserror_marks_source_unreadable(
+        self, tmp_path: Path
+    ) -> None:
+        """Row 8 — a directory at the log path raises ``IsADirectoryError``, marked ``unreadable``.
+
+        Gap: only the ``FileNotFoundError`` arm of the first open was
+        exercised; any other ``OSError`` (the same family ``IsADirectoryError``
+        belongs to) is what this branch handles.
+        """
+        state_home = tmp_path / "state"
+        log_dir = state_home / "voice-loop"
+        log_dir.mkdir(parents=True)
+        # Replace speak.log with a directory so the first open raises
+        # IsADirectoryError (a subclass of OSError, distinct from FileNotFoundError).
+        (log_dir / "speak.log").mkdir()
+
+        result = doctor.read_logs(str(state_home))
+        assert result.source_status["speak.log"] == "unreadable"
+        # str(OSError) renders the filename via repr(), so Windows backslashes come back doubled and the
+        # exception class differs by platform — assert the basename, which both renderings share.
+        assert "speak.log" in result.source_details["speak.log"]
+        assert result.source_status["dictate.log"] == "missing"
+        assert result.status == "degraded"
+
+
+class TestReadLogsSecondOpenRaises:
+    """Row 9 — the second open in ``read_logs`` raises a structured exception."""
+
+    def test_second_open_raises_filenotfounderror_marks_missing(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """The file vanishes between reads → ``status='missing'``, detail names the cause.
+
+        Gap: lines 669-671 in ``scripts/doctor.py`` were uncovered — the
+        race between the tail read and the re-read for a UTF-8 decode error
+        must surface as a structured verdict, not a crash.
+        """
+        state_home = tmp_path / "state"
+        log_dir = state_home / "voice-loop"
+        log_dir.mkdir(parents=True)
+        log_path = log_dir / "speak.log"
+        log_path.write_text("first line\nsecond line\n", encoding="utf-8")
+
+        real_open = builtins.open
+        call_count = {"n": 0}
+
+        def counting_open(path, *args, **kwargs):
+            call_count["n"] += 1
+            if call_count["n"] == 2 and str(path).endswith("speak.log"):
+                raise FileNotFoundError("vanished")
+            return real_open(path, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "open", counting_open)
+
+        result = doctor.read_logs(str(state_home))
+        assert result.source_status["speak.log"] == "missing"
+        # The detail names the path and the cause: ``f"{path} disappeared after reading"``.
+        assert "disappeared after reading" in result.source_details["speak.log"]
+        assert "speak.log" in result.source_details["speak.log"]
+
+    def test_second_open_raises_oserror_marks_unreadable(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """The second open raises a non-FileNotFoundError ``OSError`` → ``unreadable``.
+
+        Gap: lines 672-674 in ``scripts/doctor.py`` were uncovered — the
+        read-recheck handshake has to fall through every OSError branch.
+        """
+        state_home = tmp_path / "state"
+        log_dir = state_home / "voice-loop"
+        log_dir.mkdir(parents=True)
+        log_path = log_dir / "speak.log"
+        log_path.write_text("first line\nsecond line\n", encoding="utf-8")
+
+        real_open = builtins.open
+        call_count = {"n": 0}
+
+        def counting_open(path, *args, **kwargs):
+            call_count["n"] += 1
+            if call_count["n"] == 2 and str(path).endswith("speak.log"):
+                raise OSError("second read blocked")
+            return real_open(path, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "open", counting_open)
+
+        result = doctor.read_logs(str(state_home))
+        assert result.source_status["speak.log"] == "unreadable"
+        assert "OSError" in result.source_details["speak.log"]
+
+    def test_second_open_raises_unicodedecodeerror_marks_malformed(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        """The second open sees a malformed UTF-8 byte → ``malformed`` with the decoder name.
+
+        Gap: lines 666-668 in ``scripts/doctor.py`` were uncovered — a log
+        that was readable on the first pass (because the first pass uses
+        ``errors='replace'``) but not on the second (which uses strict UTF-8)
+        must surface as a structured verdict rather than a crash.
+        """
+        state_home = tmp_path / "state"
+        log_dir = state_home / "voice-loop"
+        log_dir.mkdir(parents=True)
+        log_path = log_dir / "speak.log"
+        # Bytes that ``errors='replace'`` makes it through, but strict UTF-8 rejects.
+        log_path.write_bytes(b"first line\n\xff\xfe bad utf-8\n")
+
+        result = doctor.read_logs(str(state_home))
+        assert result.source_status["speak.log"] == "malformed"
+        assert "UnicodeDecodeError" in result.source_details["speak.log"]
+
+
+class TestLoadManifestDefensiveRaises:
+    """Row 10 — the two ``load_manifest`` defensive raises carry the manifest path."""
+
+    def test_spec_is_none_raises_filenotfounderror(
+        self, monkeypatch, tmp_path: Path
+    ) -> None:
+        """``importlib.util.spec_from_file_location`` returning ``None`` → ``FileNotFoundError``.
+
+        Gap: line 687 in ``scripts/doctor.py`` was uncovered — a malformed
+        manifest file (one that the import machinery refuses to spec) must
+        surface as a missing-manifest error, not a silent empty checklist.
+        """
+        import importlib.util
+
+        monkeypatch.setattr(
+            importlib.util,
+            "spec_from_file_location",
+            lambda name, location, *args, **kwargs: None,
+        )
+
+        # ``load_manifest`` resolves ``plugin_root / "skills" / "doctor" / "check_manifest.py"``;
+        # the error message names THAT path, not whatever the caller passes.
+        manifest_path = tmp_path / "skills" / "doctor" / "check_manifest.py"
+        manifest_path.parent.mkdir(parents=True)
+        manifest_path.write_text("# anything", encoding="utf-8")
+
+        with pytest.raises(FileNotFoundError) as raised:
+            doctor.load_manifest(tmp_path)
+        assert "manifest not found" in str(raised.value)
+        assert str(manifest_path) in str(raised.value)
+
+    def test_spec_loader_is_none_raises_runtimeerror(
+        self, monkeypatch, tmp_path: Path
+    ) -> None:
+        """A spec without a loader → ``RuntimeError`` naming the manifest path.
+
+        Gap: line 690 in ``scripts/doctor.py`` was uncovered — an environment
+        that produces a spec without a usable loader must surface as a
+        distinct diagnostic, not a generic ``NoneType`` crash inside exec_module.
+        """
+        import importlib.util
+
+        class FakeSpec:
+            # ``importlib.util.module_from_spec`` reads several spec
+            # attributes; stand in with sentinels so the call does not
+            # raise AttributeError BEFORE we reach the line we are testing.
+            name = "fake_spec"
+            loader = None
+            submodule_search_locations = None
+            parent = None
+            has_location = False
+            origin = None
+
+        monkeypatch.setattr(
+            importlib.util,
+            "spec_from_file_location",
+            lambda name, location, *args, **kwargs: FakeSpec(),
+        )
+
+        manifest_path = tmp_path / "skills" / "doctor" / "check_manifest.py"
+        manifest_path.parent.mkdir(parents=True)
+        manifest_path.write_text("# anything", encoding="utf-8")
+
+        with pytest.raises(RuntimeError) as raised:
+            doctor.load_manifest(tmp_path)
+        assert "loader is None" in str(raised.value)
+        assert str(manifest_path) in str(raised.value)
+
+
+class TestMainArgvFallsBackToSysArgv:
+    """Row 11 — ``main(argv=None)`` reads ``sys.argv`` when no argv is supplied."""
+
+    def test_argv_none_uses_sys_argv_for_help_message(
+        self, monkeypatch, capsys
+    ) -> None:
+        """Calling ``main()`` with no argv honours ``sys.argv`` — including argv[0] in the help line.
+
+        Gap: line 697 in ``scripts/doctor.py`` was reachable only via the
+        ``runpy`` test in row 4; this pins it independently so a regression
+        to ``argv = []`` is caught even if the runpy shape changes.
+        """
+        monkeypatch.setattr(sys, "argv", ["doctor.py", "--help"])
+
+        rc = doctor.main()
+        assert rc == 0
+        assert "doctor.py" in capsys.readouterr().err
+
+
+class TestMainWslBoundaryBlockSkipped:
+    """Row 12 — when config is PRESENT, the WSL block and finding filter are SKIPPED.
+
+    A single end-to-end ``main()`` run with a non-empty config drives the
+    false arm at branch 739→745 (``not config`` is False, falls through) and
+    keeps ``wsl_finding`` None at 835, so the filter at 835→842 is also a
+    no-op pass.
+    """
+
+    def test_present_config_skips_wsl_block_and_filter(
+        self, monkeypatch, capsys, tmp_path: Path
+    ) -> None:
+        """With a config present, no WSL boundary finding is appended and the filter is a no-op.
+
+        Gap: branches 739→745 and 835→842 in ``scripts/doctor.py`` were
+        uncovered — both are branch-only arcs with no missed statement
+        behind them, and both fall through in this single run.
+        """
+        config_path = tmp_path / "config.json"
+        # A non-empty object: ``DiagnosticData`` extends ``dict``, so an
+        # empty body would make ``not config`` True and re-enter the
+        # WSL block we are trying to bypass.
+        config_path.write_text(
+            json.dumps({"speak": {"enabled": True}}),
+            encoding="utf-8",
+        )
+        state_home = tmp_path / "state"
+
+        # Force the file readers and loaders to their real implementations so
+        # the WSL-block predicate (``not config``) sees a non-empty config.
+        monkeypatch.setattr(doctor, "_default_state_home", lambda: str(state_home))
+        monkeypatch.setattr(doctor, "_default_config_path", lambda: str(config_path))
+        monkeypatch.setattr(doctor, "_sill_core_root", lambda: _core_root)
+        # An absent WSL finding is exactly what this test asserts: the
+        # branch 835→842 arc is the "no filter" pass when ``wsl_finding`` stays None.
+        # Track whether the WSL boundary finding was ever probed.
+        probe_called = {"n": 0}
+
+        def counting_probe(**kwargs):
+            probe_called["n"] += 1
+            return None
+
+        monkeypatch.setattr(doctor, "_wsl_boundary_finding", counting_probe)
+
+        rc = doctor.main(["doctor.py"])
+        assert rc == 0
+        # The WSL probe is inside the ``if not config`` block; with a
+        # non-empty config the probe is never invoked, which is the
+        # branch 739→745 false arm.
+        assert probe_called["n"] == 0
+
+        rendered = json.loads(capsys.readouterr().out)
+        # Branch 835→842 false arm: ``wsl_finding`` stayed None, so the
+        # filter list-comprehension is a no-op pass and the findings the
+        # engine produced are preserved as-is.
+        keys = [finding["key"] for finding in rendered["findings"]]
+        assert "wsl" not in keys
+
+
+# ---------------------------------------------------------------------------
+# Pinned pragma list — the source-text test that holds the allow-list to its
+# enumerated size.
+# ---------------------------------------------------------------------------
+
+
+class TestPinnedPragmaList:
+    """The no-cover pragma list in ``scripts/doctor.py`` is exactly three entries.
+
+    Each pragma corresponds to a Windows-only body branch that the Linux
+    coverage job cannot exercise without faking the Windows API — a fake
+    would itself need a correctness argument, so the discipline is to enumerate
+    the allow-list in the PR body and pin the count in this test so an
+    unbounded pragma cannot slip through.
+    """
+
+    def test_no_cover_pragmas_are_exactly_three_entries(self) -> None:
+        """The sorted 1-indexed line numbers carrying ``# pragma: no cover`` equal the pinned list.
+
+        Today that list is ``[198, 239, 289]``. The list grows ONLY when a
+        new Windows-only body is added AND named in the PR body's
+        allow-list in the same commit.
+        """
+        source = _DOCTOR_PATH.read_text(encoding="utf-8")
+        pragma_lines = sorted(
+            index
+            for index, line in enumerate(source.splitlines(), start=1)
+            if "pragma: no cover" in line
+        )
+        assert pragma_lines == [198, 239, 289]
+
+    def test_pinned_lines_carry_the_windows_only_reason(self) -> None:
+        """Each pinned pragma sits on a Windows-only body branch.
+
+        The reason appears verbatim on the same line (the brief specifies a
+        one-line reason per entry), and the substring "Windows-only" is the
+        vocabulary that gates it.
+        """
+        source_lines = _DOCTOR_PATH.read_text(encoding="utf-8").splitlines()
+        for line_number in (198, 239, 289):
+            assert "Windows-only" in source_lines[line_number - 1], (
+                f"line {line_number} pragma lost its Windows-only reason: "
+                f"{source_lines[line_number - 1]!r}"
+            )
+
+
+# ---------------------------------------------------------------------------
+# Row 4 — the __main__ guard is covered with runpy + monkeypatched sys.argv
+# ---------------------------------------------------------------------------
+
+
+class TestScriptEntrypointRequiresACommand:
+    """``doctor.py`` executed as ``__main__`` exits with the parsed code."""
+
+    def test_main_module_execution_exits(self, monkeypatch) -> None:
+        """Running the file as ``__main__`` propagates ``SystemExit(main())``.
+
+        Gap: lines 871-872 in ``scripts/doctor.py`` were uncovered — the
+        ``__main__`` guard is a one-liner whose body IS the executable
+        entry, and it is the shape five sibling scripts use.
+        """
+        # Mirror ``test_report_bug.py``'s pattern: monkeypatch ``sys.argv`` so the
+        # unknown-argument branch fires deterministically.  An argv that
+        # contains an unknown flag returns 2 and raises SystemExit(2).
+        monkeypatch.setattr(sys, "argv", ["doctor.py", "--unknown"])
+        with pytest.raises(SystemExit) as raised:
+            runpy.run_path(str(_DOCTOR_PATH), run_name="__main__")
+        assert raised.value.code == 2
