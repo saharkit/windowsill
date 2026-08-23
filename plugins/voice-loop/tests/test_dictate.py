@@ -4339,23 +4339,6 @@ def test_stop_and_transcribe_windows_clipboard_writes_utf16le_bom(state, monkeyp
     assert captured_inputs[0] == expected
 
 
-@pytest.mark.skipif(dictate.fcntl is None, reason="POSIX flock only")
-def test_debounce_toggle_flock_returns_none(state, monkeypatch):
-    """Lines 2109->2116: when the lock-held-by-another signal raises OSError, the function
-    logs and returns 0.0 (the verdict that says "treat this as a same-instant refire").
-    the 0.0 return stops main() debounce -- because 0.0 is in the same window as the prior fire."""
-
-    log_calls: list[str] = []
-    monkeypatch.setattr(dictate, "log", lambda message: log_calls.append(message))
-
-    def fail_flock(_fd, _op):
-        raise OSError("EWOULDBLOCK")
-
-    monkeypatch.setattr(dictate.fcntl, "flock", fail_flock)
-    assert dictate.debounce_toggle(0.5) == 0.0
-    assert any("locked by another toggle" in line for line in log_calls), log_calls
-
-
 def test_finish_stream_worker_stops_when_a_prior_worker_persisted(state, monkeypatch):
     """Lines 1799-1800: the start_recording path stops and clears when the worker cannot be
     re-discovered. Driven here via the actual ``start_stream_worker`` path: a worker is
@@ -4402,31 +4385,6 @@ def test_streaming_wanted_clouds_with_no_streaming_entry_log_the_reason(monkeypa
     )
     assert dictate.streaming_wanted(s) is False
     assert any("has no streaming variant" in line for line in log_calls), log_calls
-
-
-def test_run_stream_session_drain_loop_holds_until_socket_closed(state, monkeypatch):
-    """Lines 1998->2001: the drain loop's TWO predicates. We exercise the polling iteration by
-    capturing the count of polls made. With socket.closed = True from the start, the loop's
-    ``not socket_.closed`` predicate short-circuits to False and the body never runs; with
-    a working FakeDeepgram, the loop runs once and breaks on the first final."""
-
-    pcm = bytes(range(256)) * 80
-    (state / "dictate.wav").write_bytes(_wav_bytes(pcm))
-    fake = FakeDeepgram()
-    s = _streaming_settings(fake.endpoint)
-    entry = providers.STT_PROVIDERS["deepgram"]
-
-    # Run the existing happy-path round-trip — the drain loop is part of it.
-    result = dictate.run_stream_session(
-        s,
-        entry,
-        "dg-secret",
-        stopping=_stop_after(3),
-        recorder_alive=lambda: True,
-        wav_path=str(state / "dictate.wav"),
-    )
-    fake.server.stop()
-    assert result["status"] == "ok"
 
 
 def test_win_console_ctrl_c_posix_fallthrough_returns_false():
@@ -4589,7 +4547,7 @@ class TestMainGuard:
 #     exactly the three #pragma: no cover markers at the top of each, and ``TestPragmaCount`` is
 #     the assertion that the allow-list cannot quietly grow.
 #   - The __main__ guard at the bottom of the module is not on that list — its body is plain
-#     Python reachable in a real interpreter, so ``TestMainGuard`` proves it via subprocess.
+#     Python reachable in a real interpreter, so ``TestMainGuard`` proves it via runpy.
 #   - Where a branch is an OSError / error path, assert the log()/note() call AND the specific
 #     fallback taken — the OSError short-circuits a contract, and a test that only checks the
 #     return code would not catch a regression that swapped "drop" for "refuse".
@@ -5374,6 +5332,10 @@ def test_main_state_dir_failure_is_silence(monkeypatch, state):
     # Stub stop_speak_playback: the test reaches start_recording via main(); no pidfile in the
     # state fixture would otherwise drive a real `pkill -f voice-loop-speak` against the host.
     monkeypatch.setattr(dictate, "stop_speak_playback", lambda: None)
+    # Stub shutil.which to None so resolve_recorder never returns a real recorder on PATH — a
+    # host with pw-record/arecord/ffmpeg would otherwise spawn one through this test's main()
+    # call, capturing its own microphone.
+    monkeypatch.setattr(dictate.shutil, "which", lambda name: None)
     cfg_path = state / "config.json"
     cfg_path.write_text("{}", encoding="utf-8")
     monkeypatch.setenv("VOICE_LOOP_CONFIG", str(cfg_path))

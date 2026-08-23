@@ -58,20 +58,17 @@ There is deliberately **no line-coverage number for the hook scripts** (`speak.p
 `speak.sh`); the 100% gate above is scoped to `server/voice_server.py`. Line coverage is not a
 meaningful metric for glue that spends its life calling players, recorders, `wl-copy` and
 `ydotool`: such code can be 100% "covered" by mocks and still fail on the only thing that matters —
-the real runtime. The guarantee is layered differently. The `scripts/` ratchet
+the real runtime. So the guarantee is layered differently. The `scripts/` ratchet
 (`coverage report --include='scripts/*' --fail-under=80`, ratcheting upward) is what
 actually gates the dictation-toggle (`scripts/dictate.py`) and the dictation-opinion modules;
 `speak.py`'s own clauses sit beside the 100% gate and run under the same `tests/test_speak.py`.
-On the Linux CI job, `scripts/dictate.py` is held close to 100% by an **enumerated allow-list of
-exactly three `pragma: no cover` markers**, each on a Windows-`ctypes` body — `_pid_alive`,
-`_win_console_ctrl_c`, and `_win_pid_is_recorder` — and a `TestPragmaCount` test asserts the
-count cannot quietly grow. The scripts gate is `fail-under=80` (deliberately loose: the ratchet
-should fail only on a real regression, not on coverage jitter), and the per-file 100% is a
-**measured** property — a coverage report run alongside the suite reports it; it is not a
-mechanical CI gate. So the layering is: a hard 80% floor catches regressions; a measured 100%
-on `dictate.py` plus the named pragma list pin the upper bound; and `TestPragmaCount` keeps the
-allow-list from growing without a doc update. The hook side earns its guarantee on a separate
-axis, so it gets a numbered list rather than a paragraph:
+The scripts gate is `fail-under=80` (deliberately loose: the ratchet should fail only on a real
+regression, not on coverage jitter). On `scripts/dictate.py` specifically, the upper bound is
+held in place by **an enumerated allow-list of exactly three `pragma: no cover` markers** — each
+on a Windows-`ctypes` body (`_pid_alive`, `_win_console_ctrl_c`, `_win_pid_is_recorder`) — and
+`TestPragmaCount` asserts the count cannot quietly grow; a new exclusion without a doc update
+fails the suite. The hook side earns its guarantee on a separate axis, so it gets a numbered
+list:
 
 1. `bash -n` and **shellcheck** (`-S warning`) on every script, every commit; the speak logic
    itself is Python (stdlib-only `scripts/speak.py`, launched by a thin `speak.sh`);
