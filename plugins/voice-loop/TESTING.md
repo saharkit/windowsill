@@ -65,10 +65,14 @@ Linux (the Windows-only `msvcrt` byte-range lock, the `ctypes.WinDLL` process pr
 Windows-only no-`killpg` arm of `_kill_process_group`; plus the macOS-only `_ps_cmdline_of` helper
 that wraps `ps -p`) are excluded by the registered `pragma: windows-only` and `pragma: macos-only`
 markers in `.coveragerc` and pinned by marker-count tests so a silent grow or shrink of either
-allow-list cannot drift unnoticed behind a green 100%. Line coverage is
-not a meaningful metric for the rest of the glue that spends its life calling players, recorders,
-`wl-copy` and `ydotool`: such code can be 100% "covered" by mocks and still fail on the only thing
-that matters — the real runtime. So the guarantee is layered differently:
+allow-list cannot drift unnoticed behind a green 100%. On `scripts/dictate.py` specifically, the
+upper bound is held in place by **an enumerated allow-list of exactly three `pragma: no cover`
+markers** — each on a Windows-`ctypes` body (`_pid_alive`, `_win_console_ctrl_c`,
+`_win_pid_is_recorder`) — and `TestPragmaCount` asserts the count cannot quietly grow; a new
+exclusion without a doc update fails the suite. Line coverage is not a meaningful metric for the
+glue that spends its life calling players, recorders, `wl-copy` and `ydotool`: such code can be
+100% "covered" by mocks and still fail on the only thing that matters — the real runtime. The hook
+side earns its guarantee on a separate axis, so it gets a numbered list:
 
 1. `bash -n` and **shellcheck** (`-S warning`) on every script, every commit; the speak logic
    itself is Python (stdlib-only `scripts/speak.py`, launched by a thin `speak.sh`);
