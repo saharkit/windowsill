@@ -5463,6 +5463,13 @@ class TestScriptsFloorCoverage:
         # module still answers the surface the suite expects.
         monkeypatch.setattr(builtins, "__import__", real_import)
         importlib.reload(dictate)  # restore for subsequent tests
+        # The reload re-ran dictate.py's module-level path constants from ambient environ, which
+        # overrides the `state` fixture's monkeypatched `_STATE_DIR` and points `_TOGGLE_PATH`
+        # at the operator's live ~/.local/state/voice-loop/dictate-last-toggle. Re-apply the
+        # redirect here so the assertion below stays inside the test's tmp dir — the file header
+        # carries the "never the live state dir" invariant and ``debounce_toggle`` would otherwise
+        # ``os.open(O_CREAT)`` the operator's real stamp on a host where the dir exists.
+        monkeypatch.setattr(dictate, "_TOGGLE_PATH", str(state / "dictate-last-toggle"))
         # And the toggle still works.
         assert dictate.debounce_toggle(0.5, now=1000.0) is None
 
