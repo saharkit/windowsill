@@ -4496,52 +4496,52 @@ class TestMainGuard:
 
     def test_the_guard_catches_an_unhandled_exception(self, monkeypatch, state, tmp_path):
         """The bare ``except Exception:`` branch (lines 2555-2563) is the difference between a
-        hotkey-mounted invocation that pages nobody and one that crashes the daemon. We cover
-        these lines by Slicing the real guard text out of ``dictate.py`` and exec'ing it under
-        ``__name__ == "__main__"`` — that way coverage tracks the real file lines, and an edit
-        above the guard cannot repaint the wrong range as covered."""
+        hotkey-mounted invocation that pages nobody and one that crashes the daemon. We drive
+        the REAL guard — the one at the bottom of ``dictate.py``, not a sliced re-construction —
+        by running the file under ``runpy`` with two module-level surfaces replaced: ``main()``
+        unwraps ``platform.system()`` at the very top (line 2476), so patching it to raise a
+        hotkey-shaped ``RuntimeError`` propagates straight into the outer ``except Exception:``;
+        and ``log()`` only catches ``OSError`` internally, so patching ``time.strftime`` (its
+        only call site in this file) to raise a non-OSError forces the inner
+        ``except Exception: pass`` to fire. runpy runs ``dictate.py`` under
+        ``__name__ == "__main__"`` in this process — the same route the sibling test uses — so
+        coverage sees the real line numbers, and any edit to the guard text above the except
+        body is what this test exercises, with no slicing and no line-table trick to keep honest."""
 
-        # A main() that raises — the contract the guard was written for.
-        def main_raises(argv):
-            raise RuntimeError("a hotkey-shaped crash for the guard")
+        import runpy
 
-        # A log() that raises on its own — covers the inner except Exception: pass branch:
-        # the guard tries ``log(...)``, the call throws, the inner except catches silently,
-        # and the program still exits 1. This is the second-level safety net.
-        def log_fails(message):
-            raise OSError("disk full")
+        cfg_path = state / "config.json"
+        cfg_path.write_text("{}", encoding="utf-8")
+        monkeypatch.setenv("VOICE_LOOP_CONFIG", str(cfg_path))
+        monkeypatch.setenv("XDG_STATE_HOME", str(state / "xdg-state"))
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(state / "xdg-config"))
+        # Same hermeticity as the sibling test: no recorder resolvable, so resolve_recorder
+        # falls through to '' and the toggle's start path never spawns Popen; stop_speak_playback
+        # is stubbed so the no-pidfile branch does not fire a real pkill against the host.
+        monkeypatch.setattr(dictate.shutil, "which", lambda name: None)
+        monkeypatch.setattr(dictate, "stop_speak_playback", lambda: None)
+        # main() calls ``platform.system()`` at line 2476 with no try/except around it — a
+        # RuntimeError here is the contract the guard was written for: hotkey-shaped crash,
+        # the daemon must not see a traceback.
+        monkeypatch.setattr(
+            dictate.platform,
+            "system",
+            lambda: (_ for _ in ()).throw(RuntimeError("hotkey-shaped crash for the guard")),
+        )
+        # log() catches OSError but not anything else (line 313). Its only call site in this
+        # file is ``time.strftime(...)`` at line 312, so a TypeError there propagates out of
+        # log() and is what the inner ``except Exception: pass`` has to swallow — the
+        # second-level safety net.
+        monkeypatch.setattr(
+            dictate.time,
+            "strftime",
+            lambda *_a, **_kw: (_ for _ in ()).throw(TypeError("log() raises past its OSError swallow")),
+        )
 
-        src_path = Path(dictate.__file__)
-        # Read the real guard out of the file so coverage tracks the actual line range.
-        # A synthesized preamble-with-line-pinning approach (the previous one) painted the
-        # wrong lines as covered on any edit above the guard — slicing the file keeps the
-        # coverage report honest.
-        lines = src_path.read_text(encoding="utf-8").splitlines()
-        # Find the guard by its first line; the guard ends at the last non-empty line.
-        try:
-            start = next(i for i, line in enumerate(lines) if line.startswith('if __name__ == "__main__":'))
-        except StopIteration:
-            pytest.fail("dictate.py: __main__ guard not found")
-        end = start
-        while end + 1 < len(lines) and lines[end + 1].strip() != "":
-            end += 1
-        # Prepend `start` newlines so the compiled source's line 1 corresponds to file line
-        # ``start + 1`` — coverage reads the filename and tracks real file lines, not the sliced
-        # source's line numbers, so without this padding the except body is painted onto lines 1-9
-        # of ``dictate.py`` while the real guard text at lines 2555-2563 stays uncovered.
-        guard_src = "\n" * start + "\n".join(lines[start : end + 1]) + "\n"
-
-        namespace = {
-            "__name__": "__main__",
-            "__file__": str(src_path),
-            "sys": sys,
-            "main": main_raises,
-            "log": log_fails,
-        }
         with pytest.raises(SystemExit) as excinfo:
-            exec(compile(guard_src, str(src_path), "exec"), namespace)
-        # main() threw -> outer except caught -> log() threw -> inner except swallowed ->
-        # sys.exit(1) propagated.
+            runpy.run_path(str(Path(dictate.__file__)), run_name="__main__")
+        # main() raised RuntimeError -> outer except caught -> log() raised TypeError -> inner
+        # except swallowed -> sys.exit(1) propagated.
         assert excinfo.value.code == 1
 
 
