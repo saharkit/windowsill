@@ -1320,7 +1320,7 @@ def _pid_alive(pid: int) -> bool:
     ask is a per-iteration process launch."""
     if pid <= 0:
         return False
-    if os.name == "nt":
+    if os.name == "nt":  # pragma: no cover — Windows-kernel32-handle probe; unreachable on the Linux CI job
         import ctypes
 
         try:
@@ -1400,47 +1400,49 @@ def _win_console_ctrl_c(pid: int) -> bool:
     finalizes the output container — which TerminateProcess never does. Our own process ignores
     the event for the duration (SetConsoleCtrlHandler NULL/True), because the event reaches every
     process attached to that console, this one included."""
-    import ctypes
+    if os.name == "nt":  # pragma: no cover — Windows-kernel32-CTRL_C_EVENT raise; unreachable on the Linux CI job
+        import ctypes
 
-    kernel32 = ctypes.windll.kernel32  # stdlib; this function is Windows-only by caller
-    was_attached = False
-    target_attached = False
-    handler_set = False
-    try:
-        # GetConsoleCP returns zero when this process has no console, unlike a window-handle
-        # probe which does not describe pseudoconsole attachment reliably.
-        was_attached = bool(kernel32.GetConsoleCP())
-        if was_attached:
-            kernel32.FreeConsole()
-        if not kernel32.AttachConsole(pid):
-            return False  # the process (or its console) is already gone
-        target_attached = True
-        kernel32.SetConsoleCtrlHandler(None, True)
-        handler_set = True
-        return bool(kernel32.GenerateConsoleCtrlEvent(0, 0))  # 0 = CTRL_C_EVENT, console-wide
-    except Exception:
-        return False
-    finally:
-        # Detach BEFORE restoring the handler, on EVERY exit path: SetConsoleCtrlHandler(None,
-        # False) re-arms this process's default Ctrl+C handler, and while we are still attached to
-        # the target console the CTRL_C_EVENT just raised can still reach us — killing the stop
-        # toggle before it transcribes the speech it stopped for. FreeConsole first, so the
-        # re-armed handler can never receive that event.
-        if target_attached:
-            try:
+        kernel32 = ctypes.windll.kernel32  # stdlib; this function is Windows-only by caller
+        was_attached = False
+        target_attached = False
+        handler_set = False
+        try:
+            # GetConsoleCP returns zero when this process has no console, unlike a window-handle
+            # probe which does not describe pseudoconsole attachment reliably.
+            was_attached = bool(kernel32.GetConsoleCP())
+            if was_attached:
                 kernel32.FreeConsole()
-            except Exception:
-                pass
-        if handler_set:
-            try:
-                kernel32.SetConsoleCtrlHandler(None, False)
-            except Exception:
-                pass
-        if was_attached:
-            try:
-                kernel32.AttachConsole(-1)  # ATTACH_PARENT_PROCESS
-            except Exception:
-                pass
+            if not kernel32.AttachConsole(pid):
+                return False  # the process (or its console) is already gone
+            target_attached = True
+            kernel32.SetConsoleCtrlHandler(None, True)
+            handler_set = True
+            return bool(kernel32.GenerateConsoleCtrlEvent(0, 0))  # 0 = CTRL_C_EVENT, console-wide
+        except Exception:
+            return False
+        finally:
+            # Detach BEFORE restoring the handler, on EVERY exit path: SetConsoleCtrlHandler(None,
+            # False) re-arms this process's default Ctrl+C handler, and while we are still attached to
+            # the target console the CTRL_C_EVENT just raised can still reach us — killing the stop
+            # toggle before it transcribes the speech it stopped for. FreeConsole first, so the
+            # re-armed handler can never receive that event.
+            if target_attached:
+                try:
+                    kernel32.FreeConsole()
+                except Exception:
+                    pass
+            if handler_set:
+                try:
+                    kernel32.SetConsoleCtrlHandler(None, False)
+                except Exception:
+                    pass
+            if was_attached:
+                try:
+                    kernel32.AttachConsole(-1)  # ATTACH_PARENT_PROCESS
+                except Exception:
+                    pass
+    return False  # POSIX callers reach here only via explicit platform override; treat as no-op
 
 
 def _pid_looks_like_recorder(pid: int, recorder: str, platform_id: str = sys.platform) -> bool:
@@ -1483,45 +1485,47 @@ def _win_pid_is_recorder(pid: int, recorder: str) -> bool:
     """
     if pid <= 0 or not recorder:
         return False  # plain-Python guard, left under coverage: no Windows-only API before this
-    import ctypes
-    try:
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # stdlib; Windows arm
-        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-        kernel32.OpenProcess.argtypes = (
-            ctypes.c_uint32,  # dwDesiredAccess
-            ctypes.c_int,  # bInheritHandle
-            ctypes.c_uint32,  # dwProcessId
-        )
-        kernel32.OpenProcess.restype = ctypes.c_void_p
-        kernel32.QueryFullProcessImageNameW.argtypes = (
-            ctypes.c_void_p,  # hProcess
-            ctypes.c_uint32,  # dwFlags (0 = the Win32 path form)
-            ctypes.c_wchar_p,  # lpExeName
-            ctypes.POINTER(ctypes.c_uint32),  # lpdwSize (in TCHARs, in and out)
-        )
-        kernel32.QueryFullProcessImageNameW.restype = ctypes.c_int
-        kernel32.CloseHandle.argtypes = (ctypes.c_void_p,)
-        kernel32.CloseHandle.restype = ctypes.c_int
-
-        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
-        if not handle:
-            return False  # gone, or not ours to inspect — either way, not something to signal
+    if os.name == "nt":  # pragma: no cover — Windows-kernel32-QueryFullProcessImageNameW probe; unreachable on the Linux CI job
+        import ctypes
         try:
-            size = ctypes.c_uint32(32768)
-            buffer = ctypes.create_unicode_buffer(size.value)
-            if not kernel32.QueryFullProcessImageNameW(handle, 0, buffer, ctypes.byref(size)):
-                return False
-            image = os.path.basename(buffer.value).lower()
-            if image.endswith(".exe"):
-                image = image[: -len(".exe")]
-            # sox's front-end binary is `rec` (recorder_argv returns ["rec", ...]); every other
-            # recorder key IS the executable name.
-            expected = ("rec" if recorder == "sox" else recorder).lower()
-            return image == expected
-        finally:
-            kernel32.CloseHandle(handle)  # every path that opened it closes it
-    except (OSError, AttributeError):
-        return False  # kernel32 is not what we expect: cannot verify, do not signal
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # stdlib; Windows arm
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            kernel32.OpenProcess.argtypes = (
+                ctypes.c_uint32,  # dwDesiredAccess
+                ctypes.c_int,  # bInheritHandle
+                ctypes.c_uint32,  # dwProcessId
+            )
+            kernel32.OpenProcess.restype = ctypes.c_void_p
+            kernel32.QueryFullProcessImageNameW.argtypes = (
+                ctypes.c_void_p,  # hProcess
+                ctypes.c_uint32,  # dwFlags (0 = the Win32 path form)
+                ctypes.c_wchar_p,  # lpExeName
+                ctypes.POINTER(ctypes.c_uint32),  # lpdwSize (in TCHARs, in and out)
+            )
+            kernel32.QueryFullProcessImageNameW.restype = ctypes.c_int
+            kernel32.CloseHandle.argtypes = (ctypes.c_void_p,)
+            kernel32.CloseHandle.restype = ctypes.c_int
+
+            handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+            if not handle:
+                return False  # gone, or not ours to inspect — either way, not something to signal
+            try:
+                size = ctypes.c_uint32(32768)
+                buffer = ctypes.create_unicode_buffer(size.value)
+                if not kernel32.QueryFullProcessImageNameW(handle, 0, buffer, ctypes.byref(size)):
+                    return False
+                image = os.path.basename(buffer.value).lower()
+                if image.endswith(".exe"):
+                    image = image[: -len(".exe")]
+                # sox's front-end binary is `rec` (recorder_argv returns ["rec", ...]); every other
+                # recorder key IS the executable name.
+                expected = ("rec" if recorder == "sox" else recorder).lower()
+                return image == expected
+            finally:
+                kernel32.CloseHandle(handle)  # every path that opened it closes it
+        except (OSError, AttributeError):
+            return False  # kernel32 is not what we expect: cannot verify, do not signal
+    return False  # POSIX: caller is Windows-only; defensive default
 
 
 def _stop_recorder(pid: int, system: str, recorder: str = "") -> None:
