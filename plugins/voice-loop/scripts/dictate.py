@@ -1320,7 +1320,7 @@ def _pid_alive(pid: int) -> bool:
     ask is a per-iteration process launch."""
     if pid <= 0:
         return False
-    if os.name == "nt":  # pragma: no cover — Windows-kernel32-handle probe; unreachable on the Linux CI job
+    if os.name == "nt":  # pragma: windows-only — Windows-kernel32-handle probe; unreachable on the Linux CI job
         import ctypes
 
         try:
@@ -1400,7 +1400,7 @@ def _win_console_ctrl_c(pid: int) -> bool:
     finalizes the output container — which TerminateProcess never does. Our own process ignores
     the event for the duration (SetConsoleCtrlHandler NULL/True), because the event reaches every
     process attached to that console, this one included."""
-    if os.name == "nt":  # pragma: no cover — Windows-kernel32-CTRL_C_EVENT raise; unreachable on the Linux CI job
+    if os.name == "nt":  # pragma: windows-only — Windows-kernel32-CTRL_C_EVENT raise; unreachable on the Linux CI job
         import ctypes
 
         kernel32 = ctypes.windll.kernel32  # stdlib; this function is Windows-only by caller
@@ -1485,7 +1485,7 @@ def _win_pid_is_recorder(pid: int, recorder: str) -> bool:
     """
     if pid <= 0 or not recorder:
         return False  # plain-Python guard, left under coverage: no Windows-only API before this
-    if os.name == "nt":  # pragma: no cover — Windows-kernel32-QueryFullProcessImageNameW probe; unreachable on the Linux CI job
+    if os.name == "nt":  # pragma: windows-only — Windows-kernel32-QueryFullProcessImageNameW probe; unreachable on the Linux CI job
         import ctypes
         try:
             kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # stdlib; Windows arm

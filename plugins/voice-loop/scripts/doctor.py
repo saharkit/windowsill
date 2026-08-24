@@ -195,7 +195,7 @@ def _redact_windows_path(path: str) -> str:
         home = os.environ.get("HOMEPATH", "")
         profile = f"{drive}{home}" or None
 
-    if profile:  # pragma: no cover - Windows-only profile redaction; the coverage job runs on Ubuntu
+    if profile:  # pragma: windows-only - Windows-only profile redaction; the coverage job runs on Ubuntu
         # Windows-only profile-path redaction; the coverage job runs on Ubuntu.
         profile_parts = PureWindowsPath(profile).parts
         profile_length = len(profile_parts)
@@ -236,7 +236,7 @@ def _decode_windows_output(output: Any) -> str:
         # a BOM or NUL bytes identify the stream as UTF-16; where.exe normally
         # emits UTF-8/ANSI text without either marker.
         # Windows-only wsl.exe UTF-16 output; the coverage job runs on Ubuntu.
-        if output.startswith((b"\xff\xfe", b"\xfe\xff")) or b"\x00" in output:  # pragma: no cover - Windows-only wsl.exe UTF-16 decoding; the coverage job runs on Ubuntu
+        if output.startswith((b"\xff\xfe", b"\xfe\xff")) or b"\x00" in output:  # pragma: windows-only - Windows-only wsl.exe UTF-16 decoding; the coverage job runs on Ubuntu
             try:  # Windows-only wsl.exe decoding; the coverage job runs on Ubuntu.
                 return output.decode("utf-16le").lstrip("﻿")
             except UnicodeDecodeError:
@@ -286,7 +286,7 @@ _WSL_DOCKER_DISTROS = frozenset({
 _WSL_LXSS_SUBKEY = r"Software\Microsoft\Windows\CurrentVersion\Lxss"
 
 
-def _registered_wsl_distros() -> tuple[list[str], int]:  # pragma: no cover - Windows-only winreg WSL scan; the coverage job runs on Ubuntu
+def _registered_wsl_distros() -> tuple[list[str], int]:  # pragma: windows-only - Windows-only winreg WSL scan; the coverage job runs on Ubuntu
     """Enumerate registered WSL distro names straight from the registry.
 
     Returns ``(names, docker_excluded)`` where *names* excludes the Docker

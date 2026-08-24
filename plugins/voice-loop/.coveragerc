@@ -2,18 +2,19 @@
 # this file) for what that number does and does not claim. Read from this directory: the suite runs
 # as `cd plugins/voice-loop && pytest …`, and `source` resolves through pytest.ini's `pythonpath`.
 #
-# scripts/ is also under coverage measurement, enforced via TWO separate CI gates so a regression
-# in one scope cannot hide behind another's threshold:
-#   • `coverage report --include='scripts/*' --fail-under=100` (100% of what is measurable on a
-#     Linux runner; the exclusions are disclosed by class in TESTING.md, not silently inherited
-#     from this file) for the hook scripts (dictate.py, speak.py, report_bug.py, tls-probe.py) —
-#     proven in parallel by real invocation, so the gate exists to keep regression pressure on the
-#     helper surface.
-#   • `coverage report --include='scripts/doctor.py' --fail-under=100` for the diagnose tool the
-#     user runs first when something is wrong, so it cannot be the broken thing they hit.
-# The server's 100% is non-negotiable and never dropped. The combined coverage job downloads this
-# per-plugin .coverage artifact and combines it with sill-core's artifact for the shelf-level
-# report.
+# scripts/ is also under coverage measurement. The 100% claim for `scripts/*`, `scripts/doctor.py`
+# and `scripts/speak.py` was moved off this file's per-leg gate and onto the union after #276:
+# platform-specific code is now MEASURED on a coverage leg per platform (Linux, Windows, macOS)
+# rather than excluded. This file's `exclude_lines` therefore carries only `pragma: no cover` —
+# the one non-platform marker left in the plugin (server/voice_server.py:2245's `__main__` shell,
+# declared in TESTING.md). The `pragma: windows-only` and `pragma: macos-only` tokens that used
+# to live here are gone; the markers themselves stay in the source as documentation of what
+# each platform leg is responsible for exercising.
+#
+# The server's 100% is non-negotiable and never dropped, and is asserted on every leg (Linux,
+# Windows, macOS). The combined coverage job downloads this per-plugin .coverage artifact and
+# combines it with sill-core's artifact for the shelf-level report; the three union gates for
+# `scripts/*`, `scripts/doctor.py` and `scripts/speak.py` run there against the combined data.
 [run]
 branch = True
 source = voice_server, scripts
@@ -23,5 +24,3 @@ show_missing = True
 skip_covered = False
 exclude_lines =
     pragma: no cover
-    pragma: windows-only
-    pragma: macos-only

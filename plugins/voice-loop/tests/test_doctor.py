@@ -1711,27 +1711,26 @@ class TestMainWslBoundaryBlockSkipped:
 
 
 class TestPinnedPragmaList:
-    """The no-cover pragma list in ``scripts/doctor.py`` is exactly three entries.
+    """The Windows-only pragma list in ``scripts/doctor.py`` is exactly three entries.
 
-    Each pragma corresponds to a Windows-only body branch that the Linux
-    coverage job cannot exercise without faking the Windows API — a fake
-    would itself need a correctness argument, so the discipline is to enumerate
-    the allow-list in the PR body and pin the count in this test so an
-    unbounded pragma cannot slip through.
+    After #276 each pragma corresponds to a Windows-only body branch that the Windows
+    coverage leg is responsible for exercising — they are documentation of platform-specificity,
+    not registered coverage exclusions. The discipline is to enumerate the source-side
+    enumeration in TESTING.md and pin the count in this test so an unbounded pragma cannot
+    slip through unnoticed.
     """
 
-    def test_no_cover_pragmas_are_exactly_three_entries(self) -> None:
-        """The sorted 1-indexed line numbers carrying ``# pragma: no cover`` equal the pinned list.
+    def test_windows_only_pragmas_are_exactly_three_entries(self) -> None:
+        """The sorted 1-indexed line numbers carrying ``# pragma: windows-only`` equal the pinned list.
 
         Today that list is ``[198, 239, 289]``. The list grows ONLY when a
-        new Windows-only body is added AND named in the PR body's
-        allow-list in the same commit.
+        new Windows-only body is added AND named in TESTING.md's enumeration in the same commit.
         """
         source = _DOCTOR_PATH.read_text(encoding="utf-8")
         pragma_lines = sorted(
             index
             for index, line in enumerate(source.splitlines(), start=1)
-            if "pragma: no cover" in line
+            if "pragma: windows-only" in line
         )
         assert pragma_lines == [198, 239, 289]
 

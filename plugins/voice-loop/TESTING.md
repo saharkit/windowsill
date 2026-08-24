@@ -54,49 +54,54 @@ What makes 100% honest rather than decorative:
 
 ### The hook scripts — shellcheck, a pytest for the pure parts, and a real invocation
 
-`scripts/*` itself is gated at **100% of what is measurable on a Linux runner** in `selftest.yml`
-(after #156 C moved the floor from 80 to 100); the rest of `scripts/` — `dictate.py`,
-`contour_poll.py`, `contracts.py`, `doctor.py`, `providers.py`, `report_bug.py`,
-`install_ledger.py`, `preview.py`, `rvc_corpus.py`, `tls-probe.py`, `wsclient.py`, the
-`voice-loop-dictate` entry point — sits under that gate, and the exclusions are NAMED HERE in
-plain prose (not silently inherited from `.coveragerc`). The disclosure is by class:
+`scripts/*` is gated at **100% of what is measurable on the union of three platforms**
+(Linux, Windows, macOS) in `selftest.yml` (after #156 C moved the floor from 80 to 100, and #276
+moved the per-scope claim off the Linux-only leg and onto the combined report that aggregates the
+three platforms' artifacts). The rest of `scripts/` — `dictate.py`, `contour_poll.py`,
+`contracts.py`, `doctor.py`, `providers.py`, `report_bug.py`, `install_ledger.py`, `preview.py`,
+`rvc_corpus.py`, `tls-probe.py`, `wsclient.py`, the `voice-loop-dictate` entry point — sits
+under that gate. There is no platform-exclusion table: every region that ships enters the
+denominator, and every platform leg is responsible for EXERCISING its own. The full list is the
+list read forwards rather than backwards —
 
-| marker class | count | where |
-|---|---|---|
-| `pragma: no cover` | **6** | `dictate.py` 3, `doctor.py` 3 |
-| `pragma: windows-only` | **12** | `speak.py` 11, `contracts.py` 1 |
-| `pragma: macos-only` | **1** | `speak.py` 1 |
-| **total** | **19** | |
+- the Windows-only `msvcrt` byte-range lock and its release, and the `ctypes.WinDLL("kernel32")`
+  process probe (`speak.py`);
+- the Windows-only no-`killpg` arm of `_kill_process_group`, and the `sys.platform == "win32"` arm
+  of the kill helper (`speak.py`);
+- the macOS-only `_ps_cmdline_of` helper that wraps `ps -p` (`speak.py`);
+- the three Windows-`ctypes` bodies in `dictate.py` (`_pid_alive`, `_win_console_ctrl_c`,
+  `_win_pid_is_recorder`), each on `os.name == "nt"`;
+- the three Windows-WSL bodies in `doctor.py` (profile redaction, the `wsl.exe` UTF-16 decoder
+  path, and `_registered_wsl_distros` reading `winreg`);
+- and the `ctypes.WinDLL("kernel32")` handle probe `_windows_process_is_live` in `contracts.py`.
 
-A regression that adds an exclusion WITHOUT updating this table fails the suite's source-text
-pin (`TestPinnedPragmaList`, `TestPragmaCount`,
-`test_contracts_py_windows_only_marker_count_is_exactly_the_allow_list`) and fails the README
-operator that reads this paragraph. A regression that removes a marker without retiring its body, however, fails the gate
-directly — the per-file coverage report then names the line.
+The `pragma: windows-only` and `pragma: macos-only` markers stay in the source as documentation
+of what is platform-specific — they are simply not registered in `.coveragerc` any more. The
+`pragma: no cover` token remains registered, and after #276 the only `pragma: no cover` line in
+this plugin is `server/voice_server.py:2245`'s `if __name__ == "__main__":` shell (declared in
+the server section above).
 
-`speak.py` itself carries a separate 100% gate of its own (#156 B2): the play-back / no-play /
-give-up paths and the cloud-TTS error-document branch are pinned in a way mocks would not catch,
-and they earn the 100% gate that the server also carries; the platform-only statements that are
-unreachable on Linux (the Windows-only `msvcrt` byte-range lock, the `ctypes.WinDLL` process
-probe, and the Windows-only no-`killpg` arm of `_kill_process_group`; plus the macOS-only
-`_ps_cmdline_of` helper that wraps `ps -p`) are excluded by the registered `pragma:
-windows-only` and `pragma: macos-only` markers in `.coveragerc` and pinned by marker-count tests
-so a silent grow or shrink of either allow-list cannot drift unnoticed behind a green 100%. On
-`scripts/dictate.py` specifically, the upper bound is held in place by **an enumerated allow-list
-of exactly three `pragma: no cover` markers** — each on a Windows-`ctypes` body (`_pid_alive`,
-`_win_console_ctrl_c`, `_win_pid_is_recorder`) — and `TestPragmaCount` asserts the count cannot
-quietly grow; a new exclusion without a doc update fails the suite. The `contracts.py`
-`windows-only` marker (1 entry, on `_windows_process_is_live`) is the new addition under this
-ticket; it is a `ctypes.WinDLL("kernel32")` handle probe that a Linux runner cannot reach by
-construction, and the exclusion is the standing ruling applied rather than a CI lane bought.
+The remaining pieces of the ruling this plugin formerly published are also gone. The previous
+nineteen-marker table (six `pragma: no cover` on dictate/doctor, twelve `pragma: windows-only`
+on speak/contracts, one `pragma: macos-only` on speak) and the closing sentence *"the exclusion
+is the standing ruling applied rather than a CI lane bought"* are the ruling **#276** overturns.
+The standing rule now in its place is the one at the top of this paragraph: every platform that
+ships here gets a coverage leg, and no region of this plugin enters the `scripts/*` denominator
+without being measured by a runner that can actually reach it. The scope of that rule is
+voice-loop alone — it is the policy of THIS plugin's `selftest.yml`, not shelf policy, and the
+guard that holds it (the plugin-scoped test in `tests/test_windows_surfaces.py` that asserts no
+`pragma: .*-only` entry is registered in `.coveragerc`) is bound to the same scope. A
+shelf-wide rule would bind `agent-handbook`, which has no coverage job at all and only an
+`emit-standing-rules.js` hook; the operator ruled against promoting the rule up to the shelf's
+root `CLAUDE.md` on 2026-08-24 for exactly that reason.
 
 The `scripts/*` floor at 100% does NOT say "100% of every line" — it says "100% of what is
-measurable on a Linux runner". Coverage IS still a meaningful metric for the GLUE that calls
-players, recorders, `wl-copy` and `ydotool`: the fixture-shaping unit tests live in `tests/` and
-the real-runtime proof comes from the loopback job beside it. Line coverage is not the WHOLE
-metric for any of these scripts — it is the floor that keeps regression pressure on the helper
-surface, and the disclosure above names every line it does not measure. The hook side earns its
-guarantee on a separate axis, so it gets a numbered list:
+measurable across Linux + Windows + macOS". Coverage IS still a meaningful metric for the GLUE
+that calls players, recorders, `wl-copy` and `ydotool`: the fixture-shaping unit tests live in
+`tests/` and the real-runtime proof comes from the loopback job beside it. Line coverage is not
+the WHOLE metric for any of these scripts — it is the floor that keeps regression pressure on
+the helper surface, and the list above names every region each platform leg is responsible for.
+The hook side earns its guarantee on a separate axis, so it gets a numbered list:
 
 1. `bash -n` and **shellcheck** (`-S warning`) on every script, every commit; the speak logic
    itself is Python (stdlib-only `scripts/speak.py`, launched by a thin `speak.sh`);

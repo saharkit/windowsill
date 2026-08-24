@@ -318,29 +318,21 @@ jobs:
       # invoked from there rather than from the repo root.
       #
       # Coverage measures the server, the helper scripts (dictate.py, speak.py, report_bug.py,
-      # tls-probe.py), and the diagnose tool (scripts/doctor.py). Four independent gates are
-      # enforced via separate `coverage report --include` calls so a regression in one scope cannot
-      # hide behind another's threshold: ``server/voice_server*`` at 100% (branch + statement,
-      # non-negotiable and never dropped), ``scripts/*`` at 100% of what is measurable on a Linux
-      # runner (the exclusions are disclosed by class in ``plugins/voice-loop/TESTING.md``), and
-      # ``scripts/doctor.py`` at 100% (the diagnose tool the user runs first when something is
-      # wrong cannot be the broken thing they hit), and ``scripts/speak.py`` at 100% (the
-      # play-back / no-play / give-up paths and the cloud-TTS error-document branch).
-      - name: pytest with coverage gates (server 100%, scripts 100%-of-measurable, doctor.py 100%, speak.py 100%)
+      # tls-probe.py), and the diagnose tool (scripts/doctor.py). The 100% claim for
+      # ``server/voice_server*`` stays on every leg (the non-negotiable one, every platform
+      # reaches it); the 100% claims for ``scripts/*``, ``scripts/doctor.py`` and
+      # ``scripts/speak.py`` were moved off this leg and onto the union — see the
+      # ``pytest with coverage gates`` step in `combined-coverage` below, which runs them against
+      # the data combined from Linux, Windows and macOS legs. A single-platform gate here
+      # could only ever be red, since these scripts now contain platform-specific code that
+      # must be measured by the platform that can reach it.
+      - name: pytest with coverage gates (server 100%)
         working-directory: plugins/voice-loop
         run: |
           pytest --cov --cov-report=term-missing
-          echo "::group::server coverage gate (non-negotiable 100%)"
+          echo "::group::server coverage gate (non-negotiable 100%, asserted on every leg)"
           python -m coverage report --include='server/voice_server*' --fail-under=100
           echo "::endgroup::"
-          echo "::group::scripts coverage gate (100% of measurable on a Linux runner)"
-          python -m coverage report --include='scripts/*' --fail-under=100
-          echo "::endgroup::"
-          echo "::group::doctor coverage gate (round #156 B1 — 100%)"
-          python -m coverage report --include='scripts/doctor.py' --fail-under=100
-          echo "::endgroup::"
-          echo "::group::scripts/speak.py coverage gate (B2 of #156, 100%)"
-          python -m coverage report --include='scripts/speak.py' --fail-under=100
           echo "::endgroup::"
 
       # The plugin's own .coverage is what gets uploaded — the same file pytest just wrote, with
@@ -374,9 +366,51 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           python -m pip install -r tests/requirements.txt
-      - name: run the voice-loop unit suite on native Windows
+      # Coverage collection only — no `--fail-under` here, because each Windows leg is by
+      # construction missing the macOS/Linux arms and a per-leg gate here could only ever be red.
+      # The 100% claim for `scripts/*` is asserted once, against the union of the three platforms,
+      # in combined-coverage.
+      - name: run the voice-loop unit suite on native Windows (with coverage)
         working-directory: plugins/voice-loop
-        run: python -m pytest
+        run: python -m pytest --cov --cov-report=term-missing
+      # `.coverage` starts with a dot — v4 excludes hidden files by default, which is why
+      # `include-hidden-files: true` is the same dance as on the Linux legs.
+      - name: upload coverage for combined report (windows)
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-voice-loop-windows-3.12
+          path: plugins/voice-loop/.coverage
+          include-hidden-files: true
+          if-no-files-found: error
+
+  voice-loop-macos:
+    name: voice-loop unit tests (macos, python 3.12)
+    runs-on: macos-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: install test dependencies
+        working-directory: plugins/voice-loop
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r tests/requirements.txt
+      # Coverage collection only — no `--fail-under` here, because each macOS leg is by
+      # construction missing the Linux/Windows arms and a per-leg gate here could only ever
+      # be red. The 100% claim for `scripts/*` is asserted once, against the union of the
+      # three platforms, in combined-coverage.
+      - name: run the voice-loop unit suite on macOS (with coverage)
+        working-directory: plugins/voice-loop
+        run: python -m pytest --cov --cov-report=term-missing
+      - name: upload coverage for combined report (macos)
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-voice-loop-macos-3.12
+          path: plugins/voice-loop/.coverage
+          include-hidden-files: true
+          if-no-files-found: error
 
   sill-core-coverage:
     name: sill-core unit tests (${{ matrix.os }}, python ${{ matrix.python }})
@@ -1371,7 +1405,7 @@ jobs:
   combined-coverage:
     name: combined coverage gate
     runs-on: ubuntu-latest
-    needs: [coverage, sill-core-coverage]
+    needs: [coverage, voice-loop-windows, voice-loop-macos, sill-core-coverage]
     env:
       # Ratchet: update only to the measured percentage printed by this job after coverage improves.
       SHELF_COVERAGE_FLOOR: "90"
@@ -1404,18 +1438,36 @@ jobs:
         id: compute-coverage
         run: |
           set -euo pipefail
-          VOICE=$(find coverage-data/voice-loop -name '.coverage' 2>/dev/null | wc -l)
-          SILL=$(find coverage-data/sill-core -name '.coverage' 2>/dev/null | wc -l)
-          [ "$VOICE" -gt 0 ] || {
-            echo "FAIL: no voice-loop coverage artifacts ($VOICE found)"
-            echo "an artifact was not uploaded, or the upload step was skipped"
-            exit 1
-          }
-          [ "$SILL" -gt 0 ] || {
-            echo "FAIL: no sill-core coverage artifacts ($SILL found)"
-            echo "an artifact was not uploaded, or the upload step was skipped"
-            exit 1
-          }
+          # Explicit arrival check: every expected artifact must land in the downloaded
+          # directory. A leg that silently fails to upload would otherwise lower the combined
+          # percentage instead of failing the job — the failure mode this list exists to
+          # prevent. Each expected name is one matrix leg's `name:` on its upload step; the
+          # platform-specific legs were added in #276 so the voice-loop union spans all three
+          # platforms that ship code.
+          VOICE_EXPECTED=(
+            coverage-voice-loop-3.10
+            coverage-voice-loop-3.11
+            coverage-voice-loop-3.12
+            coverage-voice-loop-3.13
+            coverage-voice-loop-windows-3.12
+            coverage-voice-loop-macos-3.12
+          )
+          SILL_EXPECTED=(
+            coverage-sill-core-3.10
+            coverage-sill-core-3.11
+            coverage-sill-core-3.12
+            coverage-sill-core-3.13
+          )
+          found_dirs=$(ls -1 coverage-data/voice-loop 2>/dev/null || true)
+          for expected in "${VOICE_EXPECTED[@]}" "${SILL_EXPECTED[@]}"; do
+            if ! grep -qx "$expected" <<<"$found_dirs"; then
+              echo "FAIL: expected coverage artifact $expected did not arrive"
+              echo "a leg failed to upload; the shelf percentage is NOT lowered silently"
+              exit 1
+            fi
+          done
+          VOICE=${#VOICE_EXPECTED[@]}
+          SILL=${#SILL_EXPECTED[@]}
           echo "combining $VOICE voice-loop + $SILL sill-core coverage files"
 
           # Path remapping: each runner's .coverage records absolute paths under
@@ -1426,14 +1478,22 @@ jobs:
           [paths]
           source =
               /home/runner/work/windowsill/windowsill
+              D:/a/windowsill/windowsill
+              /Users/runner/work/windowsill/windowsill
               .
           [report]
           show_missing = True
-          # Both plugins' own .coveragerc set the same single exclude — only
-          # "pragma: no cover".  The combined report replaces coverage.py's
-          # built-in excludes with an identical list, so the denominator the
-          # per-plugin gates measure is the same denominator the combined gate
-          # measures.  No hidden difference.
+          # Both plugins register `pragma: no cover` and nothing else. voice-loop's
+          # platform-specific code is now measured on a leg per platform (Linux,
+          # Windows, macOS) rather than excluded — the `pragma: windows-only` and
+          # `pragma: macos-only` tokens were dropped from `plugins/voice-loop/.coveragerc`
+          # so every region that ships enters the denominator and gets covered by a
+          # runner that can actually reach it. sill-core's own two `pragma: no cover`
+          # arms in `sill_core/assistant_state.py` (the `sys.platform == "win32"` /
+          # `else` fork) are deliberately out of this change's scope and remain
+          # excluded through this list — sill-core uploads from Ubuntu only, so the
+          # single `pragma: no cover` token is the only way to keep those two arms
+          # out of the denominator without buying sill-core its own Windows lane.
           exclude_lines =
               pragma: no cover
           RCFILE
@@ -1477,6 +1537,22 @@ jobs:
           print(f'OK: {len(normed)} unique source files, no duplicates')
           "
 
+          # The voice-loop scripts 100% claims moved off the Linux leg and onto the union —
+          # see delta (a2) in #276. Each gate below asserts a non-empty file set against the
+          # combined data, and exits non-zero with `No data to report.` if the include pattern
+          # matches nothing, so a vacuous gate cannot pass quietly. File sets are reported by
+          # the gate so the PR body can paste them; an empty list means a mis-specified pattern
+          # and fails loud, not green.
+          echo "::group::voice-loop scripts coverage gate (100% on the Linux+Windows+macOS union)"
+          python -m coverage report --include='*plugins/voice-loop/scripts/*' --fail-under=100
+          echo "::endgroup::"
+          echo "::group::voice-loop doctor.py coverage gate (#156 B1 — 100% on the union)"
+          python -m coverage report --include='*plugins/voice-loop/scripts/doctor.py' --fail-under=100
+          echo "::endgroup::"
+          echo "::group::voice-loop speak.py coverage gate (#156 B2 — 100% on the union)"
+          python -m coverage report --include='*plugins/voice-loop/scripts/speak.py' --fail-under=100
+          echo "::endgroup::"
+
           set +e
           python -m coverage report --fail-under="$SHELF_COVERAGE_FLOOR" | tee /tmp/shelf-coverage-report.txt
           report_rc=${PIPESTATUS[0]}
@@ -1485,11 +1561,11 @@ jobs:
           [ -n "$measured" ] || { echo "FAIL: coverage report did not produce a TOTAL percentage"; exit 1; }
           echo "shelf coverage: measured=${measured}% floor=${SHELF_COVERAGE_FLOOR}%"
           {
-            echo "### Shelf coverage (Ubuntu artifacts)"
+            echo "### Shelf coverage"
             echo
             echo "- Measured: **${measured}%**"
             echo "- Floor: **${SHELF_COVERAGE_FLOOR}%**"
-            echo "- Scope: combined statements and branches from the Ubuntu coverage artifacts for voice-loop and sill-core; Windows test legs are excluded."
+            echo "- Scope: combined statements and branches from the Linux, Windows, and macOS coverage artifacts for voice-loop (4+1+1 legs) and the Ubuntu artifacts for sill-core (4 legs); the voice-loop scripts 100% claims are also asserted against the union in this job's per-scope gates."
           } >> "$GITHUB_STEP_SUMMARY"
           [ "$report_rc" -eq 0 ] || exit "$report_rc"
           # The measured number reaches the publish-coverage-badge job via this job output, so the
@@ -1568,7 +1644,7 @@ jobs:
   gate:
     name: gate
     runs-on: ubuntu-latest
-    needs: [shellcheck, coverage, voice-loop-windows, sill-core-coverage, loopback, combined-coverage]
+    needs: [shellcheck, coverage, voice-loop-windows, voice-loop-macos, sill-core-coverage, loopback, combined-coverage]
     if: always()
     steps:
       - name: every needed job succeeded
