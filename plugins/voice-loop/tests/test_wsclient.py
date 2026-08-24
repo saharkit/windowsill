@@ -698,6 +698,19 @@ class TestFailureWalls:
         assert ws._drain_buffer() == []
         assert ws._buf == bytes([0x82, 127, 0, 0, 0, 0, 0, 0, 0])
 
+    def test_a_partial_16_bit_length_header_waits_for_the_rest(self):
+        """The client must not parse a declared 16-bit length before all four header bytes arrive.
+
+        A kernel-driven read on a live socket normally delivers the four-byte extended-length
+        header whole, leaving the partial-header branch unreached. The branch is exercised here
+        directly: a buffer holding a final binary frame that announces the 16-bit length, but with
+        only one of the two length bytes present. ``_take_frame`` returns ``None`` at the
+        ``len(buf) < 4`` guard and the buffer is left untouched for the next read to complete it.
+        """
+        ws = wsclient.WebSocket(None, bytes([0x82, 126, 0]))
+        assert ws._drain_buffer() == []
+        assert ws._buf == bytes([0x82, 126, 0])
+
     def test_close_swallows_send_and_socket_close_errors(self):
         """Cleanup is best effort even when both the close frame and socket close fail."""
         class BrokenClose:
