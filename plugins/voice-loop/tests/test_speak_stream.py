@@ -46,6 +46,7 @@ _ENTRY = providers.TTS_PROVIDERS["elevenlabs"]
 def _settings(**overrides) -> dict:
     base = {
         "endpoint": "",
+        "cloud_endpoint": "",
         "voice_id": "vX",
         "cloud_model": "eleven_flash_v2_5",
         "stream_output_format": "pcm_22050",
@@ -157,6 +158,23 @@ def test_the_digest_changes_with_a_settings_edit():
         {"tts": {"cloud": {"provider": "elevenlabs", "streaming": True, "voice_settings": {"speed": 0.9}}}}, "Linux"
     )
     assert speak.stream_settings_digest(base) != speak.stream_settings_digest(faster)
+
+
+def test_the_digest_changes_when_only_the_cloud_endpoint_changes():
+    """windowsill#270: the streaming URL reads ``cloud_endpoint`` first, so two configs that differ
+    only in that key cannot share one warm socket — the digest must include it or a settings edit
+    would silently reuse the wrong vendor's socket."""
+    base = speak.resolve_settings(
+        {"tts": {"cloud": {"provider": "elevenlabs", "streaming": True}}}, "Linux"
+    )
+    overridden = speak.resolve_settings(
+        {"tts": {"cloud": {"provider": "elevenlabs", "streaming": True,
+                           "endpoint": "https://gateway.internal"}}},
+        "Linux",
+    )
+    assert base["cloud_endpoint"] == ""
+    assert overridden["cloud_endpoint"] == "https://gateway.internal"
+    assert speak.stream_settings_digest(base) != speak.stream_settings_digest(overridden)
 
 
 # --- the holder's decisions, against a fake websocket --------------------------------------------
@@ -715,7 +733,9 @@ def test_synthesize_line_against_a_real_loopback_websocket():
     reach. Pins that the pieces compose; a registry URL drift or a wsclient regression fails here."""
     server = FakeElevenLabs([b"\x01\x02", b"\x03\x04"])
     try:
-        s = _settings(endpoint=server.http_url)
+        # windowsill#270: the cloud override now lives in ``cloud_endpoint`` (rank 1) so the
+        # holder's URL builder resolves to the fake loopback server, not the vendor's host.
+        s = _settings(cloud_endpoint=server.http_url)
         holder = speak.TtsStreamHolder(_ENTRY, s, "xi-key")
         frags = list(holder.synthesize_line("hello there", deadline=time.monotonic() + 10))
         holder.close()

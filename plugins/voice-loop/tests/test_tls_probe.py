@@ -375,16 +375,18 @@ def test_an_empty_config_falls_back_to_the_host_pip_needs():
     assert tls_probe.resolve_url({}) == tls_probe.DEFAULT_URL
 
 
-def test_the_openai_compatible_cloud_path_has_no_remote_default_host_of_its_own():
-    # Deliberate, and easy to misread as a gap: speak.py defaults the OpenAI-compatible endpoint to
-    # the LOCAL server on http, so there is no https host to probe unless one is configured — in
-    # which case tts.endpoint above already wins. That is the entry's `default_host: ""`, and it is
-    # the same field the providers with a remote default fill in.
-    unset = {"tts": {"backend": "cloud"}}
+def test_the_openai_cloud_path_has_the_remote_default_host_of_its_own():
+    # windowsill#270: openai's ``default_host`` is now ``OPENAI_HOST`` for both directions, and
+    # ``resolve_url`` reads it off the registry unchanged. A cloud ``openai`` config therefore
+    # probes ``https://api.openai.com`` for free, without a single edit to tls-probe.py — the
+    # provider's own remote default is now the same fact on every script.
+    no_backend = {}  # no tts.backend at all — the probe falls through to the pip fallback
     openai = {"tts": {"backend": "cloud", "cloud": {"provider": "openai"}}}
     configured = {"tts": {"backend": "cloud", "cloud": {"provider": "openai"}, "endpoint": "https://api.openai.com"}}
-    assert tls_probe.resolve_url(unset) == tls_probe.DEFAULT_URL
-    assert tls_probe.resolve_url(openai) == tls_probe.DEFAULT_URL
+    assert tls_probe.resolve_url(no_backend) == tls_probe.DEFAULT_URL
+    assert tls_probe.resolve_url(openai) == "https://api.openai.com"
+    # a configured top-level tts.endpoint STILL wins over the registry's default_host — the
+    # probe's own resolution rule (which orders top-level https above default_host) is unchanged.
     assert tls_probe.resolve_url(configured) == "https://api.openai.com"
 
 
