@@ -1282,17 +1282,30 @@ def _transcribe_cloud(s: dict, wav_bytes: bytes, boundary: str) -> str | None:
     request = entry.request(s, key, wav_bytes, boundary)
     parsed = urllib.parse.urlsplit(request.url)
     if not parsed.scheme or not parsed.hostname:
-        # The endpoint resolved to nothing: a provider with no remote default host (openai, the
-        # OpenAI-compatible path) and no stt.cloud.endpoint / stt.endpoint would otherwise build a
-        # relative URL that urllib turns into an opaque "unknown url type" — the user's real problem
-        # is "you have not configured an endpoint", so say that instead of reaching for the network.
+        # The endpoint resolved to nothing: a relative URL urllib turns into an opaque "unknown
+        # url type" — a network error for "you have not configured an endpoint", so say that
+        # instead of reaching for the network. Every registry row has a default_host now
+        # (windowsill#270), so this guard is reached only on an UNPARSEABLE stt.cloud.endpoint —
+        # a value with no scheme or host — which is the one way it stays reachable for the
+        # scripts/* 100% branch gate. The literal head up to the first interpolation is the row id
+        # in ``report_bug.LOG_RULES``; only the tail changes.
         log(
-            f"cloud stt: no endpoint for {entry.name} — stt.cloud.endpoint is unset and "
-            f"{entry.name} has no default host"
+            f"cloud stt: no endpoint for {entry.name} — {s.get('cloud_endpoint', '')!r} has no "
+            f"scheme or host"
         )
         return None
     raw = _post_bytes(request.url, request.headers, request.body, request.content_type, s["timeout"])
     if raw is None:
+        # A failed cloud STT request whose endpoint resolved to a local address gets a diagnostic
+        # line: the failure gate is the request itself, not the spelling — a loopback cloud
+        # endpoint is the supported self-hosted deployment, so the message only fires when the
+        # POST failed. ``parsed.hostname`` (not ``.netloc``) is what ``is_local_host`` reads, so a
+        # port-suffixed ``127.0.0.1:8355`` parses correctly (windowsill#270).
+        if providers.is_local_host(parsed.hostname or ""):
+            log(
+                f"cloud stt: the endpoint resolved to a local address ({parsed.netloc.rsplit('@', 1)[-1]}) "
+                f"— not {entry.name}'s API; set stt.cloud.endpoint to your remote host, or stt.backend to \"lan\" if you meant this machine"
+            )
         return None  # network error — already logged by _post_bytes
     data = providers.decode(raw)
     text = entry.transcript(data)

@@ -563,6 +563,7 @@ referenced). Full schema — omit what you do not need, the scripts have default
     "command": "",
     "cloud": {
       "provider": "elevenlabs",
+      "endpoint": "",
       "voice_id": "",
       "model": "eleven_multilingual_v2",
       "output_format": "mp3_44100_128",
@@ -654,6 +655,13 @@ Field notes worth telling the user:
   - A provider name the plugin does not know falls back to `"openai"` and says so in the log — so
     if dictation is quietly OpenAI-shaped when the user asked for something else, check the spelling
     in `~/.local/state/voice-loop/dictate.log` first.
+- `stt.cloud.endpoint` / `tts.cloud.endpoint` — the cloud override for both directions, read
+  first in the resolution order: an explicit value here wins, then the provider's own remote
+  default (`https://api.openai.com`, `https://api.elevenlabs.io`, `https://api.deepgram.com`),
+  then the top-level `stt.endpoint` / `tts.endpoint`. The top-level key is this plugin's OWN
+  server on loopback (`http://127.0.0.1:8355`); a config that used it as a cloud override
+  (an OpenAI-compatible gateway, a self-hosted ElevenLabs/Deepgram deployment) must move the
+  value to `stt.cloud.endpoint` / `tts.cloud.endpoint` (windowsill#270).
 
 **Checkpoint** — after the config file is written and valid (`jq .` parses it):
 

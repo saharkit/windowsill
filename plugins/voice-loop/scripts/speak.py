@@ -537,10 +537,16 @@ def resolve_settings(config: dict, system: str) -> dict:
         "max_chars": contracts.resolve_number(cfg(config, "speak.max_chars", 600), 600, "speak.max_chars", log, minimum=1, integer=True),
         "timeout": contracts.resolve_number(cfg(config, "speak.timeout", 60), 60.0, "speak.timeout", log, minimum=0.000001),
         "backend": str(cfg(config, "tts.backend", "lan")),
+        # the cloud override, first in the resolution order: an explicit ``tts.cloud.endpoint``
+        # wins, then the registry entry's ``default_host``, then the top-level ``tts.endpoint``
+        # (the legacy OpenAI-compatible path's setting), then ``LOCAL_SPEECH_HOST`` (TTS only).
+        # Every shipped provider has a remote default_host now, so a self-hosted operator uses
+        # this key rather than ``tts.endpoint`` (windowsill#270).
+        "cloud_endpoint": str(cfg(config, "tts.cloud.endpoint", "")),
         # left empty here: the per-backend default differs (see synthesize) — the LAN server and a
         # provider with no remote default host both land on the local speech server, while a
-        # provider that HAS one (ElevenLabs, Deepgram) lands on its own remote API host. That choice
-        # is the entry's.
+        # provider that HAS one (ElevenLabs, Deepgram, OpenAI) lands on its own remote API host.
+        # That choice is the entry's.
         "endpoint": str(cfg(config, "tts.endpoint", "")),
         "speaker": speaker,
         # top-level "language" is the one the user sets; ".tts.language" is the advanced escape for
@@ -1037,6 +1043,18 @@ def synthesize(text: str, s: dict, key: str) -> bytes | None:
         body = _post(f"{endpoint}/tts", {}, payload, s["timeout"])
 
     if body is None:
+        # A failed cloud request that resolved to a local address gets a diagnostic line. The
+        # backend check is part of the predicate (the LAN branch shares this return), and the
+        # predicate reads `.hostname`, NOT `.netloc` — a loopback address carrying its port
+        # (`127.0.0.1:8355`) would otherwise fail the `is_local_host` check and the line would
+        # be dead code on the very endpoint this diagnostic exists to name (windowsill#270).
+        if s["backend"] == "cloud" and providers.is_local_host(
+            urllib.parse.urlsplit(request.url).hostname or ""
+        ):
+            log(
+                f"cloud tts: the endpoint resolved to a local address ({urllib.parse.urlsplit(request.url).netloc.rsplit('@', 1)[-1]}) "
+                f"— not {entry.name}'s API; set tts.cloud.endpoint to your remote host, or tts.backend to \"lan\" if you meant this machine"
+            )
         return None
     if not body:
         log(f"empty synthesis from {endpoint}")
@@ -1836,9 +1854,12 @@ def play_text(text: str, s: dict, t0: float, *, extract_ms: int) -> bool:
 
 def stream_settings_digest(s: dict) -> str:
     """A hash of the settings the holder bakes into its held socket — the ones a change to MUST
-    respawn it (provider, voice, model, output format, voice settings incl. speed, endpoint). The
-    KEY is deliberately not in it: the holder reads the key itself, and a rotated key is no reason
-    to drop a warm socket."""
+    respawn it (provider, voice, model, output format, voice settings incl. speed, the cloud
+    override endpoint, the legacy top-level endpoint). The KEY is deliberately not in it: the
+    holder reads the key itself, and a rotated key is no reason to drop a warm socket.
+
+    ``cloud_endpoint`` joined the digest at #270: the streaming URL reads it first, and two configs
+    that differ only in it would otherwise share one warm socket pointed at the wrong vendor."""
     parts = {
         "provider": s["provider"],
         "voice_id": s["voice_id"],
@@ -1846,6 +1867,7 @@ def stream_settings_digest(s: dict) -> str:
         "stream_output_format": s["stream_output_format"],
         "voice_settings": s["voice_settings"],
         "speed": s["speed"],
+        "cloud_endpoint": s.get("cloud_endpoint", ""),
         "endpoint": s["endpoint"],
     }
     return hashlib.sha1(json.dumps(parts, sort_keys=True).encode()).hexdigest()[:16]

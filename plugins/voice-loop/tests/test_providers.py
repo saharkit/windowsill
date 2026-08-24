@@ -389,20 +389,46 @@ def test_elevenlabs_tts_refuses_an_unset_voice():
 
 
 def test_a_configured_endpoint_beats_the_providers_own_default_host():
-    """The self-hosted case, which is the reason stt.cloud.endpoint exists — and the reason
-    default_host is a fallback rather than a constant."""
+    """The self-hosted case, which is the reason stt.cloud.endpoint / tts.cloud.endpoint exists —
+    and the reason default_host is a fallback rather than a constant. Both directions carry a
+    cloud_endpoint key in the resolved settings (windowsill#270); the top-level endpoint is rank
+    3 — moved under default_host because every shipped row now has a remote default."""
     entry = providers.STT_PROVIDERS["deepgram"]
     s = {"cloud_endpoint": "https://deepgram.internal", "endpoint": "", "stt_model": "nova-3", "language": "en"}
     assert entry.request(s, "k", b"wav", "B").url.startswith("https://deepgram.internal/v1/listen?")
     tts = providers.TTS_PROVIDERS["deepgram"]
-    assert tts.endpoint({"endpoint": "https://deepgram.internal"}) == "https://deepgram.internal"
+    assert tts.endpoint({"cloud_endpoint": "https://deepgram.internal", "endpoint": ""}) == "https://deepgram.internal"
+    # And the demotion: a top-level-only endpoint now loses to the registry's own default_host.
+    assert tts.endpoint({"cloud_endpoint": "", "endpoint": "https://deepgram.internal"}) == (
+        providers.DEEPGRAM_HOST
+    )
 
 
 def test_a_provider_with_no_remote_default_host_falls_back_to_the_local_server():
-    assert providers.TTS_PROVIDERS["openai"].endpoint({"endpoint": ""}) == providers.LOCAL_SPEECH_HOST
-    assert providers.STT_PROVIDERS["openai"].endpoint(
-        {"cloud_endpoint": "", "endpoint": "https://speech.example"}
-    ) == "https://speech.example"
+    # No shipped row has ``default_host=""`` anymore (windowsill#270) — every registry entry has a
+    # remote default. The fallback to ``LOCAL_SPEECH_HOST`` (TTS) or to the top-level endpoint (STT)
+    # is reachable only on synthetic entries built the way ``_stt()`` builds its synthetic STT
+    # rows. The property has to be pinned on made entries or it stops being pinned at all.
+    tts_base = providers.TTS_PROVIDERS["openai"]
+    tts_synthetic = providers.TtsProvider(
+        name=tts_base.name,
+        default_model=tts_base.default_model,
+        default_host="",
+        default_output_format=tts_base.default_output_format,
+        build=tts_base.build,
+        comparison=tts_base.comparison,
+    )
+    assert tts_synthetic.endpoint({"cloud_endpoint": "", "endpoint": ""}) == providers.LOCAL_SPEECH_HOST
+    # An empty settings dict on a synthetic TTS row with no remote default still resolves to the
+    # local speech host — the only path the property survives on. assert path step 4 is reached.
+    assert tts_synthetic.endpoint({}) == providers.LOCAL_SPEECH_HOST
+    # STT side: a synthetic row with ``default_host=""`` falls through to the top-level
+    # ``endpoint`` — the STT chain ends at step 3 because ``stt.endpoint`` already defaults to
+    # ``LOCAL_SPEECH_HOST`` in ``dictate.resolve_settings``.
+    stt_synthetic = _stt(default_host="")
+    assert stt_synthetic.endpoint({"cloud_endpoint": "", "endpoint": "https://speech.example"}) == (
+        "https://speech.example"
+    )
 
 
 def test_the_credentials_home_rule_lives_on_the_entry():
@@ -634,10 +660,21 @@ class TestTheTtsStreamingVariantIsAnEntryToo:
 
     def test_a_self_hosted_endpoint_becomes_a_websocket_of_the_same_scheme(self):
         entry = providers.TTS_PROVIDERS["elevenlabs"]
-        s = {"endpoint": "http://127.0.0.1:9999", "voice_id": "v", "cloud_model": "eleven_flash_v2_5",
-             "stream_output_format": "pcm_22050", "voice_settings": None, "speed": 1.0}
+        # The self-hosted host must move into cloud_endpoint (windowsill#270): the streaming URL
+        # reads cloud_endpoint first, then the entry's default_host, then the top-level endpoint.
+        s = {"cloud_endpoint": "http://127.0.0.1:9999", "endpoint": "", "voice_id": "v",
+             "cloud_model": "eleven_flash_v2_5", "stream_output_format": "pcm_22050",
+             "voice_settings": None, "speed": 1.0}
         assert entry.streaming.url(entry.streaming, entry, s).startswith(
             "ws://127.0.0.1:9999/v1/text-to-speech/v/stream-input?"
+        )
+        # And the demotion, pinned on the socket path: a top-level-only endpoint now lands on the
+        # vendor's https host, so the socket URL becomes wss://api.elevenlabs.io/...
+        s_top_level = {"cloud_endpoint": "", "endpoint": "http://127.0.0.1:9999", "voice_id": "v",
+                       "cloud_model": "eleven_flash_v2_5", "stream_output_format": "pcm_22050",
+                       "voice_settings": None, "speed": 1.0}
+        assert entry.streaming.url(entry.streaming, entry, s_top_level).startswith(
+            "wss://api.elevenlabs.io/v1/text-to-speech/v/stream-input?"
         )
 
     def test_the_bos_carries_voice_settings_and_a_space(self):
