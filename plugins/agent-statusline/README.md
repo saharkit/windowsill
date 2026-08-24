@@ -56,8 +56,9 @@ decision.
 
 ## Degradation
 
-The script renders byte-identical output for every stdin payload — but the figures a payload
-carries differ by account type. Read this before deciding the plugin is broken.
+The line is a pure function of the payload — no host state, no clock, no environment reads —
+but the figures a payload carries differ by account type. Read this before deciding the
+plugin is broken.
 
 | figure | works for you? |
 |---|---|

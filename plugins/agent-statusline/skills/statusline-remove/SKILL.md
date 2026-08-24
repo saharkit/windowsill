@@ -13,8 +13,9 @@ and the `statusLine` key from `~/.claude/settings.json`. Nothing else changes.
 
 1. **Confirm first.** Print the two things you will remove and ask the user to confirm before
    doing either one.
-2. **Touch only `statusLine`.** Every other key in `~/.claude/settings.json` stays exactly as
-   it was — keys, order, values, indentation. The key is deleted, not emptied.
+2. **Touch only `statusLine`.** Every other key in `~/.claude/settings.json` keeps its value
+   and its relative order; the file's overall indentation is rewritten to jq's canonical form
+   (two-space indent, one trailing newline). The key is deleted, not emptied.
 3. **Do not delete `~/.claude/settings.json.bak`.** That is the user's own rollback file, made
    by `/statusline-setup` if `statusLine` was overwritten. Whether to keep it is the user's
    decision, not this skill's.
@@ -48,8 +49,9 @@ If the file exists and parses but has no `statusLine` key, say so and proceed to
 
 ## Step 3 — remove the `statusLine` key
 
-Read the JSON, delete the `statusLine` key, write the rest back. Two-space indent. One
-trailing newline. **No other key changes.**
+Read the JSON, delete the `statusLine` key, write the rest back. The file is rewritten with
+jq's canonical two-space indent and one trailing newline. **Every other key and its value
+survive**, in their original order.
 
 A read-modify-write is the right tool here — `jq` deleting one key and writing the result back
 preserves every other key and their values, including nested ones.
@@ -59,9 +61,12 @@ jq 'del(.statusLine)' ~/.claude/settings.json > ~/.claude/settings.json.tmp
 mv ~/.claude/settings.json.tmp ~/.claude/settings.json
 ```
 
-`jq` is the right tool for this — it preserves every other key, every nested value, and every
-level of indentation that `jq -r .` would emit. (On a host with no `jq`, the equivalent read-
-modify-write by hand is acceptable; the contract is "only `statusLine` is touched".)
+`jq` is the right tool for this — it preserves every other key, every nested value, and the
+key order; what it does NOT preserve is the source file's indentation, since jq always emits
+its canonical two-space form. If the user's `~/.claude/settings.json` was hand-formatted with
+a different indent, jq will normalize it; that is the trade for the rest of the file staying
+intact. (On a host with no `jq`, the equivalent read-modify-write by hand is acceptable; the
+contract is "only `statusLine` is touched" — meaning its key and its value, not its bytes.)
 
 ## Step 4 — remove the renderer file
 
