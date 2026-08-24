@@ -31,7 +31,8 @@ jobs:
         run: |
           for f in .claude-plugin/marketplace.json plugins/voice-loop/.claude-plugin/plugin.json \
                    plugins/voice-loop/hooks/hooks.json plugins/sill-core/.claude-plugin/plugin.json \
-                   plugins/agent-handbook/.claude-plugin/plugin.json plugins/agent-handbook/hooks/hooks.json; do
+                   plugins/agent-handbook/.claude-plugin/plugin.json plugins/agent-handbook/hooks/hooks.json \
+                   plugins/agent-statusline/.claude-plugin/plugin.json; do
             python3 -c "import json,sys; json.load(open(sys.argv[1]))" "$f" || exit 1
           done
 
@@ -205,6 +206,7 @@ jobs:
         run: |
           claude plugin validate ./plugins/voice-loop
           claude plugin validate ./plugins/sill-core
+          claude plugin validate ./plugins/agent-statusline
       # `claude plugin validate` checks each manifest's own structure; it does NOT compare the two
       # copies of voice-loop's dependencies — the one in plugin.json and its mirror in the
       # marketplace entry. A change that touches one and forgets the other passes both validations,
@@ -238,6 +240,42 @@ jobs:
           print("Both must declare the same dependencies (compared order-insensitively).")
           sys.exit(1)
           PY
+
+      - name: agent-statusline renders both fixtures as specified
+        run: |
+          set -euo pipefail
+          # The plugin's acceptance criterion (#269), pinned here so a regression in either the
+          # renderer or a fixture cannot ship. REFUSAL FIRST: unparseable stdin must print
+          # nothing on stdout, name the failure on stderr, and exit 1 — the failure path is
+          # shown working before the happy path is believed.
+          set +e
+          printf 'not json' | node plugins/agent-statusline/statusline.js >/tmp/sl-refuse.out 2>/tmp/sl-refuse.err
+          rc=$?
+          set -e
+          [ "$rc" = "1" ] || { echo "unparseable stdin did not exit 1 (got $rc)"; exit 1; }
+          [ ! -s /tmp/sl-refuse.out ] || { echo "the refusal path printed something on stdout"; cat /tmp/sl-refuse.out; exit 1; }
+          grep -q "agent-statusline" /tmp/sl-refuse.err \
+            || { echo "the refusal stderr did not name the parse failure"; cat /tmp/sl-refuse.err; exit 1; }
+          # The Pro-shaped fixture must render exactly the line the ticket asserts, with colour
+          # escapes stripped. Comparisons are anchored end-to-end so a stray space or missing
+          # segment fails the step.
+          pro_actual=$(node plugins/agent-statusline/statusline.js < plugins/agent-statusline/fixtures/payload-pro.json \
+            | perl -pe 's/\e\[[0-9;]*m//g')
+          pro_expected="◐ ctx 84k/200k (42%) wk 63%/5h 15% Opus 5"
+          [ "$pro_actual" = "$pro_expected" ] \
+            || { echo "Pro fixture rendered wrong line"; echo "  got:      [$pro_actual]"; echo "  expected: [$pro_expected]"; exit 1; }
+          # The API-key-shaped fixture must render with the whole budget segment absent — not
+          # empty, not surrounded by spaces — so an API-key user sees two of the three figures.
+          api_actual=$(node plugins/agent-statusline/statusline.js < plugins/agent-statusline/fixtures/payload-apikey.json \
+            | perl -pe 's/\e\[[0-9;]*m//g')
+          api_expected="◐ ctx 84k/200k (42%) Opus 5"
+          [ "$api_actual" = "$api_expected" ] \
+            || { echo "API-key fixture rendered wrong line"; echo "  got:      [$api_actual]"; echo "  expected: [$api_expected]"; exit 1; }
+          # And, as a private-reference guard from the same ticket, none of the reference
+          # script's internal markers may have travelled into the public tree.
+          if grep -rn -E "1918|ORCH|apetukhov" plugins/agent-statusline/; then
+            echo "private references from the reference script leaked into the plugin"; exit 1
+          fi
 
   coverage:
     name: unit tests (python ${{ matrix.python }})
