@@ -1,0 +1,21 @@
+{
+  "session_id": "0f3b6d2e-5a41-4d0e-9c77-6b2f1c9a4e88",
+  "version": "2.1.220",
+  "model": { "id": "claude-opus-5", "display_name": "Opus 5" },
+  "workspace": { "current_dir": "/home/example/project" },
+  "cwd": "/home/example/project",
+  "context_window": {
+    "context_window_size": 0,
+    "total_input_tokens": 0,
+    "total_output_tokens": 0,
+    "used_percentage": null
+  },
+  "rate_limits": null,
+  "cost": {
+    "total_cost_usd": 0,
+    "total_duration_ms": 0,
+    "total_api_duration_ms": 0,
+    "total_lines_added": 0,
+    "total_lines_removed": 0
+  }
+}

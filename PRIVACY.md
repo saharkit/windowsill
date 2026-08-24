@@ -25,6 +25,12 @@ delete them; nothing prunes them but a 1 MB log roll. While a line is being play
 audio sits briefly in your temp directory (removed when playback ends; a hard crash can
 leave one behind). The local server also keeps its model cache under `~/.cache`.
 
+**agent-statusline** also writes under `~/.claude/`: `/statusline-setup` copies the renderer to
+`~/.claude/tools/agent-statusline.js`, writes the `statusLine` key into `~/.claude/settings.json`
+preserving every other key, and takes a `~/.claude/settings.json.bak` before any overwrite. The plugin
+reads the payload Claude Code pipes to it on stdin, sends nothing anywhere, and writes no snapshot of
+that payload to disk.
+
 ## Where your voice goes
 
 Voice-loop turns speech into text and text into speech. The audio and transcripts go to the

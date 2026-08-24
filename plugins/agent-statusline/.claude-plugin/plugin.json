@@ -1,0 +1,10 @@
+{
+  "name": "agent-statusline",
+  "version": "0.1.0",
+  "description": "One line at the bottom of Claude Code: how much of the context window is gone, how much of the weekly budget is spent, and which model is answering. Every figure is read from the payload the harness pipes to the script on stdin, so nothing is host-specific. Needs node and nothing else.",
+  "author": { "name": "Sahar" },
+  "homepage": "https://github.com/saharkit/windowsill/tree/main/plugins/agent-statusline",
+  "license": "MIT",
+  "keywords": ["statusline", "context-window", "budget", "claude-code", "agent-statusline"],
+  "category": "productivity"
+}

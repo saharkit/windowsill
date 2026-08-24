@@ -266,6 +266,10 @@
       <h3><a href="https://github.com/saharkit/windowsill/tree/main/plugins/sill-core">sill-core</a></h3>
       <p>The shared substrate the plugins build on — a plugin-agnostic, schema-versioned, atomic-write assistant state store with remind-once etiquette. One file per plugin under <code>XDG_STATE_HOME</code>, separate from your config.</p>
     </li>
+    <li>
+      <h3><a href="https://github.com/saharkit/windowsill/tree/main/plugins/agent-statusline">agent-statusline</a></h3>
+      <p>One line at the bottom of Claude Code: how much of the context window is gone, how much of the weekly budget is spent, and which model is answering. Every figure comes from the payload the harness pipes to the script on stdin, so nothing is host-specific. Needs <code>node</code> and nothing else — no jq, no network, no hardware.</p>
+    </li>
   </ul>
 
   <p class="aside">Every plugin owns its own README, its own tests, its own docs and its own version. More will land on the sill over time.</p>
