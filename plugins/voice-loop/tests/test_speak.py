@@ -1606,11 +1606,14 @@ class _NullPlayer:
     def kill(self) -> None:
         pass  # a no-op: the player was never running, so there is nothing to signal
 
-    def communicate(self, input: bytes | None = None) -> tuple[bytes, bytes]:
+    def communicate(self, input: bytes | None = None, timeout: float | None = None) -> tuple[bytes, bytes]:
         # The tts.command branch (scripts/speak.py: the local-shell player that reads text on
         # stdin) calls .communicate(input=...) on a real subprocess.Popen — a no-spawn stand-in
         # must answer the same shape so the production call site doesn't AttributeError when the
-        # monkeypatch substitutes us in for the real Popen. Done before .returncode is read on the
+        # monkeypatch substitutes us in. `timeout` is accepted and IGNORED for the same reason the
+        # parameter exists on the real `Popen.communicate(input=None, timeout=None)`: a stand-in that
+        # narrows the signature it replaces fails on the first caller that passes the other argument.
+        # Done before .returncode is read on the
         # next line, with the same shape a finished player would have handed back.
         self.returncode = 0
         return (b"", b"")
