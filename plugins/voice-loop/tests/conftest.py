@@ -8,6 +8,7 @@ end to end against objects that answer instantly.
 
 from __future__ import annotations
 
+import importlib
 import io
 import sys
 import threading
