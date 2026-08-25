@@ -38,9 +38,11 @@ def _no_extra_dictate_spawns(request, monkeypatch):
     if "test_dictate" not in str(request.fspath):
         return
     for modname in ("voice_loop.scripts.dictate", "dictate"):
-        try:
-            mod = importlib.import_module(modname)
-        except ImportError:
+        # sys.modules.get() avoids triggering an import when the test created the module
+        # via importlib.util.spec_from_file_location (it isn't registered as 'dictate' in
+        # sys.modules under that name, so importlib.import_module would raise ImportError).
+        mod = sys.modules.get(modname)
+        if mod is None:
             continue
         monkeypatch.setattr(mod, "start_stream_worker", lambda recorder_pid: None, raising=False)
         monkeypatch.setattr(mod, "_start_preview", lambda: None, raising=False)
