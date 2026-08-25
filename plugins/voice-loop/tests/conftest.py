@@ -428,15 +428,16 @@ def short_sock_path(monkeypatch, request):
     """Patch speak._STREAM_HOLDER_SOCK to a path that fits macOS's 104-byte AF_UNIX sun_path
     limit. Pytest's tmp_path on macOS is /private/var/folders/... which is too long; the fix is
     a /tmp/ subdir for darwin runners. autouse=True so every test in this directory gets the
-    short path without explicitly requesting the fixture.
+    short path without explicitly requesting the fixture. Returns the short path so tests
+    that declare the fixture as a parameter receive the patched path string.
     """
     if not any(p in str(request.fspath) for p in ("test_speak_stream", "test_speak", "test_dictate")):
-        return
+        return "/tmp/vl-test/h.sock"  # path string for tests that take this as a parameter
     import sys
     try:
         import voice_loop.scripts.speak as speak  # noqa: PLC0415
     except ImportError:
-        return
+        return "/tmp/vl-test/h.sock"
     path = "/tmp/vl-test/h.sock"  # 14 chars, well under darwin's 104-byte sun_path limit
     monkeypatch.setattr(speak, "_STREAM_HOLDER_SOCK", path)
-    return
+    return path
