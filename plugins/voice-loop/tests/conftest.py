@@ -29,15 +29,20 @@ def _no_extra_dictate_spawns(request, monkeypatch):
     """For tests in this directory that exercise dictate.main, suppress the stream-worker and
     preview spawns the production flow now triggers (macOS CI otherwise counts two Popen calls
     per main() and the test fixtures' `assert len(spawned) == 1` fails). Pure no-op everywhere else.
+
+    NB: test_dictate.py loads dictate.py via importlib.util.spec_from_file_location so the
+    symbol the test sees is a separate module instance from voice_loop.scripts.dictate. Patch
+    BOTH module objects so the mock takes effect either way.
     """
     if "test_dictate" not in str(request.fspath):
         return
-    try:
-        import voice_loop.scripts.dictate as dictate  # noqa: PLC0415 — fixture-local import
-    except ImportError:
-        return
-    monkeypatch.setattr(dictate, "start_stream_worker", lambda recorder_pid: None)
-    monkeypatch.setattr(dictate, "_start_preview", lambda: None)
+    for modname in ("voice_loop.scripts.dictate", "dictate"):
+        try:
+            mod = importlib.import_module(modname)
+        except ImportError:
+            continue
+        monkeypatch.setattr(mod, "start_stream_worker", lambda recorder_pid: None, raising=False)
+        monkeypatch.setattr(mod, "_start_preview", lambda: None, raising=False)
 
 
 class GateHeldTwice(RuntimeError):
