@@ -504,8 +504,10 @@ def test_run_holder_main_refuses_for_a_provider_without_a_variant(monkeypatch, t
 @pytest.mark.skipif(not hasattr(socket, "AF_UNIX"), reason="the holder's socket is Unix-domain; Windows has no AF_UNIX to bind")
 def test_bind_unix_listener_creates_a_listener_and_drops_a_stale_file(tmp_path, short_sock_path):
     """A leftover socket file from a crashed holder would make bind() fail; the bind removes any
-    stale file first, so a respawn always succeeds."""
-    path = str(tmp_path / "h.sock")
+    stale file first, so a respawn always succeeds. The path is the short one the autouse fixture
+    hands every holder test — the macOS 104-byte AF_UNIX limit makes tmp_path / h.sock unbindable
+    on a darwin runner."""
+    path = short_sock_path
     open(path, "w").close()  # a stale file where the socket should go
     listener = speak._bind_unix_listener(path)
     try:
@@ -514,6 +516,14 @@ def test_bind_unix_listener_creates_a_listener_and_drops_a_stale_file(tmp_path, 
         another.close()
     finally:
         listener.close()
+        # Linux keeps the bound socket file on disk after close() — the next test in this file
+        # shares the autouse path and bind() over a live inode returns EADDRINUSE before its
+        # own unlink-runs-first branch ever executes. Drop the file here so the suite is
+        # order-independent on every platform.
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
 
 
 def test_an_exiting_holder_spares_the_socket_its_replacement_rebound(holder_state):
