@@ -428,7 +428,7 @@ def short_sock_path(monkeypatch, request):
     a /tmp/ subdir for darwin runners. autouse=True so every test in this directory gets the
     short path without explicitly requesting the fixture.
     """
-    if "test_speak_stream" not in str(request.fspath) and "test_speak" not in str(request.fspath):
+    if not any(p in str(request.fspath) for p in ("test_speak_stream", "test_speak", "test_dictate")):
         return
     import sys
     try:
