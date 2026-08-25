@@ -1394,7 +1394,7 @@ class TestPasteLock:
         _write_config(monkeypatch, state, {"dictate": {"recorder": "arecord", "debounce_ms": 0}})
 
         assert dictate.main(["dictate.py"]) == 0
-        assert len(spawned) == 1  # the recording started
+        assert len(_recorder_spawns(spawned)) == 1  # the recording started
         assert not (state / "dictate-paste-lock").exists()  # stale lock was cleaned
 
     def test_stop_and_transcribe_claims_the_lock(self, state, monkeypatch):
@@ -1584,6 +1584,27 @@ def _write_config(monkeypatch, tmp_path, config: dict) -> None:
     monkeypatch.setenv("VOICE_LOOP_CONFIG", str(cfg_file))
 
 
+# macOS additionally spawns an audible cue (afplay /System/Library/Sounds/Pop.aiff at start,
+# /System/Library/Sounds/Blow.aiff at stop) through `sound()`. These spawns are platform-shaped
+# — the same recorder-vs-cue split exists nowhere else — so the recorder-vs-cue distinction
+# must be invisible to assertions that count recorder invocations to pin concurrency properties
+# (one winner of a race, one debounced press per window, no repeat). The cue executable is
+# platform-known and distinct from any recorder, so we exclude the cue argv by its first element.
+_AUDIO_CUE_EXECUTABLES = frozenset({"afplay", "aplay"})
+
+
+def _recorder_spawns(spawned: list[list[str]]) -> list[list[str]]:
+    """Filter spawned argvs down to recorder invocations only.
+
+    Linux CI never sees an afplay/aplay spawn — `start_sound` and `stop_sound` default to "" and
+    `sound()` early-returns on an absent path — so this is a no-op there. On macOS the same
+    `dictate.main` flow additionally spawns an audible cue (afplay on Pop.aiff / Blow.aiff), and
+    `assert len(recorder_spawns(spawned)) == N` stays true regardless. Every other entry in
+    `spawned` is left in place for tests that look at them.
+    """
+    return [argv for argv in spawned if argv and argv[0] not in _AUDIO_CUE_EXECUTABLES]
+
+
 def test_claim_pidfile_admits_exactly_one_winner(state):
     barrier = threading.Barrier(8)
     results: list[int | None] = []
@@ -1633,7 +1654,7 @@ def test_concurrent_toggles_start_exactly_one_recorder(state, monkeypatch):
         thread.join(timeout=10)
 
     assert sorted(rcs) == [0, 0]
-    assert len(spawned) == 1  # the loser spawned NOTHING onto the shared WAV
+    assert len(_recorder_spawns(spawned)) == 1  # the loser spawned NOTHING onto the shared WAV
     assert (state / "dictate.pid").read_text(encoding="utf-8") == "4242"
     assert sum("already starting" in message for message in notes) == 1
     assert notes.count("recording…") == 1
@@ -1666,7 +1687,7 @@ def test_dead_garbage_claim_older_than_the_grace_window_is_cleared(state, monkey
     monkeypatch.setattr(dictate, "note", lambda message, system: None)
     _write_config(monkeypatch, state, {"dictate": {"recorder": "arecord"}})
     assert dictate.main(["dictate.py"]) == 0
-    assert len(spawned) == 1
+    assert len(_recorder_spawns(spawned)) == 1
     assert pidfile.read_text(encoding="utf-8") == "4242"
 
 
@@ -1680,7 +1701,7 @@ def test_a_stale_dead_pid_is_removed_and_the_start_proceeds(state, monkeypatch):
     monkeypatch.setattr(dictate, "note", lambda message, system: None)
     _write_config(monkeypatch, state, {"dictate": {"recorder": "arecord"}})
     assert dictate.main(["dictate.py"]) == 0
-    assert len(spawned) == 1
+    assert len(_recorder_spawns(spawned)) == 1
     assert (state / "dictate.pid").read_text(encoding="utf-8") == "4242"
 
 
@@ -1874,7 +1895,7 @@ def test_a_repeat_burst_through_main_produces_exactly_one_recording_cycle(state,
     for _ in range(7):  # the OS repeats, immediately after
         assert dictate.main(["dictate.py"]) == 0
 
-    assert len(spawned) == 1  # one recorder…
+    assert len(_recorder_spawns(spawned)) == 1  # one recorder…
     assert kills == []  # …never signalled: no repeat reached the stop branch at all
     assert (state / "dictate.pid").read_text(encoding="utf-8") == "4242"  # still recording
     assert notes.count("recording…") == 1
@@ -1991,7 +2012,7 @@ def test_debounce_ms_is_configurable_and_zero_disables_it(state, monkeypatch):
 
     assert dictate.main(["dictate.py"]) == 0
     assert dictate.main(["dictate.py"]) == 0  # with the guard off, back to the old raw behaviour
-    assert len(spawned) == 1
+    assert len(_recorder_spawns(spawned)) == 1
     assert stopped == [FakeProc.pid]
 
 

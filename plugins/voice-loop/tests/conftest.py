@@ -34,8 +34,15 @@ def _no_extra_dictate_spawns(request, monkeypatch):
     NB: test_dictate.py loads dictate.py via importlib.util.spec_from_file_location so the
     symbol the test sees is a separate module instance from voice_loop.scripts.dictate. Patch
     BOTH module objects so the mock takes effect either way.
+
+    Tests that exercise `start_stream_worker` / `_start_preview` directly need the REAL function;
+    a no-op turns a regression test into a green-for-the-wrong-reason pass. Identify them by name
+    so the suppression only applies to `dictate.main`-driven tests.
     """
     if "test_dictate" not in str(request.fspath):
+        return
+    test_name = request.node.name
+    if "start_stream_worker" in test_name or "start_preview" in test_name:
         return
     for modname in ("voice_loop.scripts.dictate", "dictate"):
         # sys.modules.get() avoids triggering an import when the test created the module
@@ -431,13 +438,16 @@ def short_sock_path(monkeypatch, request):
     short path without explicitly requesting the fixture. Returns the short path so tests
     that declare the fixture as a parameter receive the patched path string.
     """
+    import os
+    path = "/tmp/vl-test/h.sock"  # 14 chars, well under darwin's 104-byte sun_path limit
+    # Ensure the parent directory exists so the bind never fails with FileNotFoundError —
+    # the directory must be created regardless of whether the voice_loop import below succeeds.
+    os.makedirs(os.path.dirname(path), exist_ok=True)
     if not any(p in str(request.fspath) for p in ("test_speak_stream", "test_speak", "test_dictate")):
-        return "/tmp/vl-test/h.sock"  # path string for tests that take this as a parameter
-    import sys
+        return path  # path string for tests that take this as a parameter
     try:
         import voice_loop.scripts.speak as speak  # noqa: PLC0415
     except ImportError:
-        return "/tmp/vl-test/h.sock"
-    path = "/tmp/vl-test/h.sock"  # 14 chars, well under darwin's 104-byte sun_path limit
+        return path
     monkeypatch.setattr(speak, "_STREAM_HOLDER_SOCK", path)
     return path

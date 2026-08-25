@@ -1193,7 +1193,7 @@ def test_run_holder_returns_1_when_bind_fails(state, monkeypatch):
     assert "could not bind its socket" in log
 
 
-def test_run_holder_exits_when_accept_raises_oserror(monkeypatch, tmp_path):
+def test_run_holder_exits_when_accept_raises_oserror(monkeypatch, tmp_path, short_sock_path):
     """A OSError on accept() (the listener was closed externally) breaks the loop, the finally
     cleans up, and the function returns 0. Prime is skipped so the fake ws cannot hang the test."""
     sock_path = str(tmp_path / "h.sock")
@@ -1227,7 +1227,7 @@ def test_run_holder_exits_when_accept_raises_oserror(monkeypatch, tmp_path):
     assert accept_count[0] >= 1  # the OSError path was exercised
 
 
-def test_run_holder_idle_exits_when_keepalive_loop_never_quiet(monkeypatch, tmp_path):
+def test_run_holder_idle_exits_when_keepalive_loop_never_quiet(monkeypatch, tmp_path, short_sock_path):
     """The idle-exit path (clock - last_activity >= STREAM_HOLDER_IDLE_EXIT). STREAM_HOLDER_IDLE_EXIT
     is 0 so the very first accept-timeout satisfies the condition; prime is skipped to keep the
     test off the websocket drain loop."""
@@ -1262,7 +1262,7 @@ def test_run_holder_idle_exits_when_keepalive_loop_never_quiet(monkeypatch, tmp_
     assert not os.path.exists(sock_path)
 
 
-def test_run_holder_keepalive_arm_continues_when_idle_exit_far(monkeypatch, tmp_path):
+def test_run_holder_keepalive_arm_continues_when_idle_exit_far(monkeypatch, tmp_path, short_sock_path):
     """Lines 2238-2239 + 2231->2252: when listener.accept() raises socket.timeout but the
     idle-exit deadline is far away (clock stays flat so clock() - last_activity stays below
     STREAM_HOLDER_IDLE_EXIT), the loop calls holder.keepalive_if_due() and `continue`s. Distinct
@@ -1320,7 +1320,7 @@ def test_run_holder_keepalive_arm_continues_when_idle_exit_far(monkeypatch, tmp_
     assert keepalive_calls[0] >= 1, "keepalive_if_due must fire when the idle-exit deadline is far"
 
 
-def test_run_holder_swallows_per_turn_conn_close_error(monkeypatch, tmp_path):
+def test_run_holder_swallows_per_turn_conn_close_error(monkeypatch, tmp_path, short_sock_path):
     """Lines 2248-2249: the inner finally closes the per-turn conn; if conn.close() raises
     OSError (the conn was already torn down by a signal or by the peer), the exception is
     swallowed so the next iteration's accept() still runs and last_activity bookkeeping is
@@ -1368,7 +1368,7 @@ def test_run_holder_swallows_per_turn_conn_close_error(monkeypatch, tmp_path):
     assert accept_calls[0] >= 1
 
 
-def test_run_holder_swallows_listener_close_error_in_outer_finally(monkeypatch, tmp_path):
+def test_run_holder_swallows_listener_close_error_in_outer_finally(monkeypatch, tmp_path, short_sock_path):
     """Lines 2255-2256: the outer finally closes the listener; if listener.close() raises
     OSError (e.g., the unix domain socket file was already unlinked), the exception is swallowed
     so _holder_exit_cleanup still runs. The loop itself exits via the existing 2240-2241 accept-
