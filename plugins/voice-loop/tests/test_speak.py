@@ -1603,6 +1603,9 @@ class _NullPlayer:
     def poll(self) -> int | None:
         return self.returncode
 
+    def kill(self) -> None:
+        pass  # a no-op: the player was never running, so there is nothing to signal
+
     def __enter__(self) -> "_NullPlayer":
         return self
 
