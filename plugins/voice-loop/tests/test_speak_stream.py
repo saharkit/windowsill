@@ -502,7 +502,7 @@ def test_run_holder_main_refuses_for_a_provider_without_a_variant(monkeypatch, t
 
 
 @pytest.mark.skipif(not hasattr(socket, "AF_UNIX"), reason="the holder's socket is Unix-domain; Windows has no AF_UNIX to bind")
-def test_bind_unix_listener_creates_a_listener_and_drops_a_stale_file(tmp_path):
+def test_bind_unix_listener_creates_a_listener_and_drops_a_stale_file(tmp_path, short_sock_path):
     """A leftover socket file from a crashed holder would make bind() fail; the bind removes any
     stale file first, so a respawn always succeeds."""
     path = str(tmp_path / "h.sock")
@@ -746,12 +746,13 @@ def test_synthesize_line_against_a_real_loopback_websocket():
 
 
 @pytest.mark.skipif(not hasattr(socket, "AF_UNIX"), reason="the holder's socket is Unix-domain; Windows has no AF_UNIX to connect")
-def test_run_holder_serves_a_turn_and_self_exits_when_its_listener_closes(monkeypatch, tmp_path):
+def test_run_holder_serves_a_turn_and_self_exits_when_its_listener_closes(monkeypatch, tmp_path, short_sock_path):
     """The daemon loop end to end: prime on the held socket, accept one per-turn connection, emit the
     SSE chunks, and exit cleanly when the listener goes (the shutdown path). Runs in the MAIN thread
     so its signal handlers install; the client runs in a thread and closes the listener to stop the
     loop. Pins the accept/serve/keepalive-loop composition a unit test cannot reach (L6)."""
     sock_path = str(tmp_path / "h.sock")
+    sock_path = short_sock_path
     monkeypatch.setattr(speak, "_STREAM_HOLDER_SOCK", sock_path)
     monkeypatch.setattr(speak, "_STREAM_HOLDER_PID", str(tmp_path / "h.pid"))
     listener_ref: list = []
@@ -1196,6 +1197,7 @@ def test_run_holder_exits_when_accept_raises_oserror(monkeypatch, tmp_path):
     """A OSError on accept() (the listener was closed externally) breaks the loop, the finally
     cleans up, and the function returns 0. Prime is skipped so the fake ws cannot hang the test."""
     sock_path = str(tmp_path / "h.sock")
+    sock_path = short_sock_path
     monkeypatch.setattr(speak, "_STREAM_HOLDER_SOCK", sock_path)
     monkeypatch.setattr(speak, "_STREAM_HOLDER_PID", str(tmp_path / "h.pid"))
 
@@ -1230,6 +1232,7 @@ def test_run_holder_idle_exits_when_keepalive_loop_never_quiet(monkeypatch, tmp_
     is 0 so the very first accept-timeout satisfies the condition; prime is skipped to keep the
     test off the websocket drain loop."""
     sock_path = str(tmp_path / "h.sock")
+    sock_path = short_sock_path
     monkeypatch.setattr(speak, "_STREAM_HOLDER_SOCK", sock_path)
     monkeypatch.setattr(speak, "_STREAM_HOLDER_PID", str(tmp_path / "h.pid"))
     monkeypatch.setattr(speak, "STREAM_HOLDER_IDLE_EXIT", 0.0)
@@ -1269,6 +1272,7 @@ def test_run_holder_keepalive_arm_continues_when_idle_exit_far(monkeypatch, tmp_
     stopping["now"] = True, and the very next while-check takes the 2231->2252 branch (exit by
     CONDITION, not by break)."""
     sock_path = str(tmp_path / "h.sock")
+    sock_path = short_sock_path
     monkeypatch.setattr(speak, "_STREAM_HOLDER_SOCK", sock_path)
     monkeypatch.setattr(speak, "_STREAM_HOLDER_PID", str(tmp_path / "h.pid"))
     # huge deadline so the idle-exit arm never fires — this test exercises the KEEPALIVE arm.
@@ -1322,6 +1326,7 @@ def test_run_holder_swallows_per_turn_conn_close_error(monkeypatch, tmp_path):
     swallowed so the next iteration's accept() still runs and last_activity bookkeeping is
     kept honest."""
     sock_path = str(tmp_path / "h.sock")
+    sock_path = short_sock_path
     monkeypatch.setattr(speak, "_STREAM_HOLDER_SOCK", sock_path)
     monkeypatch.setattr(speak, "_STREAM_HOLDER_PID", str(tmp_path / "h.pid"))
 
@@ -1370,6 +1375,7 @@ def test_run_holder_swallows_listener_close_error_in_outer_finally(monkeypatch, 
     OSError break arm (covered by test_run_holder_exits_when_accept_raises_oserror) so this test
     does not double up on the keepalive or condition-exit branches."""
     sock_path = str(tmp_path / "h.sock")
+    sock_path = short_sock_path
     monkeypatch.setattr(speak, "_STREAM_HOLDER_SOCK", sock_path)
     monkeypatch.setattr(speak, "_STREAM_HOLDER_PID", str(tmp_path / "h.pid"))
 

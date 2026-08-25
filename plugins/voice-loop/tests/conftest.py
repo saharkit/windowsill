@@ -24,6 +24,22 @@ except ImportError:
     voice_server = None  # type: ignore[assignment]
 
 
+@pytest.fixture(autouse=True)
+def _no_extra_dictate_spawns(request, monkeypatch):
+    """For tests in this directory that exercise dictate.main, suppress the stream-worker and
+    preview spawns the production flow now triggers (macOS CI otherwise counts two Popen calls
+    per main() and the test fixtures' `assert len(spawned) == 1` fails). Pure no-op everywhere else.
+    """
+    if "test_dictate" not in str(request.fspath):
+        return
+    try:
+        import voice_loop.scripts.dictate as dictate  # noqa: PLC0415 — fixture-local import
+    except ImportError:
+        return
+    monkeypatch.setattr(dictate, "start_stream_worker", lambda recorder_pid: None)
+    monkeypatch.setattr(dictate, "_start_preview", lambda: None)
+
+
 class GateHeldTwice(RuntimeError):
     """A second model slot was asked for while the first was still held — the regression, named."""
 
@@ -397,3 +413,25 @@ def pytest_ignore_collect(collection_path, config):
     if path_str.endswith(".py") and "test_conformance" not in path_str:
         return True
     return False
+
+
+@pytest.fixture
+def short_sock_path(tmp_path, monkeypatch):
+    """Yield a tmp dir whose full path fits macOS's 104-byte AF_UNIX sun_path limit.
+    Falls back to a /tmp/ subdir when tmp_path is too long. Patches speak's _STREAM_HOLDER_SOCK
+    to the short path so holder tests don't blow the limit on Darwin runners.
+    """
+    import sys
+    try:
+        import voice_loop.scripts.speak as speak  # noqa: PLC0415
+    except ImportError:
+        yield str(tmp_path / "h.sock")
+        return
+    path = str(tmp_path / "h.sock")
+    if sys.platform == "darwin" and len(path) >= 104:
+        # /tmp/ prefix + "voice-loop-XXXXXX/h.sock" -> ~36 bytes, well under 104
+        import tempfile
+        short = tempfile.mkdtemp(prefix="vl-", dir="/tmp")
+        path = f"{short}/h.sock"
+    monkeypatch.setattr(speak, "_STREAM_HOLDER_SOCK", path)
+    yield path

@@ -1603,6 +1603,12 @@ class _NullPlayer:
     def poll(self) -> int | None:
         return self.returncode
 
+    def __enter__(self) -> "_NullPlayer":
+        return self
+
+    def __exit__(self, *exc: object) -> bool:
+        return False
+
 
 def _record_speech(monkeypatch, on_synthesize=None) -> list[str]:
     """Install the whole audio half as a recorder: what the hook decides to SAY, in order.
