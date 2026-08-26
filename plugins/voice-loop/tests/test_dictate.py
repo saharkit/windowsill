@@ -1394,7 +1394,10 @@ class TestPasteLock:
         _write_config(monkeypatch, state, {"dictate": {"recorder": "arecord", "debounce_ms": 0}})
 
         assert dictate.main(["dictate.py"]) == 0
-        assert len(spawned) == 1  # the recording started
+        # The recorder writes to state/dictate.wav — the macOS start cue writes to Pop.aiff, so the
+        # WAV path uniquely identifies the recorder spawn in the captured Popen list.
+        recorder_spawns = [argv for argv in spawned if str(state / "dictate.wav") in argv]
+        assert len(recorder_spawns) == 1  # the recording started
         assert not (state / "dictate-paste-lock").exists()  # stale lock was cleaned
 
     def test_stop_and_transcribe_claims_the_lock(self, state, monkeypatch):
@@ -1633,7 +1636,10 @@ def test_concurrent_toggles_start_exactly_one_recorder(state, monkeypatch):
         thread.join(timeout=10)
 
     assert sorted(rcs) == [0, 0]
-    assert len(spawned) == 1  # the loser spawned NOTHING onto the shared WAV
+    # The loser spawned NOTHING onto the shared WAV. On macOS the winner's start cue also
+    # reaches subprocess.Popen, so select the recorder argv by its WAV path before counting.
+    recorder_spawns = [argv for argv in spawned if str(state / "dictate.wav") in argv]
+    assert len(recorder_spawns) == 1  # the loser spawned NOTHING onto the shared WAV
     assert (state / "dictate.pid").read_text(encoding="utf-8") == "4242"
     assert sum("already starting" in message for message in notes) == 1
     assert notes.count("recording…") == 1
@@ -1666,7 +1672,8 @@ def test_dead_garbage_claim_older_than_the_grace_window_is_cleared(state, monkey
     monkeypatch.setattr(dictate, "note", lambda message, system: None)
     _write_config(monkeypatch, state, {"dictate": {"recorder": "arecord"}})
     assert dictate.main(["dictate.py"]) == 0
-    assert len(spawned) == 1
+    recorder_spawns = [argv for argv in spawned if str(state / "dictate.wav") in argv]
+    assert len(recorder_spawns) == 1
     assert pidfile.read_text(encoding="utf-8") == "4242"
 
 
@@ -1680,7 +1687,8 @@ def test_a_stale_dead_pid_is_removed_and_the_start_proceeds(state, monkeypatch):
     monkeypatch.setattr(dictate, "note", lambda message, system: None)
     _write_config(monkeypatch, state, {"dictate": {"recorder": "arecord"}})
     assert dictate.main(["dictate.py"]) == 0
-    assert len(spawned) == 1
+    recorder_spawns = [argv for argv in spawned if str(state / "dictate.wav") in argv]
+    assert len(recorder_spawns) == 1
     assert (state / "dictate.pid").read_text(encoding="utf-8") == "4242"
 
 
