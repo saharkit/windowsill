@@ -1552,14 +1552,25 @@ jobs:
           # matches nothing, so a vacuous gate cannot pass quietly. File sets are reported by
           # the gate so the PR body can paste them; an empty list means a mis-specified pattern
           # and fails loud, not green.
+          #
+          # THE PATTERNS MUST LEAD WITH `**/`, NOT `*`. `coverage combine`'s `[paths]` canonical
+          # above is the runner root, so every path in the combined data stays ABSOLUTE
+          # (`/home/runner/work/windowsill/windowsill/plugins/voice-loop/scripts/doctor.py`) — the
+          # remap collapses the three runners onto one prefix, it does not make the paths
+          # repo-relative. In coverage 7.x a single `*` does not cross a `/`, so a leading `*`
+          # cannot reach past that prefix and every gate below reported `No data to report.`
+          # Verified against coverage.files.GlobMatcher on the real artifact:
+          #   '*plugins/voice-loop/scripts/*'   -> absolute False, relative True
+          #   '**/plugins/voice-loop/scripts/*' -> absolute True,  relative True
+          # The `**/` form is correct under BOTH shapes, so it survives a later relative remap.
           echo "::group::voice-loop scripts coverage gate (100% on the Linux+Windows+macOS union)"
-          python -m coverage report --include='*plugins/voice-loop/scripts/*' --fail-under=100
+          python -m coverage report --include='**/plugins/voice-loop/scripts/*' --fail-under=100
           echo "::endgroup::"
           echo "::group::voice-loop doctor.py coverage gate (#156 B1 — 100% on the union)"
-          python -m coverage report --include='*plugins/voice-loop/scripts/doctor.py' --fail-under=100
+          python -m coverage report --include='**/plugins/voice-loop/scripts/doctor.py' --fail-under=100
           echo "::endgroup::"
           echo "::group::voice-loop speak.py coverage gate (#156 B2 — 100% on the union)"
-          python -m coverage report --include='*plugins/voice-loop/scripts/speak.py' --fail-under=100
+          python -m coverage report --include='**/plugins/voice-loop/scripts/speak.py' --fail-under=100
           echo "::endgroup::"
 
           set +e
