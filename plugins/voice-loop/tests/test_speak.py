@@ -1603,6 +1603,16 @@ class _NullPlayer:
     def poll(self) -> int | None:
         return self.returncode
 
+    def __enter__(self):
+        # Real subprocess.Popen is a context manager (waits on __exit__). The macOS leg of
+        # test_speak enters whatever Popen returns as `with ...:` in a code path the Linux leg
+        # does not reach; without these, that leg reds with
+        # `'_NullPlayer' object does not support the context manager protocol`.
+        return self
+
+    def __exit__(self, *exc_info):
+        return False
+
 
 def _record_speech(monkeypatch, on_synthesize=None) -> list[str]:
     """Install the whole audio half as a recorder: what the hook decides to SAY, in order.
@@ -1642,6 +1652,20 @@ def _fire(state, monkeypatch, transcript, event: str) -> tuple[int, list[float]]
 def _append_message(transcript, text: str) -> None:
     with transcript.open("a", encoding="utf-8") as fh:
         fh.write(_assistant(text) + "\n")
+
+
+def test_null_player_supports_the_context_manager_protocol():
+    """Mutation gap: real subprocess.Popen is a context manager (returns self on __enter__,
+    waits on __exit__). The macOS leg of test_speak enters the Popen stand-in with `with ...:` in a
+    code path the Linux leg does not reach; dropping __enter__/__exit__ makes that leg red with
+    `'_NullPlayer' object does not support the context manager protocol`. The fix is scaffolding
+    only — pin the contract here so a future refactor cannot silently re-break the macOS leg."""
+    player = _NullPlayer()
+    with player as entered:
+        assert entered is player, "__enter__ must return self, matching subprocess.Popen"
+        assert entered.pid == player.pid
+        assert entered.returncode is None  # the context body has not waited yet
+    assert player.returncode is None, "__exit__ must NOT call wait() — the test double stays inert"
 
 
 def test_eager_stays_a_no_op_until_it_is_opted_into(state, monkeypatch):
