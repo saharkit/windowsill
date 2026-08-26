@@ -1589,6 +1589,16 @@ class _Stdin:
         return self._payload
 
 
+# Audio player binaries the production `_default_player` / `_player_argv` paths resolve to on
+# every supported platform. The Popen stand-in below discriminates on this set so the macOS `ps`
+# identity probe (``speak._ps_cmdline_of`` -> ``subprocess.run(["ps", ...])``) reaches the real
+# stdlib instead of a stand-in that lacks ``communicate`` / ``kill``. Keeping the set explicit
+# — rather than reading ``sys.platform`` — means the test never silently skips on a runner that
+# does not reach the darwin branch, and a new player that lands in `_default_player` shows up
+# here as a missing branch.
+_PLAYER_BINARIES = frozenset({"afplay", "aplay", "pw-play", "powershell.exe"})
+
+
 class _NullPlayer:
     """A player process that plays nothing, instantly."""
 
@@ -1614,6 +1624,30 @@ class _NullPlayer:
         return False
 
 
+def _is_player_argv(argv) -> bool:
+    """True only when this Popen would actually play audio — the argv's first element is the
+    resolved player binary. The macOS ``ps`` probe (``["ps", "-p", pid, "-o", "command="]``),
+    the stream-holder spawn (``[sys.executable, ...]``), and the local-command shell
+    (``["/bin/sh", "-c", ...]``) all fall through to the real stdlib, so ``subprocess.run``
+    can finish what it started."""
+    if not argv:
+        return False
+    return os.path.basename(str(argv[0])) in _PLAYER_BINARIES
+
+
+def _audio_only_popen(argv, **kwargs):
+    """Popen stand-in for the audio half only. The audio-player spawn goes to ``_NullPlayer``;
+    every other spawn — the macOS ``ps`` identity probe (``speak._ps_cmdline_of`` reaches this
+    via ``subprocess.run``), the stream-holder spawn in ``ensure_stream_holder``, the
+    ``/bin/sh -c`` shell in ``_play_local_command`` — goes to the real stdlib, so
+    ``communicate`` and ``kill`` are real. Discrimination is on the argv's resolved player
+    binary, not on ``sys.platform``: the test stays live on every runner that does or does
+    not reach the darwin branch."""
+    if _is_player_argv(argv):
+        return _NullPlayer()
+    return subprocess.Popen(argv, **kwargs)
+
+
 def _record_speech(monkeypatch, on_synthesize=None) -> list[str]:
     """Install the whole audio half as a recorder: what the hook decides to SAY, in order.
 
@@ -1630,7 +1664,7 @@ def _record_speech(monkeypatch, on_synthesize=None) -> list[str]:
         return WAV_A
 
     monkeypatch.setattr(speak, "synthesize", fake_synthesize)
-    monkeypatch.setattr(speak.subprocess, "Popen", lambda argv, **kwargs: _NullPlayer())
+    monkeypatch.setattr(speak.subprocess, "Popen", _audio_only_popen)
     return spoken
 
 
@@ -1666,6 +1700,52 @@ def test_null_player_supports_the_context_manager_protocol():
         assert entered.pid == player.pid
         assert entered.returncode is None  # the context body has not waited yet
     assert player.returncode is None, "__exit__ must NOT call wait() — the test double stays inert"
+
+
+def test_audio_only_popen_intercepts_only_audio_player_argv():
+    """Mutation gap (windowsill#276, fix(#276 blocker)): the macOS ``ps`` identity probe
+    (``subprocess.run(["ps", "-p", pid, "-o", "command="])``) reaches ``speak.subprocess.Popen``
+    THROUGH ``subprocess.run``'s internal lookup, so a double that swaps ``Popen`` for
+    ``_NullPlayer`` unconditionally also swallows the probe — and ``_NullPlayer`` lacks
+    ``communicate`` / ``kill``, which is exactly the AttributeError that reds the macOS leg of
+    ``test_a_line_written_while_the_previous_clip_plays_is_queued_not_dropped``. The discriminator
+    must keep the audio-player path faked and let every other spawn through to the real stdlib."""
+    # The audio-player branch: argv[0] is the resolved player binary the production code would
+    # spawn (``afplay`` on Darwin, ``aplay -q`` on Linux, ``pw-play`` with a sink, the Windows
+    # PowerShell player). The double must return _NullPlayer here — the whole point of
+    # ``_record_speech`` is to play nothing, instantly.
+    for binary in ("afplay", "aplay", "pw-play", "powershell.exe"):
+        argv = [binary, "/tmp/voice-loop-speak-abc.wav"]
+        if binary == "powershell.exe":
+            argv = [binary, "-NoProfile", "-Command", "(New-Object ...).PlaySync()"]
+        assert isinstance(_audio_only_popen(argv), _NullPlayer), (
+            f"audio player argv {argv!r} must be faked through _NullPlayer"
+        )
+    # The probe / spawn branch: argv[0] is NOT a player binary, so the double must fall through to
+    # the real stdlib Popen. The macOS probe, the stream-holder spawn (``[sys.executable, ...]``),
+    # and the local-command shell (``["/bin/sh", "-c", ...]``) all hit this branch — and only
+    # this branch makes the call have a real ``.communicate`` / ``.kill``.
+    captured = []
+
+    class _Real:
+        def __init__(self, argv, **kwargs):
+            captured.append((argv, kwargs))
+
+    real = subprocess.Popen
+    subprocess.Popen = _Real  # type: ignore[assignment]
+    try:
+        for argv in (
+            ["ps", "-p", "12345", "-o", "command="],
+            [sys.executable, os.path.abspath(__file__), "stream-holder-arg", "digest"],
+            ["/bin/sh", "-c", "echo hi"],
+            [],
+        ):
+            _audio_only_popen(argv)
+            assert captured[-1][0] == argv, (
+                f"non-audio argv {argv!r} must reach the real Popen unchanged — captured {captured[-1]!r}"
+            )
+    finally:
+        subprocess.Popen = real  # type: ignore[assignment]
 
 
 def test_eager_stays_a_no_op_until_it_is_opted_into(state, monkeypatch):
@@ -3033,7 +3113,7 @@ def test_an_alert_the_stopped_speech_server_could_not_voice_is_retried_not_swall
     _contour_status(state, [_UNREACHABLE])
     refused = _RefusedOpener()
     monkeypatch.setattr(speak.urllib.request, "build_opener", lambda *handlers: refused)
-    monkeypatch.setattr(speak.subprocess, "Popen", lambda argv, **kwargs: _NullPlayer())
+    monkeypatch.setattr(speak.subprocess, "Popen", _audio_only_popen)
 
     speak.contour_check({}, 0.0)
 
