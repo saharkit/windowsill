@@ -9,12 +9,14 @@ end to end against objects that answer instantly.
 from __future__ import annotations
 
 import io
+import os
 import sys
 import threading
 import types
 import wave
 
 import pytest
+from pytest import ExitCode
 
 try:
     from fastapi.testclient import TestClient
@@ -390,10 +392,125 @@ def pytest_ignore_collect(collection_path, config):
     not install per-plugin dependencies such as fastapi or torch.  Tests that need the real
     server are skipped here so that the conformance-only tests (which validate SKILL.md
     structure against the repo, with no server dependency at all) can still run and report.
+
+    The skip is intentionally LOUD when it fires (windowsill#267): the dropped modules are
+    recorded so that pytest_report_header, pytest_terminal_summary, and pytest_sessionfinish
+    can name the count, the install command, and the opt-in that would let the run exit 0.
+    A silent "19 tests passed" while 28 modules went unseen is exactly the failure mode that
+    ticket describes, and it must not come back.
     """
     if voice_server is not None:
         return False
     path_str = str(collection_path)
     if path_str.endswith(".py") and "test_conformance" not in path_str:
+        _IGNORED_AT_COLLECT.append(path_str)
         return True
     return False
+
+
+# Operator opt-in: setting this env var to "1" tells the conftest "I know voice_server is
+# missing, I want the conformance-only run to still exit 0". Anything else (unset, "0",
+# "true") preserves the default refusal. The string is intentionally specific and plugin-
+# prefixed so it cannot collide with any other tool's flag.
+DEGRADED_COLLECTION_OK_ENV = "VOICE_LOOP_ALLOW_DEGRADED_COLLECTION"
+
+# Per-session list of modules that pytest_ignore_collect returned True for because
+# voice_server was not importable. Reset at the start of each collection so two runs in the
+# same process don't bleed into each other (see pytest_collectstart below).
+_IGNORED_AT_COLLECT: list[str] = []
+
+
+def pytest_collectstart(collector):
+    """Clear the per-session ignored list at the start of every top-level collection.
+
+    Without this, a caller that drives `pytest.main()` twice in one process would see the
+    second banner report the SUM of both runs: pytest_sessionfinish reads the module-level
+    list to decide whether the run was degraded, and would otherwise flip the exit when it
+    should not. `pytest_collectstart` fires before the root collector's children collect;
+    we restrict the reset to the top-level collector (`collector.session is collector`)
+    so it runs ONCE per pytest.main() call, not once per file.
+    """
+    if collector.session is collector:
+        _IGNORED_AT_COLLECT.clear()
+
+
+def _degraded_collection_ok() -> bool:
+    """True iff the operator has explicitly accepted a conformance-only run."""
+    return os.environ.get(DEGRADED_COLLECTION_OK_ENV) == "1"
+
+
+def pytest_report_header(config):
+    """Announce the degraded run at the top of the output, before collection swallows the clue.
+
+    Returned strings are appended to pytest's own header. They are suppressed by `-q`, but
+    the terminal summary below carries the same information and IS shown under `-q`.
+    """
+    if voice_server is not None:
+        return None
+    lines = [
+        "voice-loop: voice_server is not importable in this environment.",
+        "voice-loop: server-dependent test modules will be SKIPPED at collection time.",
+        "voice-loop: install server deps with "
+        "`pip install -r plugins/voice-loop/tests/requirements.txt` and re-run for the full suite.",
+    ]
+    if _degraded_collection_ok():
+        lines.append(
+            f"voice-loop: opt-in detected ({DEGRADED_COLLECTION_OK_ENV}=1); "
+            "conformance-only run will be allowed to exit 0."
+        )
+    else:
+        lines.append(
+            f"voice-loop: opt-in NOT detected; this run will exit non-zero. "
+            f"Set {DEGRADED_COLLECTION_OK_ENV}=1 to accept the conformance-only run."
+        )
+    return lines
+
+
+def pytest_terminal_summary(terminalreporter, exitstatus, config):
+    """Name the dropped modules at the end, where the next line of output cannot miss them.
+
+    A reader of the two lines below can answer both questions the ticket asks for without
+    knowing the codebase: how many modules were skipped, and what to install to stop them
+    being skipped.
+    """
+    if voice_server is not None:
+        return
+    if not _IGNORED_AT_COLLECT:
+        return
+    count = len(_IGNORED_AT_COLLECT)
+    section = (
+        "voice-loop: conformance-only (opt-in)"
+        if _degraded_collection_ok()
+        else "voice-loop: DEGRADED TEST COLLECTION"
+    )
+    terminalreporter.write_sep("=", section, yellow=True)
+    terminalreporter.write_line(
+        f"voice-loop: {count} test module(s) were skipped because voice_server is "
+        f"not importable. Install server deps with "
+        f"`pip install -r plugins/voice-loop/tests/requirements.txt` to run the full suite."
+    )
+    if not _degraded_collection_ok():
+        terminalreporter.write_line(
+            f"voice-loop: set {DEGRADED_COLLECTION_OK_ENV}=1 to accept the "
+            f"conformance-only run and exit 0."
+        )
+
+
+def pytest_sessionfinish(session, exitstatus):
+    """Force a non-zero exit when modules were dropped and the caller did not opt in.
+
+    The mutation works because pytest's main returns `session.exitstatus` after the hook
+    runs; only OK is flipped to TESTS_FAILED. NO_TESTS_COLLECTED is left alone — it is
+    ALREADY a non-zero exit code, and it already honestly reports that nothing ran; a
+    reader of the exit code who cannot read the log deserves the right label, not a
+    relabel as "tests failed" when no tests were even collected. Real test failures
+    and usage errors (other ExitCode values) are also left untouched.
+    """
+    if voice_server is not None:
+        return
+    if _degraded_collection_ok():
+        return
+    if not _IGNORED_AT_COLLECT:
+        return
+    if exitstatus == ExitCode.OK:
+        session.exitstatus = ExitCode.TESTS_FAILED

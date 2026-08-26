@@ -397,7 +397,39 @@ STREAM_HOLDER_READY_TIMEOUT = 6.0
 # is a RECONNECT TRIGGER: a mismatched digest respawns the holder with the new settings, because a
 # voice_settings change on a held socket may require reopening the stream.
 _STREAM_HOLDER_PID = os.path.join(_STATE_DIR, "speak-stream.pid")
-_STREAM_HOLDER_SOCK = os.path.join(_STATE_DIR, "speak-stream.sock")
+
+
+def _stream_holder_sock_path(state_dir: str) -> str:
+    """The path the stream holder binds and the client connects to. The bound path's length must
+    stay inside ``sockaddr_un.sun_path``: macOS caps it at 104 bytes, Linux at 108, and a deep
+    pytest ``tmp_path`` alone routinely reaches 80-95 chars on a macOS GitHub runner — adding the
+    socket basename pushes the previous ``os.path.join(state_dir, "speak-stream.sock")`` past 104
+    on Darwin while staying inside the Linux limit. Two design choices keep the length bounded
+    regardless of how long ``state_dir`` is:
+
+    * the directory is ``$XDG_RUNTIME_DIR`` when set and writable, otherwise
+      ``tempfile.gettempdir()`` — on macOS that resolves to the per-user ``$TMPDIR`` under
+      ``/var/folders/.../T/``, which is where the socket belongs anyway; it must NOT collapse to a
+      shared ``/tmp`` with a guessable name;
+    * the basename mixes the SHA-256 of the absolute state dir into its first 16 hex chars, so two
+      different state dirs still get two different socket paths (per-instance isolation the test
+      suite depends on — every test has its own ``tmp_path`` and therefore its own socket) but
+      the basename itself is bounded at ``speak-stream-`` + 16 hex + ``.sock``.
+
+    The state-dir arg is the SOLE input that distinguishes two callers with different state
+    dirs; everything else (env, tempdir) is ambient, which keeps bind and connect resolving to
+    the SAME constant for the SAME state dir — drift between the two would be a silent
+    socket-not-found failure."""
+    runtime_dir = os.environ.get("XDG_RUNTIME_DIR", "").strip()
+    if runtime_dir and os.path.isdir(runtime_dir) and os.access(runtime_dir, os.W_OK):
+        base_dir = runtime_dir
+    else:
+        base_dir = tempfile.gettempdir()
+    digest = hashlib.sha256(os.path.abspath(state_dir).encode("utf-8")).hexdigest()[:16]
+    return os.path.join(base_dir, f"speak-stream-{digest}.sock")
+
+
+_STREAM_HOLDER_SOCK = _stream_holder_sock_path(_STATE_DIR)
 
 # The event this invocation was fired for, recorded by main() the moment stdin is read so the
 # contour check can tell which path it is on. A module cell rather than a return value: main()'s
@@ -537,10 +569,16 @@ def resolve_settings(config: dict, system: str) -> dict:
         "max_chars": contracts.resolve_number(cfg(config, "speak.max_chars", 600), 600, "speak.max_chars", log, minimum=1, integer=True),
         "timeout": contracts.resolve_number(cfg(config, "speak.timeout", 60), 60.0, "speak.timeout", log, minimum=0.000001),
         "backend": str(cfg(config, "tts.backend", "lan")),
+        # the cloud override, first in the resolution order: an explicit ``tts.cloud.endpoint``
+        # wins, then the registry entry's ``default_host``, then the top-level ``tts.endpoint``
+        # (the legacy OpenAI-compatible path's setting), then ``LOCAL_SPEECH_HOST`` (TTS only).
+        # Every shipped provider has a remote default_host now, so a self-hosted operator uses
+        # this key rather than ``tts.endpoint`` (windowsill#270).
+        "cloud_endpoint": str(cfg(config, "tts.cloud.endpoint", "")),
         # left empty here: the per-backend default differs (see synthesize) — the LAN server and a
         # provider with no remote default host both land on the local speech server, while a
-        # provider that HAS one (ElevenLabs, Deepgram) lands on its own remote API host. That choice
-        # is the entry's.
+        # provider that HAS one (ElevenLabs, Deepgram, OpenAI) lands on its own remote API host.
+        # That choice is the entry's.
         "endpoint": str(cfg(config, "tts.endpoint", "")),
         "speaker": speaker,
         # top-level "language" is the one the user sets; ".tts.language" is the advanced escape for
@@ -1037,6 +1075,18 @@ def synthesize(text: str, s: dict, key: str) -> bytes | None:
         body = _post(f"{endpoint}/tts", {}, payload, s["timeout"])
 
     if body is None:
+        # A failed cloud request that resolved to a local address gets a diagnostic line. The
+        # backend check is part of the predicate (the LAN branch shares this return), and the
+        # predicate reads `.hostname`, NOT `.netloc` — a loopback address carrying its port
+        # (`127.0.0.1:8355`) would otherwise fail the `is_local_host` check and the line would
+        # be dead code on the very endpoint this diagnostic exists to name (windowsill#270).
+        if s["backend"] == "cloud" and providers.is_local_host(
+            urllib.parse.urlsplit(request.url).hostname or ""
+        ):
+            log(
+                f"cloud tts: the endpoint resolved to a local address ({urllib.parse.urlsplit(request.url).netloc.rsplit('@', 1)[-1]}) "
+                f"— not {entry.name}'s API; set tts.cloud.endpoint to your remote host, or tts.backend to \"lan\" if you meant this machine"
+            )
         return None
     if not body:
         log(f"empty synthesis from {endpoint}")
@@ -1836,9 +1886,12 @@ def play_text(text: str, s: dict, t0: float, *, extract_ms: int) -> bool:
 
 def stream_settings_digest(s: dict) -> str:
     """A hash of the settings the holder bakes into its held socket — the ones a change to MUST
-    respawn it (provider, voice, model, output format, voice settings incl. speed, endpoint). The
-    KEY is deliberately not in it: the holder reads the key itself, and a rotated key is no reason
-    to drop a warm socket."""
+    respawn it (provider, voice, model, output format, voice settings incl. speed, the cloud
+    override endpoint, the legacy top-level endpoint). The KEY is deliberately not in it: the
+    holder reads the key itself, and a rotated key is no reason to drop a warm socket.
+
+    ``cloud_endpoint`` joined the digest at #270: the streaming URL reads it first, and two configs
+    that differ only in it would otherwise share one warm socket pointed at the wrong vendor."""
     parts = {
         "provider": s["provider"],
         "voice_id": s["voice_id"],
@@ -1846,6 +1899,7 @@ def stream_settings_digest(s: dict) -> str:
         "stream_output_format": s["stream_output_format"],
         "voice_settings": s["voice_settings"],
         "speed": s["speed"],
+        "cloud_endpoint": s.get("cloud_endpoint", ""),
         "endpoint": s["endpoint"],
     }
     return hashlib.sha1(json.dumps(parts, sort_keys=True).encode()).hexdigest()[:16]
@@ -2022,6 +2076,7 @@ def _clear_stream_holder_pid() -> bool:
     try:
         os.unlink(_STREAM_HOLDER_PID)
     except OSError:
+        _stream_holder_pid_record = None
         return False
     _stream_holder_pid_record = None
     return True
@@ -2224,6 +2279,14 @@ def _bind_unix_listener(path: str):
         raise OSError("Unix-domain sockets are unavailable on this platform")
     listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     listener.bind(path)
+    # The derived `_stream_holder_sock_path` falls back to ``tempfile.gettempdir()`` when
+    # ``$XDG_RUNTIME_DIR`` is unset/unwritable — on Linux that is /tmp, world-traversable.
+    # bind() creates the inode with mode 0o666 & ~umask, which is 0o644 under the typical
+    # umask 0o022 — any local user that discovers the hashed basename could connect and
+    # trigger ElevenLabs synthesis billed to the legitimate user (windowsill#285, security
+    # reviewer #30262). Tighten the mode to owner-only on every bind; this is the only
+    # socket file the holder creates.
+    os.chmod(path, 0o600)
     listener.listen(1)
     return listener
 

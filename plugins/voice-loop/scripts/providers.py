@@ -28,7 +28,10 @@ The axes that vary per provider, all seven of them in the entry and nowhere else
 5. **credential resolution** — ``key_env_fallbacks``, the "one credentials home" rule
 6. **error-document reading** — ``error_summary``, so a degrade names a real reason
 7. **the remote default host** — ``default_host``; "" means "this provider has none, use the
-   configured endpoint", which is what makes the TLS probe's old ElevenLabs special case go away
+   configured endpoint", which is what makes the TLS probe's old ElevenLabs special case go away.
+   Every shipped provider carries one (the `openai` row's default was empty for both directions
+   before #270, sending cloud requests to the plugin's own loopback — the documented surface is
+   now `*.cloud.endpoint` first, then `default_host`, then the top-level `*.endpoint`).
 
 This is the module the other scripts import, so the "a single file can be copied out and still run"
 property now means "that file plus ``providers.py``" — and, for the dictation toggle since the
@@ -55,10 +58,12 @@ from typing import Callable
 
 ELEVENLABS_HOST = "https://api.elevenlabs.io"
 DEEPGRAM_HOST = "https://api.deepgram.com"
+OPENAI_HOST = "https://api.openai.com"
 
 # Where the OpenAI-compatible path lands when nothing is configured: this plugin's own server, on
 # loopback and on http. It is deliberately NOT a `default_host` — a provider's default_host is a
-# REMOTE host, which is exactly the distinction the TLS probe branches on.
+# REMOTE host. It is the TTS chain's step 4 and the LAN default; nothing in the shipped registry
+# ever reaches it because every row now has a remote default_host (windowsill#270).
 LOCAL_SPEECH_HOST = "http://127.0.0.1:8355"
 
 # The provider a config that names none — or names one nobody has heard of — resolves to. Same
@@ -223,8 +228,10 @@ class SttProvider:
     streaming: "SttStreaming | None" = None
 
     def endpoint(self, s: dict) -> str:
-        """The host this call goes to: an explicit stt.cloud.endpoint wins, then the provider's own
-        remote default, then whatever stt.endpoint is (the OpenAI-compatible path's behaviour)."""
+        """One order, both directions (windowsill#270): an explicit stt.cloud.endpoint wins, then
+        the provider's remote default_host, then the top-level stt.endpoint. The STT chain ends at
+        step 3 because stt.endpoint already defaults to LOCAL_SPEECH_HOST in dictate.resolve_settings
+        — that literal is the same address the TTS chain ends at, by a different route."""
         return str(s.get("cloud_endpoint") or self.default_host or s.get("endpoint", ""))
 
     def key_envs(self, configured: str) -> tuple[str, ...]:
@@ -256,9 +263,16 @@ class TtsProvider:
     streaming: "TtsStreaming | None" = None
 
     def endpoint(self, s: dict) -> str:
-        """An explicit tts.endpoint wins, then the provider's remote default, then this plugin's
-        own server on loopback."""
-        return str(s.get("endpoint") or self.default_host or LOCAL_SPEECH_HOST)
+        """One order, both directions, batch AND socket (windowsill#270): an explicit
+        tts.cloud.endpoint wins, then the provider's remote default_host, then the top-level
+        tts.endpoint, then this plugin's own server on loopback. The top-level key is at rank 3
+        because every shipped row now has a remote default_host — a self-hosted operator sets
+        tts.cloud.endpoint, not tts.endpoint — and rank 1 was the only order that fixed the
+        conformance-pass failure where openai had no default and the plugin fell through to its
+        own loopback address."""
+        return str(
+            s.get("cloud_endpoint") or self.default_host or s.get("endpoint", "") or LOCAL_SPEECH_HOST
+        )
 
     def request(self, s: dict, key: str, text: str) -> TtsRequest:
         return self.build(self, s, key, text)
@@ -634,8 +648,12 @@ def _elevenlabs_stream_url(stream: TtsStreaming, entry: TtsProvider, s: dict) ->
     """ElevenLabs stream-input, live: the same text-to-speech voice as the batch call, over a
     websocket that stays open across lines. The model and the OUTPUT FORMAT are query parameters —
     there is no container on the way back, only raw PCM frames, so the format the player must
-    handle is declared here (pcm_22050 = raw s16le, no decoder in the critical path)."""
-    host = websocket_scheme(str(s.get("endpoint") or entry.default_host))
+    handle is declared here (pcm_22050 = raw s16le, no decoder in the critical path).
+
+    Resolution order (windowsill#270) matches ``TtsProvider.endpoint``: cloud_endpoint -> the
+    entry's remote default_host -> the top-level endpoint. ``_deepgram_stream_url`` already reads
+    cloud_endpoint first."""
+    host = websocket_scheme(str(s.get("cloud_endpoint") or entry.default_host or s.get("endpoint", "")))
     voice_id = urllib.parse.quote(str(s.get("voice_id") or ""), safe="")
     query = urllib.parse.urlencode(
         {
@@ -711,7 +729,7 @@ STT_PROVIDERS: dict[str, SttProvider] = {
     "openai": SttProvider(
         name="openai",
         default_model="whisper-1",
-        default_host="",
+        default_host=OPENAI_HOST,
         key_env_fallbacks=(),
         build=_openai_stt,
         transcript=text_field,
@@ -768,7 +786,7 @@ TTS_PROVIDERS: dict[str, TtsProvider] = {
     "openai": TtsProvider(
         name="openai",
         default_model="tts-1",
-        default_host="",
+        default_host=OPENAI_HOST,
         default_output_format="",
         build=_openai_tts,
         comparison=Comparison(
@@ -810,7 +828,8 @@ TTS_PROVIDERS: dict[str, TtsProvider] = {
             cost="Aura list price ≈$0.030 per 1k characters; the $200 new-account credit covers it too",
             languages="English and Spanish only on Aura-2 — no Russian, Ukrainian or Turkish. "
             "Not a choice for a Russian-, Ukrainian- or Turkish-speaking contour",
-            privacy="text leaves the machine; self-hosted deployment is offered",
+            privacy="text leaves the machine; self-hosted deployment is offered, and "
+            "tts.cloud.endpoint points at one",
         ),
     ),
 }

@@ -176,11 +176,13 @@ That shared-key rule is ElevenLabs' alone, because it is the one provider coveri
 with one account here: a `deepgram` STT config is never handed an ElevenLabs key.
 
 **A configured endpoint that would carry the key over clear text is refused, not warned about.**
-An `http://` (or `ws://`) `stt.cloud.endpoint` / `tts.endpoint` together with a configured key is
-rejected when the configuration is assembled — the request is never built — unless the endpoint
+An `http://` (or `ws://`) `stt.cloud.endpoint` / `tts.cloud.endpoint` together with a configured key
+is rejected when the configuration is assembled — the request is never built — unless the endpoint
 is on this machine (`127.0.0.1`, `::1`, `localhost`, or a name that resolves there). Use
 `https://` (the streaming path derives `wss://` from it), or point the endpoint at your own
-loopback server.
+self-hosted deployment. The top-level `stt.endpoint` / `tts.endpoint` is this plugin's own
+server on loopback — a config that used it as a cloud override must move the value to
+`stt.cloud.endpoint` / `tts.cloud.endpoint` (windowsill#270).
 
 **Privacy note: with any cloud `stt.cloud.provider`, your recorded audio clips leave your machine
 and are sent to that provider's servers for transcription** — that is the trade the `cloud` row

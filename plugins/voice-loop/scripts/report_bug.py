@@ -460,6 +460,10 @@ LOG_RULES: tuple[tuple[str, str | None], ...] = (
     ("cloud tts: no key", None),
     # a builder refusing a misconfiguration (an unset ElevenLabs voice) — the reason is fixed prose
     ("cloud tts misconfigured: ", None),
+    # a failed cloud request whose resolved endpoint was a local address (windowsill#270). The
+    # only host the line can ever name is loopback, which the bundle already redacts whole, so no
+    # cut: the whole message is metadata.
+    ("cloud tts: the endpoint resolved to a local address (", None),
     # a provider name the registry does not know is the user's own typo — cut like paste_target's
     ("tts.cloud.provider is not a known provider — using ", "instead of "),
     ("stream died before its first chunk", None),
@@ -497,6 +501,9 @@ LOG_RULES: tuple[tuple[str, str | None], ...] = (
     ("cloud stt: no key for ", None),
     # a provider with no default host and no endpoint: the line names the provider and fixed prose
     ("cloud stt: no endpoint for ", None),
+    # a failed cloud STT request whose resolved endpoint was a local address (windowsill#270).
+    # The only host the line can ever name is loopback, which the bundle already redacts whole.
+    ("cloud stt: the endpoint resolved to a local address (", None),
     ("stt.cloud.provider is not a known provider — using ", "instead of "),
     ("cloud stt failed — falling back to local whisper", None),
     # streaming dictation (#99): the worker's lifecycle and the degrade. Counts, byte totals, pids

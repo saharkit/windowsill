@@ -91,7 +91,7 @@ paths are compared on your own machine rather than on a claim in this table.
 |---|---|---|---|---|---|
 | `openai` (TTS) | `tts-1` | under a second to first byte for a short line | list price **$15 per 1M characters** | multilingual, **Russian ✅ Ukrainian ✅ Turkish ✅** — in an English-accented voice | text leaves the machine; retention follows the account's API data policy |
 | `elevenlabs` (TTS) | `eleven_multilingual_v2` | around a second to first byte; the flash models trade quality for speed | credit-based; the character rate depends on the plan tier | 29+ languages, **Russian ✅ Ukrainian ✅ Turkish ✅**; voice cloning through `/voice-design` | text leaves the machine; voices you design live in your ElevenLabs account |
-| `deepgram` (TTS) | `aura-2-thalia-en` | the lowest first-byte latency of the three | ≈**$0.030 per 1k characters**; the $200 new-account credit covers it too | **English and Spanish only** on Aura-2 — **Russian ❌ Ukrainian ❌ Turkish ❌** | text leaves the machine; a self-hosted deployment is offered |
+| `deepgram` (TTS) | `aura-2-thalia-en` | the lowest first-byte latency of the three | ≈**$0.030 per 1k characters**; the $200 new-account credit covers it too | **English and Spanish only** on Aura-2 — **Russian ❌ Ukrainian ❌ Turkish ❌** | text leaves the machine; a self-hosted deployment is offered, and `tts.cloud.endpoint` points at one |
 
 **If your contour speaks Russian or Ukrainian, Deepgram is an STT choice and not a TTS one.** That
 asymmetry is the reason the two directions are configured independently — `stt.cloud.provider:

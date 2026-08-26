@@ -22,6 +22,7 @@ import json
 import os
 import socket
 import struct
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -46,6 +47,7 @@ _ENTRY = providers.TTS_PROVIDERS["elevenlabs"]
 def _settings(**overrides) -> dict:
     base = {
         "endpoint": "",
+        "cloud_endpoint": "",
         "voice_id": "vX",
         "cloud_model": "eleven_flash_v2_5",
         "stream_output_format": "pcm_22050",
@@ -157,6 +159,23 @@ def test_the_digest_changes_with_a_settings_edit():
         {"tts": {"cloud": {"provider": "elevenlabs", "streaming": True, "voice_settings": {"speed": 0.9}}}}, "Linux"
     )
     assert speak.stream_settings_digest(base) != speak.stream_settings_digest(faster)
+
+
+def test_the_digest_changes_when_only_the_cloud_endpoint_changes():
+    """windowsill#270: the streaming URL reads ``cloud_endpoint`` first, so two configs that differ
+    only in that key cannot share one warm socket — the digest must include it or a settings edit
+    would silently reuse the wrong vendor's socket."""
+    base = speak.resolve_settings(
+        {"tts": {"cloud": {"provider": "elevenlabs", "streaming": True}}}, "Linux"
+    )
+    overridden = speak.resolve_settings(
+        {"tts": {"cloud": {"provider": "elevenlabs", "streaming": True,
+                           "endpoint": "https://gateway.internal"}}},
+        "Linux",
+    )
+    assert base["cloud_endpoint"] == ""
+    assert overridden["cloud_endpoint"] == "https://gateway.internal"
+    assert speak.stream_settings_digest(base) != speak.stream_settings_digest(overridden)
 
 
 # --- the holder's decisions, against a fake websocket --------------------------------------------
@@ -498,6 +517,47 @@ def test_bind_unix_listener_creates_a_listener_and_drops_a_stale_file(tmp_path):
         listener.close()
 
 
+@pytest.mark.skipif(not hasattr(socket, "AF_UNIX"), reason="the holder's socket is Unix-domain; Windows has no AF_UNIX to bind")
+def test_bind_unix_listener_chmods_the_socket_to_owner_only(tmp_path):
+    """windowsill#285, security reviewer #30262: the derived `_stream_holder_sock_path` falls
+    back to ``tempfile.gettempdir()`` when ``$XDG_RUNTIME_DIR`` is unset/unwritable — on Linux
+    that is /tmp, world-traversable. ``bind()`` creates the socket inode with mode 0o666 &
+    ~umask (0o644 under the typical umask 0o022), so any local user that discovers the hashed
+    basename could connect and trigger ElevenLabs synthesis billed to the legitimate user.
+    ``_bind_unix_listener`` must therefore tighten the mode to 0o600 after bind.
+
+    The test places the socket in a ``tempfile.gettempdir()``-style location (tmp_path is
+    close enough for the mode assertion; the path derivation itself is covered by the
+    ``_stream_holder_sock_path`` tests) and asserts the bound socket file's mode bits are
+    owner-only — no group, no other.
+
+    The precondition for the assertion is that ``os.chmod`` actually reduces access on this
+    runner: on root (mode bits are advisory) it does not, and on Windows there is no AF_UNIX
+    at all (the test is already skipped above). The skip predicate below mirrors the
+    `XDG_RUNTIME_DIR` fallback test's pattern: a precondition that does not hold produces a
+    skip, not a false negative, so this test cannot become a tautology on a runner where the
+    fix cannot be verified."""
+    path = str(tmp_path / "holder.sock")
+    listener = speak._bind_unix_listener(path)
+    try:
+        mode = os.stat(path).st_mode & 0o777
+        # Sanity: chmod 0o600 takes effect on this runner — if it doesn't (root, or any
+        # filesystem where mode bits are advisory), the assertion below would fail on the
+        # wrong ground. Skip when the precondition does not hold.
+        if mode & 0o077:
+            pytest.skip(
+                f"bound socket mode is {oct(mode)} — chmod 0o600 did not remove group/other "
+                "access on this runner (happens as root and on any filesystem where mode "
+                "bits are advisory); the fix's effect cannot be verified here."
+            )
+        assert mode == 0o600, (
+            f"bound socket mode is {oct(mode)}, expected 0o600 — the chmod(0o600) after bind "
+            "is missing or not taking effect (windowsill#285, security reviewer #30262)"
+        )
+    finally:
+        listener.close()
+
+
 def test_an_exiting_holder_spares_the_socket_its_replacement_rebound(holder_state):
     """The generation fence on the exit unlink: a SIGTERMed holder reaches its exit up to one
     accept-timeout AFTER its replacement rebound the same socket path, so the unlink must not
@@ -715,7 +775,9 @@ def test_synthesize_line_against_a_real_loopback_websocket():
     reach. Pins that the pieces compose; a registry URL drift or a wsclient regression fails here."""
     server = FakeElevenLabs([b"\x01\x02", b"\x03\x04"])
     try:
-        s = _settings(endpoint=server.http_url)
+        # windowsill#270: the cloud override now lives in ``cloud_endpoint`` (rank 1) so the
+        # holder's URL builder resolves to the fake loopback server, not the vendor's host.
+        s = _settings(cloud_endpoint=server.http_url)
         holder = speak.TtsStreamHolder(_ENTRY, s, "xi-key")
         frags = list(holder.synthesize_line("hello there", deadline=time.monotonic() + 10))
         holder.close()
@@ -894,12 +956,12 @@ def test_write_stream_holder_pid_is_noop_when_atomic_write_fails(holder_state):
     speak.os.replace = deny_replace
     try:
         speak._write_stream_holder_pid(12345, "digest-xyz")
+        # the global record was NOT updated — a holder that thinks it wrote the pidfile but didn't
+        # would falsely pass the generation fence otherwise
+        assert speak._stream_holder_pid_record is None
     finally:
         speak.os.replace = original_replace
         speak._stream_holder_pid_record = original_record
-    # the global record was NOT updated — a holder that thinks it wrote the pidfile but didn't
-    # would falsely pass the generation fence otherwise
-    assert speak._stream_holder_pid_record is None
 
 
 def test_read_stream_holder_pid_handles_unreadable_file(holder_state):
@@ -944,12 +1006,12 @@ def test_clear_stream_holder_pid_swallow_path(holder_state):
     speak.os.unlink = deny
     try:
         result = speak._clear_stream_holder_pid()
+        # the global is still cleared — this process's view of "is the pidfile mine" is now false
+        assert speak._stream_holder_pid_record is None
     finally:
         speak.os.unlink = original_unlink
         speak._stream_holder_pid_record = original_record
     assert result is False  # the cleanup didn't happen
-    # the global is still cleared — this process's view of "is the pidfile mine" is now false
-    assert speak._stream_holder_pid_record is None
 
 
 def test_stream_holder_pid_is_ours_returns_false_when_no_record(holder_state):
@@ -1415,3 +1477,239 @@ def test_run_holder_main_folds_speed_into_voice_settings(state, monkeypatch, tmp
     assert speak.run_holder_main("deadbeef") == 0
     # speed was folded into voice_settings — the BOS will carry it
     assert captured["voice_settings"] == {"speed": 1.0}
+
+
+# --- the AF_UNIX path-length bound (windowsill#285) ---------------------------------------------
+# The stream holder binds an AF_UNIX socket at `_STREAM_HOLDER_SOCK`. macOS caps ``sun_path`` at
+# 104 bytes; Linux at 108; the previous `os.path.join(_STATE_DIR, "speak-stream.sock")` rides on
+# the state dir's length, which on a GitHub-hosted macOS pytest `tmp_path` is 80-95 chars — adding
+# the basename pushes the bound path past 104 on Darwin while staying inside the Linux one, so
+# #276's macOS leg reds with `AF_UNIX path too long` even though the Linux leg stays green. The
+# tests below pin the new derived-path shape: a length bound that holds REGARDLESS of how deep
+# the state dir is, the single-constant property the holder and client share, per-instance
+# isolation across distinct state dirs, and the XDG_RUNTIME_DIR selection/fallback contract.
+
+_DARWIN_SUN_PATH_LIMIT = 104  # the documented macOS sockaddr_un.sun_path ceiling
+
+
+def _make_deep_state_dir(parent: Path, length: int) -> Path:
+    """Build a state dir whose absolute path is at least `length` bytes. Uses multiple nested
+    subdirs (each up to ~120 chars, well under the 255-char-per-component cap) rather than one
+    long name — Linux's NAME_MAX is 255 and the absolute-path limit is 4096, so a 400-char state
+    dir is constructed as parent / subA / subB rather than parent / 'x'*400, which would itself
+    overflow NAME_MAX. The function does NOT need the dir to actually exist on disk for the
+    test that exercises the length bound — but it does need ``os.path.abspath`` to resolve the
+    same path both here and inside ``_stream_holder_sock_path``, which it does whether the dir
+    exists or not."""
+    parent_str = str(parent)
+    if len(parent_str) >= length:
+        return parent  # the parent already satisfies the requested length
+    # Fill the gap with as many 120-char nested subdirs as we need.
+    gap = length - len(parent_str)
+    cur = parent
+    while len(str(cur)) < length:
+        remaining = length - len(str(cur)) - 1  # -1 for the separator
+        chunk = "x" * min(120, max(1, remaining))
+        cur = cur / chunk
+    return cur
+
+
+def _short_runtime_dir(monkeypatch) -> Path:
+    """A SHORT writable directory the bound-shape tests can use as XDG_RUNTIME_DIR. Pytest's own
+    ``tmp_path`` is routinely 70+ chars deep on a Linux runner (``/tmp/pytest-of-<user>/pytest-NN/
+    test_<name>``), which itself crosses the Darwin 104-byte limit when a 34-char basename is
+    appended — so testing the bound against ``tmp_path`` would exercise the directory length,
+    not the derivation. This builds a fresh directory under ``tempfile.gettempdir()`` (which is
+    ``/tmp`` on Linux, ``$TMPDIR`` on macOS) with a unique short name; the parent path is
+    deliberately SHORT so the 34-char basename + the parent + the separator still fits under
+    the Darwin sun_path cap."""
+    base = Path(tempfile.gettempdir())
+    short = tempfile.mkdtemp(prefix="vlrt-", dir=str(base))
+    return Path(short)
+
+
+def test_stream_holder_sock_path_stays_inside_the_darwin_sun_path_limit(monkeypatch, tmp_path):
+    """The Darwin ``sun_path`` ceiling is 104 bytes; the OLD `os.path.join(state_dir, "speak-stream.sock")`
+    rode on the state dir's length and crossed 104 on macOS for a deep pytest tmp_path. The
+    derived path puts the socket in a short runtime/temp directory and bounds the basename
+    itself, so the result is inside the limit REGARDLESS of how deep the state dir is. This
+    test would FAIL on the OLD shape (the bound `os.path.join(state_dir, "speak-stream.sock")`
+    is `len(state_dir) + 1 + len("speak-stream.sock")`, and a 120-byte state dir already exceeds
+    104+18 = 122 chars) and PASSES after the change."""
+    # Use a SHORT runtime dir as XDG_RUNTIME_DIR — pytest's own tmp_path is 70+ chars deep on a
+    # Linux runner and would itself cross 104 when a 34-char basename is appended, masking the
+    # derivation's bound in directory noise. A short sibling isolates the test to the
+    # derivation's invariant: basename 34 chars + directory ≤ 69 chars ≤ 104 total.
+    runtime = _short_runtime_dir(monkeypatch)
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(runtime))
+    state_dir = _make_deep_state_dir(tmp_path, length=120)  # 120-byte absolute state dir
+    sock = speak._stream_holder_sock_path(str(state_dir))
+    assert len(sock.encode("utf-8")) <= _DARWIN_SUN_PATH_LIMIT, (
+        f"derived sock path {sock!r} is {len(sock)} bytes — Darwin sun_path caps at 104; "
+        "the path-shape fix failed to bound the result"
+    )
+    # The basename is the bounded part of the shape — must not echo the state dir verbatim.
+    assert os.path.dirname(sock) != str(state_dir)
+    # The basename mixes the state dir's hash so two deep dirs still resolve to the same
+    # directory but distinct paths.
+    assert "speak-stream-" in os.path.basename(sock)
+    assert sock.endswith(".sock")
+
+
+def test_stream_holder_sock_path_basename_is_bounded_regardless_of_state_dir_length(
+    monkeypatch, tmp_path,
+):
+    """Whatever the state dir's length, the basename is `speak-stream-` + 16 hex + `.sock`
+    (34 chars by construction). The bound carries the entire path inside the Darwin limit
+    because the directory itself is short. The OLD shape's basename was a fixed 17 chars but
+    sat under an UNBOUNDED directory — this test pins the new bounded-basename invariant."""
+    runtime = _short_runtime_dir(monkeypatch)
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(runtime))
+    for length in (80, 120, 200, 400):
+        state_dir = _make_deep_state_dir(tmp_path, length=length)
+        assert len(str(state_dir)) >= length, (
+            f"_make_deep_state_dir could not reach length {length}; got {str(state_dir)!r} "
+            f"({len(str(state_dir))} chars)"
+        )
+        sock = speak._stream_holder_sock_path(str(state_dir))
+        basename = os.path.basename(sock)
+        assert len(basename) == 34, (
+            f"basename {basename!r} is {len(basename)} chars at state_dir length {length}; "
+            "the bounded shape must hold regardless of state_dir depth"
+        )
+        # The 16-hex digest must come from the state dir, not be hardcoded — different state
+        # dirs at the same length still get distinct basenames.
+        digest_in_basename = basename[len("speak-stream-"):-len(".sock")]
+        expected_digest = hashlib.sha256(os.path.abspath(str(state_dir)).encode("utf-8")).hexdigest()[:16]
+        assert digest_in_basename == expected_digest
+
+
+def test_stream_holder_sock_path_is_stable_for_one_state_dir(monkeypatch, tmp_path):
+    """The single-constant property: the holder binds and the client connects, and the two must
+    resolve the SAME path for the SAME state dir. Drift between bind and connect would be a
+    silent socket-not-found failure rather than a loud error. Calling the function twice with
+    the same state dir pins that the derivation is deterministic — there is no place for bind
+    and connect to disagree except by both calling this function with the same arg."""
+    runtime = _short_runtime_dir(monkeypatch)
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(runtime))
+    state_dir = str(tmp_path / "instance-A")
+    first = speak._stream_holder_sock_path(state_dir)
+    second = speak._stream_holder_sock_path(state_dir)
+    assert first == second
+    # The module-level constant derives from the import-time _STATE_DIR; it must also match
+    # what a fresh call with the same state dir returns. (This is the drift guard: if a future
+    # refactor puts a different path in `_STREAM_HOLDER_SOCK` than the function computes, this
+    # catches it.)
+    monkeypatch.setattr(speak, "_STATE_DIR", state_dir)
+    monkeypatch.setattr(speak, "_STREAM_HOLDER_SOCK", speak._stream_holder_sock_path(state_dir))
+    assert speak._STREAM_HOLDER_SOCK == first
+
+
+def test_stream_holder_sock_path_differs_per_state_dir(monkeypatch, tmp_path):
+    """Per-instance isolation: every test gets its own tmp_path and therefore its own socket,
+    so two concurrent instances of the hook (two users on the same machine, two pytest runs in
+    parallel) do not collide. The OLD shape's `speak-stream.sock` was a fixed name and would
+    have collided across instances; the NEW shape hashes the state dir into the basename so
+    distinct state dirs always resolve to distinct paths."""
+    runtime = _short_runtime_dir(monkeypatch)
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(runtime))
+    a = speak._stream_holder_sock_path(str(tmp_path / "instance-A"))
+    b = speak._stream_holder_sock_path(str(tmp_path / "instance-B"))
+    assert a != b
+    # Sanity: each path still ends in the same bounded basename shape.
+    for path in (a, b):
+        basename = os.path.basename(path)
+        assert basename.startswith("speak-stream-") and basename.endswith(".sock")
+
+
+def test_stream_holder_sock_path_uses_xdg_runtime_dir_when_writable(monkeypatch, tmp_path):
+    """When XDG_RUNTIME_DIR is set and writable, the socket lives there — the per-user runtime
+    directory the spec mandates. On a typical Linux desktop this is /run/user/<uid>, which is
+    short and where a per-user socket belongs."""
+    runtime_dir = tmp_path / "runtime"
+    runtime_dir.mkdir()
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(runtime_dir))
+    sock = speak._stream_holder_sock_path(str(tmp_path / "state"))
+    assert os.path.dirname(sock) == str(runtime_dir)
+
+
+def test_stream_holder_sock_path_falls_back_to_tempfile_gettempdir_when_xdg_runtime_dir_unwritable(
+    monkeypatch, tmp_path,
+):
+    """When XDG_RUNTIME_DIR is set but unwritable (a stale mount, a chmod 000 directory), the
+    function falls back to ``tempfile.gettempdir()`` rather than failing the bind. On macOS
+    this resolves to the per-user ``$TMPDIR`` under ``/var/folders/.../T/`` — where the socket
+    belongs anyway, and which is the EXPECTED fallback on a machine that does not set
+    ``$XDG_RUNTIME_DIR`` at all.
+
+    The precondition for this test is that ``chmod 0o000`` actually makes the directory
+    unwritable: on Linux for a non-root user it does (and the assertion below is meaningful);
+    on root (``os.access(W_OK)`` returns True for root regardless of mode bits) and on Windows
+    (``chmod`` does not remove write access from a directory) it does not, and any future
+    filesystem where mode bits are advisory would join them. The skip predicate below uses
+    ``os.access(runtime_dir, os.W_OK)`` after the chmod — the same call the production code
+    uses — so a precondition that does not hold produces a skip, not a false negative. The
+    bounded-shape test above pins the real invariant on runners where this one cannot fire."""
+    runtime_dir = tmp_path / "unwritable"
+    runtime_dir.mkdir()
+    try:
+        os.chmod(runtime_dir, 0o000)
+        # If chmod 0o000 did not actually make the directory unwritable (root, Windows, or any
+        # filesystem where mode bits are advisory), the production predicate would still take
+        # its runtime_dir branch and the assertion below would fail on the wrong ground. Skip
+        # when the precondition does not hold — covers the same root case the previous gate did
+        # AND the Windows case the brief is about.
+        if os.access(runtime_dir, os.W_OK):
+            pytest.skip("XDG_RUNTIME_DIR is still writable after chmod 0o000 — the function's "
+                        "os.access(W_OK) predicate would take its runtime_dir branch here, so "
+                        "the fallback cannot be exercised (this happens as root, on Windows, "
+                        "and on any filesystem where mode bits are advisory). The bounded-shape "
+                        "test above pins the real invariant on those runners.")
+        monkeypatch.setenv("XDG_RUNTIME_DIR", str(runtime_dir))
+        sock = speak._stream_holder_sock_path(str(tmp_path / "state"))
+        assert os.path.dirname(sock) == tempfile.gettempdir(), (
+            f"XDG_RUNTIME_DIR is unwritable; the function must fall back to "
+            f"tempfile.gettempdir(), got {os.path.dirname(sock)!r}"
+        )
+    finally:
+        os.chmod(runtime_dir, 0o755)
+
+
+def test_stream_holder_sock_path_falls_back_when_xdg_runtime_dir_is_unset(monkeypatch, tmp_path):
+    """macOS does not set XDG_RUNTIME_DIR by default; the function must still produce a path,
+    and the directory must be a real temp directory (``tempfile.gettempdir()``, which on macOS
+    is the per-user $TMPDIR). This is the path the macOS CI leg #276 adds will exercise."""
+    monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
+    sock = speak._stream_holder_sock_path(str(tmp_path / "state"))
+    assert os.path.dirname(sock) == tempfile.gettempdir()
+    # And the result still satisfies the Darwin bound.
+    assert len(sock.encode("utf-8")) <= _DARWIN_SUN_PATH_LIMIT
+
+
+def test_module_level_stream_holder_sock_uses_the_derived_path(monkeypatch, tmp_path):
+    """The module-level `_STREAM_HOLDER_SOCK` is the SINGLE constant the holder binds and the
+    client connects to; it must be the function's output for the import-time `_STATE_DIR`, not
+    the OLD `os.path.join(_STATE_DIR, "speak-stream.sock")`. This pins the single-constant
+    property at the module level rather than just at the function level — a regression that
+    restored the OLD shape at the constant would not be caught by the function-level tests."""
+    # Reset to a known state dir and clear XDG_RUNTIME_DIR so the path lands in the tempdir.
+    monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
+    state_dir = str(tmp_path / "module-level-state")
+    monkeypatch.setattr(speak, "_STATE_DIR", state_dir)
+    # The module constant was already computed at import time using the ORIGINAL state dir.
+    # Compute what it MUST equal for the new state dir and assert the constant was derived
+    # through the function, not the OLD `os.path.join` shape.
+    expected = speak._stream_holder_sock_path(state_dir)
+    # The OLD shape would be `os.path.join(state_dir, "speak-stream.sock")` — that path
+    # contains the literal state dir as a prefix component, and its basename is the fixed
+    # "speak-stream.sock" (17 chars, no hex digest). The new shape's basename is 34 chars and
+    # mixes the state's hash. The module constant must look like the new shape.
+    assert os.path.basename(speak._STREAM_HOLDER_SOCK).startswith("speak-stream-")
+    assert not speak._STREAM_HOLDER_SOCK.endswith("speak-stream.sock"), (
+        "module-level _STREAM_HOLDER_SOCK still has the OLD basename — the single-constant "
+        "drift guard failed"
+    )
+    # And the same derivation applied to a fresh state dir gives the path the module would
+    # produce after the import-time monkeypatch — i.e. the function is the only place the
+    # path is computed.
+    assert speak._stream_holder_sock_path(state_dir) == expected

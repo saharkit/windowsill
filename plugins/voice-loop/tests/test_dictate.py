@@ -2055,7 +2055,11 @@ def test_cloud_stt_posts_the_documented_openai_transcription_shape(state, monkey
     (state / "dictate.wav").write_bytes(b"RIFFfakewav")
     fake = opener(b'{"text": " hello "}')
     monkeypatch.setenv("VOICE_LOOP_STT_API_KEY", "sk-secret")
-    s = dictate.resolve_settings({"stt": {"backend": "cloud", "endpoint": "https://api.example.com"}}, "Linux")
+    # windowsill#270: the host goes in ``stt.cloud.endpoint`` — the top-level ``stt.endpoint`` is
+    # rank 3 under the registry's default_host, and a self-hosted operator uses the cloud key.
+    s = dictate.resolve_settings(
+        {"stt": {"backend": "cloud", "cloud": {"endpoint": "https://api.example.com"}}}, "Linux"
+    )
     assert dictate.transcribe(s) == "hello"
 
     request, timeout = fake.requests[0]
@@ -2145,12 +2149,13 @@ def test_stt_prompt_in_config_reaches_the_openai_cloud_request(state, monkeypatc
     """windowsill#162, and the #159 shape on purpose: the builder-level include is pinned in
     test_providers.py (hand-built ``s``), but THIS test goes through ``resolve_settings`` from a real
     config dict — the exact shortcut that let #159's defect (a resolver collapsing a key) survive its
-    own test. A resolver that drops ``stt_prompt`` would pass the builder test and fail here."""
+    own test. A resolver that drops ``stt_prompt`` would pass the builder test and fail here.
+    windowsill#270: the host now lives under ``stt.cloud.endpoint``."""
     (state / "dictate.wav").write_bytes(b"RIFFfakewav")
     fake = opener(b'{"text": "ok"}')
     monkeypatch.setenv("VOICE_LOOP_STT_API_KEY", "sk-secret")
     s = dictate.resolve_settings(
-        {"stt": {"backend": "cloud", "endpoint": "https://api.example.com", "prompt": "kubectl, Acme"}},
+        {"stt": {"backend": "cloud", "cloud": {"endpoint": "https://api.example.com"}, "prompt": "kubectl, Acme"}},
         "Linux",
     )
     assert s["stt_prompt"] == "kubectl, Acme"  # the resolver carried the key through
@@ -2428,8 +2433,8 @@ def test_a_local_by_resolution_endpoint_is_classified_once_not_per_request(state
 
 
 def test_the_default_local_cloud_path_is_never_refused(state, monkeypatch, opener):
-    """The local voice-loop server on http://127.0.0.1 is the DEFAULT — a key over plaintext to
-    loopback is what the shipped configuration does, and the policy allows it."""
+    """windowsill#270: openai now has a remote default_host (``https://api.openai.com``); the test
+    still passes because https is not clear text — the policy guards the SCHEME, not the address."""
     (state / "dictate.wav").write_bytes(b"RIFFfakewav")
     fake = opener(b'{"text": " hello "}')
     monkeypatch.setenv("VOICE_LOOP_STT_API_KEY", "sk-secret")
@@ -2482,12 +2487,13 @@ def test_loopback_http_batch_endpoint_is_silent(state, monkeypatch, opener):
 
 
 def test_https_batch_endpoint_is_silent(state, monkeypatch, opener):
-    """A correctly configured https endpoint warrants no warning."""
+    """A correctly configured https endpoint warrants no warning. windowsill#270: the host now
+    lives under ``stt.cloud.endpoint`` so the config shape means what it reads."""
     (state / "dictate.wav").write_bytes(b"RIFFfakewav")
     fake = opener(b'{"text": " hello "}')
     monkeypatch.setenv("VOICE_LOOP_STT_API_KEY", "sk-secret")
     s = dictate.resolve_settings(
-        {"stt": {"backend": "cloud", "endpoint": "https://api.example.com"}}, "Linux"
+        {"stt": {"backend": "cloud", "cloud": {"endpoint": "https://api.example.com"}}}, "Linux"
     )
     assert dictate.transcribe(s) == "hello"
     assert "api key" not in _log_of(state).lower()
@@ -2500,9 +2506,11 @@ def test_https_batch_endpoint_is_silent(state, monkeypatch, opener):
 
 
 def test_an_unset_stt_endpoint_logs_misconfiguration_and_never_posts(state, monkeypatch):
-    """A cloud provider with no default host (openai, the OpenAI-compatible path) and no endpoint
-    used to build a relative URL that urllib turns into an opaque "unknown url type" — a network
-    error for "you have not configured an endpoint". The guard says that instead, before any post."""
+    """A cloud endpoint with no scheme or hostname used to build a relative URL that urllib turns
+    into an opaque "unknown url type" — a network error for "you have not configured an endpoint".
+    The guard says that instead, before any post. windowsill#270: openai's ``default_host`` is no
+    longer empty, so reaching this guard requires an UNPARSEABLE endpoint, not merely an unset
+    one. Keeping the guard reachable is what keeps the scripts/* 100% branch gate green."""
     monkeypatch.setenv("VOICE_LOOP_STT_API_KEY", "sk-secret")
     posts: list[tuple] = []
     monkeypatch.setattr(dictate, "_post_bytes", lambda *args, **kwargs: posts.append(args) or None)
@@ -2510,16 +2518,50 @@ def test_an_unset_stt_endpoint_logs_misconfiguration_and_never_posts(state, monk
         "stt_provider": "openai",
         "key_env": "VOICE_LOOP_STT_API_KEY",
         "key_file": "",
-        "cloud_endpoint": "",
+        # an UNPARSEABLE cloud_endpoint: a value with no scheme or hostname is the only way this
+        # guard is still reachable now that every registry row has a default host.
+        "cloud_endpoint": "not-a-url",
         "endpoint": "",
         "stt_model": "whisper-1",
         "language": "en",
         "timeout": 60.0,
     }
     assert dictate._transcribe_cloud(s, b"RIFFfakewav", "BOUND") is None
-    assert posts == [], "an unset endpoint must not reach the network"
+    assert posts == [], "an unparseable endpoint must not reach the network"
     log_text = (state / "dictate.log").read_text(encoding="utf-8")
-    assert "cloud stt: no endpoint for openai" in log_text
+    assert "cloud stt: no endpoint for openai — 'not-a-url' has no scheme or host" in log_text
+
+
+def test_a_cloud_request_whose_endpoint_resolved_to_loopback_logs_the_diagnosis(state, monkeypatch):
+    """windowsill#270, acceptance clause (h): a failed cloud STT whose endpoint resolved to a
+    local address logs the new line. The predicate reads ``.hostname`` so the port-suffixed
+    ``127.0.0.1:8355`` — the literal the ticket is about — fires the branch.
+    """
+    monkeypatch.setenv("VOICE_LOOP_STT_API_KEY", "sk-secret")
+    monkeypatch.setattr(dictate, "_post_bytes", lambda *args, **kwargs: None)
+    s = dictate.resolve_settings(
+        {"stt": {"backend": "cloud", "cloud": {"endpoint": "http://127.0.0.1:8355"}}}, "Linux"
+    )
+    # call _transcribe_cloud directly — transcribe() degrades to whisper and that path may run
+    # the LAN server with its own log lines, which is not the unit under test.
+    assert dictate._transcribe_cloud(s, b"RIFFfakewav", "BOUND") is None
+    log_text = _log_of(state)
+    assert "cloud stt: the endpoint resolved to a local address (127.0.0.1:8355)" in log_text
+
+
+def test_a_cloud_request_against_a_remote_endpoint_does_not_log_the_loopback_line(state, monkeypatch, opener):
+    """windowsill#270, clause (h) second half: a cloud POST against a REMOTE endpoint that fails
+    does NOT read the new line — only loopback resolutions do."""
+    monkeypatch.setenv("VOICE_LOOP_STT_API_KEY", "sk-secret")
+    # a successful POST to a remote endpoint — the line should not fire regardless.
+    (state / "dictate.wav").write_bytes(b"RIFFfakewav")
+    opener(b'{"text": "hello"}')
+    s = dictate.resolve_settings(
+        {"stt": {"backend": "cloud", "cloud": {"endpoint": "https://api.example.com"}}}, "Linux"
+    )
+    assert dictate.transcribe(s) == "hello"
+    log_text = _log_of(state)
+    assert "cloud stt: the endpoint resolved to a local address" not in log_text
 
 
 def _log_of(state) -> str:
