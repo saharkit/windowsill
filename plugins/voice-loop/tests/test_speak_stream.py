@@ -1599,19 +1599,31 @@ def test_stream_holder_sock_path_falls_back_to_tempfile_gettempdir_when_xdg_runt
     function falls back to ``tempfile.gettempdir()`` rather than failing the bind. On macOS
     this resolves to the per-user ``$TMPDIR`` under ``/var/folders/.../T/`` — where the socket
     belongs anyway, and which is the EXPECTED fallback on a machine that does not set
-    ``$XDG_RUNTIME_DIR`` at all. The unwritable check uses ``os.access(W_OK)``, which returns
-    True for root regardless of mode bits — so the test runs as non-root (the default for this
-    repo's suite); running as root would silently let the bad path through, which is why the
-    bound-shape invariant above is the load-bearing test."""
-    # ``chmod 000`` only bites for non-root; skip if we cannot exercise the fallback.
-    if hasattr(os, "geteuid") and os.geteuid() == 0:
-        pytest.skip("os.access returns True for root regardless of mode bits; the XDG_RUNTIME_DIR "
-                    "fallback cannot be exercised as root — the bounded-shape test above pins the "
-                    "real invariant")
+    ``$XDG_RUNTIME_DIR`` at all.
+
+    The precondition for this test is that ``chmod 0o000`` actually makes the directory
+    unwritable: on Linux for a non-root user it does (and the assertion below is meaningful);
+    on root (``os.access(W_OK)`` returns True for root regardless of mode bits) and on Windows
+    (``chmod`` does not remove write access from a directory) it does not, and any future
+    filesystem where mode bits are advisory would join them. The skip predicate below uses
+    ``os.access(runtime_dir, os.W_OK)`` after the chmod — the same call the production code
+    uses — so a precondition that does not hold produces a skip, not a false negative. The
+    bounded-shape test above pins the real invariant on runners where this one cannot fire."""
     runtime_dir = tmp_path / "unwritable"
     runtime_dir.mkdir()
     try:
         os.chmod(runtime_dir, 0o000)
+        # If chmod 0o000 did not actually make the directory unwritable (root, Windows, or any
+        # filesystem where mode bits are advisory), the production predicate would still take
+        # its runtime_dir branch and the assertion below would fail on the wrong ground. Skip
+        # when the precondition does not hold — covers the same root case the previous gate did
+        # AND the Windows case the brief is about.
+        if os.access(runtime_dir, os.W_OK):
+            pytest.skip("XDG_RUNTIME_DIR is still writable after chmod 0o000 — the function's "
+                        "os.access(W_OK) predicate would take its runtime_dir branch here, so "
+                        "the fallback cannot be exercised (this happens as root, on Windows, "
+                        "and on any filesystem where mode bits are advisory). The bounded-shape "
+                        "test above pins the real invariant on those runners.")
         monkeypatch.setenv("XDG_RUNTIME_DIR", str(runtime_dir))
         sock = speak._stream_holder_sock_path(str(tmp_path / "state"))
         assert os.path.dirname(sock) == tempfile.gettempdir(), (
