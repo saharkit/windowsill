@@ -839,27 +839,52 @@ def test_run_holder_serves_a_turn_and_self_exits_when_its_listener_closes(monkey
     outcome: dict = {}
 
     def client():
-        for _ in range(200):
-            if os.path.exists(sock_path):
-                break
-            time.sleep(0.01)
-        c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        c.settimeout(5.0)
-        c.connect(sock_path)
-        c.sendall((json.dumps({"text": "a line"}) + "\n").encode())
-        c.shutdown(socket.SHUT_WR)
-        received = b""
-        while b"event: end" not in received:
+        # EVERY exit from this thread MUST close the listener. It is the only thing that breaks the
+        # holder's accept loop, so a client that dies on the way — a slow bind, a refused connect —
+        # leaves run_holder blocked in accept() until pytest-timeout kills the whole test 30s later.
+        # That is what made this test flaky on the macOS leg: a bare 2s bind wait that fell THROUGH
+        # on expiry into a connect that could only fail, taking the listener close down with it.
+        # The timeout was never the fault; it was this test converting any client failure into a hang.
+        try:
+            # Wait for the listener OBJECT, not just the socket file: _bind_unix_listener binds
+            # (the file appears) before fake_bind appends, so the file existing is not yet proof
+            # that listener_ref[0] is readable. 20s, because a loaded macOS runner is slow and the
+            # cost of waiting is nothing next to the cost of a false red.
+            deadline = time.monotonic() + 20.0
+            while time.monotonic() < deadline:
+                if listener_ref and os.path.exists(sock_path):
+                    break
+                time.sleep(0.01)
+            else:
+                outcome["error"] = (
+                    f"listener never came up within 20s (file={os.path.exists(sock_path)}, "
+                    f"listener_ref={len(listener_ref)})"
+                )
+                return
+            c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            c.settimeout(5.0)
             try:
-                chunk = c.recv(65536)
-            except socket.timeout:
-                break
-            if not chunk:
-                break
-            received += chunk
-        outcome["sse"] = received
-        c.close()
-        listener_ref[0].close()  # closing the listener breaks the accept loop -> the holder exits
+                c.connect(sock_path)
+                c.sendall((json.dumps({"text": "a line"}) + "\n").encode())
+                c.shutdown(socket.SHUT_WR)
+                received = b""
+                while b"event: end" not in received:
+                    try:
+                        chunk = c.recv(65536)
+                    except socket.timeout:
+                        break
+                    if not chunk:
+                        break
+                    received += chunk
+                outcome["sse"] = received
+            finally:
+                c.close()
+        except BaseException as exc:  # noqa: BLE001 — reported as a test failure, never swallowed
+            outcome["error"] = f"{type(exc).__name__}: {exc}"
+        finally:
+            # closing the listener breaks the accept loop -> the holder exits
+            if listener_ref:
+                listener_ref[0].close()
 
     ct = threading.Thread(target=client)
     ct.start()
@@ -868,6 +893,8 @@ def test_run_holder_serves_a_turn_and_self_exits_when_its_listener_closes(monkey
         connect=fake_connect, clock=lambda: 0.0, sleep=lambda _: None, bind_socket=fake_bind,
     )
     ct.join(timeout=5.0)
+    assert not ct.is_alive(), "the client thread outlived the holder; it should have exited with it"
+    assert "error" not in outcome, f"the client thread failed: {outcome.get('error')}"
     assert rc == 0
     assert b"event: chunk" in outcome["sse"]
     assert b"event: end" in outcome["sse"]
