@@ -1882,7 +1882,10 @@ def test_a_repeat_burst_through_main_produces_exactly_one_recording_cycle(state,
     for _ in range(7):  # the OS repeats, immediately after
         assert dictate.main(["dictate.py"]) == 0
 
-    assert len(spawned) == 1  # one recorder…
+    # The recorder writes to state/dictate.wav — the macOS start cue writes to Pop.aiff, so the
+    # WAV path uniquely identifies the recorder spawn in the captured Popen list.
+    recorder_spawns = [argv for argv in spawned if str(state / "dictate.wav") in argv]
+    assert len(recorder_spawns) == 1  # one recorder…
     assert kills == []  # …never signalled: no repeat reached the stop branch at all
     assert (state / "dictate.pid").read_text(encoding="utf-8") == "4242"  # still recording
     assert notes.count("recording…") == 1
@@ -1999,7 +2002,10 @@ def test_debounce_ms_is_configurable_and_zero_disables_it(state, monkeypatch):
 
     assert dictate.main(["dictate.py"]) == 0
     assert dictate.main(["dictate.py"]) == 0  # with the guard off, back to the old raw behaviour
-    assert len(spawned) == 1
+    # The recorder writes to state/dictate.wav — the macOS start cue writes to Pop.aiff, so the
+    # WAV path uniquely identifies the recorder spawn in the captured Popen list.
+    recorder_spawns = [argv for argv in spawned if str(state / "dictate.wav") in argv]
+    assert len(recorder_spawns) == 1
     assert stopped == [FakeProc.pid]
 
 
