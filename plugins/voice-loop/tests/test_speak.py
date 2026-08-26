@@ -1592,9 +1592,15 @@ class _Stdin:
 class _NullPlayer:
     """A player process that plays nothing, instantly."""
 
-    def __init__(self) -> None:
+    def __init__(self, args: object = None) -> None:
         self.pid = os.getpid()  # a pid the pidfile writer can render; never signalled here
         self.returncode: int | None = None
+        # ``subprocess.run`` reads ``process.args`` to build its CompletedProcess — on EVERY path,
+        # not only the ``check=True`` raise — so a stand-in for ``Popen`` that omits it fails there.
+        # This only bites on darwin: ``contracts.pid_looks_like_speak`` reads /proc directly on
+        # linux and never spawns, but on darwin it goes through ``_ps_cmdline_of``, whose
+        # ``subprocess.run(["ps", ...])`` picks up this same monkeypatched Popen.
+        self.args = [] if args is None else args
 
     def wait(self) -> int:
         self.returncode = 0
@@ -1641,7 +1647,7 @@ def _record_speech(monkeypatch, on_synthesize=None) -> list[str]:
         return WAV_A
 
     monkeypatch.setattr(speak, "synthesize", fake_synthesize)
-    monkeypatch.setattr(speak.subprocess, "Popen", lambda argv, **kwargs: _NullPlayer())
+    monkeypatch.setattr(speak.subprocess, "Popen", lambda argv, **kwargs: _NullPlayer(argv))
     return spoken
 
 
@@ -3030,7 +3036,7 @@ def test_an_alert_the_stopped_speech_server_could_not_voice_is_retried_not_swall
     _contour_status(state, [_UNREACHABLE])
     refused = _RefusedOpener()
     monkeypatch.setattr(speak.urllib.request, "build_opener", lambda *handlers: refused)
-    monkeypatch.setattr(speak.subprocess, "Popen", lambda argv, **kwargs: _NullPlayer())
+    monkeypatch.setattr(speak.subprocess, "Popen", lambda argv, **kwargs: _NullPlayer(argv))
 
     speak.contour_check({}, 0.0)
 
@@ -3592,7 +3598,7 @@ def test_contour_no_player_leaves_the_alert_unannounced_to_be_retried(state, mon
 
     _contour_status(state, [_DEMOTED])
     monkeypatch.setattr(speak, "_get", lambda url, timeout: None)  # blob path
-    monkeypatch.setattr(speak.subprocess, "Popen", lambda argv, **kwargs: _DyingPlayer())
+    monkeypatch.setattr(speak.subprocess, "Popen", lambda argv, **kwargs: _DyingPlayer(argv))
     speak.contour_check({}, 0.0)
     assert not (state / "contour-announced").exists()
     assert "the page reached no player" in _speak_log(state)
