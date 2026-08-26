@@ -1647,7 +1647,24 @@ def _record_speech(monkeypatch, on_synthesize=None) -> list[str]:
         return WAV_A
 
     monkeypatch.setattr(speak, "synthesize", fake_synthesize)
-    monkeypatch.setattr(speak.subprocess, "Popen", lambda argv, **kwargs: _NullPlayer(argv))
+
+    # The fake replaces Popen on the MODULE, so it intercepts every spawn in the process — not just the
+    # player. On darwin that includes `contracts._ps_cmdline_of`, whose `ps` call is how
+    # `pid_looks_like_speak` decides whether a recorded pid is still playing. Answering it with a
+    # no-spawn stand-in returns an empty cmdline, so a LIVE child reads as dead and the wait exits
+    # early. That contradicts the premise these tests state in their own docstrings — "the liveness the
+    # wait hangs on is a real process" — and it is invisible on linux, where the same function reads
+    # /proc/<pid>/cmdline directly and never spawns at all.
+    #
+    # So the audio half fakes the AUDIO half only: `ps` goes to the real subprocess.
+    real_popen = speak.subprocess.Popen
+
+    def _player_only(argv, **kwargs):
+        if argv and str(argv[0]) == "ps":
+            return real_popen(argv, **kwargs)
+        return _NullPlayer(argv)
+
+    monkeypatch.setattr(speak.subprocess, "Popen", _player_only)
     return spoken
 
 
