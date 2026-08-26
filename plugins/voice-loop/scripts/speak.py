@@ -397,7 +397,39 @@ STREAM_HOLDER_READY_TIMEOUT = 6.0
 # is a RECONNECT TRIGGER: a mismatched digest respawns the holder with the new settings, because a
 # voice_settings change on a held socket may require reopening the stream.
 _STREAM_HOLDER_PID = os.path.join(_STATE_DIR, "speak-stream.pid")
-_STREAM_HOLDER_SOCK = os.path.join(_STATE_DIR, "speak-stream.sock")
+
+
+def _stream_holder_sock_path(state_dir: str) -> str:
+    """The path the stream holder binds and the client connects to. The bound path's length must
+    stay inside ``sockaddr_un.sun_path``: macOS caps it at 104 bytes, Linux at 108, and a deep
+    pytest ``tmp_path`` alone routinely reaches 80-95 chars on a macOS GitHub runner — adding the
+    socket basename pushes the previous ``os.path.join(state_dir, "speak-stream.sock")`` past 104
+    on Darwin while staying inside the Linux limit. Two design choices keep the length bounded
+    regardless of how long ``state_dir`` is:
+
+    * the directory is ``$XDG_RUNTIME_DIR`` when set and writable, otherwise
+      ``tempfile.gettempdir()`` — on macOS that resolves to the per-user ``$TMPDIR`` under
+      ``/var/folders/.../T/``, which is where the socket belongs anyway; it must NOT collapse to a
+      shared ``/tmp`` with a guessable name;
+    * the basename mixes the SHA-256 of the absolute state dir into its first 16 hex chars, so two
+      different state dirs still get two different socket paths (per-instance isolation the test
+      suite depends on — every test has its own ``tmp_path`` and therefore its own socket) but
+      the basename itself is bounded at ``speak-stream-`` + 16 hex + ``.sock``.
+
+    The state-dir arg is the SOLE input that distinguishes two callers with different state
+    dirs; everything else (env, tempdir) is ambient, which keeps bind and connect resolving to
+    the SAME constant for the SAME state dir — drift between the two would be a silent
+    socket-not-found failure."""
+    runtime_dir = os.environ.get("XDG_RUNTIME_DIR", "").strip()
+    if runtime_dir and os.path.isdir(runtime_dir) and os.access(runtime_dir, os.W_OK):
+        base_dir = runtime_dir
+    else:
+        base_dir = tempfile.gettempdir()
+    digest = hashlib.sha256(os.path.abspath(state_dir).encode("utf-8")).hexdigest()[:16]
+    return os.path.join(base_dir, f"speak-stream-{digest}.sock")
+
+
+_STREAM_HOLDER_SOCK = _stream_holder_sock_path(_STATE_DIR)
 
 # The event this invocation was fired for, recorded by main() the moment stdin is read so the
 # contour check can tell which path it is on. A module cell rather than a return value: main()'s
@@ -2044,6 +2076,7 @@ def _clear_stream_holder_pid() -> bool:
     try:
         os.unlink(_STREAM_HOLDER_PID)
     except OSError:
+        _stream_holder_pid_record = None
         return False
     _stream_holder_pid_record = None
     return True
