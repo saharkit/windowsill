@@ -1458,7 +1458,16 @@ jobs:
             coverage-sill-core-3.12
             coverage-sill-core-3.13
           )
-          found_dirs=$(ls -1 coverage-data/voice-loop 2>/dev/null || true)
+          # Both plugin directories, because the loop below checks BOTH lists: the
+          # sill-core artifacts land under coverage-data/sill-core, so listing only
+          # coverage-data/voice-loop made every SILL_EXPECTED name read as missing and
+          # the gate failed on the first of them, coverage-sill-core-3.10, while the
+          # artifact was demonstrably present on the run.
+          found_dirs=$(
+            { ls -1 coverage-data/voice-loop 2>/dev/null || true
+              ls -1 coverage-data/sill-core  2>/dev/null || true
+            }
+          )
           for expected in "${VOICE_EXPECTED[@]}" "${SILL_EXPECTED[@]}"; do
             if ! grep -qx "$expected" <<<"$found_dirs"; then
               echo "FAIL: expected coverage artifact $expected did not arrive"
