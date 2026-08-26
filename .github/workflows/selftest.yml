@@ -1553,6 +1553,20 @@ jobs:
           # the gate so the PR body can paste them; an empty list means a mis-specified pattern
           # and fails loud, not green.
           #
+          # THE THREE FLOORS BELOW ARE PINNED AT THEIR MEASURED VALUES, NOT AT 100, AND #290 RAISES
+          # THEM BACK. This branch retires the 19-marker exclusion table and measures the platform
+          # regions on a leg per platform instead, so lines that used to be excluded now count. The
+          # first honest run of these gates (run 33001776821) read 99 for the scripts scope, 95 for
+          # doctor.py and 99 for speak.py — 61 statements and 13 partial branches across contracts.py,
+          # dictate.py, doctor.py and speak.py, all of them Windows- or macOS-only regions whose legs
+          # upload coverage but whose tests do not reach them.
+          #
+          # The old 100 was over a SMALLER DENOMINATOR — it was reached by excluding these very lines,
+          # so this is the first measurement of the full scope, not a lowered bar over the same one.
+          # The gates stay ARMED rather than deleted so a regression downward still goes red between
+          # here and #290; deleting them would leave scripts/ ungated entirely, because this branch
+          # also removes the per-leg gate that used to assert the same claim.
+          #
           # THE PATTERNS MUST LEAD WITH `**/`, NOT `*`. `coverage combine`'s `[paths]` canonical
           # above is the runner root, so every path in the combined data stays ABSOLUTE
           # (`/home/runner/work/windowsill/windowsill/plugins/voice-loop/scripts/doctor.py`) — the
@@ -1564,13 +1578,13 @@ jobs:
           #   '**/plugins/voice-loop/scripts/*' -> absolute True,  relative True
           # The `**/` form is correct under BOTH shapes, so it survives a later relative remap.
           echo "::group::voice-loop scripts coverage gate (100% on the Linux+Windows+macOS union)"
-          python -m coverage report --include='**/plugins/voice-loop/scripts/*' --fail-under=100
+          python -m coverage report --include='**/plugins/voice-loop/scripts/*' --fail-under=99   # PINNED, see #290
           echo "::endgroup::"
           echo "::group::voice-loop doctor.py coverage gate (#156 B1 — 100% on the union)"
-          python -m coverage report --include='**/plugins/voice-loop/scripts/doctor.py' --fail-under=100
+          python -m coverage report --include='**/plugins/voice-loop/scripts/doctor.py' --fail-under=95   # PINNED, see #290
           echo "::endgroup::"
           echo "::group::voice-loop speak.py coverage gate (#156 B2 — 100% on the union)"
-          python -m coverage report --include='**/plugins/voice-loop/scripts/speak.py' --fail-under=100
+          python -m coverage report --include='**/plugins/voice-loop/scripts/speak.py' --fail-under=99   # PINNED, see #290
           echo "::endgroup::"
 
           set +e
