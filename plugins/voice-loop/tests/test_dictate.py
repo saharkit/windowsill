@@ -1394,7 +1394,10 @@ class TestPasteLock:
         _write_config(monkeypatch, state, {"dictate": {"recorder": "arecord", "debounce_ms": 0}})
 
         assert dictate.main(["dictate.py"]) == 0
-        assert len(spawned) == 1  # the recording started
+        # The recorder writes to state/dictate.wav — the macOS start cue writes to Pop.aiff, so the
+        # WAV path uniquely identifies the recorder spawn in the captured Popen list.
+        recorder_spawns = [argv for argv in spawned if str(state / "dictate.wav") in argv]
+        assert len(recorder_spawns) == 1  # the recording started
         assert not (state / "dictate-paste-lock").exists()  # stale lock was cleaned
 
     def test_stop_and_transcribe_claims_the_lock(self, state, monkeypatch):
@@ -1633,7 +1636,10 @@ def test_concurrent_toggles_start_exactly_one_recorder(state, monkeypatch):
         thread.join(timeout=10)
 
     assert sorted(rcs) == [0, 0]
-    assert len(spawned) == 1  # the loser spawned NOTHING onto the shared WAV
+    # The loser spawned NOTHING onto the shared WAV. On macOS the winner's start cue also
+    # reaches subprocess.Popen, so select the recorder argv by its WAV path before counting.
+    recorder_spawns = [argv for argv in spawned if str(state / "dictate.wav") in argv]
+    assert len(recorder_spawns) == 1  # the loser spawned NOTHING onto the shared WAV
     assert (state / "dictate.pid").read_text(encoding="utf-8") == "4242"
     assert sum("already starting" in message for message in notes) == 1
     assert notes.count("recording…") == 1
@@ -1666,7 +1672,8 @@ def test_dead_garbage_claim_older_than_the_grace_window_is_cleared(state, monkey
     monkeypatch.setattr(dictate, "note", lambda message, system: None)
     _write_config(monkeypatch, state, {"dictate": {"recorder": "arecord"}})
     assert dictate.main(["dictate.py"]) == 0
-    assert len(spawned) == 1
+    recorder_spawns = [argv for argv in spawned if str(state / "dictate.wav") in argv]
+    assert len(recorder_spawns) == 1
     assert pidfile.read_text(encoding="utf-8") == "4242"
 
 
@@ -1680,7 +1687,8 @@ def test_a_stale_dead_pid_is_removed_and_the_start_proceeds(state, monkeypatch):
     monkeypatch.setattr(dictate, "note", lambda message, system: None)
     _write_config(monkeypatch, state, {"dictate": {"recorder": "arecord"}})
     assert dictate.main(["dictate.py"]) == 0
-    assert len(spawned) == 1
+    recorder_spawns = [argv for argv in spawned if str(state / "dictate.wav") in argv]
+    assert len(recorder_spawns) == 1
     assert (state / "dictate.pid").read_text(encoding="utf-8") == "4242"
 
 
@@ -1874,7 +1882,10 @@ def test_a_repeat_burst_through_main_produces_exactly_one_recording_cycle(state,
     for _ in range(7):  # the OS repeats, immediately after
         assert dictate.main(["dictate.py"]) == 0
 
-    assert len(spawned) == 1  # one recorder…
+    # The recorder writes to state/dictate.wav — the macOS start cue writes to Pop.aiff, so the
+    # WAV path uniquely identifies the recorder spawn in the captured Popen list.
+    recorder_spawns = [argv for argv in spawned if str(state / "dictate.wav") in argv]
+    assert len(recorder_spawns) == 1  # one recorder…
     assert kills == []  # …never signalled: no repeat reached the stop branch at all
     assert (state / "dictate.pid").read_text(encoding="utf-8") == "4242"  # still recording
     assert notes.count("recording…") == 1
@@ -1991,7 +2002,10 @@ def test_debounce_ms_is_configurable_and_zero_disables_it(state, monkeypatch):
 
     assert dictate.main(["dictate.py"]) == 0
     assert dictate.main(["dictate.py"]) == 0  # with the guard off, back to the old raw behaviour
-    assert len(spawned) == 1
+    # The recorder writes to state/dictate.wav — the macOS start cue writes to Pop.aiff, so the
+    # WAV path uniquely identifies the recorder spawn in the captured Popen list.
+    recorder_spawns = [argv for argv in spawned if str(state / "dictate.wav") in argv]
+    assert len(recorder_spawns) == 1
     assert stopped == [FakeProc.pid]
 
 
@@ -3836,12 +3850,13 @@ class TestPreviewLifecycle:
 
 # --- coverage ratchet (windowsill#156 B3, round 3) -----------------------------------------------
 # Everything below was added to drive scripts/dictate.py's plain-Python control flow to 100% on
-# the Linux CI matrix. The three Windows-ctypes bodies remain on the allow-list as named
-# ``pragma: no cover`` markers; the __main__ guard is exercised here under TestMainGuard (runpy
-# in-process so coverage tracks it). Where the branch is an OSError or an error path, the
-# assertion is on the log() / note() call AND the specific fallback taken — not on the return
-# code alone. A test that only checks the return code would not catch a regression that swapped
-# "drop" for "refuse".
+# the Linux CI matrix. After #276 the three Windows-ctypes bodies are tagged
+# ``pragma: windows-only`` (documentation of what the Windows coverage leg is responsible for
+# exercising, not registered coverage exclusions); the __main__ guard is exercised here under
+# TestMainGuard (runpy in-process so coverage tracks it). Where the branch is an OSError or an
+# error path, the assertion is on the log() / note() call AND the specific fallback taken — not
+# on the return code alone. A test that only checks the return code would not catch a regression
+# that swapped "drop" for "refuse".
 
 
 def test_paste_plan_returns_empty_for_ydotool_without_enter():
@@ -4457,21 +4472,25 @@ def test_win_pid_is_recorder_plain_guard_returns_false():
 
 
 class TestPragmaCount:
-    """The enumerated allow-list: exactly three ``pragma: no cover`` markers, all on Windows-ctypes
-    bodies, nowhere else in the file. A count > 3 means a new exclusion slipped in undocumented; a
-    count < 3 means the file changed without updating the ratchet this test pins."""
+    """The enumerated allow-list: exactly three ``pragma: windows-only`` markers, all on Windows-ctypes
+    bodies, nowhere else in the file. After #276 these markers are NO LONGER coverage exclusions —
+    they are documentation of what the Windows coverage leg is responsible for exercising — but the
+    count must still be pinned so a future regression that grows the source-side enumeration (or
+    removes one of the markers and re-exposes the ctypes body, which has no other witness on Linux)
+    fails this test before it can drift unnoticed behind a green union 100%."""
 
-    def test_three_named_exclusions_on_dictate_py(self):
+    def test_three_named_windows_only_markers_on_dictate_py(self):
         text = Path(dictate.__file__).read_text(encoding="utf-8")
-        pragmas = [line for line in text.splitlines() if "pragma: no cover" in line]
+        pragmas = [line for line in text.splitlines() if "pragma: windows-only" in line]
         assert len(pragmas) == 3, (
-            f"dictate.py carries {len(pragmas)} 'pragma: no cover' markers, expected exactly 3. "
-            f"Each must be on a Windows-ctypes body and named in TESTING.md; a count higher means "
-            f"the allow-list grew silently, a lower means a doc-level change missed the suite."
+            f"dictate.py carries {len(pragmas)} 'pragma: windows-only' markers, expected exactly 3. "
+            f"Each must be on a Windows-ctypes body and named in TESTING.md's enumeration; a count "
+            f"higher means the source-side enumeration grew silently, a lower means the file "
+            f"changed without updating the ratchet this test pins."
         )
         # Every one names the same idea — a Windows kernel32 surface the Linux CI cannot reach —
-        # so a future exclusion on, say, "the clipboard-tiers' macOS branch" reads at once as
-        # wrong: the ratchet's purpose is to forbid those.
+        # so a future marker on, say, "the clipboard-tiers' macOS branch" reads at once as wrong:
+        # the ratchet's purpose is to forbid those.
         for line in pragmas:
             assert "Windows" in line, f"every pragma must name a Windows-only body; got: {line!r}"
 
@@ -4586,8 +4605,10 @@ class TestMainGuard:
 # Every test in this section exists to close a plain-Python branch that the refreshed coverage
 # measurement showed uncovered. Three windowsill#156 B3 rules apply throughout:
 #   - The Windows-ctypes bodies of _pid_alive / _win_console_ctrl_c / _win_pid_is_recorder carry
-#     exactly the three #pragma: no cover markers at the top of each, and ``TestPragmaCount`` is
-#     the assertion that the allow-list cannot quietly grow.
+#     exactly the three ``pragma: windows-only`` markers at the top of each (after #276's retag),
+#     and ``TestPragmaCount`` is the assertion that the source-side enumeration cannot quietly
+#     grow. These are NOT registered coverage exclusions any more — the Windows coverage leg
+#     actually exercises these bodies.
 #   - The __main__ guard at the bottom of the module is not on that list — its body is plain
 #     Python reachable in a real interpreter, so ``TestMainGuard`` proves it via runpy.
 #   - Where a branch is an OSError / error path, assert the log()/note() call AND the specific

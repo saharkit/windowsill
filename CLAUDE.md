@@ -79,23 +79,33 @@ queue's `merge_group` ref, and manual:
   context: `needs` all three real jobs, `if: always()`, and fails unless every needed result is
   `success` — one fixed-name check that reports on every run (matrix jobs publish per-leg
   display names, which is why the ruleset must not point at them).
-- **`coverage` job** — `cd plugins/voice-loop && pytest --cov --cov-report=term-missing`, on
-  Python **3.10, 3.11, 3.12 and 3.13**. `.coveragerc` sets `branch = True`, so the 100% is
-  **statements *and* branches**. Pytest runs *bare* (no `--cov-fail-under`): every coverage
-  threshold below is enforced by a separate `coverage report --include=… --fail-under=…` call
-  against the same `.coverage` artifact, so a regression in one scope cannot hide behind another's
-  threshold. The 100% gates are: `server/voice_server.py` (non-negotiable, never dropped),
-  **`scripts/doctor.py`** (round #156 B1 — the diagnose tool the user runs first when something is
-  wrong, so it cannot itself be the broken thing they hit) and **`scripts/speak.py`** (B2 of #156 —
-  the play-back / no-play / give-up paths and the cloud-TTS error-document branch are pinned in a
-  way mocks would not catch). The `scripts/*` gate sits at 100% of what is measurable on a Linux
-  runner; the exclusions are disclosed in `plugins/voice-loop/TESTING.md`. Windows-only statements
-  in `speak.py` that the Linux matrix cannot reach (the `msvcrt` byte-range lock, the
-  `ctypes.WinDLL` process probe) and the macOS-only `_ps_cmdline_of` helper that wraps `ps -p` are
-  excluded by the registered `pragma: windows-only` and `pragma: macos-only` markers in
-  `.coveragerc`, and the marker counts are pinned by tests so the allow-lists cannot silently grow
-  or shrink. The remaining hook scripts are deliberately *not* under a 100% gate — they are proven
-  by real invocation instead (see `plugins/voice-loop/TESTING.md`).
+- **`coverage` job** (the voice-loop Linux matrix leg) — `cd plugins/voice-loop && pytest --cov
+  --cov-report=term-missing`, on Python **3.10, 3.11, 3.12 and 3.13**. `.coveragerc` sets
+  `branch = True`, so the 100% is **statements *and* branches**. Pytest runs *bare* (no
+  `--cov-fail-under`): every coverage threshold below is enforced by a separate `coverage
+  report --include=… --fail-under=…` call against the same `.coverage` artifact, so a regression
+  in one scope cannot hide behind another's threshold. The 100% gate on this leg is
+  `server/voice_server*` (non-negotiable, never dropped, asserted on every leg that reaches it
+  — the Linux matrix, the Windows leg, and the macOS leg all do). The remaining hook scripts
+  are deliberately *not* under a per-leg 100% gate on this job: `scripts/*`, `scripts/doctor.py`
+  and `scripts/speak.py` were moved off this leg and onto the union (combined-coverage, below)
+  when voice-loop bought coverage legs per platform — platform code is MEASURED on the platform
+  leg that can reach it rather than excluded, and a single-platform gate here could only ever be
+  red. Each platform leg's coverage artifact is uploaded and named with a platform suffix
+  (`coverage-voice-loop-windows-3.12`, `coverage-voice-loop-macos-3.12`, alongside the Linux
+  `coverage-voice-loop-${{ matrix.python }}`); the explicit arrival list of every expected
+  artifact lives in `combined-coverage`'s compute step, so a leg that silently fails to upload
+  fails the job rather than lowering the percentage.
+- **`voice-loop-windows` job** — same suite on `windows-latest`, Python 3.12, with `--cov
+  --cov-report=term-missing` and an `upload-artifact` of `coverage-voice-loop-windows-3.12`.
+  This leg is what exercises the Windows-only statements (`msvcrt` byte-range lock, the
+  `ctypes.WinDLL("kernel32")` process probe, the Windows-only no-`killpg` arm, the
+  `_pid_alive` / `_win_console_ctrl_c` / `_win_pid_is_recorder` ctypes bodies in `dictate.py`,
+  the WSL/registry/profile-redaction bodies in `doctor.py`, and `_windows_process_is_live` in
+  `contracts.py`) — the regions the platform table #276 retired.
+- **`voice-loop-macos` job** — same shape on `macos-latest`, Python 3.12, with `--cov
+  --cov-report=term-missing` and an `upload-artifact` of `coverage-voice-loop-macos-3.12`.
+  This leg exercises the macOS-only `_ps_cmdline_of` helper that wraps `ps -p`.
 - **`loopback` job** — ubuntu/Russian and macOS/English lanes. Starts the **real server** and then
   runs **real-invocation smokes**: the `selftest.sh` TTS→STT loopback at `--strict --threshold 0.7`;
   the Stop-hook contract (asserts `via=stream` and `chunks>1`, so a silent regression to the blob
