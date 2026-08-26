@@ -505,8 +505,17 @@ def test_run_holder_main_refuses_for_a_provider_without_a_variant(monkeypatch, t
 @pytest.mark.skipif(not hasattr(socket, "AF_UNIX"), reason="the holder's socket is Unix-domain; Windows has no AF_UNIX to bind")
 def test_bind_unix_listener_creates_a_listener_and_drops_a_stale_file(tmp_path):
     """A leftover socket file from a crashed holder would make bind() fail; the bind removes any
-    stale file first, so a respawn always succeeds."""
-    path = str(tmp_path / "h.sock")
+    stale file first, so a respawn always succeeds. The path is the production shape
+    (``speak._stream_holder_sock_path``), not a raw ``tmp_path`` child — a deep tmp_path
+    alone crosses the Darwin sun_path cap of 104 bytes, which is what windowsill#276's macOS
+    leg red on. The hard assert below pins that invariant on the path actually about to be
+    bound: if the production derivation ever stops bounding, this test goes red — never
+    a silent skip keyed on a platform name."""
+    path = speak._stream_holder_sock_path(str(tmp_path))
+    assert len(path.encode("utf-8")) <= _DARWIN_SUN_PATH_LIMIT, (
+        f"bound sock path {path!r} is {len(path)} bytes — Darwin sun_path caps at 104; "
+        "_stream_holder_sock_path must bound the path or every bind red on macOS"
+    )
     open(path, "w").close()  # a stale file where the socket should go
     listener = speak._bind_unix_listener(path)
     try:
@@ -536,8 +545,14 @@ def test_bind_unix_listener_chmods_the_socket_to_owner_only(tmp_path):
     at all (the test is already skipped above). The skip predicate below mirrors the
     `XDG_RUNTIME_DIR` fallback test's pattern: a precondition that does not hold produces a
     skip, not a false negative, so this test cannot become a tautology on a runner where the
-    fix cannot be verified."""
-    path = str(tmp_path / "holder.sock")
+    fix cannot be verified. The path is the production shape
+    (``speak._stream_holder_sock_path``) — a deep tmp_path child would cross Darwin's 104-byte
+    sun_path cap; the hard assert pins the bound on the path actually about to be bound."""
+    path = speak._stream_holder_sock_path(str(tmp_path))
+    assert len(path.encode("utf-8")) <= _DARWIN_SUN_PATH_LIMIT, (
+        f"bound sock path {path!r} is {len(path)} bytes — Darwin sun_path caps at 104; "
+        "_stream_holder_sock_path must bound the path or every bind red on macOS"
+    )
     listener = speak._bind_unix_listener(path)
     try:
         mode = os.stat(path).st_mode & 0o777
@@ -792,8 +807,15 @@ def test_run_holder_serves_a_turn_and_self_exits_when_its_listener_closes(monkey
     """The daemon loop end to end: prime on the held socket, accept one per-turn connection, emit the
     SSE chunks, and exit cleanly when the listener goes (the shutdown path). Runs in the MAIN thread
     so its signal handlers install; the client runs in a thread and closes the listener to stop the
-    loop. Pins the accept/serve/keepalive-loop composition a unit test cannot reach (L6)."""
-    sock_path = str(tmp_path / "h.sock")
+    loop. Pins the accept/serve/keepalive-loop composition a unit test cannot reach (L6). The
+    sock path is the production shape (``speak._stream_holder_sock_path``) — a deep tmp_path
+    child would cross Darwin's 104-byte sun_path cap; the hard assert pins the bound on the
+    path actually about to be bound."""
+    sock_path = speak._stream_holder_sock_path(str(tmp_path))
+    assert len(sock_path.encode("utf-8")) <= _DARWIN_SUN_PATH_LIMIT, (
+        f"bound sock path {sock_path!r} is {len(sock_path)} bytes — Darwin sun_path caps at "
+        "104; _stream_holder_sock_path must bound the path or every bind red on macOS"
+    )
     monkeypatch.setattr(speak, "_STREAM_HOLDER_SOCK", sock_path)
     monkeypatch.setattr(speak, "_STREAM_HOLDER_PID", str(tmp_path / "h.pid"))
     listener_ref: list = []

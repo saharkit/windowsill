@@ -29,6 +29,19 @@ from pathlib import Path
 
 import pytest
 
+# Real ``subprocess.Popen`` captured at module load. The audio-only stand-in
+# (``_audio_only_popen``) is installed on top of ``subprocess.Popen`` by ``_record_speech``,
+# the same way production-style monkeypatching replaces attributes on the live module:
+# once that swap lands, ``subprocess.Popen`` IS ``_audio_only_popen`` and a fall-through that
+# name-resolves ``subprocess.Popen`` recurses into itself. The fix is to capture the real
+# stdlib constructor here, before any test has a chance to monkeypatch it, and reference the
+# captured closure from the stand-in's fall-through branch. ``speak.subprocess`` and
+# ``subprocess`` are the same module object, so a production ``subprocess.run`` call resolves
+# ``subprocess.Popen`` to whatever ``_REAL_POPEN`` references here — never to ``_audio_only_popen``
+# — which is what lets ``subprocess.run`` reach ``communicate`` / ``kill`` on a probe it did
+# not start.
+_REAL_POPEN = subprocess.Popen
+
 _SPEAK_PATH = Path(__file__).resolve().parents[1] / "scripts" / "speak.py"
 _spec = importlib.util.spec_from_file_location("speak", _SPEAK_PATH)
 speak = importlib.util.module_from_spec(_spec)
@@ -1589,6 +1602,16 @@ class _Stdin:
         return self._payload
 
 
+# Audio player binaries the production `_default_player` / `_player_argv` paths resolve to on
+# every supported platform. The Popen stand-in below discriminates on this set so the macOS `ps`
+# identity probe (``speak._ps_cmdline_of`` -> ``subprocess.run(["ps", ...])``) reaches the real
+# stdlib instead of a stand-in that lacks ``communicate`` / ``kill``. Keeping the set explicit
+# — rather than reading ``sys.platform`` — means the test never silently skips on a runner that
+# does not reach the darwin branch, and a new player that lands in `_default_player` shows up
+# here as a missing branch.
+_PLAYER_BINARIES = frozenset({"afplay", "aplay", "pw-play", "powershell.exe"})
+
+
 class _NullPlayer:
     """A player process that plays nothing, instantly."""
 
@@ -1614,6 +1637,37 @@ class _NullPlayer:
         return False
 
 
+def _is_player_argv(argv) -> bool:
+    """True only when this Popen would actually play audio — the argv's first element is the
+    resolved player binary. The macOS ``ps`` probe (``["ps", "-p", pid, "-o", "command="]``),
+    the stream-holder spawn (``[sys.executable, ...]``), and the local-command shell
+    (``["/bin/sh", "-c", ...]``) all fall through to the real stdlib, so ``subprocess.run``
+    can finish what it started."""
+    if not argv:
+        return False
+    return os.path.basename(str(argv[0])) in _PLAYER_BINARIES
+
+
+def _audio_only_popen(argv, **kwargs):
+    """Popen stand-in for the audio half only. The audio-player spawn goes to ``_NullPlayer``;
+    every other spawn — the macOS ``ps`` identity probe (``speak._ps_cmdline_of`` reaches this
+    via ``subprocess.run``), the stream-holder spawn in ``ensure_stream_holder``, the
+    ``/bin/sh -c`` shell in ``_play_local_command`` — goes to the real stdlib, so
+    ``communicate`` and ``kill`` are real. Discrimination is on the argv's resolved player
+    binary, not on ``sys.platform``: the test stays live on every runner that does or does
+    not reach the darwin branch.
+
+    The fall-through references ``_REAL_POPEN`` (the real stdlib constructor captured at module
+    load), NOT ``subprocess.Popen`` — and that is the whole point of the capture. ``_record_speech``
+    installs this stand-in as ``speak.subprocess.Popen``, so a name-resolved
+    ``return subprocess.Popen(...)`` here would dispatch back to ``_audio_only_popen`` itself and
+    recurse until ``RecursionError``. The capture short-circuits the lookup: the real stdlib is
+    reached even when ``subprocess.Popen`` IS the stand-in."""
+    if _is_player_argv(argv):
+        return _NullPlayer()
+    return _REAL_POPEN(argv, **kwargs)
+
+
 def _record_speech(monkeypatch, on_synthesize=None) -> list[str]:
     """Install the whole audio half as a recorder: what the hook decides to SAY, in order.
 
@@ -1630,7 +1684,7 @@ def _record_speech(monkeypatch, on_synthesize=None) -> list[str]:
         return WAV_A
 
     monkeypatch.setattr(speak, "synthesize", fake_synthesize)
-    monkeypatch.setattr(speak.subprocess, "Popen", lambda argv, **kwargs: _NullPlayer())
+    monkeypatch.setattr(speak.subprocess, "Popen", _audio_only_popen)
     return spoken
 
 
@@ -1666,6 +1720,100 @@ def test_null_player_supports_the_context_manager_protocol():
         assert entered.pid == player.pid
         assert entered.returncode is None  # the context body has not waited yet
     assert player.returncode is None, "__exit__ must NOT call wait() — the test double stays inert"
+
+
+def test_audio_only_popen_intercepts_only_audio_player_argv():
+    """Mutation gap (windowsill#276, fix(#276 blocker)): the macOS ``ps`` identity probe
+    (``subprocess.run(["ps", "-p", pid, "-o", "command="])``) reaches ``speak.subprocess.Popen``
+    THROUGH ``subprocess.run``'s internal lookup, so a double that swaps ``Popen`` for
+    ``_NullPlayer`` unconditionally also swallows the probe — and ``_NullPlayer`` lacks
+    ``communicate`` / ``kill``, which is exactly the AttributeError that reds the macOS leg of
+    ``test_a_line_written_while_the_previous_clip_plays_is_queued_not_dropped``. The discriminator
+    must keep the audio-player path faked and let every other spawn through to the real stdlib."""
+    # The audio-player branch: argv[0] is the resolved player binary the production code would
+    # spawn (``afplay`` on Darwin, ``aplay -q`` on Linux, ``pw-play`` with a sink, the Windows
+    # PowerShell player). The double must return _NullPlayer here — the whole point of
+    # ``_record_speech`` is to play nothing, instantly.
+    for binary in ("afplay", "aplay", "pw-play", "powershell.exe"):
+        argv = [binary, "/tmp/voice-loop-speak-abc.wav"]
+        if binary == "powershell.exe":
+            argv = [binary, "-NoProfile", "-Command", "(New-Object ...).PlaySync()"]
+        assert isinstance(_audio_only_popen(argv), _NullPlayer), (
+            f"audio player argv {argv!r} must be faked through _NullPlayer"
+        )
+    # The probe / spawn branch: argv[0] is NOT a player binary, so the double must fall through to
+    # the real stdlib Popen. The macOS probe, the stream-holder spawn (``[sys.executable, ...]``),
+    # and the local-command shell (``["/bin/sh", "-c", ...]``) all hit this branch — and only
+    # this branch makes the call have a real ``.communicate`` / ``.kill``. The stand-in's
+    # fall-through references the module-load-captured ``_REAL_POPEN`` (not ``subprocess.Popen``
+    # at call time), so the substitute lives on the captured name — that is the only name the
+    # fall-through can possibly resolve.
+    captured = []
+
+    class _Real:
+        def __init__(self, argv, **kwargs):
+            captured.append((argv, kwargs))
+
+    real_real = _REAL_POPEN
+    sys.modules[__name__]._REAL_POPEN = _Real  # type: ignore[assignment]
+    try:
+        for argv in (
+            ["ps", "-p", "12345", "-o", "command="],
+            [sys.executable, os.path.abspath(__file__), "stream-holder-arg", "digest"],
+            ["/bin/sh", "-c", "echo hi"],
+            [],
+        ):
+            _audio_only_popen(argv)
+            assert captured[-1][0] == argv, (
+                f"non-audio argv {argv!r} must reach the real Popen unchanged — captured {captured[-1]!r}"
+            )
+    finally:
+        sys.modules[__name__]._REAL_POPEN = real_real  # type: ignore[assignment]
+
+
+def test_audio_only_popen_falls_through_to_real_popen_in_production_substitution(monkeypatch):
+    """Companion to ``test_audio_only_popen_intercepts_only_audio_player_argv``: pins the
+    fall-through under the actual production installation. ``_record_speech`` swaps
+    ``speak.subprocess.Popen`` for ``_audio_only_popen`` itself — the same shape
+    ``monkeypatch.setattr`` uses in any test that wants the audio half recorded. The earlier
+    test exercises the stand-in against a third-party substitute (``_Real``) and would never
+    catch the recursion the production installation triggers, because a third-party substitute
+    has no chain back into ``_audio_only_popen``. The capture at module load
+    (``_REAL_POPEN``) is what keeps the fall-through safe under the production substitution;
+    this test pins that the capture works end-to-end through the real installation path."""
+    # Production-style installation: ``speak.subprocess.Popen`` IS ``_audio_only_popen``.
+    # A name-resolved ``return subprocess.Popen(...)`` inside the stand-in would now dispatch
+    # back into the stand-in itself and recurse to ``RecursionError``. We assert the call
+    # reaches the captured ``_REAL_POPEN`` instead, which is the closure the fall-through
+    # references precisely to avoid this recursion.
+    monkeypatch.setattr(speak.subprocess, "Popen", _audio_only_popen)
+    # Observe the fall-through without spawning a real subprocess: swap the captured
+    # ``_REAL_POPEN`` for a recording stub. The stand-in looks the name up in the test
+    # module's globals at call time, so swapping the captured name is what the call would
+    # actually reach in production once ``_record_speech`` has installed the stand-in.
+    captured = []
+
+    class _RealStub:
+        def __init__(self, argv, **kwargs):
+            captured.append((argv, kwargs))
+
+    monkeypatch.setattr(sys.modules[__name__], "_REAL_POPEN", _RealStub)
+    for argv in (
+        ["ps", "-p", "12345", "-o", "command="],
+        [sys.executable, os.path.abspath(__file__), "stream-holder-arg", "digest"],
+        ["/bin/sh", "-c", "echo hi"],
+        [],
+    ):
+        _audio_only_popen(argv)
+        assert captured[-1][0] == argv, (
+            f"non-audio argv {argv!r} must reach the captured _REAL_POPEN unchanged "
+            f"under the production substitution — captured {captured[-1]!r}"
+        )
+    # The audio-player branch still goes to ``_NullPlayer`` under the production substitution;
+    # otherwise the recording tests would lose the audio half they exist to record.
+    assert isinstance(_audio_only_popen(["afplay", "/tmp/voice-loop-speak-abc.wav"]), _NullPlayer), (
+        "audio player argv must still be faked through _NullPlayer under the production substitution"
+    )
 
 
 def test_eager_stays_a_no_op_until_it_is_opted_into(state, monkeypatch):
@@ -3033,7 +3181,7 @@ def test_an_alert_the_stopped_speech_server_could_not_voice_is_retried_not_swall
     _contour_status(state, [_UNREACHABLE])
     refused = _RefusedOpener()
     monkeypatch.setattr(speak.urllib.request, "build_opener", lambda *handlers: refused)
-    monkeypatch.setattr(speak.subprocess, "Popen", lambda argv, **kwargs: _NullPlayer())
+    monkeypatch.setattr(speak.subprocess, "Popen", _audio_only_popen)
 
     speak.contour_check({}, 0.0)
 
