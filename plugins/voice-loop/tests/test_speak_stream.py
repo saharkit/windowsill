@@ -517,6 +517,47 @@ def test_bind_unix_listener_creates_a_listener_and_drops_a_stale_file(tmp_path):
         listener.close()
 
 
+@pytest.mark.skipif(not hasattr(socket, "AF_UNIX"), reason="the holder's socket is Unix-domain; Windows has no AF_UNIX to bind")
+def test_bind_unix_listener_chmods_the_socket_to_owner_only(tmp_path):
+    """windowsill#285, security reviewer #30262: the derived `_stream_holder_sock_path` falls
+    back to ``tempfile.gettempdir()`` when ``$XDG_RUNTIME_DIR`` is unset/unwritable — on Linux
+    that is /tmp, world-traversable. ``bind()`` creates the socket inode with mode 0o666 &
+    ~umask (0o644 under the typical umask 0o022), so any local user that discovers the hashed
+    basename could connect and trigger ElevenLabs synthesis billed to the legitimate user.
+    ``_bind_unix_listener`` must therefore tighten the mode to 0o600 after bind.
+
+    The test places the socket in a ``tempfile.gettempdir()``-style location (tmp_path is
+    close enough for the mode assertion; the path derivation itself is covered by the
+    ``_stream_holder_sock_path`` tests) and asserts the bound socket file's mode bits are
+    owner-only — no group, no other.
+
+    The precondition for the assertion is that ``os.chmod`` actually reduces access on this
+    runner: on root (mode bits are advisory) it does not, and on Windows there is no AF_UNIX
+    at all (the test is already skipped above). The skip predicate below mirrors the
+    `XDG_RUNTIME_DIR` fallback test's pattern: a precondition that does not hold produces a
+    skip, not a false negative, so this test cannot become a tautology on a runner where the
+    fix cannot be verified."""
+    path = str(tmp_path / "holder.sock")
+    listener = speak._bind_unix_listener(path)
+    try:
+        mode = os.stat(path).st_mode & 0o777
+        # Sanity: chmod 0o600 takes effect on this runner — if it doesn't (root, or any
+        # filesystem where mode bits are advisory), the assertion below would fail on the
+        # wrong ground. Skip when the precondition does not hold.
+        if mode & 0o077:
+            pytest.skip(
+                f"bound socket mode is {oct(mode)} — chmod 0o600 did not remove group/other "
+                "access on this runner (happens as root and on any filesystem where mode "
+                "bits are advisory); the fix's effect cannot be verified here."
+            )
+        assert mode == 0o600, (
+            f"bound socket mode is {oct(mode)}, expected 0o600 — the chmod(0o600) after bind "
+            "is missing or not taking effect (windowsill#285, security reviewer #30262)"
+        )
+    finally:
+        listener.close()
+
+
 def test_an_exiting_holder_spares_the_socket_its_replacement_rebound(holder_state):
     """The generation fence on the exit unlink: a SIGTERMed holder reaches its exit up to one
     accept-timeout AFTER its replacement rebound the same socket path, so the unlink must not

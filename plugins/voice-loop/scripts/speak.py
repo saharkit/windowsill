@@ -2279,6 +2279,14 @@ def _bind_unix_listener(path: str):
         raise OSError("Unix-domain sockets are unavailable on this platform")
     listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     listener.bind(path)
+    # The derived `_stream_holder_sock_path` falls back to ``tempfile.gettempdir()`` when
+    # ``$XDG_RUNTIME_DIR`` is unset/unwritable — on Linux that is /tmp, world-traversable.
+    # bind() creates the inode with mode 0o666 & ~umask, which is 0o644 under the typical
+    # umask 0o022 — any local user that discovers the hashed basename could connect and
+    # trigger ElevenLabs synthesis billed to the legitimate user (windowsill#285, security
+    # reviewer #30262). Tighten the mode to owner-only on every bind; this is the only
+    # socket file the holder creates.
+    os.chmod(path, 0o600)
     listener.listen(1)
     return listener
 
