@@ -1683,9 +1683,34 @@ jobs:
           path, measured = sys.argv[1], sys.argv[2]
           value = int(measured)
           floor = int(os.environ["SHELF_COVERAGE_FLOOR"])
+
+          def color_for(v: int, f: int) -> str:
+              # ONE implementation, used by both the self-check below and the badge that gets written.
+              # Two copies of a rule are two rules, and the check would stop meaning anything.
+              return "brightgreen" if v >= min(f + 5, 100) else "yellow" if v >= f else "red"
+
           # Red below the gate floor, yellow for the narrow passing band just above it, green with headroom —
           # the badge must never read yellow-or-green at a coverage the gate rejects.
-          color = "brightgreen" if value >= floor + 5 else "yellow" if value >= floor else "red"
+          #
+          # The green threshold is CAPPED AT 100 because coverage is a percentage and stops there while
+          # `floor + 5` does not. Without the cap, ratcheting the floor to 96 or above puts green out of
+          # reach for good: at the floor of 99 this shelf now runs, green would begin at 104, and the
+          # badge published for a measured 100% read `"color": "yellow"` — a warning colour at a perfect
+          # score, on a public README. A ratchet whose reward for reaching the top is a warning is
+          # arguing against its own purpose.
+          color = color_for(value, floor)
+          # Self-check the projection at its three boundaries before writing anything. This is the one
+          # step in the coverage pipeline with nothing checking it — the gate is tested, the combined
+          # artifact is tested, the colour was not, which is how an unreachable green threshold shipped
+          # to a public README unnoticed. Cheap, runs on every publish, fails loudly.
+          bands = {
+              "below the floor is red": color_for(floor - 1, floor) == "red",
+              "at the floor is yellow": color_for(floor, floor) == "yellow",
+              "a perfect score is green": color_for(100, floor) == "brightgreen",
+          }
+          broken = [name for name, ok in bands.items() if not ok]
+          if broken:
+              sys.exit("badge colour projection is broken at floor %d: %s" % (floor, "; ".join(broken)))
           with open(path, "w", encoding="utf-8") as fh:
               json.dump({"schemaVersion": 1, "label": "coverage", "message": f"{value}%", "color": color}, fh)
               fh.write("\n")
