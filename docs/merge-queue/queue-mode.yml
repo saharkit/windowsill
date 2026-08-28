@@ -1,0 +1,154 @@
+name: queue-mode
+
+# The instrument for the merge-queue build-count question. One workflow measures every cell of the
+# grid: the MODE comes from the repository variable `QUEUE_MODE`, the grouping strategy comes from the
+# ruleset, so a cell is (QUEUE_MODE x grouping_strategy x where-the-breakage-is) and every cell runs
+# byte-identical workflow code. A difference in outcome can never be a difference in the instrument.
+#
+# THE MODES
+#   always  — every candidate runs the expensive suite. N runs for N pull requests. Today's behaviour.
+#   skip    — a non-head candidate reports green WITHOUT running. REFUTED: it merges broken code, under
+#             both grouping strategies. Kept so the refutation is reproducible; never a real choice.
+#   wait    — a non-head candidate stays on the cheap runner and skips only once a deeper entry reads
+#             MERGEABLE. Sound, and it DEADLOCKS: a red head that is not promptly ejected holds every
+#             shallower candidate.
+#   atomic  — a non-head candidate mirrors the deepest verdict it can see. Deeper green means skip;
+#             deeper RED means red immediately and the whole batch falls together; no deeper means run.
+#             Sound under both strategies, and with HEADGREEN the bad batch clears at once.
+#
+# THE COST MODEL, which is the whole point.
+# `decide` and `gate` run on the CHEAP github-hosted pool; `suite` stands in for the SCARCE self-hosted
+# one. A job whose `if` is false is NEVER DISPATCHED and claims no slot at all — strictly stronger than
+# switching `runs-on`, which still claims one. The saving is not fewer runs (GitHub decides that) but
+# N-1 of N runs costing seconds on a runner you have plenty of instead of the length of the suite on a
+# runner you have four of.
+#
+# `gate` with `if: always()` is not decoration: a skipped REQUIRED check leaves the queue waiting
+# forever, so one context that always reports is what makes any of this legal.
+
+on:
+  pull_request:
+  merge_group:
+
+permissions:
+  contents: read
+  checks: read
+  pull-requests: read
+
+jobs:
+  decide:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      verdict: ${{ steps.place.outputs.verdict }}
+      mode: ${{ steps.place.outputs.mode }}
+    steps:
+      - name: Decide what this candidate owes
+        id: place
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          QUEUE_MODE: ${{ vars.QUEUE_MODE }}
+        run: |
+          set -euo pipefail
+          mode="${QUEUE_MODE:-always}"
+          echo "mode=$mode" >> "$GITHUB_OUTPUT"
+          echo "MODE $mode event=${GITHUB_EVENT_NAME}"
+
+          if [ "${GITHUB_EVENT_NAME}" != "merge_group" ] || [ "$mode" = "always" ]; then
+            echo "DECIDE verdict=RUN reason=${GITHUB_EVENT_NAME}/mode=$mode"
+            echo "verdict=RUN" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+
+          # The candidate ref carries its own PR number: gh-readonly-queue/<base>/pr-NN-<sha>
+          me="$(printf '%s' "${GITHUB_REF#refs/heads/}" | sed -n 's|.*/pr-\([0-9]\+\)-.*|\1|p')"
+          echo "DECIDE self_pr=${me:-UNKNOWN}"
+          if [ -z "$me" ]; then
+            echo "DECIDE verdict=RUN reason=no-pr-number (fail safe)"
+            echo "verdict=RUN" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+
+          # One loop serves all three deciding modes: `skip` simply never returns HOLD.
+          for attempt in $(seq 1 60); do
+            gh api graphql -f query='
+              query($owner:String!, $name:String!) {
+                repository(owner:$owner, name:$name) {
+                  mergeQueue { entries(first:50) { nodes {
+                    position state pullRequest { number }
+                  } } }
+                }
+              }' -F owner="${GITHUB_REPOSITORY%/*}" -F name="${GITHUB_REPOSITORY#*/}" > q.json || echo '{}' > q.json
+
+            v="$(python3 - "$me" "$mode" "$attempt" <<'PY'
+          import json, sys
+          me, mode, attempt = sys.argv[1], sys.argv[2], sys.argv[3]
+          def say(m): print(m, file=sys.stderr)
+          try:
+              nodes = json.load(open("q.json"))["data"]["repository"]["mergeQueue"]["entries"]["nodes"]
+          except Exception as exc:
+              say(f"DECIDE[{attempt}] queue_read=FAILED {type(exc).__name__} -> RUN (fail safe)")
+              print("RUN"); raise SystemExit(0)
+          nodes = [n for n in nodes if n.get("position") is not None]
+          nodes.sort(key=lambda n: n["position"])
+          mine = [n for n in nodes if str(n["pullRequest"]["number"]) == me]
+          if not mine:
+              say(f"DECIDE[{attempt}] self=NOT_IN_QUEUE -> RUN (fail safe)")
+              print("RUN"); raise SystemExit(0)
+          pos = mine[0]["position"]
+          deeper = [n for n in nodes if n["position"] > pos]
+          say(f"DECIDE[{attempt}] mode={mode} self_position={pos} total={len(nodes)} deeper={len(deeper)}")
+          for n in deeper:
+              say(f"DECIDE[{attempt}]   deeper pos={n['position']} state={n['state']} pr={n['pullRequest']['number']}")
+          if not deeper:
+              say(f"DECIDE[{attempt}] verdict=RUN reason=head-its-tree-is-what-lands")
+              print("RUN"); raise SystemExit(0)
+          if mode == "skip":
+              say(f"DECIDE[{attempt}] verdict=SKIP reason=a-deeper-candidate-EXISTS (refuted mode)")
+              print("SKIP"); raise SystemExit(0)
+          if mode == "atomic" and any(n["state"] == "UNMERGEABLE" for n in deeper):
+              bad = [n["pullRequest"]["number"] for n in deeper if n["state"] == "UNMERGEABLE"]
+              say(f"DECIDE[{attempt}] verdict=FAIL reason=deeper-red pr={bad} -- the batch falls together")
+              print("FAIL"); raise SystemExit(0)
+          if any(n["state"] == "MERGEABLE" for n in deeper):
+              ok = [n["pullRequest"]["number"] for n in deeper if n["state"] == "MERGEABLE"]
+              say(f"DECIDE[{attempt}] verdict=SKIP reason=deeper-green pr={ok}")
+              print("SKIP"); raise SystemExit(0)
+          say(f"DECIDE[{attempt}] verdict=HOLD reason=deeper-undecided")
+          print("HOLD")
+          PY
+          )"
+            case "$v" in
+              RUN|SKIP|FAIL) echo "verdict=$v" >> "$GITHUB_OUTPUT"; exit 0 ;;
+              *) sleep 15 ;;
+            esac
+          done
+          echo "DECIDE verdict=RUN reason=timed-out (fail safe)"
+          echo "verdict=RUN" >> "$GITHUB_OUTPUT"
+
+  suite:
+    needs: decide
+    if: needs.decide.outputs.verdict == 'RUN'
+    runs-on: ubuntu-latest          # stands in for the EXPENSIVE pool
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash ci/check.sh
+
+  gate:
+    needs: [decide, suite]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Report the one context the queue waits on
+        run: |
+          set -euo pipefail
+          v="${{ needs.decide.outputs.verdict }}"
+          echo "gate: mode=${{ needs.decide.outputs.mode }} decide=${{ needs.decide.result }} suite=${{ needs.suite.result }} verdict=$v"
+          if [ "${{ needs.decide.result }}" != "success" ]; then
+            echo "gate: RED — the decision itself failed"; exit 1
+          fi
+          if [ "$v" = "FAIL" ]; then
+            echo "gate: RED — a deeper candidate is red and this batch is atomic"; exit 1
+          fi
+          if [ "$v" = "RUN" ] && [ "${{ needs.suite.result }}" != "success" ]; then
+            echo "gate: RED — the suite ran and did not pass"; exit 1
+          fi
+          echo "gate: GREEN"
