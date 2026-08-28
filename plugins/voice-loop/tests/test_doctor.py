@@ -1789,7 +1789,6 @@ class TestDecodeWindowsOutputUtf16:
     need no Windows at all — the marker on the branch says "Windows-only" about the SOURCE of the
     bytes, not about the code that decodes them."""
 
-    @pytest.mark.skip(reason="PROBE ONLY — proves the coverage floor refuses; never merge")
     def test_a_bom_marked_stream_is_read_as_utf16_and_loses_the_bom(self) -> None:
         """A regression that dropped the UTF-16 attempt would decode ``wsl.exe``'s output as UTF-8
         with replacements: every distro name would arrive interleaved with NULs and no name would
