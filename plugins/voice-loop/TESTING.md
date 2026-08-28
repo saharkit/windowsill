@@ -63,8 +63,10 @@ Retiring the exclusion table put the platform regions into the denominator for t
 the numbers were pinned at what the first honest run measured; #277 then wrote the tests and raised
 the two that reached. `dictate.py`'s residue is closed too now, so the `scripts/*` floor is below
 what the union measures and is due a ratchet the next time the gate prints a figure.
-What is still short, and why, is stated below under *What the union does not reach* — as a
-disclosure rather than as an exclusion, which is the whole point of #276. The rest of `scripts/` — `dictate.py`, `contour_poll.py`,
+
+What each leg reaches, and what is left to the union, is stated below under *What the union does
+not reach* — as a disclosure rather than as an exclusion, which is the whole point of #276.
+The rest of `scripts/` — `dictate.py`, `contour_poll.py`,
 `contracts.py`, `doctor.py`, `providers.py`, `report_bug.py`, `install_ledger.py`, `preview.py`,
 `rvc_corpus.py`, `tls-probe.py`, `wsclient.py`, the `voice-loop-dictate` entry point — sits
 under that gate. There is no platform-exclusion table: every region that ships enters the
