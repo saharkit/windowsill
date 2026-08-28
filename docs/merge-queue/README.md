@@ -90,7 +90,7 @@ itself genuinely red.
 |---|---|---|
 | `always` | sound, resolves, **4 expensive runs** | sound, resolves, **4 expensive runs** |
 | `skip` | **REFUTED — merged a red tree** | **REFUTED — merged a red tree** |
-| `wait` | sound, **DEADLOCK** | not yet measured — the one open cell |
+| `wait` | sound, **DEADLOCK** | sound, **DEADLOCK** |
 | `atomic` | **sound, resolves** | **sound, resolves, and clears fastest** |
 
 **`skip` merges broken code, and the mechanism is not the one you would guess.** It is not an ejection
@@ -99,10 +99,15 @@ merges **the largest green PREFIX** — and a no-op has made "green" mean "did n
 at 5m34s and 5m36s after enqueue. Verified by hand on the candidate ref before the merge and on the
 base branch after it: the suite exits 1 on both.
 
-**`wait` is sound and deadlocks.** A shallow candidate that skips only once a deeper entry reads
-MERGEABLE never issues green on credit — so at timer expiry there is no green prefix and nothing
-merges. But a red head that GitHub does not promptly eject holds every shallower candidate, and the
-whole batch sits unchanged until a timeout.
+**`wait` is sound and deadlocks, under both strategies.** A shallow candidate that skips only once a
+deeper entry reads MERGEABLE never issues green on credit — so at timer expiry there is no green prefix
+and nothing merges. But a red head that GitHub does not promptly eject holds every shallower candidate,
+and the whole batch sits unchanged until a timeout.
+
+`HEADGREEN` was the plausible escape: if only the head gates, a red head might be ejected promptly and
+the deadlock would be a property of collecting every verdict rather than of waiting. It is not. Under
+both strategies the batch sat with three entries at `AWAITING_CHECKS` and the fourth already
+`UNMERGEABLE`, and nothing moved for the whole watch. The deadlock belongs to the mode.
 
 **`atomic` is the answer.** A shallow candidate mirrors the deepest verdict it can see: deeper green
 means skip, **deeper red means red immediately**, no deeper means run. The only green ever issued
@@ -117,6 +122,14 @@ four.
 
 **Neither half is sufficient alone.** `HEADGREEN` without `atomic` merges broken code exactly as
 `ALLGREEN` does. `atomic` without `HEADGREEN` is correct but slower to clear.
+
+**The table does not move when the batch gets worse.** The same modes were run again with three of the
+four members red, and again with all four, under both strategies. Every soundness verdict is
+unchanged; `always` and `atomic` still return the queue to empty and `wait` still returns it to empty
+in no cell at any density. What the denser batches add is a negative worth stating: past a certain
+amount of red there is no green prefix longer than one, so the grouping strategy has nothing left to
+choose between and the two columns become literally identical. The strategy earns its keep on the
+ordinary shape, not on the bad one.
 
 ---
 
@@ -144,6 +157,11 @@ the watch window. Same word, two opposite meanings. The fix was to measure wheth
 shrank — and then to re-run the affected cells at one common ceiling rather than caveating the
 difference in prose, because a caveat is not a controlled variable.
 
+Both re-runs returned the verdict their originals had. The correction changed no conclusion, and it
+was still the right spend: before it, two cells in the table had been watched for less time than the
+cells they were being compared against, and a table whose squares were not measured the same way is
+not a grid — it is a list of results that happen to share a border.
+
 ---
 
 ## What this does NOT establish
@@ -153,7 +171,6 @@ difference in prose, because a caveat is not a controlled variable.
   group could be re-queued without the accused candidate, one attempt per accusation instead of a
   bisection. A wrong accusation would cost one more attempt and could never cost a broken base branch,
   because the safety is not in the attribution. That is reasoning, not measurement.
-- **Whether `wait` deadlocks under `HEADGREEN` too.** Under that strategy only the head gates, so a red head might be ejected promptly and the deadlock might be a property of `ALLGREEN` rather than of waiting. That cell is the one square of the grid still open, and it is named here rather than quietly omitted.
 - **`wait`'s deadlock cause.** What was measured is that a candidate GitHub had already marked
   UNMERGEABLE sat in the queue while every shallower candidate held. *Why* GitHub leaves it there is
   unknown.
