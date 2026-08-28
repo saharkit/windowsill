@@ -1566,27 +1566,28 @@ jobs:
           # the gate so the PR body can paste them; an empty list means a mis-specified pattern
           # and fails loud, not green.
           #
-          # THE THREE FLOORS BELOW ARE PINNED AT MEASURED VALUES, NOT AT 100. #276 retired the
-          # 19-marker exclusion table and measures the platform regions on a leg per platform
-          # instead, so lines that used to be excluded now count. The first honest run of these
-          # gates read 99 for the scripts scope, 95 for doctor.py and 99 for speak.py — 61 statements
-          # and 13 partial branches across contracts.py, dictate.py, doctor.py and speak.py, all of
-          # them Windows- or macOS-only regions whose legs upload coverage but whose tests did not
-          # reach them.
+          # THE THREE FLOORS BELOW ARE ALL AT 100, AND EACH ONE MOVED THERE OVER A FIGURE THIS JOB
+          # HAD ALREADY PRINTED — the only way a floor here is ever allowed to move. #276 retired
+          # the 19-marker exclusion table and measures the platform regions on a leg per platform
+          # instead, so lines that used to be excluded now count. The first honest run read 99 for
+          # the scripts scope, 95 for doctor.py and 99 for speak.py — 61 statements and 13 partial
+          # branches across contracts.py, dictate.py, doctor.py and speak.py, all of them Windows-
+          # or macOS-only regions whose legs upload coverage but whose tests did not reach them.
           #
           # #277 wrote those tests — the kernel32 handle probes and the winreg distro scan on the
           # Windows leg, the no-WinDLL guards on the legs that have none, the UTF-16 decoder
-          # anywhere — and 61 missed statements became 19. Two of the three floors below then moved
-          # over a figure that HAD been seen, which is the only way a floor here is ever allowed to
-          # move: this job printed contracts.py 100%, doctor.py 100%, speak.py 100% and dictate.py
-          # 98% on that branch, so doctor.py went 95 -> 100 and speak.py 99 -> 100.
+          # anywhere — and 61 missed statements became 19, all of them in dictate.py. That left the
+          # `scripts/*` scope at 99 while doctor.py went 95 -> 100 and speak.py 99 -> 100.
           #
-          # The `scripts/*` scope stays at 99 because dictate.py is short, and it will stay short:
-          # what remains there is named in plugins/voice-loop/TESTING.md, "What the union does not
-          # reach" — defensive `except` arms around ctypes calls that return error codes rather than
-          # raising, a console-wide CTRL_C_EVENT that would travel through the test runner's own
-          # process, and two arms that fire only on a real race. Disclosed rather than excluded, so
-          # this one floor is expected to stop short of 100 for as long as that is true.
+          # The last 19 were unreachable because a decision about a return value was written in the
+          # same function as the call that produced it: no runner can fail to open pid 4, produce a
+          # process image without `.exe`, exit between two of its own calls, or raise a console-wide
+          # CTRL_C_EVENT through the process running the tests. Splitting the kernel32 calls
+          # (`_Kernel32`, no branching) from the decisions about their return values (`_win_pid_alive`,
+          # `_win_image_is_recorder`, `_console_ctrl_c`, each taking the boundary as an argument) made
+          # every one of them ordinary code, testable on all three legs against a stand-in that holds
+          # no Win32 knowledge. Nothing was excluded to get there. This job then printed dictate.py
+          # 100% and the whole scripts scope 100%, so this floor goes 99 -> 100 over that figure.
           #
           # The old 100 was over a SMALLER DENOMINATOR — it was reached by excluding these very lines,
           # so this is the first measurement of the full scope, not a lowered bar over the same one.
@@ -1604,8 +1605,8 @@ jobs:
           #   '*plugins/voice-loop/scripts/*'   -> absolute False, relative True
           #   '**/plugins/voice-loop/scripts/*' -> absolute True,  relative True
           # The `**/` form is correct under BOTH shapes, so it survives a later relative remap.
-          echo "::group::voice-loop scripts coverage gate (Linux+Windows+macOS union, floor at 99 — dictate.py)"
-          python -m coverage report --include='**/plugins/voice-loop/scripts/*' --fail-under=99   # PINNED, see #277
+          echo "::group::voice-loop scripts coverage gate (Linux+Windows+macOS union, floor at 100)"
+          python -m coverage report --include='**/plugins/voice-loop/scripts/*' --fail-under=100
           echo "::endgroup::"
           echo "::group::voice-loop doctor.py coverage gate (#156 B1 — 100% on the union)"
           python -m coverage report --include='**/plugins/voice-loop/scripts/doctor.py' --fail-under=100

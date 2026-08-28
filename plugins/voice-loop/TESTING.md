@@ -57,12 +57,13 @@ What makes 100% honest rather than decorative:
 `scripts/*` is gated on the **union of three platforms** (Linux, Windows, macOS) in
 `selftest.yml` (after #156 C moved the floor from 80 to 100, and #276 moved the per-scope claim off
 the Linux-only leg and onto the combined report that aggregates the three platforms' artifacts).
-Two of the three union floors are at 100 (`doctor.py` and `speak.py`, both measured there), and the
-third — the whole `scripts/*` scope — sits at 99, pinned where `dictate.py` used to hold it.
-Retiring the exclusion table put the platform regions into the denominator for the first time and
-the numbers were pinned at what the first honest run measured; #277 then wrote the tests and raised
-the two that reached. `dictate.py`'s residue is closed too now, so the `scripts/*` floor is below
-what the union measures and is due a ratchet the next time the gate prints a figure.
+All three union floors are now at 100 — `doctor.py`, `speak.py` and the whole `scripts/*` scope —
+and each moved there over a figure the gate had already printed, which is the only way a floor here
+ever moves. Retiring the exclusion table put the platform regions into the denominator for the first
+time and the numbers were pinned at what the first honest run measured; #277 then wrote the tests
+and raised the two that reached, leaving `scripts/*` at 99 because `dictate.py` held it there.
+`dictate.py` is now measured at **100% on the union — 1309 statements, 426 branches, none missed,
+none partial** — so the last of the three floors moved up with it.
 
 What each leg reaches, and what is left to the union, is stated below under *What the union does
 not reach* — as a disclosure rather than as an exclusion, which is the whole point of #276.
@@ -148,7 +149,9 @@ the Windows leg is what executes it: the constructor runs on every `_pid_alive` 
 process, pid 4, and a pid that cannot exist. The console entry points are bound in that same
 constructor rather than wrapped in methods, precisely so that no statement exists whose execution
 would require raising a console-wide Ctrl+C through the test runner. On the Linux and macOS legs
-those 25 lines are missed and counted; on the union they are covered.
+those 25 lines are missed and counted; on the union the gate printed them covered, and the file
+reads 1309 statements, 0 missed, 426 branches, 0 partial. There is nothing left in this section to
+disclose about `dictate.py`; the heading is kept because the other files may need it again.
 
 One correction to the older entry above, worth keeping because it was measured: `os.path.basename`
 was reading the Win32 path `QueryFullProcessImageNameW` returns. On Windows `os.path` *is* `ntpath`,
