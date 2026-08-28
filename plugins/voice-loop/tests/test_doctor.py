@@ -1812,6 +1812,7 @@ class TestRegisteredWslDistros:
     """The registry scan behind ``import winreg``. It is the source of truth ``wsl.exe -l`` reports
     from, read directly so a localized "no distributions" banner cannot be counted as a distro."""
 
+    @pytest.mark.skip(reason="PROBE ONLY — proves the coverage floor refuses; never merge")
     def test_a_host_without_winreg_reports_no_distros(self) -> None:
         """Every non-Windows leg takes this arm. ``doctor.py`` is imported by the shared diagnosis
         engine on every platform, so an uncaught ``ImportError`` here would break the doctor
