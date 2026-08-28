@@ -79,8 +79,9 @@ A cheap unsound mode loses to an expensive sound one, always.
 | `ALLGREEN` | 4 | **4** |
 | `HEADGREEN` | 4 | **4** |
 
-`HEADGREEN` changes what GATES the merge, not how many builds are DISPATCHED. GitHub's documentation
-permits both readings and settles neither; the first is the true one.
+`HEADGREEN` changes what GATES the merge, not how many builds are DISPATCHED. That is what the two
+rows above measure; the rig did not read or test the documentation, so it makes no claim about what the
+documentation says.
 
 **Side finding: candidates form a CHAIN, not a tree.** Each candidate's base is the previous
 candidate's head, so depth relative to its own base is always 1 and the last candidate's tree contains
@@ -102,9 +103,10 @@ itself genuinely red.
 | `atomic` | **sound, resolves** | **sound, resolves, and clears fastest** |
 
 **`skip` merges broken code, and the mechanism is not the one you would guess.** It is not an ejection
-race. `min_entries_to_merge_wait_minutes` expires with fewer than `min` entries green, and GitHub
-merges **the largest green PREFIX** — and a no-op has made "green" mean "did not look". Measured twice
-at 5m34s and 5m36s after enqueue. Verified by hand on the candidate ref before the merge and on the
+race. In both `skip` cells, `min_entries_to_merge_wait_minutes` expired with fewer than `min` entries
+green and the queue merged **the largest green run from the front** — and a no-op has made "green" mean
+"did not look". Measured twice, at 5m34s and 5m36s after enqueue. The rig did not test whether this is
+the documented behaviour, or the only behaviour. Verified by hand on the candidate ref before the merge and on the
 base branch after it: the suite exits 1 on both.
 
 **`wait` is sound and deadlocks, under both strategies.** A shallow candidate that skips only once a
@@ -120,7 +122,9 @@ both strategies the batch sat with three entries at `AWAITING_CHECKS` and the fo
 **`atomic` is the answer.** A shallow candidate mirrors the deepest verdict it can see: deeper green
 means skip, **deeper red means red immediately**, no deeper means run. The only green ever issued
 stands behind a real run, so no untested tree can reach the base branch — and there is nothing to wait
-on, so no deadlock. One expensive run per merge-group attempt, against N.
+on, so no deadlock. By construction, one expensive run per merge-group attempt against N — the rig
+prints the runs it saw but does not total them, so this figure follows from the design rather than from
+a count.
 
 Paired with `HEADGREEN` it also clears fastest, and for a reason that has nothing to do with the flake
 tolerance the strategy is usually argued for: under `ALLGREEN` the queue collects every candidate's
@@ -184,8 +188,7 @@ not a grid — it is a list of results that happen to share a border.
   unknown.
 - **Why the numbers matter more on a bounded pool.** On a self-hosted pool, `merge_group` builds and
   ordinary `pull_request` builds draw from the same runners, so N−1 redundant candidate builds do not
-  merely cost money — they contend with every other build the repository is running. That effect was
-  observed on a real repository, not on this rig.
+  merely cost money — they contend with every other build the repository is running.
 
 ---
 
