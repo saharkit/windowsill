@@ -15,7 +15,8 @@ obvious way to do that merges broken code.
 
 ## The rig
 
-Four files, one throwaway repository, no tooling of ours.
+Four files, one throwaway repository. No toolchain to install — `gh`, `jq`, `python3`, and `git` are
+already on any reasonable dev box.
 
 | file | what it is |
 |---|---|
@@ -28,11 +29,13 @@ Four files, one throwaway repository, no tooling of ours.
 ruleset field, so a cell is *(mode × strategy × where-the-breakage-is)* and every cell runs
 byte-identical workflow code. A difference in outcome can never be a difference in the instrument.
 
-**Three jobs, deliberately split across two runner pools.** `decide` and `gate` run on the cheap
-hosted pool; `suite` stands in for the scarce one. **A job whose `if` is false is never dispatched and
-claims no slot at all** — strictly stronger than switching `runs-on`, which still claims one. And
-`gate` carries `if: always()` because a *skipped* required check leaves the queue waiting forever;
-one context that always reports is what makes any of this legal.
+**Three jobs. `decide` and `gate` run on the cheap hosted pool; `suite` stands in for the scarce one.**
+The rig uses `ubuntu-latest` for all three so the demonstration stays self-contained — on a
+self-hosted pool, switching `suite`'s `runs-on` to the scarce pool is the natural change. **A job
+whose `if` is false is never dispatched and claims no slot at all** — strictly stronger than switching
+`runs-on`, which still claims one. And `gate` carries `if: always()` because a *skipped* required
+check leaves the queue waiting forever; one context that always reports is what makes any of this
+legal.
 
 **The PR check and the queue check differ on purpose.** `check.sh` passes unconditionally on
 `pull_request` and applies the real rule only on `merge_group`. That is not a rig convenience — it is
@@ -47,16 +50,21 @@ itself. Without that, one bad cell poisons every later measurement — which is 
 
 ---
 
-## The verdict function, and it is lexicographic
+## The verdict function
 
 1. **SOUND** — did anything the suite calls bad reach the base branch? Judged by applying *this cell's*
    rule to whatever the branch actually holds, never by running the branch's own `check.sh`, which is
    vacuous when nothing merged. **One red merge refutes a mode. No saving redeems it.**
 2. **LIVE** — did the queue resolve? And "still queued" is two different things: a batch that is
    FALLING (entries leaving as they turn red) is progressing, just slower than the ceiling; a batch
-   where nothing moved is a deadlock. The rig distinguishes them by whether the entry set shrank.
-3. **CHEAP** — how many expensive suite runs actually executed.
-4. **PROGRESSIVE** — did the good prefix land, or did everything fall?
+   where nothing moved is a deadlock. The rig captures how many of THIS cell's PRs are queued at the
+   start of the watch and how many are queued at the end, and reads verdict off whether that count
+   shrank — counted in this cell's terms so a previous cell's leftovers cannot masquerade as progress.
+3. **CHEAP** — how many expensive `merge_group` runs actually completed in this cell. The README's
+   table cell `4 expensive runs` and the prose claim `One expensive run per merge-group attempt,
+   against N` are produced by this verdict, not by the reader's eyeball over the run list.
+4. **PROGRESSIVE** — did the good prefix land, or did everything fall? Counted from the files this cell
+   left on main: good members vs. bad members.
 
 A cheap unsound mode loses to an expensive sound one, always.
 
@@ -125,11 +133,11 @@ four.
 
 **The table does not move when the batch gets worse.** The same modes were run again with three of the
 four members red, and again with all four, under both strategies. Every soundness verdict is
-unchanged; `always` and `atomic` still return the queue to empty and `wait` still returns it to empty
-in no cell at any density. What the denser batches add is a negative worth stating: past a certain
-amount of red there is no green prefix longer than one, so the grouping strategy has nothing left to
-choose between and the two columns become literally identical. The strategy earns its keep on the
-ordinary shape, not on the bad one.
+unchanged; `always` and `atomic` still return the queue to empty, and `wait` never returns the queue
+to empty in any cell, at any density. What the denser batches add is a negative worth stating: past a
+certain amount of red there is no green prefix longer than one, so the grouping strategy has nothing
+left to choose between and the two columns become literally identical. The strategy earns its keep on
+the ordinary shape, not on the bad one.
 
 ---
 
@@ -183,24 +191,10 @@ not a grid — it is a list of results that happen to share a border.
 
 ## Reproducing it
 
-You need one throwaway repository with a merge queue on its default branch, and a token that can read
-the queue over GraphQL.
+**Prerequisites.** A throwaway repository with a merge queue on its default branch; a `gh` token
+authenticated with full `repo` scope on that repository (the script force-pushes branches, opens and
+auto-merges PRs, rewrites the ruleset, and sets repository variables — a read-only token is not
+enough); `jq` and `python3` on the PATH; a working `git push` to the throwaway repo. `gh auth status`
+should report an authenticated account before the first arm runs.
 
-```sh
-export SANDBOX_OWNER=<your-org-or-user>
-export SANDBOX_NAME=<throwaway-repo>
-export SANDBOX_REPO="$SANDBOX_OWNER/$SANDBOX_NAME"
-export SANDBOX_CHECKOUT=/path/to/a/clone
-export RULESET_ID=<the merge-queue ruleset id on that repo>
-
-# copy queue-mode.yml into .github/workflows/, and check.sh + arm.conf into ci/, then:
-#   run-arm.sh <arm-letter> NONE <ALLGREEN|HEADGREEN> <wait-minutes> <bad-members> <mode>
-./run-arm.sh A NONE HEADGREEN 1 3 atomic
-```
-
-The driver creates four pull requests, arms the ruleset, enqueues them, watches, and prints a SOUND
-and a LIVE verdict. Then it cleans up after itself, because a cell that leaves its entries in the
-queue makes them the next cell's starting condition and every later verdict is contaminated.
-
-**One warning worth heeding:** the `skip` mode merges broken code. That is the finding, and it means
-the rig must run against a repository you do not care about.
+**One-time setup on the throwaway repo:**
