@@ -16,6 +16,7 @@ second implementation of the client). No model, no key on the wire.
 from __future__ import annotations
 
 import base64
+import errno
 import hashlib
 import importlib.util
 import json
@@ -88,6 +89,20 @@ class FakeWs:
 
     def close(self) -> None:
         self.closed = True
+
+
+def _half_close_write(sock) -> None:
+    """A half-close only signals "no more writes". On Linux the write-half shutdown is a silent
+    no-op once the peer has already gone; on Darwin the same call raises errno 57 ("socket is
+    not connected"), and a half-closed stream that races a peer close can surface a broken
+    pipe instead. Both of those errnos mean the intended state was reached rather than that
+    something failed: a peer that has gone has, by definition, already received the half-
+    close."""
+    try:
+        sock.shutdown(socket.SHUT_WR)
+    except OSError as err:
+        if err.errno not in (errno.ENOTCONN, errno.EPIPE):
+            raise
 
 
 # --- the pure helpers ----------------------------------------------------------------------------
@@ -631,7 +646,7 @@ def test_serve_emits_one_chunk_per_sentence_then_end():
     thread = threading.Thread(target=speak._serve_stream_connection, args=(a, holder, _settings()))
     thread.start()
     b.sendall((json.dumps({"text": "one short line"}) + "\n").encode())
-    b.shutdown(socket.SHUT_WR)
+    _half_close_write(b)
     received = b""
     while b"event: end" not in received:
         chunk = b.recv(65536)
@@ -656,7 +671,7 @@ def test_serve_emits_an_error_event_on_a_degrade():
     thread = threading.Thread(target=speak._serve_stream_connection, args=(a, holder, _settings()))
     thread.start()
     b.sendall((json.dumps({"text": "a line"}) + "\n").encode())
-    b.shutdown(socket.SHUT_WR)
+    _half_close_write(b)
     received = b""
     while b"event: error" not in received and len(received) < 4096:
         chunk = b.recv(65536)
@@ -866,7 +881,7 @@ def test_run_holder_serves_a_turn_and_self_exits_when_its_listener_closes(monkey
             try:
                 c.connect(sock_path)
                 c.sendall((json.dumps({"text": "a line"}) + "\n").encode())
-                c.shutdown(socket.SHUT_WR)
+                _half_close_write(c)
                 received = b""
                 while b"event: end" not in received:
                     try:
@@ -1209,7 +1224,7 @@ def test_serve_stream_connection_handles_empty_request(socket_pair):
     thread = threading.Thread(target=speak._serve_stream_connection, args=(a, holder, _settings()))
     thread.start()
     b.sendall(b'{"text": "   "}\n')
-    b.shutdown(socket.SHUT_WR)
+    _half_close_write(b)
     received = b""
     while b"event: end" not in received:
         try:
@@ -1234,7 +1249,7 @@ def test_serve_stream_connection_handles_unparseable_request(socket_pair):
     thread = threading.Thread(target=speak._serve_stream_connection, args=(a, holder, _settings()))
     thread.start()
     b.sendall(b"this is not json\n")
-    b.shutdown(socket.SHUT_WR)
+    _half_close_write(b)
     received = b""
     while b"event: end" not in received:
         try:
