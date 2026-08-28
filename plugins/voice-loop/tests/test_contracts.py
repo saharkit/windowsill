@@ -17,12 +17,17 @@ requires each reachable branch to be pinned. Three surfaces are tested here:
   ``platform_id`` that names nothing in its dispatch table must return ``False`` rather than
   raising or reaching the cmdline substring check with a ``cmdline`` that was never assigned.
 
-The ``_windows_process_is_live`` body is excluded by ``pragma: windows-only`` on its introducing
-line and is not exercised here — the disclosure lives in ``plugins/voice-loop/TESTING.md``.
+* ``_windows_process_is_live``'s two arms that no single platform reaches: the ``OpenProcess``
+  failure read (only a Windows runner can execute it) and the ``ctypes.WinDLL`` AttributeError arm
+  (only a runner WITHOUT ``WinDLL`` can execute it). The body carries a ``pragma: windows-only``
+  marker, but since #276 that marker is documentation of which leg owes the exercise rather than a
+  registered coverage exclusion — so the union of the Linux, Windows and macOS legs is what has to
+  reach it, and the two tests below are split by platform for that reason.
 """
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -240,3 +245,63 @@ class TestPidLooksLikeSpeakUnknownPlatform:
         )
 
         assert called == []
+
+
+# --- _windows_process_is_live: the arms that need a platform to reach them ----------------------
+
+
+class TestWindowsProcessIsLive:
+    """The Windows arm of ``pid_looks_like_speak``: is the pid recorded in ``playing.pid`` still a
+    live process?
+
+    ``os.kill(pid, 0)`` is not available as a probe on Windows — it maps to ``TerminateProcess``
+    and would kill what it asks about — so this opens a SYNCHRONIZE handle and polls it instead.
+    Neither arm below is reachable on every runner, which is exactly why they are split: the
+    combined coverage report is the union of the three legs, and each test names the leg that owes
+    it.
+    """
+
+    # Windows pids are small and 4-aligned; a value near the top of the DWORD range names no
+    # process, which makes ``OpenProcess`` fail deterministically rather than by luck.
+    _PID_THAT_CANNOT_EXIST = 0xFFFFFFF0
+
+    @pytest.mark.skipif(
+        os.name == "nt",
+        reason="the AttributeError arm needs a runtime with no ctypes.WinDLL; the Linux and macOS legs own it",
+    )
+    def test_a_host_without_kernel32_reports_the_process_dead(self):
+        """``ctypes.WinDLL`` exists only on Windows, so on any other host the very first statement
+        inside the ``try`` raises ``AttributeError``. Without the catch, importing and calling this
+        from the shared ``contracts`` module would raise into ``pid_looks_like_speak``'s caller —
+        the speaking-lock takeover path — instead of answering "not ours".
+        """
+
+        assert contracts._windows_process_is_live(1) is False
+
+    @pytest.mark.skipif(
+        os.name != "nt",
+        reason="OpenProcess is a Windows API; the Windows leg owns this arm",
+    )
+    def test_a_pid_that_cannot_be_opened_is_judged_by_the_last_error(self):
+        """When ``OpenProcess`` returns NULL the function does NOT get to poll a handle — it has to
+        decide from the error code, and only ERROR_ACCESS_DENIED (5) means "exists but not ours".
+        A pid that names no process fails with ERROR_INVALID_PARAMETER, so the answer is False.
+
+        The regression this catches is a refactor that treats every NULL handle as "alive": the
+        takeover path would then refuse to speak forever, waiting on a process that is gone.
+        """
+
+        assert contracts._windows_process_is_live(self._PID_THAT_CANNOT_EXIST) is False
+
+    @pytest.mark.skipif(
+        os.name != "nt",
+        reason="OpenProcess is a Windows API; the Windows leg owns this arm",
+    )
+    def test_this_very_process_reads_as_live(self):
+        """The positive control that gives the negative above its meaning: a handle that DOES open
+        must be polled, and a running process leaves ``WaitForSingleObject`` at WAIT_TIMEOUT. An
+        inverted comparison would make every live speaker look dead and let a second firing speak
+        over it.
+        """
+
+        assert contracts._windows_process_is_live(os.getpid()) is True

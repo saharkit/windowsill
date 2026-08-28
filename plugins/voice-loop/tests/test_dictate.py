@@ -5999,3 +5999,115 @@ class TestScriptsFloorCoverage:
         assert StubSocket.polls <= 1, (
             f"the drain loop ran its body; expected at most 1 poll, got {StubSocket.polls}"
         )
+
+
+# --- the Windows-ctypes arms, executed rather than excluded ---------------------------------------
+#
+# Since #276 the three `pragma: windows-only` markers in dictate.py are documentation of which
+# coverage leg owes the exercise, not registered exclusions, so the bodies have to be run. Each test
+# below names the leg that can run it: the `except (OSError, AttributeError)` guards are reachable
+# ONLY where `ctypes.WinDLL` does not exist, and the kernel32 calls themselves ONLY on Windows.
+
+
+class TestPidAliveWindowsArm:
+    """``_pid_alive`` must never use ``os.kill(pid, 0)`` on Windows — there is no signal 0 there and
+    the call maps straight to ``TerminateProcess``, so the probe would kill what it asks about. The
+    Windows arm opens a SYNCHRONIZE handle and polls it with a zero timeout instead."""
+
+    @pytest.mark.skipif(
+        os.name == "nt",
+        reason="the AttributeError guard needs a runtime with no ctypes.WinDLL; the Linux and macOS legs own it",
+    )
+    def test_a_host_without_kernel32_reports_the_pid_dead(self, monkeypatch):
+        """Forcing the Windows arm on a host with no ``WinDLL`` runs the real failure the guard is
+        written for, with no stand-in for kernel32 anywhere in the test.
+
+        The comment on the guard states the contract it protects: report dead, do NOT fall back to
+        spawning a process to ask. A regression that let the ``AttributeError`` escape would turn
+        every poll of the recorder into a traceback.
+        """
+
+        monkeypatch.setattr(dictate.os, "name", "nt")
+        result = dictate._pid_alive(os.getpid())
+        monkeypatch.undo()  # restore before asserting, so a failure never reports under a faked os.name
+
+        assert result is False
+
+    @pytest.mark.skipif(
+        os.name != "nt", reason="kernel32 is a Windows API; the Windows leg owns this arm"
+    )
+    def test_this_very_process_reads_as_running(self):
+        """A handle that opens must be POLLED, and a live process leaves ``WaitForSingleObject`` at
+        WAIT_TIMEOUT. An inverted comparison would report the running recorder as dead, and the
+        stop toggle would spawn a second recorder over the first."""
+
+        assert dictate._pid_alive(os.getpid()) is True
+
+    @pytest.mark.skipif(
+        os.name != "nt", reason="kernel32 is a Windows API; the Windows leg owns this arm"
+    )
+    def test_a_process_this_user_may_not_open_still_reads_as_running(self):
+        """The System process (pid 4) always exists and never opens for an ordinary caller, so
+        ``OpenProcess`` fails with ERROR_ACCESS_DENIED. That is "exists but is not ours", the
+        Windows twin of the POSIX arm's ``PermissionError`` -> True, and the two arms must answer
+        the same way. Reading access-denied as "no such process" would let the stop path treat a
+        live recorder owned by another session as gone."""
+
+        assert dictate._pid_alive(4) is True
+
+    @pytest.mark.skipif(
+        os.name != "nt", reason="kernel32 is a Windows API; the Windows leg owns this arm"
+    )
+    def test_a_pid_that_cannot_exist_reads_as_dead(self):
+        """L3 counterpart to the two above: a NULL handle whose error is NOT access-denied means the
+        process is gone. Windows pids are small and 4-aligned, so a value near the top of the DWORD
+        range names nothing and ``OpenProcess`` fails deterministically."""
+
+        assert dictate._pid_alive(0xFFFFFFF0) is False
+
+
+class TestWinPidIsRecorderWindowsArm:
+    """The PID-reuse guard on the Windows stop path. ``_win_console_ctrl_c`` signals the WHOLE
+    console a pid is attached to and ``_stop_recorder`` then terminates it, so the image name behind
+    the pid is checked first — through the same handle, with no subprocess, because the stop path
+    runs on every toggle."""
+
+    @pytest.mark.skipif(
+        os.name == "nt",
+        reason="the AttributeError guard needs a runtime with no ctypes.WinDLL; the Linux and macOS legs own it",
+    )
+    def test_a_host_without_kernel32_refuses_to_vouch_for_the_pid(self, monkeypatch):
+        """Same shape as the ``_pid_alive`` guard and the same safe direction: cannot verify means
+        do not signal. A regression that returned True here would hand an unverified pid to a
+        console-wide Ctrl+C followed by ``TerminateProcess``."""
+
+        monkeypatch.setattr(dictate.os, "name", "nt")
+        result = dictate._win_pid_is_recorder(os.getpid(), "arecord")
+        monkeypatch.undo()
+
+        assert result is False
+
+    @pytest.mark.skipif(
+        os.name != "nt", reason="kernel32 is a Windows API; the Windows leg owns this arm"
+    )
+    def test_the_running_image_name_is_read_and_compared(self):
+        """``QueryFullProcessImageNameW`` through an open handle, against this very process, whose
+        image name is known independently from ``sys.executable``. The comparison is basename-only,
+        lowercased, with ``.exe`` stripped — a regression in any of those three steps makes every
+        legitimate recorder look like a stranger and the stop toggle stops signalling at all."""
+
+        image = os.path.basename(sys.executable).lower()
+        if image.endswith(".exe"):
+            image = image[: -len(".exe")]
+
+        assert dictate._win_pid_is_recorder(os.getpid(), image) is True
+
+    @pytest.mark.skipif(
+        os.name != "nt", reason="kernel32 is a Windows API; the Windows leg owns this arm"
+    )
+    def test_a_different_image_name_is_refused(self):
+        """L3 counterpart, and the reason the guard exists: the pidfile outlives its process and the
+        kernel recycles pids, so by stop time the recorded pid can belong to somebody else. A
+        comparison that always matched would let the stop path Ctrl+C and terminate a stranger."""
+
+        assert dictate._win_pid_is_recorder(os.getpid(), "definitely-not-a-recorder") is False

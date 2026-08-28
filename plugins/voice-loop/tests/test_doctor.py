@@ -1771,3 +1771,132 @@ class TestScriptEntrypointRequiresACommand:
         with pytest.raises(SystemExit) as raised:
             runpy.run_path(str(_DOCTOR_PATH), run_name="__main__")
         assert raised.value.code == 2
+
+
+# ---------------------------------------------------------------------------
+# The Windows-only surfaces, executed rather than excluded
+#
+# Since #276 the `pragma: windows-only` markers in `doctor.py` are documentation of which coverage
+# leg owes the exercise, not registered exclusions. Two of the three bodies are reachable from any
+# host — `_decode_windows_output` is pure bytes, and the `winreg` ImportError arm is what every
+# non-Windows host takes — and the registry scan itself is owned by the Windows leg.
+# ---------------------------------------------------------------------------
+
+
+class TestDecodeWindowsOutputUtf16:
+    """``wsl.exe`` commonly writes UTF-16LE to a pipe while ``where.exe`` writes 8-bit text, so the
+    decoder picks the codec from a BOM or an embedded NUL. Both arms are plain bytes handling and
+    need no Windows at all — the marker on the branch says "Windows-only" about the SOURCE of the
+    bytes, not about the code that decodes them."""
+
+    def test_a_bom_marked_stream_is_read_as_utf16_and_loses_the_bom(self) -> None:
+        """A regression that dropped the UTF-16 attempt would decode ``wsl.exe``'s output as UTF-8
+        with replacements: every distro name would arrive interleaved with NULs and no name would
+        ever match, so a real WSL contour would report as absent."""
+
+        raw = b"\xff\xfe" + "Ubuntu\n".encode("utf-16le")
+
+        assert doctor._decode_windows_output(raw) == "Ubuntu\n"
+
+    def test_a_bom_that_does_not_decode_falls_through_to_the_8bit_path(self) -> None:
+        """L3 counterpart: the UTF-16 attempt must be an ATTEMPT. A truncated stream (odd byte
+        count) raises inside the codec, and the contract is that the function still returns text —
+        a propagated ``UnicodeDecodeError`` would take down the whole diagnosis over one garbled
+        pipe. Falling through, the same bytes are not valid UTF-8 either, so the replacement path
+        is what answers."""
+
+        assert doctor._decode_windows_output(b"\xff\xfeA") == "��A"
+
+
+class TestRegisteredWslDistros:
+    """The registry scan behind ``import winreg``. It is the source of truth ``wsl.exe -l`` reports
+    from, read directly so a localized "no distributions" banner cannot be counted as a distro."""
+
+    def test_a_host_without_winreg_reports_no_distros(self) -> None:
+        """Every non-Windows leg takes this arm. ``doctor.py`` is imported by the shared diagnosis
+        engine on every platform, so an uncaught ``ImportError`` here would break the doctor
+        everywhere it is not Windows — and the safe answer for "we cannot ask" is "none we can
+        vouch for", which suppresses the finding rather than inventing one."""
+
+        if os.name == "nt":
+            pytest.skip("winreg exists here; the Linux and macOS legs own this arm")
+
+        assert doctor._registered_wsl_distros() == ([], 0)
+
+    def test_an_absent_key_under_both_roots_reports_no_distros(self, monkeypatch) -> None:
+        """Neither HKCU nor HKLM carries the key: both ``OpenKey`` calls raise and the scan returns
+        empty. This is the ordinary shape on a Windows machine with no WSL installed, and the
+        regression it catches is a scan that lets the ``OSError`` escape — the doctor would crash
+        on exactly the machines that have nothing to report."""
+
+        if os.name != "nt":
+            pytest.skip("winreg is a Windows API; the Windows leg owns this arm")
+        import uuid
+
+        monkeypatch.setattr(
+            doctor,
+            "_WSL_LXSS_SUBKEY",
+            rf"Software\voice-loop-tests\absent-{uuid.uuid4().hex}",
+        )
+
+        assert doctor._registered_wsl_distros() == ([], 0)
+
+    def test_registered_names_are_read_deduplicated_and_stripped_of_the_docker_pair(
+        self, monkeypatch
+    ) -> None:
+        """The whole enumeration, against the real registry API rather than a stand-in for it.
+
+        A per-user subtree under HKCU is built with one subkey per case the scan has to survive: a
+        subkey with no ``DistributionName`` at all, one whose value is not a string, one whose value
+        is empty, the two Docker Desktop registrations that must NOT count as evidence of a WSL
+        contour, a real name, and that same name a second time. HKLM is left absent, so the loop's
+        per-root ``OSError`` arm runs in the same call.
+
+        The regression this catches is the one that made the registry the source of truth in the
+        first place: counting a name that is not evidence. Docker Desktop registers two distros on
+        every machine that runs it, so a scan that returns them reports a WSL contour to somebody
+        who has never installed one.
+        """
+
+        if os.name != "nt":
+            pytest.skip("winreg is a Windows API; the Windows leg owns this arm")
+        import uuid
+        import winreg
+
+        subkey = rf"Software\voice-loop-tests\lxss-{uuid.uuid4().hex}"
+        children = {
+            "{00000000-0000-0000-0000-000000000001}": None,  # no DistributionName value at all
+            "{00000000-0000-0000-0000-000000000002}": 7,  # a REG_DWORD, not a string
+            "{00000000-0000-0000-0000-000000000003}": "",  # registered but unnamed
+            "{00000000-0000-0000-0000-000000000004}": "docker-desktop",
+            "{00000000-0000-0000-0000-000000000005}": "docker-desktop-data",
+            "{00000000-0000-0000-0000-000000000006}": "Ubuntu",
+            "{00000000-0000-0000-0000-000000000007}": "Ubuntu",  # the same distro seen twice
+        }
+
+        created = winreg.CreateKey(winreg.HKEY_CURRENT_USER, subkey)
+        try:
+            for child, value in children.items():
+                with winreg.CreateKey(created, child) as handle:
+                    if isinstance(value, str):
+                        winreg.SetValueEx(handle, "DistributionName", 0, winreg.REG_SZ, value)
+                    elif isinstance(value, int):
+                        winreg.SetValueEx(handle, "DistributionName", 0, winreg.REG_DWORD, value)
+
+            monkeypatch.setattr(doctor, "_WSL_LXSS_SUBKEY", subkey)
+            names, docker_excluded = doctor._registered_wsl_distros()
+        finally:
+            for child in children:
+                try:
+                    winreg.DeleteKey(created, child)
+                except OSError:
+                    pass
+            created.Close()
+            for path in (subkey, r"Software\voice-loop-tests"):
+                try:
+                    winreg.DeleteKey(winreg.HKEY_CURRENT_USER, path)
+                except OSError:
+                    pass
+
+        assert names == ["Ubuntu"], "a registered distro is named once, whatever its subkey count"
+        assert docker_excluded == 2, "both Docker Desktop registrations are counted and excluded"

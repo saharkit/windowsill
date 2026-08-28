@@ -54,10 +54,15 @@ What makes 100% honest rather than decorative:
 
 ### The hook scripts — shellcheck, a pytest for the pure parts, and a real invocation
 
-`scripts/*` is gated at **100% of what is measurable on the union of three platforms**
-(Linux, Windows, macOS) in `selftest.yml` (after #156 C moved the floor from 80 to 100, and #276
-moved the per-scope claim off the Linux-only leg and onto the combined report that aggregates the
-three platforms' artifacts). The rest of `scripts/` — `dictate.py`, `contour_poll.py`,
+`scripts/*` is gated on the **union of three platforms** (Linux, Windows, macOS) in
+`selftest.yml` (after #156 C moved the floor from 80 to 100, and #276 moved the per-scope claim off
+the Linux-only leg and onto the combined report that aggregates the three platforms' artifacts).
+Two of the three union floors are at 100 (`doctor.py` and `speak.py`, both measured there), and the
+third — the whole `scripts/*` scope — sits at 99 because `dictate.py` does. Retiring the exclusion
+table put the platform regions into the denominator for the first time and the numbers were pinned
+at what the first honest run measured; #277 then wrote the tests and raised the two that reached.
+What is still short, and why, is stated below under *What the union does not reach* — as a
+disclosure rather than as an exclusion, which is the whole point of #276. The rest of `scripts/` — `dictate.py`, `contour_poll.py`,
 `contracts.py`, `doctor.py`, `providers.py`, `report_bug.py`, `install_ledger.py`, `preview.py`,
 `rvc_corpus.py`, `tls-probe.py`, `wsclient.py`, the `voice-loop-dictate` entry point — sits
 under that gate. There is no platform-exclusion table: every region that ships enters the
@@ -95,8 +100,37 @@ shelf-wide rule would bind `agent-handbook`, which has no coverage job at all an
 `emit-standing-rules.js` hook; the operator ruled against promoting the rule up to the shelf's
 root `CLAUDE.md` on 2026-08-24 for exactly that reason.
 
-The `scripts/*` floor at 100% does NOT say "100% of every line" — it says "100% of what is
-measurable across Linux + Windows + macOS". Coverage IS still a meaningful metric for the GLUE
+### What the union does not reach
+
+In `contracts.py`, `doctor.py` and `speak.py` every arm that no single leg can execute now has a
+test on a leg that can: the `ctypes.WinDLL` handle probes and the `winreg` distro scan on the
+Windows leg, the `AttributeError` guards on the legs that have no `WinDLL` at all, and the
+pure-bytes UTF-16 decoder anywhere. All three measure 100% on the union, statements and branches,
+and their gates are set there.
+
+One file resists — `dictate.py`, at 98%, with 19 statements and 8 partial branches missed out of
+1283. Every one of them is inside the three Windows-`ctypes` bodies, and each is named here rather
+than excluded:
+
+| what | why it is not reachable |
+|---|---|
+| the `except Exception: pass` arms inside `_win_console_ctrl_c`'s `finally` — around `FreeConsole()`, `SetConsoleCtrlHandler(None, False)` and `AttachConsole(-1)` | a `ctypes` foreign-function call returns an error code; it does not raise. These arms are defensive belt-and-braces around calls that have no failure mode a test can provoke without substituting something for kernel32 |
+| `_win_console_ctrl_c`'s `except Exception: return False` around the attach/raise sequence | the same reason |
+| the successful attach-and-raise path in `_win_console_ctrl_c` (`AttachConsole`, `SetConsoleCtrlHandler`, `GenerateConsoleCtrlEvent`) | reaching it means raising a console-wide `CTRL_C_EVENT` from inside the test runner's own process, after detaching that process from its console. The event reaches every process on the console, the test runner included; a mistake in the handler dance kills the run rather than failing a test |
+| `_pid_alive`'s `WAIT_FAILED` arm, and `_win_pid_is_recorder`'s `QueryFullProcessImageNameW`-returned-zero arm | both fire only when the process exits between the `OpenProcess` and the call that follows it — a real race, not a state a test can arrange |
+| `_pid_alive`'s ERROR_ACCESS_DENIED arm | measured, not assumed: the CI Windows runner opens even the System process (pid 4), so `OpenProcess` does not fail with access-denied there for any pid the test can name. The test asserting pid 4 reads as running still stands — it just reaches the answer through the handle poll instead |
+| the no-`.exe` arm of `_win_pid_is_recorder`'s image-name trim | every process image on Windows ends in `.exe`, so the branch that handles one that does not cannot be taken. It became visible only once the surrounding body started executing |
+
+The rule this plugin adopted in #276 is that platform code gets a leg rather than an exclusion, and
+these lines get neither: they are counted, they are missed, and the `scripts/*` floor stays at 99
+because of them. Substituting a
+stand-in for kernel32 would close them on paper, but a fake that needs its own correctness argument
+is a second implementation, and the test would then assert the fake. The honest reading of the
+union figure is that it counts a handful of defensive arms around a foreign-function boundary that
+nothing but a fake can enter — so the figure stays below 100 and the reason is written down.
+
+The `scripts/*` floor does NOT say "100% of every line" — it says "everything measurable across
+Linux + Windows + macOS, with the residue named". Coverage IS still a meaningful metric for the GLUE
 that calls players, recorders, `wl-copy` and `ydotool`: the fixture-shaping unit tests live in
 `tests/` and the real-runtime proof comes from the loopback job beside it. Line coverage is not
 the WHOLE metric for any of these scripts — it is the floor that keeps regression pressure on
