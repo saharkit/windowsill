@@ -98,6 +98,7 @@ from __future__ import annotations
 import atexit
 import json
 import math
+import ntpath
 import os
 import platform
 import re
@@ -1325,137 +1326,229 @@ def _transcribe_cloud(s: dict, wav_bytes: bytes, boundary: str) -> str | None:
     return text
 
 
-def _pid_alive(pid: int) -> bool:
+# --- the Windows kernel32 boundary ----------------------------------------------------------------
+#
+# Win32 constants the decision functions below compare against. They live at module level, not on
+# the adapter, so a stand-in adapter carries no constants of its own: a stub answers with values,
+# never with a table of Win32 knowledge it could get wrong.
+_WIN_SYNCHRONIZE = 0x00100000
+_WIN_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+_WIN_ERROR_ACCESS_DENIED = 5
+_WIN_WAIT_OBJECT_0 = 0
+_WIN_WAIT_TIMEOUT = 0x102
+_WIN_CTRL_C_EVENT = 0
+_WIN_ATTACH_PARENT_PROCESS = -1
+
+
+class _Kernel32:  # pragma: windows-only — the raw Windows kernel32 boundary, and the only region here a non-Windows runtime cannot enter
+    """The ONE place this script speaks to kernel32.
+
+    It holds no decisions. Every console entry point is a *bound* foreign function, every method is
+    a single foreign call plus the values that call produced, and there is not one ``if`` in the
+    class. The branching that used to surround these calls now lives in ``_win_pid_alive``,
+    ``_win_image_is_recorder`` and ``_console_ctrl_c``, which take one of these objects as an
+    argument — so those decisions are exercised on every platform, and what is left here has
+    nothing to get wrong.
+    """
+
+    def __init__(self) -> None:
+        import ctypes
+
+        # use_last_error (not a bare windll): ctypes itself makes Win32 calls between our failing
+        # call and the error read, so kernel32.GetLastError() can report a stale code and misread
+        # access-denied as no-such-process. ctypes.get_last_error() is captured at the boundary and
+        # is the reliable read.
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        # Without argtypes/restype ctypes truncates a 64-bit handle to a C int on 64-bit Python —
+        # exactly the class of defect that only shows up on the platform no lane runs. Declare
+        # every signature.
+        kernel32.OpenProcess.argtypes = (
+            ctypes.c_uint32,  # dwDesiredAccess
+            ctypes.c_int,  # bInheritHandle
+            ctypes.c_uint32,  # dwProcessId
+        )
+        kernel32.OpenProcess.restype = ctypes.c_void_p
+        kernel32.WaitForSingleObject.argtypes = (
+            ctypes.c_void_p,  # hHandle
+            ctypes.c_uint32,  # dwMilliseconds
+        )
+        kernel32.WaitForSingleObject.restype = ctypes.c_uint32
+        kernel32.CloseHandle.argtypes = (ctypes.c_void_p,)
+        kernel32.CloseHandle.restype = ctypes.c_int
+        kernel32.QueryFullProcessImageNameW.argtypes = (
+            ctypes.c_void_p,  # hProcess
+            ctypes.c_uint32,  # dwFlags (0 = the Win32 path form)
+            ctypes.c_wchar_p,  # lpExeName
+            ctypes.POINTER(ctypes.c_uint32),  # lpdwSize (in TCHARs, in and out)
+        )
+        kernel32.QueryFullProcessImageNameW.restype = ctypes.c_int
+        self._ctypes = ctypes
+        self._kernel32 = kernel32
+        # The console entry points are BOUND, not wrapped. A wrapper body would be a statement no
+        # runner can execute without raising a console-wide Ctrl+C through the test runner itself;
+        # bound here, they are declared by the same constructor the process probes already run.
+        self.console_cp = kernel32.GetConsoleCP
+        self.free_console = kernel32.FreeConsole
+        self.attach_console = kernel32.AttachConsole
+        self.set_ctrl_handler = kernel32.SetConsoleCtrlHandler
+        self.generate_ctrl_event = kernel32.GenerateConsoleCtrlEvent
+
+    def open_process(self, access: int, pid: int):
+        """(handle, last_error). The error is captured at the boundary and is meaningful only when
+        the handle is falsy — reading it after a success is allowed and ignored."""
+        handle = self._kernel32.OpenProcess(access, False, pid)
+        return handle, self._ctypes.get_last_error()
+
+    def wait(self, handle, milliseconds: int) -> int:
+        return self._kernel32.WaitForSingleObject(handle, milliseconds)
+
+    def close(self, handle) -> None:
+        self._kernel32.CloseHandle(handle)
+
+    def image_name(self, handle):
+        """(ok, path). The buffer is read back either way — it is zero-initialised, so a failed
+        call yields the empty string and `ok` is what the caller decides on."""
+        size = self._ctypes.c_uint32(32768)
+        buffer = self._ctypes.create_unicode_buffer(size.value)
+        ok = self._kernel32.QueryFullProcessImageNameW(handle, 0, buffer, self._ctypes.byref(size))
+        return bool(ok), buffer.value
+
+
+def _kernel32_api(api_factory=None):
+    """Build the kernel32 boundary, or None when it cannot be built.
+
+    A ctypes foreign function reports failure by RETURN CODE and does not raise — but BUILDING the
+    boundary genuinely can: ``ctypes.WinDLL`` raises OSError when the library will not load, and a
+    missing export raises AttributeError on lookup, which is exactly what a non-Windows runtime
+    does with ``ctypes.WinDLL`` itself. None means "cannot ask", and every caller reads it as such
+    rather than as an answer. ``api_factory`` is the seam: pass one and the Windows decision path
+    runs against it on any host.
+    """
+    try:
+        return (api_factory or _Kernel32)()
+    except (OSError, AttributeError):
+        return None
+
+
+def _win_pid_alive(pid: int, api) -> bool:
+    """The Windows liveness DECISION, given the kernel32 boundary — no ctypes in sight.
+
+    Split out of ``_pid_alive`` so every arm below is exercised on every platform: which pid a CI
+    runner may or may not open is a property of the runner, and the answer this function gives to
+    each Win32 outcome is not."""
+    handle, error = api.open_process(_WIN_SYNCHRONIZE | _WIN_PROCESS_QUERY_LIMITED_INFORMATION, pid)
+    if not handle:
+        if error == _WIN_ERROR_ACCESS_DENIED:
+            # Exists but is not ours to open — the Windows twin of the POSIX arm's
+            # PermissionError -> True, kept answering the same way on both arms.
+            return True
+        # Anything else (ERROR_INVALID_PARAMETER, 87, is "no such process") we cannot ask:
+        # report dead rather than kill what we cannot see.
+        return False
+    try:
+        wait = api.wait(handle, 0)
+        if wait == _WIN_WAIT_TIMEOUT:
+            return True  # still running
+        if wait == _WIN_WAIT_OBJECT_0:
+            return False  # exited
+        return False  # WAIT_FAILED or anything else: cannot ask, report dead
+    finally:
+        api.close(handle)  # every path that opened it closes it
+
+
+def _pid_alive(pid: int, api_factory=None) -> bool:
     """Is *pid* a live process? POSIX uses the signal-0 idiom; on Windows there IS no signal 0 —
     os.kill maps straight to TerminateProcess, so the same call would TERMINATE the very process
     it is probing. The Windows arm opens a kernel32 handle and polls it with a zero timeout — no
     subprocess, because both callers ask this per poll iteration and a spawned tasklist.exe per
-    ask is a per-iteration process launch."""
+    ask is a per-iteration process launch.
+
+    ``api_factory`` lifts the platform fact out of the ambient ``os.name``: pass a boundary and the
+    Windows arm answers on any host, which is how its decisions are tested where kernel32 is
+    absent."""
     if pid <= 0:
         return False
-    if os.name == "nt":  # pragma: windows-only — Windows-kernel32-handle probe; unreachable on the Linux CI job
-        import ctypes
-
+    if api_factory is None and os.name != "nt":
         try:
-            # use_last_error (not a bare windll): ctypes itself makes Win32 calls between our
-            # failing call and the error read, so kernel32.GetLastError() can report a stale
-            # code and misread access-denied as no-such-process. ctypes.get_last_error() is
-            # captured at the boundary and is the reliable read.
-            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # stdlib; Windows arm
-
-            # Without argtypes/restype ctypes truncates a 64-bit handle to a C int on 64-bit
-            # Python — exactly the class of defect that only shows up on the platform no lane
-            # runs. Declare every signature.
-            kernel32.OpenProcess.argtypes = (
-                ctypes.c_uint32,  # dwDesiredAccess
-                ctypes.c_int,  # bInheritHandle
-                ctypes.c_uint32,  # dwProcessId
-            )
-            kernel32.OpenProcess.restype = ctypes.c_void_p
-            kernel32.WaitForSingleObject.argtypes = (
-                ctypes.c_void_p,  # hHandle
-                ctypes.c_uint32,  # dwMilliseconds
-            )
-            kernel32.WaitForSingleObject.restype = ctypes.c_uint32
-            kernel32.CloseHandle.argtypes = (ctypes.c_void_p,)
-            kernel32.CloseHandle.restype = ctypes.c_int
-
-            # SYNCHRONIZE (0x00100000) lets us wait; PROCESS_QUERY_LIMITED_INFORMATION
-            # (0x1000) is the least-privilege right that still permits the wait below.
-            SYNCHRONIZE = 0x00100000
-            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-            ERROR_ACCESS_DENIED = 5
-            ERROR_INVALID_PARAMETER = 87
-            WAIT_OBJECT_0 = 0
-            WAIT_TIMEOUT = 0x102
-
-            handle = kernel32.OpenProcess(
-                SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, False, pid
-            )
-            if not handle:
-                error = ctypes.get_last_error()
-                if error == ERROR_ACCESS_DENIED:
-                    # Exists but is not ours to open — the Windows twin of the POSIX arm's
-                    # PermissionError → True, kept answering the same way on both arms.
-                    return True
-                # ERROR_INVALID_PARAMETER (87) is "no such process"; any other failure we
-                # cannot ask: report dead rather than kill what we cannot see.
-                return False
-            try:
-                wait = kernel32.WaitForSingleObject(handle, 0)
-                if wait == WAIT_TIMEOUT:
-                    return True  # still running
-                if wait == WAIT_OBJECT_0:
-                    return False  # exited
-                return False  # WAIT_FAILED or anything else: cannot ask, report dead
-            finally:
-                kernel32.CloseHandle(handle)  # every path that opened it closes it
-        except (OSError, AttributeError):
-            return False  # kernel32 is not what we expect: report dead, do not fall back to spawn
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        except OSError:
+            return False
         return True
-    except OSError:
+    api = _kernel32_api(api_factory)
+    if api is None:
+        return False  # kernel32 is not what we expect: report dead, do not fall back to spawn
+    return _win_pid_alive(pid, api)
+
+
+def _console_ctrl_c(pid: int, console) -> bool:
+    """The console-Ctrl+C DECISION sequence, given the console boundary — no ctypes in sight.
+
+    Attaching to the target's console and raising CTRL_C_EVENT takes the path ffmpeg's own console
+    Ctrl+C handler runs — it finalizes the output container — which TerminateProcess never does.
+    Our own process ignores the event for the duration (SetConsoleCtrlHandler NULL/True), because
+    the event reaches every process attached to that console, this one included.
+
+    Every arm here is a decision about what to do with a return value, so every arm is testable
+    against a stand-in boundary — which is the only way to reach the successful path at all: the
+    real one raises a console-wide CTRL_C_EVENT through whatever process is running the test."""
+    was_attached = False
+    target_attached = False
+    handler_set = False
+    try:
+        # GetConsoleCP returns zero when this process has no console, unlike a window-handle
+        # probe which does not describe pseudoconsole attachment reliably.
+        was_attached = bool(console.console_cp())
+        if was_attached:
+            console.free_console()
+        if not console.attach_console(pid):
+            return False  # the process (or its console) is already gone
+        target_attached = True
+        console.set_ctrl_handler(None, True)
+        handler_set = True
+        return bool(console.generate_ctrl_event(_WIN_CTRL_C_EVENT, 0))  # console-wide
+    except Exception:
         return False
-    return True
+    finally:
+        # Detach BEFORE restoring the handler, on EVERY exit path: SetConsoleCtrlHandler(None,
+        # False) re-arms this process's default Ctrl+C handler, and while we are still attached to
+        # the target console the CTRL_C_EVENT just raised can still reach us — killing the stop
+        # toggle before it transcribes the speech it stopped for. FreeConsole first, so the
+        # re-armed handler can never receive that event. Each step is guarded separately so a
+        # failure in one still leaves the other two to run.
+        if target_attached:
+            try:
+                console.free_console()
+            except Exception:
+                pass
+        if handler_set:
+            try:
+                console.set_ctrl_handler(None, False)
+            except Exception:
+                pass
+        if was_attached:
+            try:
+                console.attach_console(_WIN_ATTACH_PARENT_PROCESS)
+            except Exception:
+                pass
 
 
-def _win_console_ctrl_c(pid: int) -> bool:
+def _win_console_ctrl_c(pid: int, api_factory=None) -> bool:
     """Send CTRL_C_EVENT to the console *pid* lives in — True if the event went out.
 
     This is the Windows equivalent of SIGINT, and the only graceful stop that reaches a process
     we did not spawn: the start toggle that did spawn the recorder has exited by stop time, so
-    nobody still holds the recorder's stdin to write `q` into. Attaching to the target's console
-    and raising CTRL_C_EVENT takes the path ffmpeg's own console Ctrl+C handler runs — it
-    finalizes the output container — which TerminateProcess never does. Our own process ignores
-    the event for the duration (SetConsoleCtrlHandler NULL/True), because the event reaches every
-    process attached to that console, this one included."""
-    if os.name == "nt":  # pragma: windows-only — Windows-kernel32-CTRL_C_EVENT raise; unreachable on the Linux CI job
-        import ctypes
-
-        kernel32 = ctypes.windll.kernel32  # stdlib; this function is Windows-only by caller
-        was_attached = False
-        target_attached = False
-        handler_set = False
-        try:
-            # GetConsoleCP returns zero when this process has no console, unlike a window-handle
-            # probe which does not describe pseudoconsole attachment reliably.
-            was_attached = bool(kernel32.GetConsoleCP())
-            if was_attached:
-                kernel32.FreeConsole()
-            if not kernel32.AttachConsole(pid):
-                return False  # the process (or its console) is already gone
-            target_attached = True
-            kernel32.SetConsoleCtrlHandler(None, True)
-            handler_set = True
-            return bool(kernel32.GenerateConsoleCtrlEvent(0, 0))  # 0 = CTRL_C_EVENT, console-wide
-        except Exception:
-            return False
-        finally:
-            # Detach BEFORE restoring the handler, on EVERY exit path: SetConsoleCtrlHandler(None,
-            # False) re-arms this process's default Ctrl+C handler, and while we are still attached to
-            # the target console the CTRL_C_EVENT just raised can still reach us — killing the stop
-            # toggle before it transcribes the speech it stopped for. FreeConsole first, so the
-            # re-armed handler can never receive that event.
-            if target_attached:
-                try:
-                    kernel32.FreeConsole()
-                except Exception:
-                    pass
-            if handler_set:
-                try:
-                    kernel32.SetConsoleCtrlHandler(None, False)
-                except Exception:
-                    pass
-            if was_attached:
-                try:
-                    kernel32.AttachConsole(-1)  # ATTACH_PARENT_PROCESS
-                except Exception:
-                    pass
-    return False  # POSIX callers reach here only via explicit platform override; treat as no-op
+    nobody still holds the recorder's stdin to write `q` into. The sequence itself is
+    ``_console_ctrl_c``; this is the platform gate and the boundary it hands over."""
+    if api_factory is None and os.name != "nt":
+        return False  # POSIX callers reach here only via explicit platform override; treat as no-op
+    api = _kernel32_api(api_factory)
+    if api is None:
+        return False  # kernel32 is not what we expect: no console to signal
+    return _console_ctrl_c(pid, api)
 
 
 def _pid_looks_like_recorder(pid: int, recorder: str, platform_id: str = sys.platform) -> bool:
@@ -1486,7 +1579,35 @@ def _pid_looks_like_recorder(pid: int, recorder: str, platform_id: str = sys.pla
     return True
 
 
-def _win_pid_is_recorder(pid: int, recorder: str) -> bool:
+def _win_image_is_recorder(pid: int, recorder: str, api) -> bool:
+    """The image-name DECISION, given the kernel32 boundary — no ctypes in sight.
+
+    Split out of ``_win_pid_is_recorder`` for the same reason as ``_win_pid_alive``: whether a
+    process image happens to end in ``.exe``, and whether the query wins its race with a process
+    that is exiting, are properties of the host — the answer given to each outcome is not."""
+    handle, _error = api.open_process(_WIN_PROCESS_QUERY_LIMITED_INFORMATION, pid)
+    if not handle:
+        return False  # gone, or not ours to inspect — either way, not something to signal
+    try:
+        ok, path = api.image_name(handle)
+        if not ok:
+            return False  # the process exited between the open and the query: do not signal
+        # ntpath, not os.path: QueryFullProcessImageNameW hands back a Win32 path, and on a host
+        # whose os.path splits on "/" the backslashes would survive into the comparison. On Windows
+        # the two are the same module, so this reads identically in production and correctly
+        # everywhere the decision is exercised.
+        image = ntpath.basename(path).lower()
+        if image.endswith(".exe"):
+            image = image[: -len(".exe")]
+        # sox's front-end binary is `rec` (recorder_argv returns ["rec", ...]); every other
+        # recorder key IS the executable name.
+        expected = ("rec" if recorder == "sox" else recorder).lower()
+        return image == expected
+    finally:
+        api.close(handle)  # every path that opened it closes it
+
+
+def _win_pid_is_recorder(pid: int, recorder: str, api_factory=None) -> bool:
     """PID-reuse guard for the Windows stop path: is *pid* still OUR recorder?
 
     The pidfile outlives its process and the kernel recycles PIDs, so the pid main() reads out of
@@ -1497,48 +1618,13 @@ def _win_pid_is_recorder(pid: int, recorder: str) -> bool:
     enough for QueryFullProcessImageNameW) — no subprocess, because the stop path must stay cheap.
     """
     if pid <= 0 or not recorder:
-        return False  # plain-Python guard, left under coverage: no Windows-only API before this
-    if os.name == "nt":  # pragma: windows-only — Windows-kernel32-QueryFullProcessImageNameW probe; unreachable on the Linux CI job
-        import ctypes
-        try:
-            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # stdlib; Windows arm
-            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-            kernel32.OpenProcess.argtypes = (
-                ctypes.c_uint32,  # dwDesiredAccess
-                ctypes.c_int,  # bInheritHandle
-                ctypes.c_uint32,  # dwProcessId
-            )
-            kernel32.OpenProcess.restype = ctypes.c_void_p
-            kernel32.QueryFullProcessImageNameW.argtypes = (
-                ctypes.c_void_p,  # hProcess
-                ctypes.c_uint32,  # dwFlags (0 = the Win32 path form)
-                ctypes.c_wchar_p,  # lpExeName
-                ctypes.POINTER(ctypes.c_uint32),  # lpdwSize (in TCHARs, in and out)
-            )
-            kernel32.QueryFullProcessImageNameW.restype = ctypes.c_int
-            kernel32.CloseHandle.argtypes = (ctypes.c_void_p,)
-            kernel32.CloseHandle.restype = ctypes.c_int
-
-            handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
-            if not handle:
-                return False  # gone, or not ours to inspect — either way, not something to signal
-            try:
-                size = ctypes.c_uint32(32768)
-                buffer = ctypes.create_unicode_buffer(size.value)
-                if not kernel32.QueryFullProcessImageNameW(handle, 0, buffer, ctypes.byref(size)):
-                    return False
-                image = os.path.basename(buffer.value).lower()
-                if image.endswith(".exe"):
-                    image = image[: -len(".exe")]
-                # sox's front-end binary is `rec` (recorder_argv returns ["rec", ...]); every other
-                # recorder key IS the executable name.
-                expected = ("rec" if recorder == "sox" else recorder).lower()
-                return image == expected
-            finally:
-                kernel32.CloseHandle(handle)  # every path that opened it closes it
-        except (OSError, AttributeError):
-            return False  # kernel32 is not what we expect: cannot verify, do not signal
-    return False  # POSIX: caller is Windows-only; defensive default
+        return False  # plain-Python guard: no Windows-only API before this
+    if api_factory is None and os.name != "nt":
+        return False  # POSIX: caller is Windows-only; defensive default
+    api = _kernel32_api(api_factory)
+    if api is None:
+        return False  # kernel32 is not what we expect: cannot verify, do not signal
+    return _win_image_is_recorder(pid, recorder, api)
 
 
 def _stop_recorder(pid: int, system: str, recorder: str = "") -> None:

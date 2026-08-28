@@ -4445,26 +4445,27 @@ def test_streaming_wanted_clouds_with_no_streaming_entry_log_the_reason(monkeypa
 
 
 def test_win_console_ctrl_c_posix_fallthrough_returns_false():
-    """Line 1445: the trailing ``return False`` after the ``if os.name == "nt":`` body. On the
-    Linux CI host (os.name == "posix"), this is the branch every call takes — direct-call
-    without monkeypatching anything proves the no-op contract."""
+    """The platform gate in ``_win_console_ctrl_c``: with no boundary passed and ``os.name`` not
+    ``"nt"``, the call is a no-op that signals nothing. On the Linux CI host this is the branch
+    every ordinary call takes — a direct call without monkeypatching anything proves the
+    contract."""
 
     assert dictate._win_console_ctrl_c(1234) is False
 
 
 def test_win_pid_is_recorder_posix_fallthrough_returns_false():
-    """Line 1528: the trailing ``return False`` after the ``if os.name == "nt":`` body. Same
-    shape as ``_win_console_ctrl_c``: on Linux the no-op fallthrough is the only branch
-    reachable, and a direct call exercises it deterministically."""
+    """The platform gate in ``_win_pid_is_recorder``. Same shape as ``_win_console_ctrl_c``: with
+    no boundary passed, a host that is not Windows refuses to vouch for the pid, and a direct call
+    exercises that deterministically."""
 
     assert dictate._win_pid_is_recorder(1234, "arecord") is False
 
 
 def test_win_pid_is_recorder_plain_guard_returns_false():
-    """Line 1487: the plain-Python guard at the top of ``_win_pid_is_recorder`` — non-positive
-    pid or empty recorder must short-circuit before the cached ctypes / WinDLL block runs. The
-    guard sits before ``if os.name == "nt":`` on purpose: a malformed pid cannot reach
-    ``OpenProcess`` even when the host happens to be Windows."""
+    """The plain-Python guard at the top of ``_win_pid_is_recorder`` — a non-positive pid or an
+    empty recorder must short-circuit before any boundary is built. The guard sits before the
+    platform gate on purpose: a malformed pid cannot reach ``OpenProcess`` even when the host
+    happens to be Windows, and even when a boundary was handed in."""
 
     assert dictate._win_pid_is_recorder(0, "arecord") is False
     assert dictate._win_pid_is_recorder(-1, "arecord") is False
@@ -4472,27 +4473,38 @@ def test_win_pid_is_recorder_plain_guard_returns_false():
 
 
 class TestPragmaCount:
-    """The enumerated allow-list: exactly three ``pragma: windows-only`` markers, all on Windows-ctypes
-    bodies, nowhere else in the file. After #276 these markers are NO LONGER coverage exclusions —
-    they are documentation of what the Windows coverage leg is responsible for exercising — but the
-    count must still be pinned so a future regression that grows the source-side enumeration (or
-    removes one of the markers and re-exposes the ctypes body, which has no other witness on Linux)
-    fails this test before it can drift unnoticed behind a green union 100%."""
+    """The enumerated allow-list: exactly ONE ``pragma: windows-only`` marker, on the raw kernel32
+    boundary class, nowhere else in the file. These markers are NOT coverage exclusions — they are
+    documentation of which region only a Windows runtime can enter — and the count is pinned so a
+    future regression cannot grow that region quietly.
 
-    def test_three_named_windows_only_markers_on_dictate_py(self):
+    It was three until the decisions moved off the boundary. Each of the three former markers sat on
+    an ``os.name == "nt"`` body that mixed foreign calls with the choices made about their return
+    values; the choices now live in plain functions that take the boundary as an argument, so the
+    only region left that a non-Windows runtime cannot enter is ``_Kernel32`` itself. A count that
+    climbs back up means Win32 knowledge has leaked out of that class again."""
+
+    def test_one_named_windows_only_marker_on_dictate_py(self):
         text = Path(dictate.__file__).read_text(encoding="utf-8")
         pragmas = [line for line in text.splitlines() if "pragma: windows-only" in line]
-        assert len(pragmas) == 3, (
-            f"dictate.py carries {len(pragmas)} 'pragma: windows-only' markers, expected exactly 3. "
-            f"Each must be on a Windows-ctypes body and named in TESTING.md's enumeration; a count "
-            f"higher means the source-side enumeration grew silently, a lower means the file "
+        assert len(pragmas) == 1, (
+            f"dictate.py carries {len(pragmas)} 'pragma: windows-only' markers, expected exactly 1. "
+            f"It belongs on the kernel32 boundary class and is named in TESTING.md's enumeration; a "
+            f"count higher means a decision moved back onto the boundary, a lower means the file "
             f"changed without updating the ratchet this test pins."
         )
-        # Every one names the same idea — a Windows kernel32 surface the Linux CI cannot reach —
-        # so a future marker on, say, "the clipboard-tiers' macOS branch" reads at once as wrong:
-        # the ratchet's purpose is to forbid those.
+        # The one marker names the same idea it always did — a Windows kernel32 surface no other
+        # runtime can reach — so a future marker on, say, "the clipboard-tiers' macOS branch" reads
+        # at once as wrong: the ratchet's purpose is to forbid those.
         for line in pragmas:
             assert "Windows" in line, f"every pragma must name a Windows-only body; got: {line!r}"
+
+    def test_the_marker_is_on_the_kernel32_boundary_class(self):
+        """Mutation gap: the count alone would be satisfied by ONE marker anywhere. The point of the
+        ratchet is WHERE the unreachable region is, so pin the line it sits on."""
+        text = Path(dictate.__file__).read_text(encoding="utf-8")
+        marked = [line for line in text.splitlines() if "pragma: windows-only" in line]
+        assert marked[0].startswith("class _Kernel32:"), marked[0]
 
 
 class TestMainGuard:
@@ -6019,12 +6031,12 @@ class TestPidAliveWindowsArm:
         reason="the AttributeError guard needs a runtime with no ctypes.WinDLL; the Linux and macOS legs own it",
     )
     def test_a_host_without_kernel32_reports_the_pid_dead(self, monkeypatch):
-        """Forcing the Windows arm on a host with no ``WinDLL`` runs the real failure the guard is
-        written for, with no stand-in for kernel32 anywhere in the test.
+        """Forcing the Windows arm on a host with no ``WinDLL`` runs the real failure
+        ``_kernel32_api`` is written for, with no stand-in for kernel32 anywhere in the test.
 
-        The comment on the guard states the contract it protects: report dead, do NOT fall back to
-        spawning a process to ask. A regression that let the ``AttributeError`` escape would turn
-        every poll of the recorder into a traceback.
+        The contract it protects: report dead, do NOT fall back to spawning a process to ask. A
+        regression that let the ``AttributeError`` escape would turn every poll of the recorder
+        into a traceback.
         """
 
         monkeypatch.setattr(dictate.os, "name", "nt")
@@ -6111,3 +6123,341 @@ class TestWinPidIsRecorderWindowsArm:
         comparison that always matched would let the stop path Ctrl+C and terminate a stranger."""
 
         assert dictate._win_pid_is_recorder(os.getpid(), "definitely-not-a-recorder") is False
+
+
+# --- the Windows DECISIONS, exercised on every platform -------------------------------------------
+#
+# The three functions above reach kernel32 through `_Kernel32`, a boundary object with no branching
+# in it. Everything that decides — which Win32 outcome means "alive", which means "not our
+# recorder", what order the console handler is restored in — lives in `_win_pid_alive`,
+# `_win_image_is_recorder` and `_console_ctrl_c`, each of which takes that boundary as an argument.
+# So these tests run on Linux, Windows and macOS alike, and they reach outcomes no runner can
+# produce on demand: a pid it may not open, an image name without `.exe`, a process that exits
+# between two calls, and the successful console Ctrl+C, which on a real boundary would be raised
+# through the test runner's own process.
+#
+# The stand-ins below hold no Win32 knowledge. They return the values the test hands them and record
+# what they were asked. Nothing here reimplements an API, so a passing test asserts dictate's
+# decisions rather than a second implementation of Windows.
+
+
+def _never_called(*args, **kwargs):
+    """A stand-in for a call the code under test must NOT make. On Windows there is no signal 0 and
+    ``os.kill`` maps straight to TerminateProcess, so a liveness probe that reached it would kill the
+    very recorder it asked about."""
+    raise AssertionError(f"os.kill must not be reached on the Windows arm; got {args!r}")
+
+
+class _ProcessStub:
+    """The process half of the kernel32 boundary, answered from values the test supplies."""
+
+    def __init__(self, *, open_result=(1, 0), wait_result=dictate._WIN_WAIT_TIMEOUT, image_result=(True, "")):
+        self.open_result = open_result
+        self.wait_result = wait_result
+        self.image_result = image_result
+        self.opened = []
+        self.waited = []
+        self.closed = []
+
+    def open_process(self, access, pid):
+        self.opened.append((access, pid))
+        return self.open_result
+
+    def wait(self, handle, milliseconds):
+        self.waited.append((handle, milliseconds))
+        return self.wait_result
+
+    def close(self, handle):
+        self.closed.append(handle)
+
+    def image_name(self, handle):
+        return self.image_result
+
+
+class _ConsoleStub:
+    """The console half of the kernel32 boundary. Every entry point is a callable the test supplies;
+    the stub binds it, appends the call to `calls`, and returns whatever the callable returned — so
+    the ORDER the finally-block restores things in is observable and nothing is decided here."""
+
+    def __init__(self, calls, console_cp, free_console, attach_console, set_ctrl_handler, generate_ctrl_event):
+        self.calls = calls
+        self._console_cp = console_cp
+        self._free_console = free_console
+        self._attach_console = attach_console
+        self._set_ctrl_handler = set_ctrl_handler
+        self._generate_ctrl_event = generate_ctrl_event
+
+    def console_cp(self):
+        self.calls.append("console_cp")
+        return self._console_cp()
+
+    def free_console(self):
+        self.calls.append("free_console")
+        return self._free_console()
+
+    def attach_console(self, pid):
+        self.calls.append(f"attach_console({pid})")
+        return self._attach_console(pid)
+
+    def set_ctrl_handler(self, handler, add):
+        self.calls.append(f"set_ctrl_handler({add})")
+        return self._set_ctrl_handler(handler, add)
+
+    def generate_ctrl_event(self, event, group):
+        self.calls.append(f"generate_ctrl_event({event},{group})")
+        return self._generate_ctrl_event(event, group)
+
+
+def _console(calls, **overrides):
+    """A console stand-in whose every call succeeds, with the named ones replaced."""
+    entries = {
+        "console_cp": lambda: 0,
+        "free_console": lambda: 1,
+        "attach_console": lambda pid: 1,
+        "set_ctrl_handler": lambda handler, add: 1,
+        "generate_ctrl_event": lambda event, group: 1,
+    }
+    entries.update(overrides)
+    return _ConsoleStub(calls, **entries)
+
+
+class TestWinPidAliveDecisions:
+    """``_win_pid_alive`` maps four Win32 outcomes onto two answers. Which outcome a given host can
+    produce is a property of that host — the CI Windows runner opens even the System process, so it
+    never sees access-denied — and the mapping is not, so it is pinned here on every leg."""
+
+    def test_a_pid_that_will_not_open_for_access_reasons_reads_as_running(self):
+        """ERROR_ACCESS_DENIED is "exists but is not ours", the Windows twin of the POSIX arm's
+        PermissionError -> True. Reading it as "no such process" would let the stop path treat a
+        live recorder owned by another session as gone. No runner reaches this: the CI image runs
+        elevated enough to open pid 4."""
+
+        api = _ProcessStub(open_result=(0, dictate._WIN_ERROR_ACCESS_DENIED))
+        assert dictate._win_pid_alive(1234, api) is True
+        assert api.closed == []  # nothing was opened, so nothing may be closed
+
+    def test_a_pid_that_will_not_open_for_any_other_reason_reads_as_dead(self):
+        """ERROR_INVALID_PARAMETER (87) is "no such process", and every other failure is "cannot
+        ask" — both report dead rather than kill what we cannot see."""
+
+        assert dictate._win_pid_alive(1234, _ProcessStub(open_result=(0, 87))) is False
+
+    def test_the_probe_asks_for_synchronize_and_query_limited_information_only(self):
+        """Least privilege, and load-bearing: SYNCHRONIZE is what permits the zero-timeout wait, and
+        PROCESS_QUERY_LIMITED_INFORMATION is the weakest right that still allows it. A wider mask
+        would fail against processes this one is allowed to poll."""
+
+        api = _ProcessStub()
+        dictate._win_pid_alive(4321, api)
+        assert api.opened == [
+            (dictate._WIN_SYNCHRONIZE | dictate._WIN_PROCESS_QUERY_LIMITED_INFORMATION, 4321)
+        ]
+
+    def test_a_handle_that_times_out_is_a_running_process(self):
+        """WAIT_TIMEOUT means the process has not signalled, i.e. it is still running. An inverted
+        comparison would report the running recorder as dead and the stop toggle would spawn a
+        second recorder over the first."""
+
+        api = _ProcessStub(open_result=(0x40, 1), wait_result=dictate._WIN_WAIT_TIMEOUT)
+        assert dictate._win_pid_alive(1234, api) is True
+        assert api.waited == [(0x40, 0)]  # zero timeout: a poll, never a wait
+        assert api.closed == [0x40]
+
+    def test_a_handle_that_signals_is_an_exited_process(self):
+        assert dictate._win_pid_alive(1234, _ProcessStub(wait_result=dictate._WIN_WAIT_OBJECT_0)) is False
+
+    def test_a_wait_that_fails_outright_reports_dead_and_still_closes(self):
+        """WAIT_FAILED fires when the process exits between the OpenProcess and the wait — a real
+        race no test can arrange against a real kernel. The answer to it is a decision, so it is
+        pinned here: cannot ask, report dead, and close the handle anyway."""
+
+        api = _ProcessStub(open_result=(0x40, 0), wait_result=0xFFFFFFFF)
+        assert dictate._win_pid_alive(1234, api) is False
+        assert api.closed == [0x40]
+
+    def test_the_dispatcher_hands_the_boundary_to_the_decision(self, monkeypatch):
+        """``_pid_alive`` with a boundary factory takes the Windows arm on any host — the platform
+        fact lifted out of the ambient ``os.name``. The POSIX signal-0 idiom must not run."""
+
+        monkeypatch.setattr(dictate.os, "kill", _never_called)
+        api = _ProcessStub(open_result=(7, 0), wait_result=dictate._WIN_WAIT_TIMEOUT)
+        assert dictate._pid_alive(1234, api_factory=lambda: api) is True
+        assert api.opened and api.closed == [7]
+
+    def test_a_boundary_that_cannot_be_built_reports_dead(self, monkeypatch):
+        """``_kernel32_api`` returns None when the library will not load — an OSError from
+        ``WinDLL``, or the AttributeError a runtime with no ``WinDLL`` at all raises. The contract
+        is report dead, and do NOT fall back to spawning a process to ask."""
+
+        def _no_kernel32():
+            raise OSError("kernel32 is not loadable here")
+
+        monkeypatch.setattr(dictate.os, "kill", _never_called)
+        assert dictate._pid_alive(1234, api_factory=_no_kernel32) is False
+
+
+class TestWinImageIsRecorderDecisions:
+    """``_win_image_is_recorder`` decides whether a pid may be signalled. Two of its arms cannot be
+    produced on a Windows host at all: an image name that does not end in ``.exe``, and the query
+    losing its race with a process that is exiting."""
+
+    def test_a_handle_that_will_not_open_is_not_something_to_signal(self):
+        api = _ProcessStub(open_result=(0, 87))
+        assert dictate._win_image_is_recorder(1234, "ffmpeg", api) is False
+        assert api.closed == []
+
+    def test_a_query_that_fails_refuses_to_vouch_and_still_closes(self):
+        """The process exited between the open and the query. Returning True here would hand an
+        unverified pid to a console-wide Ctrl+C followed by TerminateProcess."""
+
+        api = _ProcessStub(open_result=(0x40, 0), image_result=(False, ""))
+        assert dictate._win_image_is_recorder(1234, "ffmpeg", api) is False
+        assert api.closed == [0x40]
+
+    def test_the_image_is_matched_by_basename_lowercased_and_untailed(self):
+        api = _ProcessStub(open_result=(0x40, 0), image_result=(True, r"C:\Program Files\FFmpeg\FFMPEG.EXE"))
+        assert dictate._win_image_is_recorder(1234, "ffmpeg", api) is True
+
+    def test_an_image_with_no_exe_suffix_is_compared_whole(self):
+        """The trim is conditional, and on Windows the condition is always true — every process
+        image there ends in ``.exe``, so no runner can take the other side. A trim applied
+        unconditionally would turn ``pw-record`` into ``pw-re`` and refuse a legitimate recorder."""
+
+        api = _ProcessStub(open_result=(0x40, 0), image_result=(True, "/usr/bin/pw-record"))
+        assert dictate._win_image_is_recorder(1234, "pw-record", api) is True
+
+    def test_sox_is_matched_by_its_front_end_binary_name(self):
+        """``recorder_argv`` spawns sox as ``rec``, so the image behind the pid is ``rec.exe``."""
+
+        api = _ProcessStub(open_result=(0x40, 0), image_result=(True, r"C:\sox\rec.exe"))
+        assert dictate._win_image_is_recorder(1234, "sox", api) is True
+        assert dictate._win_image_is_recorder(1234, "arecord", api) is False
+
+    def test_a_stranger_holding_the_recycled_pid_is_refused(self):
+        api = _ProcessStub(open_result=(0x40, 0), image_result=(True, r"C:\Windows\notepad.exe"))
+        assert dictate._win_image_is_recorder(1234, "ffmpeg", api) is False
+        assert api.closed == [0x40]
+
+    def test_the_probe_asks_for_query_limited_information_only(self):
+        api = _ProcessStub(open_result=(0x40, 0), image_result=(True, "ffmpeg.exe"))
+        dictate._win_image_is_recorder(99, "ffmpeg", api)
+        assert api.opened == [(dictate._WIN_PROCESS_QUERY_LIMITED_INFORMATION, 99)]
+
+    def test_the_dispatcher_hands_the_boundary_to_the_decision(self):
+        api = _ProcessStub(open_result=(0x40, 0), image_result=(True, "ffmpeg.exe"))
+        assert dictate._win_pid_is_recorder(1234, "ffmpeg", api_factory=lambda: api) is True
+
+    def test_a_boundary_that_cannot_be_built_refuses_to_vouch(self):
+        def _no_kernel32():
+            raise AttributeError("module 'ctypes' has no attribute 'WinDLL'")
+
+        assert dictate._win_pid_is_recorder(1234, "ffmpeg", api_factory=_no_kernel32) is False
+
+
+class TestConsoleCtrlCDecisions:
+    """``_console_ctrl_c`` is the sequence a real boundary cannot be walked through: reaching its
+    successful arm means raising a console-wide CTRL_C_EVENT from inside whatever process is running
+    the test, after detaching that process from its own console. Against a stand-in boundary the
+    whole sequence — including the order the finally-block restores things in — is ordinary code."""
+
+    def test_the_event_goes_out_and_the_console_state_is_restored_in_order(self):
+        """The successful path. Detach BEFORE re-arming the default handler: while still attached to
+        the target console, the CTRL_C_EVENT just raised can reach this process and kill the stop
+        toggle before it transcribes the speech it stopped for."""
+
+        calls = []
+        assert dictate._console_ctrl_c(4321, _console(calls)) is True
+        assert calls == [
+            "console_cp",
+            "attach_console(4321)",
+            "set_ctrl_handler(True)",
+            f"generate_ctrl_event({dictate._WIN_CTRL_C_EVENT},0)",
+            "free_console",
+            "set_ctrl_handler(False)",
+        ]
+
+    def test_a_process_with_its_own_console_leaves_it_and_comes_back(self):
+        """GetConsoleCP is non-zero when this process has a console of its own: it must be released
+        before attaching to the target's, and re-attached to the parent afterwards."""
+
+        calls = []
+        assert dictate._console_ctrl_c(77, _console(calls, console_cp=lambda: 437)) is True
+        assert calls[:3] == ["console_cp", "free_console", "attach_console(77)"]
+        assert calls[-1] == f"attach_console({dictate._WIN_ATTACH_PARENT_PROCESS})"
+
+    def test_a_console_that_will_not_attach_is_a_process_already_gone(self):
+        """Nothing was attached and no handler was replaced, so the finally-block must restore
+        neither — a stray SetConsoleCtrlHandler(None, False) here would re-arm a handler this
+        function never disarmed."""
+
+        calls = []
+        assert dictate._console_ctrl_c(77, _console(calls, attach_console=lambda pid: 0)) is False
+        assert calls == ["console_cp", "attach_console(77)"]
+
+    def test_an_event_that_does_not_go_out_is_reported_as_failure(self):
+        calls = []
+        assert dictate._console_ctrl_c(77, _console(calls, generate_ctrl_event=lambda e, g: 0)) is False
+        assert "free_console" in calls and "set_ctrl_handler(False)" in calls
+
+    def test_a_boundary_that_raises_mid_sequence_is_a_failure_not_a_traceback(self):
+        """A raise escaping here would take down the stop toggle. The recorder is signalled from a
+        hotkey; a traceback is a recording nobody gets back."""
+
+        def _explode(pid):
+            raise OSError("the console vanished")
+
+        calls = []
+        assert dictate._console_ctrl_c(77, _console(calls, attach_console=_explode)) is False
+
+    def test_a_failure_while_detaching_does_not_lose_the_answer(self):
+        """The finally-block runs after the answer is decided. A raise from FreeConsole there would
+        replace a successful Ctrl+C with an exception — and would skip re-arming the handler."""
+
+        def _explode():
+            raise OSError("FreeConsole refused")
+
+        calls = []
+        assert dictate._console_ctrl_c(77, _console(calls, free_console=_explode)) is True
+        assert calls[-1] == "set_ctrl_handler(False)"  # the next restore step still ran
+
+    def test_a_failure_while_re_arming_the_handler_does_not_lose_the_answer(self):
+        """SetConsoleCtrlHandler succeeds on the way in and fails on the way out — the only shape
+        that reaches this guard, since a failure on the way in never sets `handler_set`."""
+
+        seen = []
+
+        def _fails_the_second_time(handler, add):
+            seen.append(add)
+            if len(seen) > 1:
+                raise OSError("SetConsoleCtrlHandler refused")
+            return 1
+
+        calls = []
+        console = _console(calls, console_cp=lambda: 437, set_ctrl_handler=_fails_the_second_time)
+        assert dictate._console_ctrl_c(77, console) is True
+        assert calls[-1] == f"attach_console({dictate._WIN_ATTACH_PARENT_PROCESS})"  # still ran
+
+    def test_a_failure_while_re_attaching_the_parent_console_does_not_lose_the_answer(self):
+        """The last restore step, and the last thing that could turn a delivered Ctrl+C into a
+        traceback."""
+
+        def _attach(pid):
+            if pid == dictate._WIN_ATTACH_PARENT_PROCESS:
+                raise OSError("AttachConsole refused")
+            return 1
+
+        calls = []
+        console = _console(calls, console_cp=lambda: 437, attach_console=_attach)
+        assert dictate._console_ctrl_c(77, console) is True
+
+    def test_the_dispatcher_hands_the_boundary_to_the_sequence(self):
+        calls = []
+        console = _console(calls)
+        assert dictate._win_console_ctrl_c(4321, api_factory=lambda: console) is True
+        assert "attach_console(4321)" in calls
+
+    def test_a_boundary_that_cannot_be_built_signals_nothing(self):
+        def _no_kernel32():
+            raise AttributeError("module 'ctypes' has no attribute 'WinDLL'")
+
+        assert dictate._win_console_ctrl_c(4321, api_factory=_no_kernel32) is False

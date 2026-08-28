@@ -58,9 +58,11 @@ What makes 100% honest rather than decorative:
 `selftest.yml` (after #156 C moved the floor from 80 to 100, and #276 moved the per-scope claim off
 the Linux-only leg and onto the combined report that aggregates the three platforms' artifacts).
 Two of the three union floors are at 100 (`doctor.py` and `speak.py`, both measured there), and the
-third — the whole `scripts/*` scope — sits at 99 because `dictate.py` does. Retiring the exclusion
-table put the platform regions into the denominator for the first time and the numbers were pinned
-at what the first honest run measured; #277 then wrote the tests and raised the two that reached.
+third — the whole `scripts/*` scope — sits at 99, pinned where `dictate.py` used to hold it.
+Retiring the exclusion table put the platform regions into the denominator for the first time and
+the numbers were pinned at what the first honest run measured; #277 then wrote the tests and raised
+the two that reached. `dictate.py`'s residue is closed too now, so the `scripts/*` floor is below
+what the union measures and is due a ratchet the next time the gate prints a figure.
 What is still short, and why, is stated below under *What the union does not reach* — as a
 disclosure rather than as an exclusion, which is the whole point of #276. The rest of `scripts/` — `dictate.py`, `contour_poll.py`,
 `contracts.py`, `doctor.py`, `providers.py`, `report_bug.py`, `install_ledger.py`, `preview.py`,
@@ -74,8 +76,10 @@ list read forwards rather than backwards —
 - the Windows-only no-`killpg` arm of `_kill_process_group`, and the `sys.platform == "win32"` arm
   of the kill helper (`speak.py`);
 - the macOS-only `_ps_cmdline_of` helper that wraps `ps -p` (`speak.py`);
-- the three Windows-`ctypes` bodies in `dictate.py` (`_pid_alive`, `_win_console_ctrl_c`,
-  `_win_pid_is_recorder`), each on `os.name == "nt"`;
+- the single Windows-`ctypes` boundary class `_Kernel32` in `dictate.py` — the three
+  `os.name == "nt"` bodies that used to sit inside `_pid_alive`, `_win_console_ctrl_c` and
+  `_win_pid_is_recorder` were split into a boundary (kernel32 calls, no branching) and decisions
+  (branching, no kernel32), so only the boundary is platform-bound now;
 - the three Windows-WSL bodies in `doctor.py` (profile redaction, the `wsl.exe` UTF-16 decoder
   path, and `_registered_wsl_distros` reading `winreg`);
 - and the `ctypes.WinDLL("kernel32")` handle probe `_windows_process_is_live` in `contracts.py`.
@@ -108,26 +112,46 @@ Windows leg, the `AttributeError` guards on the legs that have no `WinDLL` at al
 pure-bytes UTF-16 decoder anywhere. All three measure 100% on the union, statements and branches,
 and their gates are set there.
 
-One file resists — `dictate.py`, at 98%, with 19 statements and 8 partial branches missed out of
-1283. Every one of them is inside the three Windows-`ctypes` bodies, and each is named here rather
-than excluded:
+`dictate.py` used to be the one file that resisted — 98%, with 19 statements and 8 partial branches
+missed out of 1283, all of them inside its three Windows-`ctypes` bodies. Six kinds of arm were
+named here as unreachable: the defensive `except` guards around the console dance, the successful
+attach-and-raise path itself, the two arms that fire only when a process exits between two calls,
+the access-denied arm, and the image-name trim for a name that does not end in `.exe`. That entry
+was accurate about the *code as it stood*, and wrong about the *conclusion it drew*: the lines were
+unreachable because a decision about a return value was written in the same function as the call
+that produced it. Neither leg could reach them — the Linux one has no kernel32, and the Windows one
+cannot make its own runner exit mid-call, cannot fail to open pid 4, has no process image without
+`.exe`, and cannot raise a console-wide Ctrl+C through the process running the tests.
 
-| what | why it is not reachable |
-|---|---|
-| the `except Exception: pass` arms inside `_win_console_ctrl_c`'s `finally` — around `FreeConsole()`, `SetConsoleCtrlHandler(None, False)` and `AttachConsole(-1)` | a `ctypes` foreign-function call returns an error code; it does not raise. These arms are defensive belt-and-braces around calls that have no failure mode a test can provoke without substituting something for kernel32 |
-| `_win_console_ctrl_c`'s `except Exception: return False` around the attach/raise sequence | the same reason |
-| the successful attach-and-raise path in `_win_console_ctrl_c` (`AttachConsole`, `SetConsoleCtrlHandler`, `GenerateConsoleCtrlEvent`) | reaching it means raising a console-wide `CTRL_C_EVENT` from inside the test runner's own process, after detaching that process from its console. The event reaches every process on the console, the test runner included; a mistake in the handler dance kills the run rather than failing a test |
-| `_pid_alive`'s `WAIT_FAILED` arm, and `_win_pid_is_recorder`'s `QueryFullProcessImageNameW`-returned-zero arm | both fire only when the process exits between the `OpenProcess` and the call that follows it — a real race, not a state a test can arrange |
-| `_pid_alive`'s ERROR_ACCESS_DENIED arm | measured, not assumed: the CI Windows runner opens even the System process (pid 4), so `OpenProcess` does not fail with access-denied there for any pid the test can name. The test asserting pid 4 reads as running still stands — it just reaches the answer through the handle poll instead |
-| the no-`.exe` arm of `_win_pid_is_recorder`'s image-name trim | every process image on Windows ends in `.exe`, so the branch that handles one that does not cannot be taken. It became visible only once the surrounding body started executing |
+The three bodies are now split in two:
 
-The rule this plugin adopted in #276 is that platform code gets a leg rather than an exclusion, and
-these lines get neither: they are counted, they are missed, and the `scripts/*` floor stays at 99
-because of them. Substituting a
-stand-in for kernel32 would close them on paper, but a fake that needs its own correctness argument
-is a second implementation, and the test would then assert the fake. The honest reading of the
-union figure is that it counts a handful of defensive arms around a foreign-function boundary that
-nothing but a fake can enter — so the figure stays below 100 and the reason is written down.
+- **`_Kernel32`** is the boundary. Every console entry point is a *bound* foreign function, every
+  method is one foreign call plus the values that call produced, and the class contains no `if` at
+  all. There is nothing in it to get wrong, and nothing in it to decide.
+- **`_win_pid_alive`, `_win_image_is_recorder` and `_console_ctrl_c`** are the decisions. Each takes
+  the boundary as an argument, so each runs on every platform against a stand-in that returns the
+  values the test hands it. The stand-ins hold no Win32 knowledge — no constants, no semantics, no
+  second implementation of Windows to assert against — which is what the previous entry here
+  correctly refused to accept.
+
+Every one of the 19 statements and all 8 partial branches now has a test that runs on all three
+legs, including the successful console Ctrl+C: the sequence, and the order the console state is
+restored in, are ordinary code once the kernel32 calls are somebody else's object. Nothing was
+excluded and no marker was added — the `pragma: windows-only` count in `dictate.py` went from three
+to one, and the one that remains is on `_Kernel32`.
+
+What is left is `_Kernel32` itself, 25 statements and no branches. It is measured, not excluded, and
+the Windows leg is what executes it: the constructor runs on every `_pid_alive` call there, and
+`open_process` / `wait` / `close` / `image_name` run in the Windows-only tests that probe this very
+process, pid 4, and a pid that cannot exist. The console entry points are bound in that same
+constructor rather than wrapped in methods, precisely so that no statement exists whose execution
+would require raising a console-wide Ctrl+C through the test runner. On the Linux and macOS legs
+those 25 lines are missed and counted; on the union they are covered.
+
+One correction to the older entry above, worth keeping because it was measured: `os.path.basename`
+was reading the Win32 path `QueryFullProcessImageNameW` returns. On Windows `os.path` *is* `ntpath`,
+so production behaviour was correct — but the choice made the decision unreadable anywhere else, and
+it is now `ntpath.basename` explicitly.
 
 The `scripts/*` floor does NOT say "100% of every line" — it says "everything measurable across
 Linux + Windows + macOS, with the residue named". Coverage IS still a meaningful metric for the GLUE
