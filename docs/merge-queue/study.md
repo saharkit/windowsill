@@ -1,0 +1,161 @@
+# Why the multiplier in your CI bill has nothing to do with your tests
+
+We deleted slow tests and made continuous integration faster on every pull request, to bring a bill down — and three days later the bill was worse.
+
+Ask yourself one thing before you read further: do your pull requests ever wait behind one another to land? If they never do, this article's subject does not apply to your repository, and the rest will not repay your time. If they do, keep reading — the answer costs nothing to check, and it is the whole filter.
+
+A $300 free-trial grant — credit against the whole account across every service it touched, not against any one of them — meant to last months and running from 22 July to 28 August, was gone in three days of test runs — 1,930 vCPU-hours of them. On the worst day, 2026-07-26, we burned TRY 4,404.36 in a day (about $94), at a rate between 46.63 and 47.40 lira to the dollar across the window.
+
+We made three moves, in order, and each one caused the next. The first was not really a choice: the grant was gone, and with nothing behind the account the only capacity we could add was capacity we already had. That answer stands on two facts about our own size, not one: we already owned the hardware, and our scale is small enough — we do not currently need to scale far — for that hardware to suffice. We moved the heavy, high-volume work onto machines we already owned and had sitting idle — which turns a money ceiling into a capacity ceiling, since a machine you own has to be kept busy or it is waste of a different kind. The hosted builder kept everything the volume argument does not touch, and that is the load-bearing part, still running and passing on every merge: the container images are built there, the artifact registry there holds both those images and the language packages our own build depends on, and the deploy to the managed cluster runs there — not residue, but what we chose to keep buying, and we have no intention of running it ourselves. This was a split by workload, not a departure. And because both of those conditions are facts about our size, the arrangement is temporary by construction: if either stops holding — the hardware stops being enough, or the scale grows — that work goes back to the hosted service, which is an ordinary outcome, not a defeat or a failure. Making runs cheaper — deleting tests, trimming what a pull request has to run — is a real trade, and we made it with the price stated up front: a pull request can pass its own check and still fail when the full suite runs. So we ran the full suite only where changes are combined before landing, on GitHub's merge queue.
+
+Nobody drew the consequence of that move at the time. Once the pull-request tier only runs a subset, the full suite runs, in practice, in exactly one place: the merge queue, once per pull request in the group being merged.
+
+On the day we measured it, our merge queue landed thirteen pull requests and ran the full test suite sixty times, at fifteen to nineteen minutes a run — fifteen to nineteen machine-hours of suite in a single day — on a shared pool of four machines. Nobody had been counting builds on that tier, because the counting habit had formed on the tier we had just made cheap.
+
+The cost of continuous integration is two numbers multiplied together: how many times a suite runs, and what one run costs. Every one of those moves went after the second number. The last one moved the expensive suite into the one place that charges per member of a group, not per pull request — and that is where this article's savings live.
+
+## §2. The answer, paid in the currency we just promised
+
+A merge queue tests pull requests in **groups**: it takes several pull requests together and decides, as a set, which ones are safe to land. Today, ours runs the whole test suite once for every pull request in the group. Done differently, it can run the suite **once for the group instead of four times** — about nineteen fewer machine-minutes per pull request landed, at a cost of about four minutes more waiting per pull request. There are four ways to run a group like this, and only one of them is both safe and cheaper: one lets broken code merge, one can freeze the whole group, a third is safe but is the price we are already paying, and the fourth is the one this article is about. These four are our own candidate designs — logic we wrote into a workflow and tested, not settings anyone can switch on — and the names are how we tell our candidates apart, not a claim that they exist in any documentation.
+
+The saving above is an upper bound, measured on a sandbox rig — none of this runs on our production queue yet. The reason for the ceiling is stated once, in full, in §8, where the evidence for it arrives; nothing later in this piece re-argues it.
+
+[FIGURE D3 — a 4×2 matrix, rows labelled in plain English by what each merge-queue mode does, four words of verdict in each cell, no mode names or cell letters]
+
+The four rows: run the whole suite for every pull request in the group; run it only for the last one; wait for a later one to decide; fail the whole group together.
+
+## §3. What a merge queue is, what it buys, and what it sells
+
+Nobody sets one up for fun. Without a queue, landing several pull requests against the same trunk means rebasing each one by hand every time an earlier one lands first, running its checks again, and hoping nothing else lands underneath it while that run is still going. That loop has a person standing inside it, watching a check, rebasing, waiting.
+
+[FIGURE D1 — the hand-rebase loop drawn beside the queue's loop, with a human figure standing inside the hand-rebase one and outside the queue's]
+
+A merge queue removes the person from that loop. It takes several pull requests, orders them, tests each against the ones ahead of it, and lands the ones that pass — without anyone re-triggering a check or re-doing a rebase by hand. That is what it buys: serialization without a human doing the serializing.
+
+A word of credit, because none of this would have a subject otherwise. Speculative gating — assemble the queued changes into a group, test the group as it would land, and merge only what passed together — is not new and is not GitHub's invention. Zuul has done it, in the open, on hardware you host yourself, for longer than GitHub's queue has existed, and it does things the queue still cannot, like spanning repositories. In its own deprecation notice, bors-ng — another open-source queue — directs its users to GitHub's merge queue as its successor. What GitHub did was different, and it is the reason this article has readers: they put that machinery behind a setting. No queue operator to run, no separate service to keep alive, no team to own it. A team of two can turn it on.
+
+What it sells is a build per pull request in the group, every time — that is the queue's own price for taking the human out. The people who pay are whoever is waiting for a machine — every other build in the queue behind these. This is not a new cost invented by the queue. Without one, a person pays a run per rebase too; the work does not disappear, it moves. What changes is who does the waiting, how much of it happens in parallel, and whether a person has to be present for it. A queue that runs one build per group member is not charging more than manual rebasing did — it is charging the same thing, visibly, all at once, on a bill someone eventually reads.
+
+That visibility is what makes the next question worth asking: does every member of a group really need its own full run, or does the last one already contain the answer for all of them?
+
+## §4. Four pull requests, four builds, and the fourth already contains the first three
+
+Candidates in a merge queue form a chain, not a tree: each candidate's starting point is the previous candidate's end point, so the last candidate in a group already contains everything the ones before it contain. If the fourth candidate passes, the first three passed inside it. If the fourth candidate is red because of something the first candidate broke, that same break is visible in the fourth candidate's failure. We tested that claim directly, on a throwaway repository built for it.
+
+[FIGURE D2 — four candidates drawn side by side in a chain, each box containing everything to its left, with the pull request that introduced the break shaded inside the two candidates that contain it]
+
+Four pull requests produced four group builds, dispatched within a four-second window of one another. Twenty to thirty seconds later, each build, asked about the others, reported all four still awaiting their checks — including itself. Nothing had finished early enough for a shallower build to look at a deeper one and stand down.
+
+This is the redundancy a merge queue is built to sell you: four builds where, in the passing case, one verdict would have answered for all four. It refutes the simple fix — "have the shallow ones just wait and check the deep one" — because at the moment a shallow build starts, no deeper build has an answer yet to check.
+
+## §5. Is this GitHub's to fix?
+
+We asked whether the redundancy is something GitHub's merge queue already lets you turn off, before assuming it was ours to solve.
+
+GitHub's own documentation says the settings that control merging do not combine the builds the queue dispatches — one build per candidate is the design, not a gap in it. We checked every merge-queue setting GitHub exposes, one at a time; the one setting that looked like a candidate for this — the rule that decides whether a candidate is judged against everything ahead of it or only against the newest entry — changes what *gates* a merge, not how many builds get *dispatched*. We measured this directly: four pull requests, four builds, under both settings.
+
+The other major hosted forge people reach for does not batch builds either — one pipeline per request, no setting required to get there, the same one-build-per-candidate result GitHub gives you regardless of which setting you pick. Self-hostable options split into the same two camps: bors-ng — at `bors-ng/bors-ng` — batches the way we want but has been unmaintained since April 2024; Kodiak, which is maintained, does not batch at all. GitHub community discussions [#43988](https://github.com/orgs/community/discussions/43988) and [#58523](https://github.com/orgs/community/discussions/58523) raise this exact doubled cost, and neither has a published fix attached to it.
+
+That absence is what makes this worth building ourselves.
+
+## §6. The rig, and what it computes
+
+We built one workflow with three jobs: a cheap job that reads the queue and works out where its own pull request sits in it; an expensive job, standing in for the real test suite, gated on that first job's answer; and a single always-running job, the one required check the queue watches. A job whose condition is false is never dispatched — it claims no machine time at all, which is stronger than routing it to a cheaper machine, because a cheap machine is still a machine. That frugality was forced, not preferred: nothing sits behind this study but the one trial grant, already burned through by July's test runs, so a grid that dispatched builds it did not need was a grid we could not have afforded to finish. Which of the four modes runs is a single repository setting, so every cell in the matrix runs the same code.
+
+The pull-request check and the merge-queue check are written to behave differently on purpose. If they behaved the same way, "the break sits in the first member of the group" and "the break sits somewhere else" would look identical from outside, and nothing in the results below could tell them apart.
+
+We ranked outcomes in one fixed order and used it for every case that follows: first, does anything unsafe merge - we call this soundness; second, does the group ever finish - liveness; third, what it costs; fourth, how much of the group actually lands. The driver — the shell script that drives a whole arm: it opens the pull requests, sets the mode, watches the queue, and records what each cell did — measures the first two directly. The last two we read off the recorded cells by hand.
+
+## §7. The cases: what was tested and how each behaved
+
+Four modes, one grid, same four questions for each: what we set up, what we expected, what happened, and — its own sentence every time — what that result refutes.
+
+**Run every candidate.** Set up: every candidate in the group runs its own full suite, independent of the others. Expected: safe, and correct by construction, since nothing depends on another candidate's result. Happened: sound in every run, every group resolved, four full suites dispatched every time. This refutes nothing — it is the baseline the other three modes are measured against.
+
+**Skip the ones that are not last.** Set up: only the deepest candidate runs the real suite; the others report success without running it. Expected: three fewer builds per group of four, if the queue's own bookkeeping is trustworthy. Happened: refuted. The mechanism is not a race to eject shallow candidates — it is a **wait timer**. With minimum entries to merge set to four and a five-minute wait, a group enqueued at 13:33:23 merged at 13:38:57 — five minutes and thirty-four seconds, the timer plus the queue's own bookkeeping — and the second run cleared at five minutes and thirty-six; the second pair is in the repository — hand-verified against the candidate ref and the trunk after. In both runs, when the timer expired with fewer than the minimum green, the queue merged the largest green prefix it had. This refutes the idea that skip's reporting can stand in for a real run: that prefix can include a candidate that never actually ran.
+
+**Wait for a deeper verdict.** Set up: a shallow candidate holds until a deeper one reports. Expected: safe, at the cost of some waiting. Happened: sound, and dead. The head of the group is marked unmergeable, GitHub never ejects it, every shallower candidate holds behind it, and nothing moves between eighty seconds and seven minutes in. This mode stuck in every run we gave it, under both grouping rules. The obvious explanation — that this is a property of the stricter grouping rule, which judges a candidate against everything queued ahead of it — does not hold: the same shape under the looser rule deadlocks identically. This refutes the idea that the grouping rule causes the deadlock; after that test we do not know what does. Our own mode logic treats 'unmergeable' as still undecided; why the platform never ejects the head is what we do not know.
+
+**Fail the whole group together.** Set up: a shallow candidate mirrors the deepest verdict it can already see — deeper mergeable, it stands down; deeper unmergeable, it fails immediately and the group falls together; no deeper verdict yet, it runs for real. Expected: safe and live, at the price of losing an entire group to one bad member. Happened: sound in every run; every group resolved except one, at the shortest liveness setting we tried. The sample is four modes by two grouping strategies — eight cells, every one with a verdict, none blank, the breakage that separates them in the third of four members so the deepest survivor after the head is ejected is itself red — re-run with three of four members red and again with all four, under both grouping rules, and every soundness verdict was unchanged; what is not covered is other group sizes, breakage in positions beyond those re-run, and how the rig performs under load. That one group was not a soundness failure — nothing unsafe merged there either — it was a liveness edge case at a value we had already flagged as aggressive, and it resolved cleanly when re-run at a longer one; we kept the aggressive value everywhere else in this section, since a harder case that resolves at a realistic setting tells us more than an easy case that resolves at a generous one. Where the other three modes each gave something up, this is the only one of the four that gave up nothing on the two questions we ranked first: skip gave up soundness, wait gave up liveness, and run-every gave up the saving this whole article is about. No untested tree ever reaches the trunk here, because every merge this mode issues stands behind a real run somewhere in the chain — a shallow candidate that stands down is standing behind a deeper candidate's real suite, not its own guess. That safety is paid for in full: a group of four with a defect in the first member does not land three good pull requests and drop the one bad one, the way run-every-candidate does — it drops all four, and all four re-queue. This is the mode that won. This refutes the assumption that safety and liveness trade off against each other in this design: fail-together buys both, and hands the cost of buying them — the whole group, not just the broken member — to §8 to price.
+
+Turning it on has two halves, and only one of them is a setting. The mode itself is your own workflow logic — a decide job on the cheap hosted runners that works out where its pull request sits in the queue, the suite running only when that job says so, and a gate job reporting under `if: always()` so a required check is never left unreported — and none of that can be switched on from a settings page. The platform half is GitHub's merge-queue grouping strategy, which has two values: `ALLGREEN`, where every entry in the group must pass on its own, and `HEADGREEN`, which gates on the head instead. Neither half works alone, and the order is not a preference: `HEADGREEN` without the mode merges broken code exactly as `ALLGREEN` does — that was measured, not reasoned — while the mode without `HEADGREEN` is correct but slower to clear, because the queue collects every candidate's verdict before the batch can fall. Build the mode first, observe it, and only then change the strategy.
+
+Where the break sits inside the group matters as much as which mode runs it. The safe shape, break in the first member, came back green across every mode we tried — that is an absence of a result, not a result, since a break that early gives every mode the easiest possible case. The shape that separates the modes is the break sitting third of four: shallow enough that something has to wait or guess, deep enough that the chain has already carried it partway. One pair of runs, break-in-third under both grouping rules, is what lets the "wait" mode's deadlock be pinned on the mode rather than on the grouping rule. A second run kills the hope that a **head-green grouping rule** — one that judges a candidate only against the group's current head, rather than against everything queued ahead of it — would rescue the waiting mode on its own: it deadlocks under that rule too.
+
+[FIGURE D4 — the waiting mode beside the fail-together mode on one timeline: one frozen partway across, one falling to red as a block]
+
+The full grid, with every cell identified, is in the rig repository — https://github.com/saharkit/windowsill/tree/main/docs/merge-queue — for anyone who wants to reproduce it.
+
+## §8. What the safe mode costs, and why every number here is a ceiling
+
+"Fail the whole group together" wins on safety and liveness. It does not win for free. Under that mode, any cell where a defect is present merges **nothing** — the whole group falls and every pull request in it re-queues. Under "run every candidate" on the same broken shape, the pull requests ahead of the break still land.
+
+At our own per-change failure rate — 9 defects in 40 changes on this repository, 22.5% — with groups of four and a 17-minute suite (the midpoint of the 15-to-19 range §1 measured), the two modes compare like this, per pull request that eventually merges. Forty changes is a small sample and one repository's habits are not another's, so of every input here that is the one to replace with your own before trusting the row:
+
+| | run every candidate | fail together |
+|---|---|---|
+| builds | 1.82 | 0.69 |
+| machine-minutes | 30.9 | 11.8 |
+| wait to land | 7.7 min | 11.8 min |
+
+About nineteen machine-minutes saved, about four minutes more waiting, per pull request.
+
+One number in that table and one in §1 do not agree, and we have not reconciled them: the day §1 measured implies about 4.6 full-suite runs per landed pull request — sixty runs for thirteen landings — while the model above assumes 1.82 builds per merged pull request, and the two count different things, since the measured day includes every group a pull request appeared in, including groups it did not land from. If the measured figure is the right one, the saving is larger than quoted, not smaller, so the number we publish stays the conservative one.
+
+That saving is quoted in machine-minutes rather than dollars because what a machine-minute costs depends entirely on whose machine it is, and the spread is wider than most people expect. Four published lists, observed 2026-08-28, US dollars per minute, Linux x64:
+
+| vCPU | GitHub Actions | Google Cloud Build | Blacksmith | BuildJet |
+|---|---|---|---|---|
+| 2  | 0.006 | 0.006 | 0.004 | 0.004 |
+| 8  | 0.022 | 0.0156 | 0.004 | 0.016 |
+| 32 | 0.082 | 0.0624 | 0.004 | 0.048 |
+
+Everything in that table is a Linux minute, and the platform the minute runs on is a larger multiplier than the spread between suppliers. From GitHub's published minute rates, observed 2026-08-28: the standard Windows 2-core runner is $0.010 against Linux's $0.006 — 1.67× — and at 32 cores Windows is $0.162 against Linux's $0.082, very nearly double; the standard macOS runner, at three or four cores, is $0.062 — 10.33× Linux. This article's arithmetic is about how many times a suite runs, so whatever multiplies the price of one run multiplies the whole result: a queue that runs the suite four times instead of once costs the same 4× on every platform, but on macOS each of those runs starts ten times higher. One boundary, said in the same breath: for a public repository, GitHub-hosted minutes are not billed at all — Windows and macOS legs included — so these figures bite only on private repositories. The multiplier is a fact about the size of the stake, not a complaint about anyone's pricing; owning hardware pays best where the hosted minute is dearest, and that is a statement about our own arithmetic.
+
+Substitute your own rate and the money is yours to compute. Three things the table says on the way past. A specialist that sells only runners can price flat — Blacksmith charges the same per minute at two cores as at thirty-two — where a platform that sells everything cannot; these are different businesses, not a better one and a worse one. At thirty-two cores the hosted builder is cheaper than the forge, $0.0624 against $0.082, so it is simply not the case that hosted compute is uniformly the expensive option. And the comparison claims vendors publish mostly overstate what their own lists show: BuildJet's page leads with "2x faster and cheaper" and carries a customer quoted as having had costs "cut in half", while its own published list runs 27–41% below — which is this article's own thesis applied to a price page, compute it yourself from your own numbers. The column the table does not have is hardware you already own, whose minute costs amortisation plus electricity divided by the minutes the machine actually runs, so an idle machine's minute costs infinitely much — the capacity ceiling this article opened with, written as a formula.
+
+The nineteen machine-minutes is a ceiling. The model behind it assumes every retry draws a fresh, independent batch. A real failed group does not: it comes back with the same defect still in it, and for a genuine bug, retrying the identical group never succeeds. The two modes are not symmetric here either — "run every candidate" only re-queues the pull requests past the first broken one, while "fail together" re-queues the entire group. So the dynamics this model leaves out penalize the mode we are recommending more than the baseline, not less. An audit of the model found both.
+
+So the honest version of this section's headline is a conditional: the saving is real only where something identifies which pull request broke the group between one attempt and the next — a step that reads a fallen group's results, names the member whose changes broke it, and re-queues the rest without it. That step is not built.
+
+## §9. Three things we got wrong before we got them right
+
+The first arm we ran had no required status check attached to the queue, so it merged all four pull requests immediately and dispatched **zero** group builds. Zero is not a small version of the answer — it means the queue had nothing to wait on, which is a different failure than the one we were trying to measure. The cost was the whole arm: nothing it produced could be reused once the check was added back, because a queue with nothing to gate on cannot tell you what gating costs, and every mode had to be re-run from an enqueue that actually waited on something.
+
+The second: our first grid ran only the shape where the break sits in the first member of the group, and it came back green across every mode. That reads like a result — four modes, one shape, all safe — and for a while we took it for one. It is the absence of one: the earliest possible break gives every mode the easiest case it will ever see, so a grid built only that way cannot separate a safe design from a lucky one. The cost of that mistake was a second full grid, run with where-the-break-sits added as its own axis — and it is that second pass, not the first, that found the deadlock in the waiting mode, a defect the easy shape had no way to show us no matter how many times we reran it.
+
+The third: our first pass at a liveness verdict could not distinguish "falling correctly" from "stuck." One cell had four entries frozen since eighty seconds in; a different cell had two entries already gone. A verdict that read the second as an instance of the first condemned the mode that turned out to be the right one — the fix cost a second, finer verdict function, and a re-read of every cell the coarse one had already called.
+
+Each of these has the same shape: the number that was cheapest to produce — no builds dispatched, one break position, a verdict too coarse to tell falling from stuck — stood in for the number that actually mattered, until we went back and measured the harder one. Easy measurements crowd out costly ones by default: nothing forces the harder one to get taken, so it doesn't. And on the account this study ran on — one trial grant, already spent by the time the rig was built — costly meant costly in the plainest sense.
+
+## §10. What this does not establish, and the objection we cannot answer
+
+We do not know why the waiting mode deadlocks. The one explanation we had — that it is a property of the stricter grouping rule, which judges a candidate against everything ahead of it — was refuted in §7 by running the same shape under the looser rule, where it deadlocked identically. Nothing has replaced that explanation.
+
+The contention we describe between merge-queue builds and ordinary pull-request builds sharing four runners was observed once, directly, on a real repository — not reproduced on the rig — and we have no rate for it, only the one incident. Treat it as a reason to test your own repository, not as a claim about the rate at which it happens. And the step that would make §8's saving more than a ceiling — something that identifies which pull request broke a group so the next attempt does not repeat it — is described in this article and has not been built. Nothing here has been rolled out to a real repository.
+
+Here is the objection we would raise against ourselves: the cost claim is derived, not measured, so the recommendation rests on a number we did not observe. That is true. Our answer is that soundness is measured directly and cost is derived from a model with a stated bias, and the two do not carry equal weight — which is exactly why the ranking in §6 puts soundness first and cost third.
+
+## §11. Run it yourself
+
+Five configuration values, one file to copy, one command to run — none of them printed here: the five values, the file, the command, and the names of the two command-line tools it needs are all written out in the rig at https://github.com/saharkit/windowsill/tree/main/docs/merge-queue, which is where the procedure lives. Before any of it, three things a stranger needs and might not have: a command line already authenticated against GitHub, two ordinary command-line tools, and push permission on the repository you point this at.
+
+One term needs defining rather than pointing at: a **ruleset** is the named set of rules a repository attaches to a branch — which checks are required, who may push to it, and whether a merge queue runs on it at all. The rig needs that ruleset's numeric id, which GitHub's own settings page shows next to the ruleset's name.
+
+In bold, because getting it wrong costs something real: the **skip** mode merges broken code. Run this against a repository you do not care about.
+
+The minimum-entries-to-merge and wait-timer values from §7 are pinned in the rig's configuration, because they are load-bearing for the skip mode's behavior — change them and the five-minute timer in §7 no longer applies.
+
+This section ships only because the driver runs. The driver was last verified on the rig as it stands at `ec709e33`, the commit that carries it on the default branch.
+
+## §12. The bill, again — inverted, and paid in the currency we opened with
+
+In runs, not money, first: today, four full suites run per group. Under the safe mode, about 0.69 run per pull request landed. Against the sixty group builds we measured in one day — 15 to 19 machine-hours — the model's 0.69-to-1.82 ratio of builds per merge puts the same day near 5.7 to 7.2 machine-hours, a saving of about 9.3 to 11.8; counted conservatively instead — 0.69 runs times thirteen landings — it is 2.3 to 2.9. The larger is the day's upper bound, for the reason given in §8.
+
+One framing we tried and withdrew: four runners times twenty-four hours as a 96 machine-hour ceiling. That is a ceiling on utilization at 100%, not a measured capacity limit, and nothing here shows the runners are actually the bottleneck. What we observed directly instead: at 14:43 UTC all four runners were busy, one merge build sat queued for eight minutes, and nothing merged on the repository for two hours and twenty minutes. Four runners, and merge builds draw from the same pool as ordinary pull-request builds — that contention is a fact about the shared pool, not about machine-hours in the abstract.
+
+One line of money, no more: in July we bought TRY 10,920.84 (about $234) of Cloud Build, and in August TRY 237.56 (about $5). The whole of that difference is how much of the service we chose to buy: the first move in §1, made because the grant was gone and there was nothing to buy capacity with, carried the high-volume work onto machines we already had, which suffice because we do not currently need to scale far — so what we buy from the service now is only what stayed: the delivery contour, from image builds through the artifact registry to the deploy, the load-bearing part we chose to keep buying. The bill moved. It did not vanish.
+
+And a word for the part that never asked for our attention. While we spent a month inside the queue, the hosted side of the contour built three images, kept them in its registry alongside the packages our own build depends on, and deployed to the cluster on every merge — and did it without a single incident of ours. That silence is what made the month possible: we could take one thing apart because everything under it held. A component you can stop thinking about is not a small gift when you are two people, and it is easy to thank only the parts that broke.
+
+The multiplier we were chasing was never in the price of a run.
