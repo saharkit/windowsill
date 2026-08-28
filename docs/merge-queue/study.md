@@ -10,7 +10,7 @@ We made three moves, in order, and each one caused the next. The first was not r
 
 Nobody drew the consequence of that move at the time. Once the pull-request tier only runs a subset, the full suite runs, in practice, in exactly one place: the merge queue, once per pull request in the group being merged.
 
-On the day we measured it, our merge queue landed thirteen pull requests and ran the full test suite sixty times, at fifteen to nineteen minutes a run — fifteen to nineteen machine-hours of suite in a single day — on a shared pool of four machines. Nobody had been counting builds on that tier, because the counting habit had formed on the tier we had just made cheap.
+On 2026-08-20 our merge queue ran the full test suite sixty times and landed thirty-four pull requests — one and three-quarter full suites for every pull request that landed, twelve and a half machine-hours of suite in a single day, on a shared pool of four machines. A successful run took a median of fourteen minutes and at most twenty-five. Twenty-two of the sixty failed, and a failed run costs almost exactly what a successful one costs: a median of thirteen and a half minutes against fourteen. Nothing is refunded for finding out late. Nobody had been counting builds on that tier, because the counting habit had formed on the tier we had just made cheap.
 
 The cost of continuous integration is two numbers multiplied together: how many times a suite runs, and what one run costs. Every one of those moves went after the second number. The last one moved the expensive suite into the one place that charges per member of a group, not per pull request — and that is where this article's savings live.
 
@@ -90,7 +90,7 @@ The full grid, with every cell identified, is in the rig repository — https://
 
 "Fail the whole group together" wins on safety and liveness. It does not win for free. Under that mode, any cell where a defect is present merges **nothing** — the whole group falls and every pull request in it re-queues. Under "run every candidate" on the same broken shape, the pull requests ahead of the break still land.
 
-At our own per-change failure rate — 9 defects in 40 changes on this repository, 22.5% — with groups of four and a 17-minute suite (the midpoint of the 15-to-19 range §1 measured), the two modes compare like this, per pull request that eventually merges. Forty changes is a small sample and one repository's habits are not another's, so of every input here that is the one to replace with your own before trusting the row:
+At our own per-change failure rate — 9 defects in 40 changes on this repository, 22.5% — with groups of four and a 17-minute suite (a round figure, and a little generous: §1's measured median was fourteen, and every machine-minute below scales straight with it — at fourteen the two columns read 25.5 and 9.7 rather than 30.9 and 11.8), the two modes compare like this, per pull request that eventually merges. Forty changes is a small sample and one repository's habits are not another's, so of every input here that is the one to replace with your own before trusting the row:
 
 | | run every candidate | fail together |
 |---|---|---|
@@ -98,9 +98,9 @@ At our own per-change failure rate — 9 defects in 40 changes on this repositor
 | machine-minutes | 30.9 | 11.8 |
 | wait to land | 7.7 min | 11.8 min |
 
-About nineteen machine-minutes saved, about four minutes more waiting, per pull request.
+About nineteen machine-minutes saved at a seventeen-minute suite, about sixteen at the fourteen-minute median §1 actually measured; about four minutes more waiting, per pull request.
 
-One number in that table and one in §1 do not agree, and we have not reconciled them: the day §1 measured implies about 4.6 full-suite runs per landed pull request — sixty runs for thirteen landings — while the model above assumes 1.82 builds per merged pull request, and the two count different things, since the measured day includes every group a pull request appeared in, including groups it did not land from. If the measured figure is the right one, the saving is larger than quoted, not smaller, so the number we publish stays the conservative one.
+The model and the measurement agree, and that is worth one sentence because they were derived independently and neither was fitted to the other. The table above puts run-every-candidate at 1.82 builds per merged pull request. The day §1 measured came out at 1.76 — sixty runs against thirty-four landings.
 
 That saving is quoted in machine-minutes rather than dollars because what a machine-minute costs depends entirely on whose machine it is, and the spread is wider than most people expect. Four published lists, observed 2026-08-28, US dollars per minute, Linux x64:
 
@@ -150,7 +150,7 @@ This section ships only because the driver runs. The driver was last verified on
 
 ## §12. The bill, again — inverted, and paid in the currency we opened with
 
-In runs, not money, first: today, four full suites run per group. Under the safe mode, about 0.69 run per pull request landed. Against the sixty group builds we measured in one day — 15 to 19 machine-hours — the model's 0.69-to-1.82 ratio of builds per merge puts the same day near 5.7 to 7.2 machine-hours, a saving of about 9.3 to 11.8; counted conservatively instead — 0.69 runs times thirteen landings — it is 2.3 to 2.9. The larger is the day's upper bound, for the reason given in §8.
+In runs, not money, first: today, four full suites run per group. Under the safe mode, about 0.69 run per pull request landed. Against the twelve and a half machine-hours the queue actually spent on 2026-08-20, the model's 0.69-to-1.82 ratio of builds per merge puts the same day near 4.8 machine-hours — a saving of about 7.8. Counted the other way instead, 0.69 runs times thirty-four landings is about twenty-three runs, which at the measured fourteen-minute median is 5.6 machine-hours, a saving of about 7. Two routes, one from the ratio and one from the count, agreeing to within a machine-hour. That agreement is the most that should be claimed for either, and it is still an upper bound for the reason given in §8.
 
 One framing we tried and withdrew: four runners times twenty-four hours as a 96 machine-hour ceiling. That is a ceiling on utilization at 100%, not a measured capacity limit, and nothing here shows the runners are actually the bottleneck. What we observed directly instead: at 14:43 UTC all four runners were busy, one merge build sat queued for eight minutes, and nothing merged on the repository for two hours and twenty minutes. Four runners, and merge builds draw from the same pool as ordinary pull-request builds — that contention is a fact about the shared pool, not about machine-hours in the abstract.
 
