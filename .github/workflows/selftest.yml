@@ -1408,6 +1408,13 @@ jobs:
     needs: [coverage, voice-loop-windows, voice-loop-macos, sill-core-coverage]
     env:
       # Ratchet: update only to the measured percentage printed by this job after coverage improves.
+      #
+      # It is deliberately NOT 100. The shelf wants an honest hundred rather than a hundred reached
+      # by not counting, so a plugin that needs an exclusion extends the combined rcfile's
+      # `exclude_lines` under review — it never lowers this number to meet a figure. The reason this
+      # number is not 100 yet is written down rather than excluded: `plugins/voice-loop/TESTING.md`,
+      # "What the union does not reach", names every statement still missed and why a test cannot
+      # reach it without substituting a stand-in for the Windows API it calls.
       SHELF_COVERAGE_FLOOR: "90"
     # The measuring job is read-only — the badge push is carved out into publish-coverage-badge,
     # which is the ONE job in this workflow that needs to spend the token. Exposing `measured`
@@ -1553,13 +1560,22 @@ jobs:
           # the gate so the PR body can paste them; an empty list means a mis-specified pattern
           # and fails loud, not green.
           #
-          # THE THREE FLOORS BELOW ARE PINNED AT THEIR MEASURED VALUES, NOT AT 100, AND #290 RAISES
-          # THEM BACK. This branch retires the 19-marker exclusion table and measures the platform
-          # regions on a leg per platform instead, so lines that used to be excluded now count. The
-          # first honest run of these gates (run 33001776821) read 99 for the scripts scope, 95 for
-          # doctor.py and 99 for speak.py — 61 statements and 13 partial branches across contracts.py,
-          # dictate.py, doctor.py and speak.py, all of them Windows- or macOS-only regions whose legs
-          # upload coverage but whose tests do not reach them.
+          # THE THREE FLOORS BELOW ARE PINNED AT MEASURED VALUES, NOT AT 100. #276 retired the
+          # 19-marker exclusion table and measures the platform regions on a leg per platform
+          # instead, so lines that used to be excluded now count. The first honest run of these
+          # gates read 99 for the scripts scope, 95 for doctor.py and 99 for speak.py — 61 statements
+          # and 13 partial branches across contracts.py, dictate.py, doctor.py and speak.py, all of
+          # them Windows- or macOS-only regions whose legs upload coverage but whose tests did not
+          # reach them.
+          #
+          # #277 wrote those tests: the kernel32 handle probes and the winreg distro scan now run on
+          # the Windows leg, the no-WinDLL guards on the legs that have none, and the UTF-16 decoder
+          # anywhere. The numbers below are NOT raised in the same change — a floor moves only over a
+          # figure that has been seen, and this job's own table is where it is seen. Raise each to
+          # whatever this job prints, in a change that carries no test delta, so a red build is
+          # readable. The residue that no test can reach without substituting a stand-in for kernel32
+          # is named in plugins/voice-loop/TESTING.md, "What the union does not reach"; it is
+          # disclosed rather than excluded, so these floors are expected to stop short of 100.
           #
           # The old 100 was over a SMALLER DENOMINATOR — it was reached by excluding these very lines,
           # so this is the first measurement of the full scope, not a lowered bar over the same one.
@@ -1577,14 +1593,14 @@ jobs:
           #   '*plugins/voice-loop/scripts/*'   -> absolute False, relative True
           #   '**/plugins/voice-loop/scripts/*' -> absolute True,  relative True
           # The `**/` form is correct under BOTH shapes, so it survives a later relative remap.
-          echo "::group::voice-loop scripts coverage gate (100% on the Linux+Windows+macOS union)"
-          python -m coverage report --include='**/plugins/voice-loop/scripts/*' --fail-under=99   # PINNED, see #290
+          echo "::group::voice-loop scripts coverage gate (Linux+Windows+macOS union, floor pinned below)"
+          python -m coverage report --include='**/plugins/voice-loop/scripts/*' --fail-under=99   # PINNED, see #277
           echo "::endgroup::"
-          echo "::group::voice-loop doctor.py coverage gate (#156 B1 — 100% on the union)"
-          python -m coverage report --include='**/plugins/voice-loop/scripts/doctor.py' --fail-under=95   # PINNED, see #290
+          echo "::group::voice-loop doctor.py coverage gate (#156 B1 — the union, floor pinned below)"
+          python -m coverage report --include='**/plugins/voice-loop/scripts/doctor.py' --fail-under=95   # PINNED, see #277
           echo "::endgroup::"
-          echo "::group::voice-loop speak.py coverage gate (#156 B2 — 100% on the union)"
-          python -m coverage report --include='**/plugins/voice-loop/scripts/speak.py' --fail-under=99   # PINNED, see #290
+          echo "::group::voice-loop speak.py coverage gate (#156 B2 — the union, floor pinned below)"
+          python -m coverage report --include='**/plugins/voice-loop/scripts/speak.py' --fail-under=99   # PINNED, see #277
           echo "::endgroup::"
 
           set +e

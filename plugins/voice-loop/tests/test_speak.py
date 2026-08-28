@@ -5289,3 +5289,97 @@ def test_connect_stream_holder_returns_conn_on_success(state, monkeypatch, tmp_p
     assert seen["sent"] == b'{"text": "hello"}\n'
     assert seen["shutdown_how"] == speak.socket.SHUT_WR
     assert "close_called" not in seen, "the success path does NOT close the conn — it returns it"
+
+
+# --- the platform arms the combined coverage report is the union of ------------------------------
+#
+# Each test below closes a region that no SINGLE leg can reach. Since #276 the platform markers in
+# the source are documentation of which leg owes the exercise rather than registered coverage
+# exclusions, so the arms have to be executed rather than hidden — on the leg that can execute them.
+
+
+def test_kill_process_group_terminates_the_child_where_there_are_no_process_groups(monkeypatch):
+    """``_kill_process_group`` prefers ``os.killpg`` and falls back to terminating the direct child.
+
+    Windows has no POSIX process groups and no ``os.killpg`` at all, so ``getattr(os, "killpg",
+    None)`` is the platform seam. Removing the attribute runs the real fallback on any host. The
+    regression this catches is a refactor that calls ``killpg`` unconditionally: on Windows the
+    stop path would raise ``AttributeError`` and the player would keep speaking.
+    """
+
+    terminated: list[str] = []
+
+    class _Child:
+        def terminate(self) -> None:
+            terminated.append("terminate")
+
+    monkeypatch.delattr(os, "killpg", raising=False)
+    monkeypatch.setitem(speak._live, "proc", _Child())
+
+    speak._kill_process_group(4242, signal.SIGTERM)
+
+    assert terminated == ["terminate"]
+
+
+def test_kill_process_group_is_a_no_op_when_no_child_is_live(monkeypatch):
+    """L3 counterpart: with no ``killpg`` AND no live child there is nothing to signal, and the
+    call must return rather than dereference ``None``. The stop path runs on every firing, so an
+    ``AttributeError`` here would surface as a traceback in the middle of a turn.
+    """
+
+    monkeypatch.delattr(os, "killpg", raising=False)
+    monkeypatch.setitem(speak._live, "proc", None)
+
+    speak._kill_process_group(4242, signal.SIGTERM)  # must not raise
+
+
+def test_acquire_lock_degrades_to_a_named_nolock_where_no_lock_primitive_exists(monkeypatch, tmp_path):
+    """Neither ``msvcrt`` nor ``fcntl``: the speaking lock is unavailable, and the contract is to
+    proceed UNLOCKED with a reason the caller can log once — not to crash, and not to return a
+    real lock that locks nothing.
+
+    Both module globals are the platform seam ``acquire_lock`` reads (``fcntl`` is ``None`` on
+    Windows, ``msvcrt`` is ``None`` on POSIX), so setting both to ``None`` reaches the arm that no
+    real platform reaches. The regression this catches is a refactor that returns ``None`` here
+    instead of a ``_NoLock``: ``None`` means "another firing holds it", and the speaker would fall
+    silent on a platform where it should have spoken with overlap risk disclosed.
+    """
+
+    monkeypatch.setattr(speak, "msvcrt", None)
+    monkeypatch.setattr(speak, "fcntl", None)
+    monkeypatch.setattr(speak, "_LOCK_PATH", str(tmp_path / "speaking.lock"))
+
+    lock = speak.acquire_lock()
+
+    assert isinstance(lock, speak._NoLock)
+    assert "unsupported on this platform" in lock.reason
+
+
+def test_ps_cmdline_of_returns_none_when_ps_cannot_be_run(monkeypatch):
+    """The macOS identity probe shells out to ``ps -p``; a host where that spawn fails must answer
+    "unknown" rather than propagate. ``pid_looks_like_speak`` treats ``None`` as "not ours", which
+    is the safe direction — the opposite would let a takeover signal a stranger's process.
+    """
+
+    def refuse_to_spawn(*_args, **_kwargs):
+        raise OSError("ps could not be spawned")
+
+    monkeypatch.setattr(speak.subprocess, "run", refuse_to_spawn)
+
+    assert speak._ps_cmdline_of(4242) is None
+
+
+@pytest.mark.skipif(
+    os.name != "nt",
+    reason="the kernel32 handle poll is a Windows API; the Windows leg owns this arm",
+)
+def test_windows_process_is_live_polls_a_handle_it_could_open():
+    """The complement of ``test_windows_process_is_live_returns_false_on_linux_for_any_pid``: on
+    Windows the handle DOES open, and the function must reach the poll — a running process leaves
+    ``WaitForSingleObject`` at WAIT_TIMEOUT — and close the handle on the way out.
+
+    Only a Windows leg can execute the poll and the ``finally`` that closes the handle; a leak
+    there would accumulate one handle per speaking-lock check, which runs on every firing.
+    """
+
+    assert speak._windows_process_is_live(os.getpid()) is True
