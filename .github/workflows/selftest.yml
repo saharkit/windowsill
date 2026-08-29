@@ -232,6 +232,47 @@ jobs:
           grep -q "contour_poll.py is missing" /tmp/contour-nopy2.txt \
             || { echo "the missing-script guard lost its diagnostic"; cat /tmp/contour-nopy2.txt; exit 1; }
 
+      - name: coverage badge projection boundaries (fix #3697)
+        run: |
+          set -euo pipefail
+          # The colour projection was the one step in the coverage pipeline with nothing checking
+          # it — the gate is tested, the combined artifact is tested, the colour was not, and
+          # that is how an unreachable green threshold shipped to a public README unnoticed.
+          # The rule now lives in `.github/scripts/coverage_badge.py`; this step exercises it at
+          # the four boundaries the badge lives by, so a regression here turns `gate` red on the
+          # pull request itself rather than on the first main push after the fact. See fix(#3697).
+          #
+          # Two layers of check, both pointing at the same module so a future drift cannot make
+          # the CLI re-pass while the library fails (or vice versa):
+          #   1. the CLI's own `check` subcommand — exercises the same four cases from inside
+          #      the module and exits 1 on any mismatch. Cheap, runs on every PR.
+          #   2. a direct import of `color_for` and an explicit per-case assertion — pins each
+          #      case by name, so a future failure names which boundary moved rather than just
+          #      the exit code.
+          set +e
+          python3 .github/scripts/coverage_badge.py check
+          rc=$?
+          set -e
+          [ "$rc" = "0" ] || { echo "coverage_badge boundary check failed (exit $rc) — see fix(#3697) for the four cases"; exit 1; }
+          python3 -c "
+          import sys
+          sys.path.insert(0, '.github/scripts')
+          import coverage_badge
+          cases = [
+              (98, 99, 'red',         'below the floor is red'),
+              (99, 99, 'yellow',      'at the floor is yellow'),
+              (100, 99, 'brightgreen', 'a perfect score is green (cap takes over at floor 99)'),
+              (100, 100, 'brightgreen', 'a perfect score at the cap is green (cap wins over equal-to-the-floor)'),
+          ]
+          broken = [(name, got, want) for v, f, want, name in cases for got in [coverage_badge.color_for(v, f)] if got != want]
+          if broken:
+              for name, got, want in broken:
+                  print(f'  {name}: got {got!r}, expected {want!r}', file=sys.stderr)
+              print(f'{len(broken)} coverage_badge boundary case(s) failed', file=sys.stderr)
+              sys.exit(1)
+          print(f'{len(cases)} coverage_badge boundary cases passed')
+          "
+
   # `claude plugin validate` is the local structural check the plugin directory's review pipeline
   # runs on every submission: it verifies plugin.json, skill/agent/command frontmatter and
   # hooks/hooks.json against the schema, with no auth and no model calls. Nothing here ran it, so a
@@ -1678,43 +1719,20 @@ jobs:
           fi
           mkdir -p "$badge_dir/.github"
           badge_tmp="$badge_dir/.github/coverage-badge.json.tmp"
-          python3 - "$badge_tmp" "$MEASURED" <<'PY'
-          import json, os, sys
-          path, measured = sys.argv[1], sys.argv[2]
-          value = int(measured)
-          floor = int(os.environ["SHELF_COVERAGE_FLOOR"])
-
-          def color_for(v: int, f: int) -> str:
-              # ONE implementation, used by both the self-check below and the badge that gets written.
-              # Two copies of a rule are two rules, and the check would stop meaning anything.
-              return "brightgreen" if v >= min(f + 5, 100) else "yellow" if v >= f else "red"
-
-          # Red below the gate floor, yellow for the narrow passing band just above it, green with headroom —
-          # the badge must never read yellow-or-green at a coverage the gate rejects.
+          # The colour projection lives in .github/scripts/coverage_badge.py so a CI step can
+          # pin its boundaries on every pull request. The shellcheck job runs that step (see
+          # `coverage_badge projection boundaries` below), so the publish step here is not the
+          # only place a future floor change could disagree with the rule.
           #
-          # The green threshold is CAPPED AT 100 because coverage is a percentage and stops there while
-          # `floor + 5` does not. Without the cap, ratcheting the floor to 96 or above puts green out of
-          # reach for good: at the floor of 99 this shelf now runs, green would begin at 104, and the
-          # badge published for a measured 100% read `"color": "yellow"` — a warning colour at a perfect
-          # score, on a public README. A ratchet whose reward for reaching the top is a warning is
-          # arguing against its own purpose.
-          color = color_for(value, floor)
-          # Self-check the projection at its three boundaries before writing anything. This is the one
-          # step in the coverage pipeline with nothing checking it — the gate is tested, the combined
-          # artifact is tested, the colour was not, which is how an unreachable green threshold shipped
-          # to a public README unnoticed. Cheap, runs on every publish, fails loudly.
-          bands = {
-              "below the floor is red": color_for(floor - 1, floor) == "red",
-              "at the floor is yellow": color_for(floor, floor) == "yellow",
-              "a perfect score is green": color_for(100, floor) == "brightgreen",
-          }
-          broken = [name for name, ok in bands.items() if not ok]
-          if broken:
-              sys.exit("badge colour projection is broken at floor %d: %s" % (floor, "; ".join(broken)))
-          with open(path, "w", encoding="utf-8") as fh:
-              json.dump({"schemaVersion": 1, "label": "coverage", "message": f"{value}%", "color": color}, fh)
-              fh.write("\n")
-          PY
+          # Red below the gate floor, yellow for the narrow passing band just above it, green
+          # with headroom — and the green threshold is capped at 100 because coverage is a
+          # percentage that stops there while `floor + 5` does not. At the floor of 99 this
+          # shelf now runs, an uncapped `floor + 5` would put green out of reach: a measured
+          # 100% would read yellow on the public README — a warning colour at a perfect score.
+          python3 "$GITHUB_WORKSPACE/.github/scripts/coverage_badge.py" write \
+            --output "$badge_tmp" \
+            --value "$MEASURED" \
+            --floor "$SHELF_COVERAGE_FLOOR"
           mv "$badge_tmp" "$badge_dir/.github/coverage-badge.json"
           git -C "$badge_dir" add .github/coverage-badge.json
           if ! git -C "$badge_dir" diff --cached --quiet; then
