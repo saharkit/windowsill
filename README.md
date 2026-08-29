@@ -4,7 +4,7 @@
 [![coverage](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Fsaharkit%2Fwindowsill%2Fbadges%2F.github%2Fcoverage-badge.json)](https://github.com/saharkit/windowsill/actions/workflows/selftest.yml)
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
-The coverage badge is the combined statements-and-branches figure from the Ubuntu coverage artifacts for the plugins; Windows test legs are not part of this number.
+The coverage badge is the combined statements-and-branches figure for the plugins. It combines voice-loop's Linux, Windows and macOS coverage legs with sill-core's Linux legs; sill-core's Windows legs run the same 100% gate but upload no artifact, so they are tested and not counted.
 
 Plugins and skills the **saharkit agent school** shares with everyone.
 
