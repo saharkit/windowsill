@@ -1452,17 +1452,23 @@ jobs:
       #
       # It is deliberately NOT 100. The shelf wants an honest hundred rather than a hundred reached
       # by not counting, so a plugin that needs an exclusion extends the combined rcfile's
-      # `exclude_lines` under review — it never lowers this number to meet a figure. The reason this
-      # number is not 100 is written down rather than excluded: `plugins/voice-loop/TESTING.md`,
-      # "What the union does not reach", names every statement still missed and why a test cannot
-      # reach it without substituting a stand-in for the Windows API it calls.
+      # `exclude_lines` under review — it never lowers this number to meet a figure.
       #
-      # 90 -> 99 (#277) over the figure this job printed on that branch: 6277 statements, 19 missed,
-      # all 19 in `dictate.py`. That is the ratchet doing its job, not a bar lowered to meet a
-      # number — 90 was ten points under the real standard, so the shelf could have lost a tenth of
-      # its coverage with the gate still green. 99 has real headroom (the integer percentage does not
-      # fall to 98 until 63 statements are missed) while catching any collapse.
-      SHELF_COVERAGE_FLOOR: "99"
+      # 90 -> 99 (#277) over the figure that job printed: 6277 statements, 19 missed, all 19 in
+      # `dictate.py`. The comment then said 100 was unreachable and pointed at
+      # `plugins/voice-loop/TESTING.md`, "What the union does not reach", for the list.
+      #
+      # 99 -> 100 (saharkit/sahar#3756). That reason held for three hours. #299 closed all 19 by
+      # splitting each kernel32 CALL from the DECISION about its return value, so the decisions
+      # became reachable on every platform; its own body records the correction — "That description
+      # of the code was right. The conclusion drawn from it was not." The combined gate has printed
+      # `measured=100%` since, with 0 missed on all four legs (6303 statements, 1920 branches).
+      #
+      # So the floor now equals the measurement, and the slack is gone: at 99 the shelf could have
+      # lost up to 62 covered statements without the gate saying a word, on a shelf whose every
+      # per-package gate is already `--fail-under=100`. If a leg is ever short, the answer is to
+      # cover it or to record the shortfall — never to lower this number to fit.
+      SHELF_COVERAGE_FLOOR: "100"
     # The measuring job is read-only — the badge push is carved out into publish-coverage-badge,
     # which is the ONE job in this workflow that needs to spend the token. Exposing `measured`
     # here lets the publish job consume the gate's verdict without re-deriving it from the
@@ -1693,7 +1699,7 @@ jobs:
       # Same ratchet value combined-coverage ran the gate against — passed through so the badge
       # reads against the same floor the gate enforced. Keep the two in step: this one only colours
       # the badge, but a badge coloured against a floor the gate did not use is a public lie.
-      SHELF_COVERAGE_FLOOR: "99"
+      SHELF_COVERAGE_FLOOR: "100"
     permissions:
       contents: write
     steps:
