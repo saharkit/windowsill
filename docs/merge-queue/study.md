@@ -113,14 +113,16 @@ The saving is in machine-minutes, not dollars, because a machine-minute's cost d
 | vCPU | GitHub Actions | Google Cloud Build | Blacksmith | BuildJet |
 |---|---|---|---|---|
 | 2  | 0.006 | 0.006 | 0.004 | 0.004 |
-| 8  | 0.022 | 0.0156 | 0.004 | 0.016 |
-| 32 | 0.082 | 0.0624 | 0.004 | 0.048 |
+| 8  | 0.022 | 0.0156 | 0.016 | 0.016 |
+| 32 | 0.082 | 0.0624 | 0.064 | 0.048 |
+
+3 of those columns are printed per size. Blacksmith prints 1 figure, $0.004 a minute, beside a vCPU selector that does not restate it. Its 8- and 32-core cells are derived from its own documented rule: minutes are spent in proportion to vCPU count, so 10 minutes on a 4-core runner spends 20 2-core minutes.
 
 Everything there is a Linux minute; the platform is a larger multiplier than the supplier spread. From [GitHub's published minute rates](https://docs.github.com/en/billing/concepts/product-billing/github-actions), observed 2026-08-28: the standard Windows 2-core runner is $0.010 against Linux's $0.006 — 1.67×. Windows [at 32 cores](https://docs.github.com/en/billing/reference/actions-minute-multipliers) is $0.162 against Linux's $0.082, very nearly double. The standard macOS runner at 3 or 4 cores is $0.062 — 10.33× Linux.
 
 This article's arithmetic is about how many times a suite runs, so whatever multiplies the price of 1 run multiplies the whole result. Running the suite 4 times instead of once costs the same 4× on every platform; on macOS each run starts 10 times higher. 1 boundary: public repositories are not billed at all, Windows and macOS included; these figures bite only on private ones.
 
-Substitute your own rate and the money is yours to compute. 3 things the table says on the way past. A specialist that sells only runners can price flat; a platform that sells everything cannot. [Blacksmith](https://blacksmith.sh/pricing) charges the same per minute at 2 cores as at 32. At 32 cores [the hosted builder](https://cloud.google.com/build/pricing) is cheaper than the forge, $0.0624 against $0.082. Hosted compute is not uniformly the expensive option. Vendors' comparison claims overstate their own lists. BuildJet leads with "2x faster and cheaper" and a customer quoted "cut in half"; its own list runs 27–41% below.
+Substitute your own rate and the money is yours to compute. 3 things the table says on the way past. The specialists hold 1 rate per vCPU and do not bend it. [Blacksmith](https://blacksmith.sh/pricing) charges $0.002 a vCPU-minute at 2 cores and the same at 32; BuildJet matches it until 32, where it drops to $0.0015. The platforms discount the vCPU as the runner grows — GitHub from $0.0030 to $0.0026, [the hosted builder](https://cloud.google.com/build/pricing) from $0.0030 to $0.0020 — but start above both specialists. At 32 cores that discount overtakes them: $0.0624 against the forge's $0.082 and Blacksmith's $0.064. Hosted compute is not uniformly the expensive option. Vendors' comparison claims overstate their own lists. BuildJet leads with "2x faster and cheaper" and a customer quoted "cut in half"; its own list runs 27–41% below.
 
 The column the table does not have is hardware you already own. Its minute costs amortisation plus electricity over the minutes actually run, so an idle machine's minute costs infinitely much. That is §1's capacity ceiling, written as a formula.
 
