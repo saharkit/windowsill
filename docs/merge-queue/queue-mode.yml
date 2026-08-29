@@ -91,7 +91,7 @@ jobs:
           nodes.sort(key=lambda n: n["position"])
           mine = [n for n in nodes if str(n["pullRequest"]["number"]) == me]
           if not mine:
- say(f"DECIDE[{attempt}] self=NOT_IN_QUEUE -> RUN (fail safe)")
+              say(f"DECIDE[{attempt}] self=NOT_IN_QUEUE -> RUN (fail safe)")
               print("RUN"); raise SystemExit(0)
           pos = mine[0]["position"]
           deeper = [n for n in nodes if n["position"] > pos]
