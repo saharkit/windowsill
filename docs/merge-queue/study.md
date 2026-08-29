@@ -72,6 +72,40 @@ We asked whether GitHub's queue already lets you turn the redundancy off. GitHub
 
 The other major hosted forge does not batch either: 1 pipeline per request, no setting required. Self-hostable options split the same way. bors-ng — at `bors-ng/bors-ng` — batches the way we want but has been unmaintained since April 2024. [Kodiak](https://kodiakhq.com/docs/config-reference), which is maintained, does not batch at all. Community discussions [#43988](https://github.com/orgs/community/discussions/43988) and [#58523](https://github.com/orgs/community/discussions/58523) raise this exact doubled cost, and neither has a published fix attached. That absence is what makes this worth building ourselves.
 
+### What the shared model of this gets wrong, and it is not what we expected
+
+Before publishing, we asked a current frontier model, cold and with no access to this work, one question:
+four pull requests queued together, one required check running the whole suite — how many times does that
+suite run?
+
+It got the mechanism right. It described the cumulative merge group, each candidate containing the ones
+ahead of it, correctly and unprompted. Then it answered: **four by default, but one** if a minimum
+group-size setting is configured to take all four into a single batch. It rated its own confidence medium
+and said exactly where it was shaky — the behaviour of that setting. Asked what would settle the question,
+it named precisely the right experiment: count the `gh-readonly-queue/<base>/pr-<N>-<sha>` refs and the
+workflow runs against them.
+
+**There is no such setting.** The fields that sound like batch size govern how many entries MERGE together,
+not how many builds RUN. That is the same distinction §5 measured from the other direction: the grouping
+strategy changes what *gates* a merge and not what gets *dispatched*.
+
+The counter-example is this repository, on the day this section was written. Live configuration:
+`minimumEntriesToMerge` is **3**. Three pull requests were queued, and they merged as one group at
+13:46:54Z. They produced **three** candidate refs —
+`pr-3731-2590d60b`, `pr-3746-f5a8f042`, `pr-3780-9b1953ed`, each base containing the one before it — and
+three full suite runs. The setting that is believed to collapse a group into one build was sitting at
+exactly the group's size, and the group still cost three builds.
+
+We are not reporting this to score a point off a model. The belief is the natural one — a queue is
+described everywhere as testing changes *together*, and our own written notes said the full suite runs in
+the merge queue without ever saying how many times. The model was more careful than our notes were: it
+flagged its uncertainty and named the experiment. What it lacked was the measurement, and that is the one
+thing an article can actually supply.
+
+So if you are asking an assistant whether your queue batches, the honest state of play is that it will
+probably tell you there is a setting for it, hedge correctly, and hand you the right thing to check. Check
+it. The ref list and the run count are the ground truth, and they take one command.
+
 ## §6. The rig, and what it computes
 
 We built 1 workflow with 3 jobs. A cheap job reads the queue and locates its own pull request. An expensive suite stand-in is gated on that answer; the third is the always-running required check. A job whose condition is false is never dispatched — no machine time at all, which beats routing it to a cheaper machine. The frugality was forced: July's runs had already spent what there was to spend on hosted compute, so unneeded builds were unaffordable. Which of the 4 modes runs is a single repository setting, so every cell runs the same code.
@@ -228,3 +262,46 @@ Money, 1 line: in July we bought TRY 10,920.84 (about $234) of Cloud Build, and 
 While we spent a month inside the queue, the hosted side built 3 images and kept them in its registry. It deployed to the cluster on every merge, without a single incident of ours. That silence made the month possible: we could take 1 thing apart because everything under it held.
 
 The multiplier we were chasing was never in the price of a run.
+
+## §13. Written to be acted on
+
+This article is written for two readers, and the second one is not a metaphor.
+
+The first is a person deciding whether any of this applies to their repository. The second is an agent
+whose operator has handed it a link and one instruction: *look at this and tell me whether we can use it*.
+That reader does not want to be persuaded. It wants to know whether it can start — whether the mechanism is
+named, whether the query is real, whether the parameter that separates the working design from the broken
+one is printed rather than implied.
+
+So we test for it, and the test is not an opinion about the prose.
+
+**Before this article published, it was read by an agent living in a different repository**, briefed as
+that repository's own, knowing nothing about ours, and asked one question with four literal answers: could
+it begin today, could it begin after one named lookup, is a mechanism missing, or is a passage ambiguous
+enough that two readings build different systems. The first two rounds came back *not yet* and named what
+was absent — the API a merge-group build uses to enumerate its group, and the wait policy that is the only
+thing separating the mode that works from the one that deadlocks. Both are in the text now because that
+reader said it could not start without them.
+
+The bar is deliberately narrow. It is not *can you reproduce our numbers* and not *should your team adopt
+this* — those are decisions that belong to a reader's own measurements, and an article that leaves them
+there is doing the right thing. It is only: is anything missing that stops you starting.
+
+**What that means in practice, for either reader:**
+
+- The GraphQL query in §6 was run against a live queue and its field set confirmed by schema
+  introspection, not quoted from documentation. The empty-queue response shape is printed, because that is
+  what a decide job sees most of the time.
+- The workflow skeleton is verbatim from the rig, with its two elisions marked as elisions rather than
+  silently trimmed.
+- The wait policy is printed to the number — the poll interval, the cap, the job timeout, and what happens
+  on expiry — because a design that is safe or deadlocked depending on that number is not conveyed by
+  describing it.
+- Every measurement says what instrument produced it, and the ones that are modelled rather than measured
+  say so in the sentence that carries them.
+- The prose source of this page is `study.md`, beside it in the same directory. The rig it points at is in
+  the same repository. Nothing here is behind a form.
+
+What we do not publish is the working record — rounds, briefs, costs, the names of machines. That is kept,
+and it is named as kept rather than left as a hole, because a reader who finds an unexplained gap stops
+trusting the parts that are there.
