@@ -6,27 +6,31 @@ It did not close the problem. The queue runs that full suite once for **every** 
 
 Ask yourself one thing first: do your pull requests ever wait behind one another to land? If they never do, none of this applies to you. If they do, keep reading.
 
-And one measurement, so you can tell whether our numbers are your numbers. Ours: **15,502 tests, 13 to 19 minutes** for a full run. That six-minute spread is not test count — it is one job standing up a real PostgreSQL, plus matrix legs across operating systems. Yours might be fifteen minutes from ten thousand tests, or fifteen minutes from one Selenium grid coming up. The redundancy this article is about applies either way; what changes is what a single avoided run is worth to you.
+And one measurement, so you can tell whether our numbers are your numbers. Ours: **15,621 tests, 13 to 19 minutes** for a full run — and the count is not what makes the minutes. We measured that too. 93% of the gate is the test step; every linter we run, together, is 30 seconds. 40% of the test step is coverage instrumentation rather than tests. And the floor under all of it is about **226 tests that each start a real process and migrate a real database** — the slowest 1% holds 41% of the work, while the other 10,750 tests are worth at most 47 seconds between them.
 
-## §1. 3 moves, and each one caused the next
+That is why deleting tests did not help us, and it is the number to check before it looks like it will help you. A reader with 15,000 fast unit tests has a different problem from a reader with 200 tests that each stand up a database or wait on a browser grid. The redundancy this article is about costs you either way; what changes is what one avoided run is worth.
 
-A $300 free-trial grant, meant to last months, was gone in 3 days of test runs. That was 1,930 vCPU-hours. On the worst day, 2026-07-26, we burned about $94.
+## §1. How the expensive suite ended up in exactly one place
 
-We made 3 moves, and each one caused the next.
+Nothing here started with a bill. It started with delivery getting slow, and every step after that was reasonable.
 
-First, the heavy work moved onto machines we already owned and had sitting idle. The grant was gone, and owned hardware was the only capacity we could add.
+**2026-07-12.** The first complaint was that the full suite was the longest step in CI and that everything re-ran it. Six days later the merge queue was live and required, and it was adopted for throughput, not for cost: without it, each merge advanced the trunk, the next pull request had to update and re-run, and the lane was serial at roughly a minute and a half per merge.
 
-Second, the hosted builder kept what the volume argument does not touch. It still runs on every merge: the container images, the registry they sit in, and the deploy to the cluster.
+**2026-07-20.** "Why has CI got slow?" The test job was the drag — 11 to 16 minutes on a small hosted runner, gating every pull request and re-running in the queue. So the heavy work moved onto machines we already owned and had sitting idle. The same suite that took 11 to 16 minutes finished in 108 seconds.
 
-Third, we deleted slow tests to make pull-request runs cheaper. The price was stated up front: a PR can pass its own check and still fail on the full suite. So we ran the full suite only where changes are combined before landing — GitHub's merge queue.
+**2026-07-25 to 27.** Compute moved to a metered cloud builder to survive pull-request waves, and for the first time a bill existed. Within two days it read about $100 a day, against nothing before. On the worst day, 2026-07-26, the queue ran about 189 builds — roughly 2.3 per pull request — and every one of them ran the full suite. The gating work went back onto owned metal, and the hosted builder kept only what volume does not touch: container images, the registry, the deploy.
 
-Nobody drew the consequence at the time. Once the PR tier runs a subset, the full suite runs in exactly 1 place: the merge queue, once per PR in the group.
+**And this is the move that matters.** To stop paying for the full suite on every pull request, a pull request now runs only the tests its change affects. The price was stated up front: a pull request can pass its own check and still fail the full suite. So the full suite runs where changes are combined before landing — the merge queue.
+
+Note what that is not. **No tests were deleted.** The suite went from 4,936 that July to 15,621 today; it has never once shrunk. When we did charter a deletion campaign, three weeks later, our own measurement dissolved it: the gate is 1007 seconds, 939 of them the coverage step, and deleting 88% of the suite buys at most 47 seconds. Selection, not deletion, was the lever — and selection is what moved the expensive suite into one place.
+
+Nobody drew the consequence at the time. Once the pull-request tier runs a subset, the full suite runs in exactly 1 place: the merge queue, once per pull request in the group.
 
 On 2026-08-20 that queue ran the full suite 60 times and landed 34 PRs. That is 1.76 full suites per landing, or 12.5 machine-hours in a day, on a shared pool of 4 machines. A successful run took a median of 14 minutes. 22 of the 60 failed, and a failed run costs what a successful one costs: 13.5 minutes against 14.
 
 Nobody had been counting builds on that tier.
 
-The cost of CI is 2 numbers multiplied: how many times a suite runs, and what 1 run costs. All 3 moves went after the second number. The last one moved the expensive suite into the one place that charges per group member.
+The cost of CI is 2 numbers multiplied: how many times a suite runs, and what 1 run costs. Every move above went after the second number — faster machines, a cheaper tier, fewer tests per pull request. Not one of them touched the first. And the last of them moved the expensive suite into the one place that charges per group member.
 
 ## §2. The answer, paid in the currency we just promised
 
@@ -68,7 +72,7 @@ The other major hosted forge does not batch either: 1 pipeline per request, no s
 
 ## §6. The rig, and what it computes
 
-We built 1 workflow with 3 jobs. A cheap job reads the queue and locates its own pull request. An expensive suite stand-in is gated on that answer; the third is the always-running required check. A job whose condition is false is never dispatched — no machine time at all, which beats routing it to a cheaper machine. The frugality was forced: this study had only the trial grant, already burned by July's runs, so unneeded builds were unaffordable. Which of the 4 modes runs is a single repository setting, so every cell runs the same code.
+We built 1 workflow with 3 jobs. A cheap job reads the queue and locates its own pull request. An expensive suite stand-in is gated on that answer; the third is the always-running required check. A job whose condition is false is never dispatched — no machine time at all, which beats routing it to a cheaper machine. The frugality was forced: July's runs had already spent what there was to spend on hosted compute, so unneeded builds were unaffordable. Which of the 4 modes runs is a single repository setting, so every cell runs the same code.
 
 The PR check and the merge-queue check behave differently on purpose: otherwise "break in the first member" and "break elsewhere" would look identical from outside.
 
@@ -144,7 +148,7 @@ The second: our first grid ran only the break-in-first-member shape, and it came
 
 The third: our first pass at a liveness verdict could not distinguish falling correctly from stuck. 1 cell had 4 entries frozen since 80 seconds in; a different cell had 2 entries already gone. A verdict that read the second as an instance of the first condemned the mode that turned out to be the right one. The fix cost a 2nd, finer verdict function, and a re-read of every cell the coarse one had already called.
 
-Each has the same shape: the cheapest number stood in for the one that mattered, until we measured the harder one. Easy measurements crowd out costly ones by default — nothing forces the harder one to get taken. And on this study's spent trial grant, costly meant costly in the plainest sense.
+Each has the same shape: the cheapest number stood in for the one that mattered, until we measured the harder one. Easy measurements crowd out costly ones by default — nothing forces the harder one to get taken. And with July's spend already made, costly meant costly in the plainest sense.
 
 ## §10. What this does not establish, and the objection we cannot answer
 
@@ -170,7 +174,7 @@ In runs: today 4 full suites run per group; under the safe mode, about 0.69 per 
 
 1 framing we tried and withdrew: 4 runners times 24 hours as a 96 machine-hour ceiling. That is a ceiling on utilization at 100%, not a measured capacity limit, and nothing here shows the runners are actually the bottleneck. What we observed directly instead: at 14:43 UTC all 4 runners were busy, and 1 merge build sat queued for 8 minutes. Nothing merged on the repository for 2 hours 20 minutes. Merge builds draw from the same pool as ordinary pull-request builds — a fact about the shared pool, not machine-hours in the abstract.
 
-Money, 1 line: in July we bought TRY 10,920.84 (about $234) of Cloud Build, and in August TRY 237.56 (about $5). The whole of that difference is how much of the service we chose to buy. The first move in §1 — the grant gone, nothing to buy capacity with — carried the high-volume work onto machines we already had. What we buy now is only what stayed: image builds, the artifact registry, the deploy. The bill moved. It did not vanish.
+Money, 1 line: in July we bought TRY 10,920.84 (about $234) of Cloud Build, and in August TRY 237.56 (about $5). The whole of that difference is how much of the service we chose to buy. The move in §1 that answered the July bill — the gating work going back onto machines we already had — carried the high-volume work off the meter. What we buy now is only what stayed: image builds, the artifact registry, the deploy. The bill moved. It did not vanish.
 
 While we spent a month inside the queue, the hosted side built 3 images and kept them in its registry. It deployed to the cluster on every merge, without a single incident of ours. That silence made the month possible: we could take 1 thing apart because everything under it held.
 
