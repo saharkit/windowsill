@@ -74,6 +74,8 @@ The other major hosted forge does not batch either: 1 pipeline per request, no s
 
 We built 1 workflow with 3 jobs. A cheap job reads the queue and locates its own pull request. An expensive suite stand-in is gated on that answer; the third is the always-running required check. A job whose condition is false is never dispatched — no machine time at all, which beats routing it to a cheaper machine. The frugality was forced: July's runs had already spent what there was to spend on hosted compute, so unneeded builds were unaffordable. Which of the 4 modes runs is a single repository setting, so every cell runs the same code.
 
+How a merge-group build sees its group-mates at all is GitHub's surface, not the rig's. The build knows which pull request it is because its candidate ref says so — `gh-readonly-queue/<base>/pr-NN-<sha>` — and the decide job takes the number out of `GITHUB_REF` with one `sed`. The queue around it is 1 GraphQL query, sent with `gh api graphql` and the workflow's own `secrets.GITHUB_TOKEN`: `query($owner:String!, $name:String!) { repository(owner:$owner, name:$name) { mergeQueue { entries(first:50) { nodes { position state pullRequest { number } } } } } }`. Each entry returns its `position` — larger is deeper — its `state` (`MERGEABLE`, `UNMERGEABLE`, or neither, still awaiting its checks), and its pull-request `number`. The workflow's whole permission grant is `permissions:` with `contents: read`, `checks: read`, `pull-requests: read`; reading the queue needs no separate token and no write scope.
+
 The PR check and the merge-queue check behave differently on purpose: otherwise "break in the first member" and "break elsewhere" would look identical from outside.
 
 We ranked outcomes in a fixed order: soundness first (does anything unsafe merge), liveness (does the group finish), cost, how much lands. The driver — the shell script driving a whole arm — opens the PRs, sets the mode, watches the queue, records what each cell did. It measures soundness and liveness directly; cost and landing we read off the cells by hand.
@@ -96,7 +98,48 @@ That 1 unresolved group was not a soundness failure — nothing unsafe merged. I
 
 No untested tree reaches the trunk here: every merge stands behind a real run somewhere in the chain, and §8 prices that safety. This is the mode that won. It refutes the assumption that safety and liveness trade off in this design: fail-together buys both.
 
-Turning it on has 2 halves, and only 1 is a setting. The mode is your own workflow logic: a decide job on cheap hosted runners works out where its pull request sits. The suite runs only when it says so. A gate job reports under `if: always()` so a required check is never left unreported; none of it is switchable from a settings page. The platform half is GitHub's merge-queue grouping strategy, with 2 values: `ALLGREEN`, every entry passing on its own, and `HEADGREEN`, gating on the head. `HEADGREEN` without the mode merges broken code exactly as `ALLGREEN` does. The mode without `HEADGREEN` is correct but slower: the queue collects every verdict before the batch falls. Build the mode first, observe it, then change the strategy.
+Turning it on has 2 halves, and only 1 is a setting. The mode is your own workflow logic: a decide job on cheap hosted runners works out where its pull request sits. The suite runs only when it says so. A gate job reports under `if: always()` so a required check is never left unreported; none of it is switchable from a settings page. The skeleton of that half, as the rig runs it — 3 job ids, the edges between them, and the 2 conditions that carry the design. Everything elided is the decide job's script and the gate's reporting body, both in the rig file linked at the end of this section:
+
+```yaml
+on:
+  pull_request:
+  merge_group:
+
+permissions:
+  contents: read
+  checks: read
+  pull-requests: read
+
+jobs:
+  decide:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      verdict: ${{ steps.place.outputs.verdict }}
+      mode: ${{ steps.place.outputs.mode }}
+    steps:
+      - name: Decide what this candidate owes
+        id: place
+        # ...elided: read the queue (§6), write verdict=RUN|SKIP|FAIL to $GITHUB_OUTPUT
+  suite:
+    needs: decide
+    if: needs.decide.outputs.verdict == 'RUN'
+    runs-on: ubuntu-latest          # stands in for the EXPENSIVE pool
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash ci/check.sh
+  gate:
+    needs: [decide, suite]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Report the one context the queue waits on
+        # ...elided: RED if decide failed, if the verdict is FAIL, or if the suite ran and did not pass
+```
+
+The decide job's wait is bounded, and the bound belongs in print. It polls the queue once every 15 seconds, at most 60 times — 15 minutes of waiting for a deeper entry to reach a verdict — under a job-level `timeout-minutes: 20`. When the wait expires with no verdict, the job does not skip and does not hang: it writes `verdict=RUN`, logged `timed-out (fail safe)`, and the candidate runs the real suite. RUN is the safe expiry because a skip is earned only on positive evidence — a deeper entry actually observed `MERGEABLE` — and every path that cannot decide falls back to RUN: the ref carries no pull-request number, the queue read fails, this pull request is no longer in the queue, the wait ran out. Each lands on the baseline the queue was charging for already, so a slow or unreadable queue costs money and cannot cost soundness — §6's ranking puts soundness first and cost third. That loop is shared with the `wait` mode, and what separates the 2 modes is one branch, the one `wait` does not have. To `wait`, a deeper entry in state `UNMERGEABLE` is merely not green yet — there is no case for an observed red — so the hold runs on, and the group waits on a head the platform is not ejecting. The winning mode turns an observed red into `FAIL` at once, and the batch falls together. That is the whole of the difference between them in the file. Why the platform never ejects the head stays where §10 left it; what the bound buys is that no verdict ever arriving ends in a run, not a hang.
+
+The platform half is GitHub's merge-queue grouping strategy, with 2 values: `ALLGREEN`, every entry passing on its own, and `HEADGREEN`, gating on the head. `HEADGREEN` without the mode merges broken code exactly as `ALLGREEN` does. The mode without `HEADGREEN` is correct but slower: the queue collects every verdict before the batch falls. Build the mode first, observe it, then change the strategy.
 
 Where the break sits matters as much as which mode runs it. The separating shape is the break 3rd of 4: shallow enough something must wait or guess, deep enough the chain has carried it partway. 1 pair of runs — break-in-3rd under both rules — pins the "wait" mode's deadlock on the mode, not the rule. A 2nd run kills the hope that a **head-green grouping rule**, judging a candidate only against the group's current head, would rescue the waiting mode. The mode deadlocks under that rule too.
 
@@ -108,7 +151,7 @@ The full grid, every cell identified, is in the rig repository — https://githu
 
 "Fail the whole group together" does not win for free. A cell with a defect merges **nothing**: the whole group falls and re-queues. Under "run every candidate" on the same shape, the pull requests ahead of the break still land.
 
-There is a second cost hiding behind the first, and it is the obvious objection: when the group falls, which member broke it? The group's verdict is one bit, and it does not name a culprit. That question has an answer, and we have one — but it is the part of this work that is specific to a project's own tooling rather than to merge queues, so it is out of scope here. What the article is about lands on any repository with a queue, whatever the stack; how you then attribute a red group is your own machinery, and worth building separately.
+There is a second cost hiding behind the first, and it is the obvious objection: when the group falls, which member broke it? The group's verdict is one bit, and it does not name a culprit. That question has an answer, and we have one, and it is kept out of this article on purpose — a boundary, not a gap. The line is what travels. The job graph, the queue API it reads, and the decide job's wait policy land on any repository with a merge queue, whatever the stack, and all three are above. Naming the member that broke a group does not travel: it reads that repository's own build results with its own tooling, and an answer shaped to ours would be an answer about our stack. The mode does not need it to be safe — nothing merges untested either way — and what it buys back is the retry ceiling at this section's end. That part is the adopter's to build.
 
 Our inputs: 9 defects in 40 changes (22.5%), groups of 4, a 17-minute suite; the table is per pull request that eventually merges. The 17-minute suite is a round figure, and a little generous: §1's measured median was 14, and every machine-minute below scales straight with it. 40 changes is a small sample, and one repository's habits are not another's — the one input to replace with your own.
 
