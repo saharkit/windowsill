@@ -18,6 +18,31 @@ Nothing here started with a bill. It started with delivery getting slow, and eve
 
 **2026-07-12.** The first complaint was that the full suite was the longest step in CI and that everything re-ran it. Six days later the merge queue was live and required, and it was adopted for throughput, not for cost: without it, each merge advanced the trunk, the next pull request had to update and re-run, and the lane was serial at roughly a minute and a half per merge.
 
+Nobody on the team had used a merge queue before, or knew the feature existed. It was proposed by an
+assistant, on the ordinary understanding of what one is for — and that understanding is where this whole
+article starts, so it is worth being exact about it rather than paraphrasing from memory.
+
+We put the same situation to a current frontier model before publishing this, cold, with no access to any
+of the work below. No mention of queues in the question: fifteen thousand tests, seventeen minutes, running
+on every pull request and again before landing, twenty to thirty landings a day, each run already made as
+cheap as we know how. What do we do?
+
+**It recommended the merge queue first, and described it like this:**
+
+> A merge queue batches N candidate PRs and runs the pre-merge suite once per *batch*, not once per PR — if
+> a batch of 5 passes, all 5 land off one 17-minute run instead of five. This is the only move on this list
+> that changes the *count* of full runs, not just their cost.
+
+With a projection to go with it: *roughly 1 + 1/B, where B is your average batch size. At a batch size of 5
+that's ~1.2.*
+
+That is the premise, stated better than we could have stated it ourselves at the time, and it is wrong in
+the one place that matters. The number we measured is **1.76** — on the wrong side of one. The queue does
+not run the suite once per batch. It runs it once per pull request in the group, and the group merging as a
+single unit changes nothing about that.
+
+The rest of §1 is what happened while nobody was looking at that number.
+
 **2026-07-20.** "Why has CI got slow?" The test job was the drag — 11 to 16 minutes on a small hosted runner, gating every pull request and re-running in the queue. So the heavy work moved onto machines we already owned and had sitting idle. The same suite that took 11 to 16 minutes finished in 108 seconds.
 
 **2026-07-25 to 27.** Compute moved to a metered cloud builder to survive pull-request waves, and for the first time a bill existed. Within two days it read about $100 a day, against nothing before. On the worst day, 2026-07-26, the queue ran about 189 builds — roughly 2.3 per pull request — and every one of them ran the full suite. The gating work went back onto owned metal, and the hosted builder kept only what volume does not touch: container images, the registry, the deploy.
@@ -72,39 +97,35 @@ We asked whether GitHub's queue already lets you turn the redundancy off. GitHub
 
 The other major hosted forge does not batch either: 1 pipeline per request, no setting required. Self-hostable options split the same way. bors-ng — at `bors-ng/bors-ng` — batches the way we want but has been unmaintained since April 2024. [Kodiak](https://kodiakhq.com/docs/config-reference), which is maintained, does not batch at all. Community discussions [#43988](https://github.com/orgs/community/discussions/43988) and [#58523](https://github.com/orgs/community/discussions/58523) raise this exact doubled cost, and neither has a published fix attached. That absence is what makes this worth building ourselves.
 
-### What the shared model of this gets wrong, and it is not what we expected
+### The two settings that sound like batching, and what they actually do
 
-Before publishing, we asked a current frontier model, cold and with no access to this work, one question:
-four pull requests queued together, one required check running the whole suite — how many times does that
-suite run?
+§1's premise rests on a setting that does not exist, and the confusion behind it is worth naming because it
+is systematic rather than careless.
 
-It got the mechanism right. It described the cumulative merge group, each candidate containing the ones
-ahead of it, correctly and unprompted. Then it answered: **four by default, but one** if a minimum
-group-size setting is configured to take all four into a single batch. It rated its own confidence medium
-and said exactly where it was shaky — the behaviour of that setting. Asked what would settle the question,
-it named precisely the right experiment: count the `gh-readonly-queue/<base>/pr-<N>-<sha>` refs and the
-workflow runs against them.
+We put our measurement back to the model that had given us the advice. It revised at once — four runs,
+unconditionally — and then named its own error better than we could have. Two different operations share
+the vocabulary of *grouping*: **merge batching**, how many already-green pull requests fold into a single
+merge commit, and **build batching**, one CI run covering several diffs at once. The API's field names sit
+next to each other: `minimumEntriesToMerge` and `maximumEntriesToMerge` govern the first,
+`maximumEntriesToBuild` caps how many candidates build concurrently. None of the three collapses a group
+into one run.
 
-**There is no such setting.** The fields that sound like batch size govern how many entries MERGE together,
-not how many builds RUN. That is the same distinction §5 measured from the other direction: the grouping
-strategy changes what *gates* a merge and not what gets *dispatched*.
+The counter-example is the plainest one available. On the day this section was written, this repository had
+`minimumEntriesToMerge` at **3**. Three pull requests were queued, and they merged as one group, at the same
+second. They produced three candidate refs — `pr-3731-2590d60b`, `pr-3746-f5a8f042`, `pr-3780-9b1953ed`,
+each base containing the one before it — and three full suite runs. The setting believed to collapse a
+group into one build was sitting at exactly the group's size.
 
-The counter-example is this repository, on the day this section was written. Live configuration:
-`minimumEntriesToMerge` is **3**. Three pull requests were queued, and they merged as one group at
-13:46:54Z. They produced **three** candidate refs —
-`pr-3731-2590d60b`, `pr-3746-f5a8f042`, `pr-3780-9b1953ed`, each base containing the one before it — and
-three full suite runs. The setting that is believed to collapse a group into one build was sitting at
-exactly the group's size, and the group still cost three builds.
+It also explained our own ratio back to us, correctly, and in a direction worth stating: 1.76 is *above*
+one rather than below, because when the queue ejects an entry it rebuilds the candidates behind it. Sixty
+runs over fifty-two distinct refs on the day we measured — eight refs built more than once.
 
-We are not reporting this to score a point off a model. The belief is the natural one — a queue is
-described everywhere as testing changes *together*, and our own written notes said the full suite runs in
-the merge queue without ever saying how many times. The model was more careful than our notes were: it
-flagged its uncertainty and named the experiment. What it lacked was the measurement, and that is the one
-thing an article can actually supply.
+None of this is a story about an unreliable assistant. The belief is the natural one, every description of
+a merge queue says it tests changes *together*, and our own written notes said the full suite runs in the
+merge queue without ever saying how many times — which reads exactly the same way. What was missing on both
+sides was a measurement. If you are asking an assistant whether your queue batches, expect a confident yes,
+and check it: the ref list and the run count settle it, and they take one command.
 
-So if you are asking an assistant whether your queue batches, the honest state of play is that it will
-probably tell you there is a setting for it, hedge correctly, and hand you the right thing to check. Check
-it. The ref list and the run count are the ground truth, and they take one command.
 
 ## §6. The rig, and what it computes
 
