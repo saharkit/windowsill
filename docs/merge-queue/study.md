@@ -1,8 +1,12 @@
-# Why the multiplier in your CI bill has nothing to do with your tests
+# Four pull requests, four full suites, one answer
 
-We deleted slow tests and made continuous integration faster on every pull request, to bring a bill down — and three days later the bill was worse.
+While the project was small, none of this mattered. It grew, and the suite grew with it. A great many tests need a great deal of machine time, and that becomes a choice where both answers cost: run the whole suite on every pull request, or land changes by hand-rebasing each one behind the last. We took the usual way out — a cheap check on the pull request, the expensive suite once, later, where changes are combined before landing. That is what a merge queue is for.
+
+It did not close the problem. The queue runs that full suite once for **every** pull request standing in it. Four waiting to land, four full suites — and the last of them already contains the other three. This article is about that: whether the other three have to run, what happens when you stop them, and which ways of stopping them are safe.
 
 Ask yourself one thing first: do your pull requests ever wait behind one another to land? If they never do, none of this applies to you. If they do, keep reading.
+
+And one measurement, so you can tell whether our numbers are your numbers. Ours: **15,502 tests, 13 to 19 minutes** for a full run. That six-minute spread is not test count — it is one job standing up a real PostgreSQL, plus matrix legs across operating systems. Yours might be fifteen minutes from ten thousand tests, or fifteen minutes from one Selenium grid coming up. The redundancy this article is about applies either way; what changes is what a single avoided run is worth to you.
 
 ## §1. 3 moves, and each one caused the next
 
@@ -99,6 +103,8 @@ The full grid, every cell identified, is in the rig repository — https://githu
 ## §8. What the safe mode costs
 
 "Fail the whole group together" does not win for free. A cell with a defect merges **nothing**: the whole group falls and re-queues. Under "run every candidate" on the same shape, the pull requests ahead of the break still land.
+
+There is a second cost hiding behind the first, and it is the obvious objection: when the group falls, which member broke it? The group's verdict is one bit, and it does not name a culprit. That question has an answer, and we have one — but it is the part of this work that is specific to a project's own tooling rather than to merge queues, so it is out of scope here. What the article is about lands on any repository with a queue, whatever the stack; how you then attribute a red group is your own machinery, and worth building separately.
 
 Our inputs: 9 defects in 40 changes (22.5%), groups of 4, a 17-minute suite; the table is per pull request that eventually merges. The 17-minute suite is a round figure, and a little generous: §1's measured median was 14, and every machine-minute below scales straight with it. 40 changes is a small sample, and one repository's habits are not another's — the one input to replace with your own.
 
