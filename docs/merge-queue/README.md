@@ -201,3 +201,83 @@ enough); `jq` and `python3` on the PATH; a working `git push` to the throwaway r
 should report an authenticated account before the first arm runs.
 
 **One-time setup on the throwaway repo:**
+
+1. **Default branch named `main`.** `run-arm.sh` hardcodes it — `git fetch -q origin main`,
+   `git checkout -q -B ... origin/main`, and `gh pr create --repo "$R" --base main ...` all name the
+   branch literally. A throwaway repo whose default branch is called anything else will not work
+   without editing the script.
+
+2. **A ruleset that already has a `merge_queue` rule, targeting `main`, enforcement active.**
+   `run-arm.sh` does not create a ruleset — it `gh api`-reads one by numeric id and `PUT`s it back with
+   two edits: any rule of type `merge_queue` gets its `min_entries_to_merge`,
+   `min_entries_to_merge_wait_minutes`, `check_response_timeout_minutes` and `grouping_strategy`
+   overwritten, and any existing `required_status_checks` rule is replaced with one that names `gate`
+   as the only required context. The jq filter only touches a rule it finds typed `merge_queue`; if the
+   ruleset does not already carry one, the `PUT` writes back a ruleset with no merge queue at all and
+   every later step stalls. Create the ruleset first (repo Settings → Rules → Rulesets, or `gh api
+   repos/<owner>/<repo>/rulesets` to create and then list it), enable its merge queue rule, and read off
+   the numeric id for `RULESET_ID` — the script only ever edits it in place, never discovers it.
+
+3. **`queue-mode.yml` copied to `.github/workflows/queue-mode.yml` on `main`.** This is the article's
+   "1 file to copy": GitHub only discovers workflow files at that path, and it is the workflow's `gate`
+   job (job id `gate`, no `name:` override, so the check reports under that literal name) that produces
+   the `gate` status the ruleset above requires. Copy it and let it land on `main` — by a merge or a
+   direct push, whichever the throwaway repo allows — before the ruleset is armed with `gate` as a
+   required check, or the queue will wait on a context nothing ever reports.
+
+4. **`ci/check.sh` and `ci/arm.conf` do not need to be copied by hand.** `run-arm.sh` writes both itself
+   at the start of every cell, into `$SANDBOX_CHECKOUT/ci/`, from a Python heredoc embedded in the
+   script — the copies committed at `docs/merge-queue/check.sh` and `docs/merge-queue/arm.conf` are that
+   generated output, kept here to read, not to place. Nothing to do for these before the first arm.
+
+5. **"Allow auto-merge" enabled on the throwaway repo** (Settings → General → Pull Requests).
+   `run-arm.sh` merges each member with `gh pr merge "$pr" --repo "$R" --squash --auto`; without the
+   setting, that call has nothing to enable and the PR never enters the queue.
+
+6. **`SANDBOX_CHECKOUT` is a local clone of the throwaway repo with `origin` resolving to it and push
+   already working** — the same access the Prerequisites paragraph above already asks for (full `repo`
+   scope, a working `git push`), pointed at a directory on disk. `run-arm.sh` runs `git fetch`,
+   `git checkout -B`, and `git push -f` against `origin` inside this checkout for every cell.
+
+**The five configuration values**, each read through a `: "${VAR:?...}"` guard in `run-arm.sh`
+(lines 21-25), whose messages are quoted here:
+
+| variable | guard message | holds |
+|---|---|---|
+| `SANDBOX_OWNER` | "set SANDBOX_OWNER to the org/user that owns your throwaway repo" | the org or user that owns the throwaway repo |
+| `SANDBOX_NAME` | "set SANDBOX_NAME to the throwaway repo name" | the throwaway repo's name |
+| `SANDBOX_REPO` | "set SANDBOX_REPO to <owner>/<name> of your throwaway repo" | `<owner>/<name>` — passed to every `gh ... --repo` and `gh api repos/$R/...` call |
+| `SANDBOX_CHECKOUT` | "set SANDBOX_CHECKOUT to a clone of your throwaway repo" | the path to the local clone from setup step 6 |
+| `RULESET_ID` | "set RULESET_ID to the merge-queue ruleset id on that repo" | the numeric id of the ruleset armed in setup step 2 |
+
+**Running one arm.** Once setup is done:
+
+```
+export SANDBOX_OWNER=<owner>
+export SANDBOX_NAME=<repo-name>
+export SANDBOX_REPO=$SANDBOX_OWNER/$SANDBOX_NAME
+export SANDBOX_CHECKOUT=/path/to/local/clone/of/$SANDBOX_NAME
+export RULESET_ID=<numeric id from setup step 2>
+bash docs/merge-queue/run-arm.sh A NONE ALLGREEN 1 3 atomic
+```
+
+The six positional arguments are documented at the top of `run-arm.sh` (lines 2-10): arm letter
+(advance it — `A`, `B`, `C`, ... — on every cell, never reuse one), an instrument PR number to wait on
+first or `NONE`, the grouping strategy (`ALLGREEN` or `HEADGREEN`), `min_entries_to_merge_wait_minutes`,
+the comma-separated bad member indices (`3` puts the breakage in the third of four, the shape that
+separates the modes in the table above), and the mode (`always`, `skip`, `wait`, or `atomic`). One
+invocation drives one cell end to end — sets `QUEUE_MODE`, re-arms `ci/check.sh` and `ci/arm.conf` for
+the new letter, opens four pull requests, arms the ruleset, waits for each PR's own `gate`, merges the
+green ones with `--auto`, watches the queue for up to six minutes, and prints the SOUND / LIVE / CHEAP /
+PROGRESSIVE verdicts read out in the sections above. **Start each cell against a freshly-empty merge
+queue** — the script's own cleanup step is best-effort and cannot recover a cell that left entries
+mid-merge.
+
+`skip` is REFUTED on purpose: it merges broken code in both grouping strategies (see "The modes, on the
+shape that separates them" above). Reproducing that cell means the throwaway repo's `main` receives a
+tree the suite calls bad — reserve this rig for a repository nobody depends on.
+
+What is not written above is not determinable from the four files: how `min_entries_to_merge_wait_minutes`
+should be sized against a real check's runtime, and whether a repository other than one with an
+already-configured merge queue ruleset can be brought to that state through any path other than the
+GitHub UI, are both outside what `run-arm.sh`, `queue-mode.yml`, `check.sh`, and `arm.conf` say.
