@@ -5369,6 +5369,42 @@ def test_ps_cmdline_of_returns_none_when_ps_cannot_be_run(monkeypatch):
     assert speak._ps_cmdline_of(4242) is None
 
 
+def test_ps_cmdline_of_returns_none_when_ps_reports_no_such_process(monkeypatch):
+    """``ps -p <pid>`` exits nonzero when the pid is gone, and the probe must answer "unknown"
+    rather than read an empty stdout as an identity.
+
+    Deterministic on every leg, which is the point of it. This branch used to be reached only
+    incidentally, on the macOS leg alone, through ``ensure_stream_holder``'s default guard shelling
+    out to a real ``ps -p 4321`` — so its coverage was a claim about whether pid 4321 happened to be
+    free on a GitHub runner. Measured across fifteen consecutive runs it held fourteen times, and the
+    fifteenth failed the shelf gate on a pull request that changed one line of documentation.
+    """
+
+    class _NoSuchProcess:
+        returncode = 1
+        stdout = b""
+
+    monkeypatch.setattr(speak.subprocess, "run", lambda *_a, **_kw: _NoSuchProcess())
+
+    assert speak._ps_cmdline_of(4242) is None
+
+
+def test_ps_cmdline_of_returns_the_trimmed_command_line(monkeypatch):
+    """The success arm, pinned for the same reason as the arm above.
+
+    It rested on ``os.getpid()`` being alive during another test, which is a safer accident than the
+    absent-pid one but an accident all the same.
+    """
+
+    class _LiveProcess:
+        returncode = 0
+        stdout = b"python3 /repo/scripts/speak.py --stream-holder\n"
+
+    monkeypatch.setattr(speak.subprocess, "run", lambda *_a, **_kw: _LiveProcess())
+
+    assert speak._ps_cmdline_of(4242) == "python3 /repo/scripts/speak.py --stream-holder"
+
+
 @pytest.mark.skipif(
     os.name != "nt",
     reason="the kernel32 handle poll is a Windows API; the Windows leg owns this arm",
