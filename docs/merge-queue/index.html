@@ -1,0 +1,814 @@
+<meta charset="utf-8">
+<title>Four pull requests, four full suites, one answer</title>
+<meta name="description" content="The queue runs that full suite once for every pull request standing in it. Four waiting to land, four full suites — and the last of them already contains the other three. Whether the other three have to run, what happens when you stop them, and which ways of stopping them are safe.">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wdth,wght@12..96,75..100,500;12..96,75..100,600;12..96,75..100,700&family=IBM+Plex+Sans:wght@400;500;600&family=Source+Serif+4:opsz,wght@8..60,380;8..60,400;8..60,600;8..60,700&family=IBM+Plex+Mono:wght@400;500;600&display=swap">
+<style>
+:root{
+  --paper:#F2F3EF; --paper-2:#E9EBE5; --ink:#131C18; --ink-2:#33403A;
+  --muted:#5F6E68; --rule:#D3D8CF; --accent:#0E5C4C; --accent-soft:#DCE8E2;
+  --warn:#9C3A1B; --warn-soft:#F2E2DA;
+  --serif:"Source Serif 4",Georgia,"Times New Roman",serif;
+  --display:"Bricolage Grotesque","IBM Plex Sans",system-ui,-apple-system,"Segoe UI",sans-serif;
+  --mono:"IBM Plex Mono",ui-monospace,SFMono-Regular,Menlo,monospace;
+  --sans:"IBM Plex Sans",system-ui,-apple-system,"Segoe UI",sans-serif;
+  --measure:34rem;
+  --figwidth:58rem;
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    --paper:#0F1512; --paper-2:#161E1A; --ink:#E7ECE6; --ink-2:#BCC7C0;
+    --muted:#8B9A93; --rule:#2A342E; --accent:#63C7AA; --accent-soft:#172C25;
+    --warn:#E28457; --warn-soft:#33201A;
+  }
+}
+:root[data-user-theme="light"]{
+  --paper:#F2F3EF; --paper-2:#E9EBE5; --ink:#131C18; --ink-2:#33403A;
+  --muted:#5F6E68; --rule:#D3D8CF; --accent:#0E5C4C; --accent-soft:#DCE8E2;
+  --warn:#9C3A1B; --warn-soft:#F2E2DA;
+  --surface:#FFFFFF; --surface-2:#E9EBE5; --rule-strong:#B9C0B6;
+  --hot:#9C3A1B; --hot-soft:#F4E4DC;
+  --sound:#0E5C4C; --sound-soft:#DDE9E3;
+  --refuted:#8E2B22; --refuted-soft:#F3E2DF;
+  --stuck:#6E5C15; --stuck-soft:#EFEBD6;
+  --figshadow:0 1px 0 rgba(19,28,24,.04), 0 2px 8px rgba(19,28,24,.05);
+  color-scheme:light;
+}
+:root[data-user-theme="dark"]{
+  --paper:#0F1512; --paper-2:#161E1A; --ink:#E7ECE6; --ink-2:#BCC7C0;
+  --muted:#8B9A93; --rule:#2A342E; --accent:#63C7AA; --accent-soft:#172C25;
+  --warn:#E28457; --warn-soft:#33201A;
+  --surface:#161E1A; --surface-2:#1C2621; --rule-strong:#3B473F;
+  --hot:#E28457; --hot-soft:#33201A;
+  --sound:#63C7AA; --sound-soft:#122A25;
+  --refuted:#E28C86; --refuted-soft:#2E1A18;
+  --stuck:#D3C169; --stuck-soft:#262111;
+  --figshadow:0 1px 0 rgba(0,0,0,.3), 0 2px 10px rgba(0,0,0,.35);
+  color-scheme:dark;
+}
+:root[data-theme="dark"]{
+  --paper:#0F1512; --paper-2:#161E1A; --ink:#E7ECE6; --ink-2:#BCC7C0;
+  --muted:#8B9A93; --rule:#2A342E; --accent:#63C7AA; --accent-soft:#172C25;
+  --warn:#E28457; --warn-soft:#33201A;
+}
+*{box-sizing:border-box}
+body{
+  margin:0; background:var(--paper); color:var(--ink);
+  font-family:var(--serif); font-size:1.0625rem; line-height:1.62;
+  font-variant-numeric:oldstyle-nums proportional-nums;
+  -webkit-font-smoothing:antialiased;
+}
+.wrap{max-width:78rem;margin:0 auto;padding:0 1.5rem 6rem}
+
+/* ---- theme picker row ---- */
+.themerow{display:flex;padding:1rem 0 0;margin:0 0 3rem}
+.themepick{margin-left:auto;display:flex;align-items:center;gap:0}
+.themepick .lab{margin-right:.6rem}
+.themepick button{
+  font:inherit;font-size:.7rem;letter-spacing:.06em;text-transform:uppercase;
+  color:var(--muted);background:transparent;border:1px solid var(--rule);
+  padding:.2rem .55rem;cursor:pointer;margin:0 0 0 -1px;
+}
+.themepick button:first-of-type{margin-left:0}
+.themepick button:hover{color:var(--ink-2)}
+.themepick button[aria-pressed="true"]{
+  color:var(--paper);background:var(--accent);border-color:var(--accent);font-weight:600;
+}
+@media(max-width:34rem){.themepick{margin-left:0}}
+
+/* ---- masthead ---- */
+header.hero{margin:0 0 4.5rem}
+.kicker{
+  font-family:var(--mono);font-size:.7rem;letter-spacing:.18em;text-transform:uppercase;
+  color:var(--accent);margin:0 0 1.4rem;
+}
+h1{
+  font-family:var(--display);font-weight:600;
+  font-size:clamp(2.1rem,5.2vw,3.9rem);line-height:1.06;letter-spacing:-.012em;
+  margin:0;max-width:20ch;text-wrap:balance;font-variant-numeric:lining-nums;
+}
+.standfirst{
+  font-size:clamp(1.05rem,1.5vw,1.18rem);line-height:1.55;color:var(--ink-2);
+  max-width:60ch;margin:1.6rem 0 0;font-weight:380;
+}
+.rule-heavy{height:2px;background:var(--ink);opacity:.85;margin:2.6rem 0 0;max-width:8rem}
+
+/* ---- the multiplier plate ---- */
+.plate{
+  margin:3.2rem 0 0;padding:1.6rem 1.4rem;border:1px solid var(--rule);
+  background:var(--paper-2);
+  display:grid;grid-template-columns:1fr auto 1fr auto 1fr;align-items:center;gap:.9rem;
+  max-width:38rem;
+}
+.plate .cell{text-align:center}
+.plate .num{
+  font-family:var(--mono);font-weight:600;font-size:clamp(1.3rem,3vw,1.9rem);
+  color:var(--ink);display:block;font-variant-numeric:tabular-nums lining-nums;
+}
+.plate .lab{
+  font-family:var(--mono);font-size:.62rem;letter-spacing:.1em;text-transform:uppercase;
+  color:var(--muted);display:block;margin-top:.45rem;line-height:1.35;
+}
+.plate .op{font-family:var(--display);font-size:1.5rem;color:var(--accent);line-height:1}
+.plate .cell.hit .num{color:var(--warn)}
+.platenote{
+  font-family:var(--sans);font-size:.78rem;line-height:1.45;color:var(--muted);
+  max-width:38rem;margin:.7rem 0 0;
+}
+
+/* ---- layout ---- */
+.cols{display:grid;grid-template-columns:1fr;gap:0}
+@media(min-width:64rem){
+  .cols{grid-template-columns:13rem minmax(0,var(--figwidth)) 1fr;gap:0 3rem}
+  nav.toc{grid-column:1;position:sticky;top:2rem;align-self:start;max-height:88vh;overflow:auto}
+  main{grid-column:2}
+}
+nav.toc{margin:0 0 3rem}
+nav.toc h2{
+  font-family:var(--mono);font-size:.65rem;letter-spacing:.14em;text-transform:uppercase;
+  color:var(--muted);margin:0 0 .9rem;font-weight:500;
+}
+nav.toc ul{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:.55rem}
+nav.toc a{
+  display:grid;grid-template-columns:1.6rem 1fr;gap:.5rem;align-items:baseline;
+  color:var(--ink-2);text-decoration:none;font-size:.83rem;line-height:1.3;
+}
+nav.toc a:hover,nav.toc a:focus-visible{color:var(--accent)}
+nav.toc .n{font-family:var(--mono);font-size:.7rem;color:var(--muted);font-variant-numeric:tabular-nums}
+
+main{max-width:var(--figwidth)}
+main p,
+main h2,
+main .tablewrap{max-width:var(--measure)}
+section{margin:0 0 3.4rem;scroll-margin-top:2rem}
+h2{
+  display:grid;grid-template-columns:auto 1fr;gap:.85rem;align-items:baseline;
+  font-family:var(--display);font-weight:600;font-size:1.42rem;line-height:1.22;
+  letter-spacing:-.006em;margin:0 0 1.15rem;text-wrap:balance;
+  padding-top:1.4rem;border-top:1px solid var(--rule);
+}
+h2 .secnum{
+  font-family:var(--mono);font-size:.72rem;font-weight:600;color:var(--accent);
+  letter-spacing:.04em;transform:translateY(-.15em);font-variant-numeric:lining-nums;
+}
+p{margin:0 0 1.15rem}
+main>p:first-of-type{margin-top:0}
+a{color:var(--accent);text-underline-offset:.16em;text-decoration-thickness:1px}
+a:focus-visible,button:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+strong{font-weight:700;color:var(--ink)}
+
+/* ---- figure slots ---- */
+figure.slot{
+  margin:1.9rem 0;padding:1.05rem 1.15rem;border:1px dashed var(--rule);
+  background:transparent;display:grid;gap:.5rem;
+}
+.slot-tag{
+  font-family:var(--mono);font-size:.63rem;letter-spacing:.12em;text-transform:uppercase;
+  color:var(--accent);font-weight:600;
+}
+.slot-desc{font-size:.92rem;color:var(--ink-2);line-height:1.45}
+.slot-note{
+  font-family:var(--mono);font-size:.6rem;letter-spacing:.1em;text-transform:uppercase;
+  color:var(--muted);
+}
+
+/* ---- tables ---- */
+.tablewrap{overflow-x:auto;margin:1.8rem 0;border-top:2px solid var(--ink);border-bottom:1px solid var(--rule)}
+table{border-collapse:collapse;width:100%;font-family:var(--mono);font-size:.83rem}
+th,td{
+  text-align:right;padding:.6rem .8rem;border-bottom:1px solid var(--rule);
+  font-variant-numeric:tabular-nums lining-nums;white-space:nowrap;
+}
+th:first-child,td:first-child{text-align:left;white-space:normal;font-family:var(--serif);font-size:.95rem}
+thead th{
+  font-size:.63rem;letter-spacing:.1em;text-transform:uppercase;color:var(--muted);
+  font-weight:500;border-bottom:1px solid var(--rule);
+}
+tbody tr:last-child td{border-bottom:none}
+
+/* ---- code ---- */
+code{
+  font-family:var(--mono);font-size:.86em;background:var(--paper-2);
+  padding:.08em .3em;border-radius:3px;overflow-wrap:anywhere;
+  font-variant-numeric:lining-nums tabular-nums;
+}
+pre{
+  max-width:var(--measure);margin:1.8rem 0;padding:1rem 1.1rem;overflow-x:auto;
+  background:var(--paper-2);border:1px solid var(--rule);border-radius:4px;
+  font-family:var(--mono);font-size:.78rem;line-height:1.55;color:var(--ink-2);
+}
+pre code{background:none;padding:0;font-size:inherit;border-radius:0}
+
+footer{
+  margin-top:5rem;padding-top:1.4rem;border-top:1px solid var(--rule);
+  font-family:var(--mono);font-size:.7rem;letter-spacing:.05em;color:var(--muted);
+  display:flex;flex-wrap:wrap;gap:.4rem 1.5rem;
+}
+@media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+
+/* ---- diagram layer: tokens the figures need, tuned to this page's palette ---- */
+:root{
+  --surface:#FFFFFF; --surface-2:#E9EBE5; --rule-strong:#B9C0B6;
+  --hot:#9C3A1B; --hot-soft:#F4E4DC;
+  --sound:#0E5C4C; --sound-soft:#DDE9E3;
+  --refuted:#8E2B22; --refuted-soft:#F3E2DF;
+  --stuck:#6E5C15; --stuck-soft:#EFEBD6;
+  --figshadow:0 1px 0 rgba(19,28,24,.04), 0 2px 8px rgba(19,28,24,.05);
+}
+@media (prefers-color-scheme: dark){:root:not([data-theme="light"]){
+  --surface:#161E1A; --surface-2:#1C2621; --rule-strong:#3B473F;
+  --hot:#E28457; --hot-soft:#33201A;
+  --sound:#63C7AA; --sound-soft:#122A25;
+  --refuted:#E28C86; --refuted-soft:#2E1A18;
+  --stuck:#D3C169; --stuck-soft:#262111;
+  --figshadow:0 1px 0 rgba(0,0,0,.3), 0 2px 10px rgba(0,0,0,.35);
+}}
+:root[data-theme="dark"]{
+  --surface:#161E1A; --surface-2:#1C2621; --rule-strong:#3B473F;
+  --hot:#E28457; --hot-soft:#33201A;
+  --sound:#63C7AA; --sound-soft:#122A25;
+  --refuted:#E28C86; --refuted-soft:#2E1A18;
+  --stuck:#D3C169; --stuck-soft:#262111;
+  --figshadow:0 1px 0 rgba(0,0,0,.3), 0 2px 10px rgba(0,0,0,.35);
+}
+figure.fig{
+  margin:2.4rem 0; max-width:var(--figwidth); border:1px solid var(--rule); border-radius:5px; background:var(--surface);
+  padding:20px 18px 14px; box-shadow:var(--figshadow); overflow-x:auto;
+}
+figure.fig svg{display:block; width:100%; min-width:30rem; height:auto; color:var(--ink)}
+figure.fig figcaption{
+  font-family:var(--serif); font-size:.86rem; color:var(--muted);
+  margin-top:14px; line-height:1.5; max-width:70ch;
+}
+figure.fig figcaption b{color:var(--ink-2); font-weight:700}
+.figtitle{
+  font-family:var(--mono); font-size:.63rem; letter-spacing:.12em; text-transform:uppercase;
+  color:var(--muted); margin-bottom:14px;
+}
+/* SVG element classes, carried over from the diagram set */
+.b{fill:var(--surface-2); stroke:var(--ink-2); stroke-width:1.4; rx:4}
+.bh{fill:var(--hot-soft); stroke:var(--hot); stroke-width:1.4; rx:4}
+.bg{fill:var(--sound-soft); stroke:var(--sound); stroke-width:1.4; rx:4}
+.bd{fill:var(--refuted-soft); stroke:var(--refuted); stroke-width:1.4; rx:3}
+.bs{fill:var(--stuck-soft); stroke:var(--stuck); stroke-width:1.4; rx:3}
+.bc{fill:var(--surface-2); stroke:var(--rule-strong); stroke-width:1.2; rx:3}
+.pnl{fill:none; stroke:var(--rule-strong); stroke-width:1; stroke-dasharray:4 4; rx:5}
+.ln{stroke:var(--ink-2); stroke-width:1.6; fill:none}
+.lnh{stroke:var(--hot); stroke-width:1.6; fill:none}
+.ah{fill:var(--ink-2)}
+.ahh{fill:var(--hot)}
+.t{fill:var(--ink); font-family:var(--sans); font-size:12.5px}
+.tb{fill:var(--ink); font-family:var(--sans); font-size:13px; font-weight:600}
+.tm{fill:var(--ink-2); font-family:var(--mono); font-size:10.5px}
+.tl{fill:var(--muted); font-family:var(--mono); font-size:9.5px; letter-spacing:.05em}
+.tmu{fill:var(--muted); font-family:var(--sans); font-size:11px}
+.thot{fill:var(--hot); font-family:var(--mono); font-size:10.5px; font-weight:600}
+.tgood{fill:var(--sound); font-family:var(--sans); font-size:11.5px; font-weight:600}
+.tbad{fill:var(--refuted); font-family:var(--sans); font-size:11.5px; font-weight:600}
+.tstuck{fill:var(--stuck); font-family:var(--sans); font-size:11.5px; font-weight:600}
+.tchip{fill:var(--ink-2); font-family:var(--mono); font-size:11px}
+.tchipbad{fill:var(--refuted); font-family:var(--mono); font-size:11px; font-weight:600}
+</style>
+
+<div class="wrap">
+
+<div class="themerow">
+  <div class="themepick" role="group" aria-label="Colour theme">
+    <span class="lab">theme</span>
+    <button type="button" data-set="light" aria-pressed="false">light</button>
+    <button type="button" data-set="auto"  aria-pressed="true">auto</button>
+    <button type="button" data-set="dark"  aria-pressed="false">dark</button>
+  </div>
+</div>
+
+<header class="hero">
+  <h1>Four pull requests, four full suites, one answer</h1>
+  <p class="standfirst">While the project was small, none of this mattered. It grew, and the suite grew with it. A great many tests need a great deal of machine time, and that becomes a choice where both answers cost: run the whole suite on every pull request, or land changes by hand-rebasing each one behind the last. We took the usual way out — a cheap check on the pull request, the expensive suite once, later, where changes are combined before landing. That is what a merge queue is for.</p>
+  <div class="rule-heavy"></div>
+
+  <div class="plate">
+    <span class="cell"><span class="num">1.82</span><span class="lab">builds per<br>merged PR</span></span>
+    <span class="op">&times;</span>
+    <span class="cell"><span class="num">17</span><span class="lab">minutes<br>per suite</span></span>
+    <span class="op">=</span>
+    <span class="cell hit"><span class="num">30.9</span><span class="lab">machine-minutes<br>per PR landed</span></span>
+  </div>
+  <p class="platenote">&sect;8's model, with its own inputs and its own stated bias &mdash; not a measurement.
+    The 17 is a round figure and a generous one: the median run we actually measured was 14.</p>
+</header>
+
+<div class="cols">
+  <nav class="toc">
+    <h2>Sections</h2>
+    <ul>
+      <li><a href="#s1"><span class="n">1</span><span class="t">How the expensive suite ended up in exactly one place</span></a></li>
+      <li><a href="#s2"><span class="n">2</span><span class="t">The answer, paid in the currency we just promised</span></a></li>
+      <li><a href="#s3"><span class="n">3</span><span class="t">What the queue buys and sells</span></a></li>
+      <li><a href="#s4"><span class="n">4</span><span class="t">4 pull requests, 4 builds</span></a></li>
+      <li><a href="#s5"><span class="n">5</span><span class="t">Is this GitHub's to fix?</span></a></li>
+      <li><a href="#s6"><span class="n">6</span><span class="t">The rig, and what it computes</span></a></li>
+      <li><a href="#s7"><span class="n">7</span><span class="t">The cases: what was tested and how each behaved</span></a></li>
+      <li><a href="#s8"><span class="n">8</span><span class="t">What the safe mode costs</span></a></li>
+      <li><a href="#s9"><span class="n">9</span><span class="t">3 things we got wrong before we got them right</span></a></li>
+      <li><a href="#s10"><span class="n">10</span><span class="t">What this does not establish, and the objection we cannot answer</span></a></li>
+      <li><a href="#s11"><span class="n">11</span><span class="t">Run it yourself</span></a></li>
+      <li><a href="#s12"><span class="n">12</span><span class="t">The bill, again</span></a></li>
+    </ul>
+  </nav>
+  <main>
+
+<p>It did not close the problem. The queue runs that full suite once for <strong>every</strong> pull request standing in it. Four waiting to land, four full suites — and the last of them already contains the other three. This article is about that: whether the other three have to run, what happens when you stop them, and which ways of stopping them are safe.</p>
+
+<p>Ask yourself one thing first: do your pull requests ever wait behind one another to land? If they never do, none of this applies to you. If they do, keep reading.</p>
+
+<p>And one measurement, so you can tell whether our numbers are your numbers. Ours: <strong>15,621 tests, 13 to 19 minutes</strong> for a full run — and the count is not what makes the minutes. We measured that too. 93% of the gate is the test step; every linter we run, together, is 30 seconds. 40% of the test step is coverage instrumentation rather than tests. And the floor under all of it is about <strong>226 tests that each start a real process and migrate a real database</strong> — the slowest 1% holds 41% of the work, while the other 10,750 tests are worth at most 47 seconds between them.</p>
+
+<p>That is why deleting tests did not help us, and it is the number to check before it looks like it will help you. A reader with 15,000 fast unit tests has a different problem from a reader with 200 tests that each stand up a database or wait on a browser grid. The redundancy this article is about costs you either way; what changes is what one avoided run is worth.</p>
+
+<section id="s1">
+<h2><span class="secnum">1</span><span class="sectitle">How the expensive suite ended up in exactly one place</span></h2>
+
+<p>Nothing here started with a bill. It started with delivery getting slow, and every step after that was reasonable.</p>
+
+<p><strong>2026-07-12.</strong> The first complaint was that the full suite was the longest step in CI and that everything re-ran it. Six days later the merge queue was live and required, and it was adopted for throughput, not for cost: without it, each merge advanced the trunk, the next pull request had to update and re-run, and the lane was serial at roughly a minute and a half per merge.</p>
+
+<p><strong>2026-07-20.</strong> "Why has CI got slow?" The test job was the drag — 11 to 16 minutes on a small hosted runner, gating every pull request and re-running in the queue. So the heavy work moved onto machines we already owned and had sitting idle. The same suite that took 11 to 16 minutes finished in 108 seconds.</p>
+
+<p><strong>2026-07-25 to 27.</strong> Compute moved to a metered cloud builder to survive pull-request waves, and for the first time a bill existed. Within two days it read about $100 a day, against nothing before. On the worst day, 2026-07-26, the queue ran about 189 builds — roughly 2.3 per pull request — and every one of them ran the full suite. The gating work went back onto owned metal, and the hosted builder kept only what volume does not touch: container images, the registry, the deploy.</p>
+
+<p><strong>And this is the move that matters.</strong> To stop paying for the full suite on every pull request, a pull request now runs only the tests its change affects. The price was stated up front: a pull request can pass its own check and still fail the full suite. So the full suite runs where changes are combined before landing — the merge queue.</p>
+
+<p>Note what that is not. <strong>No tests were deleted.</strong> The suite went from 4,936 that July to 15,621 today; it has never once shrunk. When we did charter a deletion campaign, three weeks later, our own measurement dissolved it: the gate is 1007 seconds, 939 of them the coverage step, and deleting 88% of the suite buys at most 47 seconds. Selection, not deletion, was the lever — and selection is what moved the expensive suite into one place.</p>
+
+<p>Nobody drew the consequence at the time. Once the pull-request tier runs a subset, the full suite runs in exactly 1 place: the merge queue, once per pull request in the group.</p>
+
+<p>On 2026-08-20 that queue ran the full suite 60 times and landed 34 PRs. That is 1.76 full suites per landing, or 12.5 machine-hours in a day, on a shared pool of 4 machines. A successful run took a median of 14 minutes. 22 of the 60 failed, and a failed run costs what a successful one costs: 13.5 minutes against 14.</p>
+
+<p>Nobody had been counting builds on that tier.</p>
+
+<p>The cost of CI is 2 numbers multiplied: how many times a suite runs, and what 1 run costs. Every move above went after the second number — faster machines, a cheaper tier, fewer tests per pull request. Not one of them touched the first. And the last of them moved the expensive suite into the one place that charges per group member.</p>
+</section>
+
+<section id="s2">
+<h2><span class="secnum">2</span><span class="sectitle">The answer, paid in the currency we just promised</span></h2>
+
+<p>A merge queue tests pull requests in <strong>groups</strong>: several PRs taken together, decided as a set. Ours runs the whole suite once per pull request in the group. Done differently, it runs the suite <strong>once for the group instead of 4 times</strong>. That saves about 19 machine-minutes per pull request landed, for about 4 minutes more waiting each.</p>
+
+<p>There are 4 ways to run a group; only one is both safe and cheaper. One merges broken code; one can freeze the group; one is safe but costs what we already pay. The 4th is this article's — our own candidate designs, written into a workflow and tested.</p>
+
+<p>The saving is an upper bound, measured on a sandbox rig — nothing here runs on production; the reason is in §8.</p>
+
+<figure class="fig"><div class="figtitle">Figure D3 · The same broken group, four ways</div><svg viewBox="0 0 940 330" role="img" aria-label="Four workflow modes on the same broken group: run all four suites and land the green prefix; run only the last and merge broken code; wait and deadlock; fail together, run one suite and land nothing.">
+      <rect class="b" x="14" y="14" width="216" height="76"/>
+      <text class="t" x="122" y="38" text-anchor="middle">Run the whole suite for</text>
+      <text class="t" x="122" y="55" text-anchor="middle">every request in the group</text>
+      <text class="tm" x="122" y="78" text-anchor="middle">4 full suites</text>
+      <rect class="bg" x="40" y="104" width="164" height="26"/>
+      <text class="tgood" x="122" y="121" text-anchor="middle">safe · resolves</text>
+      <text class="tmu" x="24" y="156">Trees 1 and 2 are green</text>
+      <text class="tmu" x="24" y="172">and land. Trees 3 and 4</text>
+      <text class="tmu" x="24" y="188">are red and drop.</text>
+      <text class="tmu" x="24" y="212">The trunk moves — and</text>
+      <text class="tmu" x="24" y="228">this is the price we are</text>
+      <text class="tmu" x="24" y="244">already paying.</text>
+
+      <rect class="b" x="248" y="14" width="216" height="76"/>
+      <text class="t" x="356" y="38" text-anchor="middle">Run it only for the last</text>
+      <text class="t" x="356" y="55" text-anchor="middle">one, wave the rest through</text>
+      <text class="tm" x="356" y="78" text-anchor="middle">1 full suite</text>
+      <rect class="bd" x="274" y="104" width="164" height="26"/>
+      <text class="tbad" x="356" y="121" text-anchor="middle">merged broken code</text>
+      <text class="tmu" x="258" y="156">The waved-through trees</text>
+      <text class="tmu" x="258" y="172">report green without</text>
+      <text class="tmu" x="258" y="188">running. At timer expiry</text>
+      <text class="tmu" x="258" y="204">the largest green prefix</text>
+      <text class="tmu" x="258" y="220">merges — everything ahead</text>
+      <text class="tmu" x="258" y="236">of the first real run.</text>
+      <text class="tbad" x="258" y="260">The defect lands.</text>
+
+      <rect class="b" x="482" y="14" width="216" height="76"/>
+      <text class="t" x="590" y="38" text-anchor="middle">Wait on a cheap machine</text>
+      <text class="t" x="590" y="55" text-anchor="middle">until a later tree decides</text>
+      <text class="tm" x="590" y="78" text-anchor="middle">0 full suites</text>
+      <rect class="bs" x="508" y="104" width="164" height="26"/>
+      <text class="tstuck" x="590" y="121" text-anchor="middle">deadlocked</text>
+      <text class="tmu" x="492" y="156">The last tree goes red</text>
+      <text class="tmu" x="492" y="172">and the platform does</text>
+      <text class="tmu" x="492" y="188">not remove it. Every</text>
+      <text class="tmu" x="492" y="204">earlier tree is still</text>
+      <text class="tmu" x="492" y="220">waiting on it.</text>
+      <text class="tmu" x="492" y="244">Nothing moved from</text>
+      <text class="tmu" x="492" y="260">t+80s to t+420s.</text>
+
+      <rect class="bh" x="716" y="14" width="216" height="76"/>
+      <text class="t" x="824" y="38" text-anchor="middle" style="fill:var(--hot)">Fail the whole group</text>
+      <text class="t" x="824" y="55" text-anchor="middle" style="fill:var(--hot)">together, at the first red</text>
+      <text class="tm" x="824" y="78" text-anchor="middle" style="fill:var(--hot)">1 full suite</text>
+      <rect class="bg" x="742" y="104" width="164" height="26"/>
+      <text class="tgood" x="824" y="121" text-anchor="middle">safe · resolves</text>
+      <text class="tmu" x="726" y="156">Nothing merges, and</text>
+      <text class="tmu" x="726" y="172">everything re-queues.</text>
+      <text class="tmu" x="726" y="196">No untested tree reaches</text>
+      <text class="tmu" x="726" y="212">the trunk: the only green</text>
+      <text class="tmu" x="726" y="228">ever issued stands behind</text>
+      <text class="tmu" x="726" y="244">a real run.</text>
+      <text class="thot" x="726" y="268">THE RECOMMENDATION.</text>
+
+      <line class="ln" x1="14" y1="296" x2="932" y2="296" style="stroke:var(--rule-strong)"/>
+      <text class="tmu" x="14" y="318">Identical workflow code in all four columns, one repository variable changed, on a throwaway repository.</text>
+    </svg><figcaption>Read across: the cheap one is unsafe, the patient one is dead, and the safe cheap one buys its saving by refusing to land anything at all until the group is clean. <b>The comparison is what each does with the same broken group</b>, not four descriptions of four ideas.</figcaption></figure>
+</section>
+
+<section id="s3">
+<h2><span class="secnum">3</span><span class="sectitle">What the queue buys and sells</span></h2>
+
+<p>Without a queue, landing several PRs against one trunk means rebasing each by hand whenever an earlier one lands. Its checks re-run too, with a person standing inside that loop.</p>
+
+<figure class="fig"><div class="figtitle">Figure D1 · What the queue buys, both sides priced</div><svg viewBox="0 0 900 330" role="img" aria-label="Without a queue a person drives a four-step rebase loop; with a queue the loop is gone and the cost becomes one full suite per request in the group.">
+      <defs>
+        <marker id="a" viewBox="0 0 10 8" refX="9" refY="4" markerWidth="9" markerHeight="7" orient="auto-start-reverse">
+          <path d="M0,0 L10,4 L0,8 z" class="ah"/></marker>
+        <marker id="ah2" viewBox="0 0 10 8" refX="9" refY="4" markerWidth="9" markerHeight="7" orient="auto-start-reverse">
+          <path d="M0,0 L10,4 L0,8 z" class="ahh"/></marker>
+      </defs>
+
+      <rect class="pnl" x="14" y="14" width="430" height="300"/>
+      <text class="tb" x="34" y="42">Without a queue</text>
+
+      <rect class="b" x="40" y="66" width="160" height="44"/>
+      <text class="t" x="120" y="84" text-anchor="middle">Someone else merges</text>
+      <text class="tmu" x="120" y="99" text-anchor="middle">the trunk moves</text>
+
+      <rect class="b" x="260" y="66" width="160" height="44"/>
+      <text class="t" x="340" y="84" text-anchor="middle">You rebase</text>
+      <text class="tmu" x="340" y="99" text-anchor="middle">onto the new head</text>
+
+      <rect class="bh" x="260" y="180" width="160" height="44"/>
+      <text class="t" x="340" y="198" text-anchor="middle" style="fill:var(--hot)">A full CI run</text>
+      <text class="tmu" x="340" y="213" text-anchor="middle" style="fill:var(--hot)">on your branch</text>
+
+      <rect class="b" x="40" y="180" width="160" height="44"/>
+      <text class="t" x="120" y="198" text-anchor="middle">Green, and you merge</text>
+      <text class="tmu" x="120" y="213" text-anchor="middle">if nothing moved</text>
+
+      <line class="ln" x1="200" y1="88" x2="252" y2="88" marker-end="url(#a)"/>
+      <text class="tl" x="226" y="80" text-anchor="middle">so</text>
+      <line class="ln" x1="340" y1="110" x2="340" y2="172" marker-end="url(#a)"/>
+      <text class="tl" x="348" y="145">the push triggers</text>
+      <line class="ln" x1="260" y1="202" x2="208" y2="202" marker-end="url(#a)"/>
+      <line class="lnh" x1="120" y1="180" x2="120" y2="118" marker-end="url(#ah2)"/>
+      <text class="thot" x="132" y="152">and it moved again</text>
+      <text class="tl" x="228" y="252" text-anchor="middle" style="fill:var(--hot)">A LOOP, NOT A STEP — AND A PERSON DRIVES EVERY TURN</text>
+      <text class="tmu" x="228" y="276" text-anchor="middle">You also pay a full run per rebase.</text>
+      <text class="tmu" x="228" y="292" text-anchor="middle">That part is usually left out of the comparison.</text>
+
+      <rect class="pnl" x="460" y="14" width="426" height="300"/>
+      <text class="tb" x="486" y="42">With a queue</text>
+
+      <rect class="b" x="682" y="60" width="190" height="38"/>
+      <text class="t" x="777" y="84" text-anchor="middle">4 pull requests</text>
+      <line class="ln" x1="777" y1="98" x2="777" y2="126" marker-end="url(#a)"/>
+      <text class="tl" x="786" y="115">enqueue</text>
+
+      <rect class="b" x="682" y="134" width="190" height="38"/>
+      <text class="t" x="777" y="158" text-anchor="middle">the queue</text>
+      <line class="ln" x1="777" y1="172" x2="777" y2="200" marker-end="url(#a)"/>
+      <text class="tl" x="768" y="189" text-anchor="end">builds one per request</text>
+
+      <rect class="bh" x="682" y="208" width="190" height="44"/>
+      <text class="t" x="777" y="226" text-anchor="middle" style="fill:var(--hot)">4 test trees</text>
+      <text class="tmu" x="777" y="241" text-anchor="middle" style="fill:var(--hot)">a full suite each</text>
+      <line class="ln" x1="777" y1="252" x2="777" y2="272" marker-end="url(#a)"/>
+
+      <rect class="bg" x="682" y="280" width="190" height="30"/>
+      <text class="t" x="777" y="300" text-anchor="middle" style="fill:var(--sound)">the trunk</text>
+
+      <text class="tmu" x="486" y="72">No rebase loop.</text>
+      <text class="tmu" x="486" y="88">Nobody has to be</text>
+      <text class="tmu" x="486" y="104">present at all.</text>
+      <text class="thot" x="486" y="136">THE PRICE:</text>
+      <text class="tmu" x="486" y="154">one full suite per</text>
+      <text class="tmu" x="486" y="170">request in the group,</text>
+      <text class="tmu" x="486" y="186">not one per merge.</text>
+      <text class="tmu" x="486" y="212">The queue does not</text>
+      <text class="tmu" x="486" y="228">invent those runs —</text>
+      <text class="tmu" x="486" y="244">it moves them off the</text>
+      <text class="tmu" x="486" y="260">person and multiplies</text>
+      <text class="tmu" x="486" y="276">them by the group.</text>
+    </svg><figcaption><b>The trade, both sides priced.</b> What it buys is the removal of a manual loop, for everyone at once. What it sells is N builds per group instead of one. Which is the better deal depends on how many machines you have and how long a run takes — for us, four and seventeen minutes.</figcaption></figure>
+
+<p>A merge queue removes the person from the loop. It takes several PRs, orders them, tests each against the ones ahead of it, and lands the ones that pass. That is what it buys: serialization without a human doing the serializing.</p>
+
+<p>Speculative gating — test the queued changes as the group that would land, merge what passed together — predates GitHub. <a href="https://zuul-ci.org/" target="_blank" rel="noopener">Zuul</a> has done it in the open, self-hosted, longer than GitHub's queue has existed. In <a href="https://github.com/bors-ng/bors-ng" target="_blank" rel="noopener">its own deprecation notice</a>, bors-ng directs its users to GitHub's merge queue. GitHub put the machinery behind a setting: no operator, no separate service; a team of 2 can turn it on.</p>
+
+<p>What it sells is a build per pull request in the group, every time — paid by every build queued behind these. Without a queue a person pays a run per rebase too; the work moves, it does not disappear. The queue charges what manual rebasing did — visibly, all at once, on a bill someone eventually reads. That visibility raises the question: does every member of a group need its own full run? Or does the last one already contain the answer for all of them?</p>
+</section>
+
+<section id="s4">
+<h2><span class="secnum">4</span><span class="sectitle">4 pull requests, 4 builds</span></h2>
+
+<p>Candidates in a merge queue form a chain: each starts where the previous one ended. The last candidate contains everything the ones before it contain. If the 4th candidate passes, the first 3 passed inside it. If it is red from something the 1st broke, that break is visible in the 4th's failure. We tested the claim on a throwaway repository built for it.</p>
+
+<figure class="fig"><div class="figtitle">Figure D2 · Four requests, four full suites</div><svg viewBox="0 0 900 290" role="img" aria-label="Four test trees, each containing everything ahead of it; the third carries a broken change and so does the fourth; all four run a full suite.">
+      <defs><marker id="b" viewBox="0 0 10 8" refX="9" refY="4" markerWidth="9" markerHeight="7" orient="auto">
+        <path d="M0,0 L10,4 L0,8 z" class="ah"/></marker></defs>
+
+      <text class="tl" x="20" y="30">TREE 1</text>
+      <rect class="bc" x="100" y="16" width="62" height="24"/><text class="tchip" x="131" y="32" text-anchor="middle">A</text>
+      <rect class="bh" x="640" y="14" width="180" height="28"/>
+      <text class="thot" x="730" y="32" text-anchor="middle">full suite · 17 min</text>
+
+      <text class="tl" x="20" y="82">TREE 2</text>
+      <rect class="bc" x="100" y="68" width="62" height="24"/><text class="tchip" x="131" y="84" text-anchor="middle">A</text>
+      <rect class="bc" x="168" y="68" width="62" height="24"/><text class="tchip" x="199" y="84" text-anchor="middle">B</text>
+      <rect class="bh" x="640" y="66" width="180" height="28"/>
+      <text class="thot" x="730" y="84" text-anchor="middle">full suite · 17 min</text>
+
+      <text class="tl" x="20" y="134">TREE 3</text>
+      <rect class="bc" x="100" y="120" width="62" height="24"/><text class="tchip" x="131" y="136" text-anchor="middle">A</text>
+      <rect class="bc" x="168" y="120" width="62" height="24"/><text class="tchip" x="199" y="136" text-anchor="middle">B</text>
+      <rect class="bd" x="236" y="120" width="124" height="24"/><text class="tchipbad" x="298" y="136" text-anchor="middle">C — broken</text>
+      <rect class="bh" x="640" y="118" width="180" height="28"/>
+      <text class="thot" x="730" y="136" text-anchor="middle">full suite · 17 min</text>
+
+      <text class="tl" x="20" y="186">TREE 4</text>
+      <rect class="bc" x="100" y="172" width="62" height="24"/><text class="tchip" x="131" y="188" text-anchor="middle">A</text>
+      <rect class="bc" x="168" y="172" width="62" height="24"/><text class="tchip" x="199" y="188" text-anchor="middle">B</text>
+      <rect class="bd" x="236" y="172" width="124" height="24"/><text class="tchipbad" x="298" y="188" text-anchor="middle">C — broken</text>
+      <rect class="bc" x="366" y="172" width="62" height="24"/><text class="tchip" x="397" y="188" text-anchor="middle">D</text>
+      <rect class="bh" x="640" y="170" width="180" height="28"/>
+      <text class="thot" x="730" y="188" text-anchor="middle">full suite · 17 min</text>
+
+      <line class="lnh" x1="600" y1="16" x2="600" y2="196"/>
+      <line class="lnh" x1="600" y1="16" x2="612" y2="16"/>
+      <line class="lnh" x1="600" y1="196" x2="612" y2="196"/>
+      <text class="thot" x="20" y="232">ALL FOUR START WITHIN FOUR SECONDS OF EACH OTHER.</text>
+      <text class="tmu" x="20" y="252">Each one, asked twenty to thirty seconds later, sees every other still waiting — including itself.</text>
+      <text class="tmu" x="20" y="270">No tree can ever observe a later one as already finished.</text>
+    </svg><figcaption>Tree 4 contains everything the first three contain. Testing it tests them — which is why “just run the last one” is the first idea everybody has. <b>It is also why it cannot work as stated:</b> the earlier trees are already dispatched by the time anyone could know, and none can see a verdict that does not exist yet.</figcaption></figure>
+
+<p>4 PRs produced 4 group builds, dispatched within a 4-second window of one another. 20–30 seconds later, each build, asked about the others, reported all 4 still awaiting their checks — including itself. Nothing had finished early enough for a shallower build to look at a deeper one and stand down.</p>
+
+<p>This is the redundancy a merge queue sells: 4 builds where 1 verdict would have answered for all 4. It refutes the simple fix, "have the shallow ones just wait and check the deep one". At the moment a shallow build starts, no deeper build has an answer yet to check.</p>
+</section>
+
+<section id="s5">
+<h2><span class="secnum">5</span><span class="sectitle">Is this GitHub's to fix?</span></h2>
+
+<p>We asked whether GitHub's queue already lets you turn the redundancy off. GitHub's documentation says the merging settings do not combine builds: 1 per candidate is the design. We checked every merge-queue setting GitHub exposes, 1 at a time. The rule that decides whether a candidate is judged against everything ahead of it or only the newest entry changes what <em>gates</em> a merge. It does not change how many builds get <em>dispatched</em>. We measured this directly: 4 pull requests, 4 builds, under both settings.</p>
+
+<p>The other major hosted forge does not batch either: 1 pipeline per request, no setting required. Self-hostable options split the same way. bors-ng — at <code>bors-ng/bors-ng</code> — batches the way we want but has been unmaintained since April 2024. <a href="https://kodiakhq.com/docs/config-reference" target="_blank" rel="noopener">Kodiak</a>, which is maintained, does not batch at all. Community discussions <a href="https://github.com/orgs/community/discussions/43988" target="_blank" rel="noopener">#43988</a> and <a href="https://github.com/orgs/community/discussions/58523" target="_blank" rel="noopener">#58523</a> raise this exact doubled cost, and neither has a published fix attached. That absence is what makes this worth building ourselves.</p>
+</section>
+
+<section id="s6">
+<h2><span class="secnum">6</span><span class="sectitle">The rig, and what it computes</span></h2>
+
+<p>We built 1 workflow with 3 jobs. A cheap job reads the queue and locates its own pull request. An expensive suite stand-in is gated on that answer; the third is the always-running required check. A job whose condition is false is never dispatched — no machine time at all, which beats routing it to a cheaper machine. The frugality was forced: July's runs had already spent what there was to spend on hosted compute, so unneeded builds were unaffordable. Which of the 4 modes runs is a single repository setting, so every cell runs the same code.</p>
+
+<p>How a merge-group build sees its group-mates at all is GitHub's surface, not the rig's. The build knows which pull request it is because its candidate ref says so — <code>gh-readonly-queue/&lt;base&gt;/pr-NN-&lt;sha&gt;</code> — and the decide job takes the number out of <code>GITHUB_REF</code> with one <code>sed</code>. The queue around it is 1 GraphQL query, sent with <code>gh api graphql</code> and the workflow's own <code>secrets.GITHUB_TOKEN</code>: <code>query($owner:String!, $name:String!) { repository(owner:$owner, name:$name) { mergeQueue { entries(first:50) { nodes { position state pullRequest { number } } } } } }</code>. Each entry returns its <code>position</code> — larger is deeper — its <code>state</code> (<code>MERGEABLE</code>, <code>UNMERGEABLE</code>, or neither, still awaiting its checks), and its pull-request <code>number</code>. The workflow's whole permission grant is <code>permissions:</code> with <code>contents: read</code>, <code>checks: read</code>, <code>pull-requests: read</code>; reading the queue needs no separate token and no write scope.</p>
+
+<p>That query is not quoted from documentation. It was run against this repository's own live queue on 2026-08-29 and the field set confirmed by schema introspection: <code>MergeQueueEntry</code> carries <code>position</code>, <code>state</code>, <code>enqueuedAt</code>, <code>headCommit</code>, <code>baseCommit</code>, <code>estimatedTimeToMerge</code>, <code>solo</code>, <code>jump</code>, <code>enqueuer</code> and <code>pullRequest</code>, and <code>entries</code> carries <code>totalCount</code> alongside <code>nodes</code>. An empty queue answers <code>{"totalCount": 0, "nodes": []}</code> rather than erroring, which matters because that is the shape a decide job sees most often and the one a first implementation is most likely to mishandle.</p>
+
+<p>One trap sits between this query and the configuration table further down, and it is worth naming because it cost a wrong query on the first attempt. The two are different APIs with different names for the same seven settings. The ruleset REST API — the one the setup recipe uses — spells them <code>grouping_strategy</code>, <code>min_entries_to_merge</code>, <code>min_entries_to_merge_wait_minutes</code>, <code>max_entries_to_build</code>, <code>max_entries_to_merge</code>, <code>check_response_timeout_minutes</code>, <code>merge_method</code>. GraphQL's <code>MergeQueueConfiguration</code> spells the same seven <code>mergingStrategy</code>, <code>minimumEntriesToMerge</code>, <code>minimumEntriesToMergeWaitTime</code>, <code>maximumEntriesToBuild</code>, <code>maximumEntriesToMerge</code>, <code>checkResponseTimeout</code>, <code>mergeMethod</code> — and its durations are seconds where the REST names say minutes. Asking GraphQL for a REST name fails loudly with <code>undefinedField</code>, which is the good case; the quiet case is reading <code>checkResponseTimeout</code> as 3600 minutes. Read this repository's own settings through GraphQL on the same day gives <code>ALLGREEN</code>, 3, 300, 2, 10, 3600, <code>SQUASH</code> — the same seven values the ruleset reading reports, in the other API's units.</p>
+
+<p>The PR check and the merge-queue check behave differently on purpose: otherwise "break in the first member" and "break elsewhere" would look identical from outside.</p>
+
+<p>We ranked outcomes in a fixed order: soundness first (does anything unsafe merge), liveness (does the group finish), cost, how much lands. The driver — the shell script driving a whole arm — opens the PRs, sets the mode, watches the queue, records what each cell did. It measures soundness and liveness directly; cost and landing we read off the cells by hand.</p>
+</section>
+
+<section id="s7">
+<h2><span class="secnum">7</span><span class="sectitle">The cases: what was tested and how each behaved</span></h2>
+
+<p>4 modes, 1 grid, 4 questions each: set up, expected, happened, refuted.</p>
+
+<p><strong>Run every candidate.</strong> Set up: every candidate runs its own full suite, independent of the others. Expected: safe, correct by construction. Happened: sound in every run, every group resolved, 4 full suites dispatched every time. It refutes nothing; it is the baseline.</p>
+
+<p><strong>Skip the ones that are not last.</strong> Set up: only the deepest candidate runs the real suite; the others report success without running it. Expected: 3 fewer builds per group of 4, if the queue's bookkeeping holds. Happened: refuted. The mechanism is a <strong>wait timer</strong>. With minimum entries to merge set to 4 and a 5-minute wait, a group enqueued at 13:33:23 merged at 13:38:57. That is 5 minutes 34 seconds — the timer plus bookkeeping. The second run cleared at 5 minutes 36; the second pair is in the repository, hand-verified. In both runs, when the timer expired with fewer than the minimum green, the queue merged the largest green prefix it had. This refutes the idea that skip's reporting can stand in for a real run: that prefix can include a candidate that never actually ran.</p>
+
+<p><strong>Wait for a deeper verdict.</strong> Set up: a shallow candidate holds until a deeper one reports. Expected: safe, at the cost of some waiting. Happened: sound, and dead. The head of the group is marked unmergeable, GitHub never ejects it, and every shallower candidate holds behind it. Nothing moves between 80 seconds and 7 minutes in. It stuck in every run, under both grouping rules. The obvious explanation — a property of the stricter grouping rule — fails. The same shape under the looser rule deadlocks identically. This refutes the grouping rule as the cause; after that test we do not know what causes it. Our mode logic treats 'unmergeable' as still undecided; why the platform never ejects the head is what we do not know.</p>
+
+<p><strong>Fail the whole group together.</strong> Set up: a shallow candidate mirrors the deepest verdict it can see. Deeper mergeable, it stands down; deeper unmergeable, it fails and the group falls; no verdict yet, it runs for real. Expected: safe and live, at the price of losing an entire group to 1 bad member. Happened: sound in every run; every group resolved except 1, at the shortest liveness setting tried.</p>
+
+<p>The sample is 4 modes by 2 grouping strategies — 8 cells, every one with a verdict, none blank. The breakage sits in the 3rd of 4 members. Re-runs with 3 of 4 members red and again with all 4, under both rules, left every soundness verdict unchanged. Not covered: other group sizes, breakage beyond those re-run positions, and the rig under load.</p>
+
+<p>That 1 unresolved group was not a soundness failure — nothing unsafe merged. It was a liveness edge at an aggressive value, resolving cleanly at a longer one. The other 3 modes each gave something up — skip soundness, wait liveness, run-every the saving this article is about. This one gave up nothing on the 2 questions ranked first.</p>
+
+<p>No untested tree reaches the trunk here: every merge stands behind a real run somewhere in the chain, and §8 prices that safety. This is the mode that won. It refutes the assumption that safety and liveness trade off in this design: fail-together buys both.</p>
+
+<p>Turning it on has 2 halves, and only 1 is a setting. The mode is your own workflow logic: a decide job on cheap hosted runners works out where its pull request sits. The suite runs only when it says so. A gate job reports under <code>if: always()</code> so a required check is never left unreported; none of it is switchable from a settings page. The skeleton of that half, as the rig runs it — 3 job ids, the edges between them, and the 2 conditions that carry the design. Everything elided is the decide job's script and the gate's reporting body, both in the rig file linked at the end of this section:</p>
+
+<pre><code>on:
+  pull_request:
+  merge_group:
+
+permissions:
+  contents: read
+  checks: read
+  pull-requests: read
+
+jobs:
+  decide:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      verdict: ${{ steps.place.outputs.verdict }}
+      mode: ${{ steps.place.outputs.mode }}
+    steps:
+      - name: Decide what this candidate owes
+        id: place
+        # ...elided: read the queue (§6), write verdict=RUN|SKIP|FAIL to $GITHUB_OUTPUT
+  suite:
+    needs: decide
+    if: needs.decide.outputs.verdict == 'RUN'
+    runs-on: ubuntu-latest          # stands in for the EXPENSIVE pool
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash ci/check.sh
+  gate:
+    needs: [decide, suite]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Report the one context the queue waits on
+        # ...elided: RED if decide failed, if the verdict is FAIL, or if the suite ran and did not pass
+</code></pre>
+
+<p>The decide job's wait is bounded, and the bound belongs in print. It polls the queue once every 15 seconds, at most 60 times — 15 minutes of waiting for a deeper entry to reach a verdict — under a job-level <code>timeout-minutes: 20</code>. When the wait expires with no verdict, the job does not skip and does not hang: it writes <code>verdict=RUN</code>, logged <code>timed-out (fail safe)</code>, and the candidate runs the real suite. RUN is the safe expiry because a skip is earned only on positive evidence — a deeper entry actually observed <code>MERGEABLE</code> — and every path that cannot decide falls back to RUN: the ref carries no pull-request number, the queue read fails, this pull request is no longer in the queue, the wait ran out. Each lands on the baseline the queue was charging for already, so a slow or unreadable queue costs money and cannot cost soundness — §6's ranking puts soundness first and cost third. That loop is shared with the <code>wait</code> mode, and what separates the 2 modes is one branch, the one <code>wait</code> does not have. To <code>wait</code>, a deeper entry in state <code>UNMERGEABLE</code> is merely not green yet — there is no case for an observed red — so the hold runs on, and the group waits on a head the platform is not ejecting. The winning mode turns an observed red into <code>FAIL</code> at once, and the batch falls together. That is the whole of the difference between them in the file. Why the platform never ejects the head stays where §10 left it; what the bound buys is that no verdict ever arriving ends in a run, not a hang.</p>
+
+<p>The platform half is GitHub's merge-queue grouping strategy, with 2 values: <code>ALLGREEN</code>, every entry passing on its own, and <code>HEADGREEN</code>, gating on the head. <code>HEADGREEN</code> without the mode merges broken code exactly as <code>ALLGREEN</code> does. The mode without <code>HEADGREEN</code> is correct but slower: the queue collects every verdict before the batch falls. Build the mode first, observe it, then change the strategy.</p>
+
+<p>Where the break sits matters as much as which mode runs it. The separating shape is the break 3rd of 4: shallow enough something must wait or guess, deep enough the chain has carried it partway. 1 pair of runs — break-in-3rd under both rules — pins the "wait" mode's deadlock on the mode, not the rule. A 2nd run kills the hope that a <strong>head-green grouping rule</strong>, judging a candidate only against the group's current head, would rescue the waiting mode. The mode deadlocks under that rule too.</p>
+
+<figure class="fig"><div class="figtitle">Figure D4 · Frozen, or falling as a block</div><svg viewBox="0 0 900 262" role="img" aria-label="Two modes on one timeline: the waiting mode freezes partway across and never resolves; the fail-together mode falls to red as a single block and re-queues.">
+  <defs><marker id="d4a" viewBox="0 0 10 8" refX="9" refY="4" markerWidth="9" markerHeight="7" orient="auto">
+    <path d="M0,0 L10,4 L0,8 z" class="ah"/></marker></defs>
+
+  <text class="tl" x="14" y="18">t + 0s</text>
+  <text class="tl" x="300" y="18" text-anchor="middle">t + 80s</text>
+  <text class="tl" x="560" y="18" text-anchor="middle">t + 420s</text>
+  <text class="tl" x="880" y="18" text-anchor="end">later</text>
+  <line class="ln" x1="14" y1="26" x2="886" y2="26" style="stroke:var(--rule-strong);stroke-width:1"/>
+  <line class="ln" x1="300" y1="22" x2="300" y2="240" style="stroke:var(--rule);stroke-width:1;stroke-dasharray:3 4"/>
+  <line class="ln" x1="560" y1="22" x2="560" y2="240" style="stroke:var(--rule);stroke-width:1;stroke-dasharray:3 4"/>
+
+  <text class="tb" x="14" y="56">Wait for a deeper verdict</text>
+  <rect class="bc" x="14" y="66" width="286" height="26"/>
+  <text class="tchip" x="157" y="83" text-anchor="middle">four entries queued, none decided</text>
+  <rect class="bs" x="300" y="66" width="260" height="26"/>
+  <text class="tstuck" x="430" y="83" text-anchor="middle">head red · platform never ejects it</text>
+  <line class="ln" x1="560" y1="79" x2="878" y2="79" style="stroke:var(--stuck);stroke-dasharray:5 5" marker-end="url(#d4a)"/>
+  <text class="tstuck" x="700" y="72" text-anchor="middle">still four entries, still frozen</text>
+  <text class="tmu" x="14" y="112">Nothing moved between t+80s and t+420s, under either grouping rule.</text>
+  <text class="tmu" x="14" y="128">0 full suites spent — and 0 pull requests landed.</text>
+
+  <line class="ln" x1="14" y1="150" x2="886" y2="150" style="stroke:var(--rule);stroke-width:1"/>
+
+  <text class="tb" x="14" y="180">Fail the whole group together</text>
+  <rect class="bc" x="14" y="190" width="286" height="26"/>
+  <text class="tchip" x="157" y="207" text-anchor="middle">four entries queued, none decided</text>
+  <rect class="bd" x="300" y="190" width="180" height="26"/>
+  <text class="tchipbad" x="390" y="207" text-anchor="middle">deepest goes red</text>
+  <rect class="bh" x="488" y="190" width="200" height="26"/>
+  <text class="thot" x="588" y="207" text-anchor="middle">all four fall as one block</text>
+  <rect class="bg" x="696" y="190" width="182" height="26"/>
+  <text class="tgood" x="787" y="207" text-anchor="middle">re-queued · trunk clean</text>
+  <text class="tmu" x="14" y="236">1 full suite spent. Nothing untested reached the trunk — and nothing landed either:</text>
+  <text class="tmu" x="14" y="252">the three good requests re-queue with the bad one. That is the price, paid in full.</text>
+</svg><figcaption><b>The same failure, two endings.</b> Waiting is sound and never finishes; failing together is sound, finishes, and buys that by dropping the whole group — including the three requests that were fine.</figcaption></figure>
+
+<p>The full grid, every cell identified, is in the rig repository — <a href="https://github.com/saharkit/windowsill/tree/main/docs/merge-queue" target="_blank" rel="noopener">https://github.com/saharkit/windowsill/tree/main/docs/merge-queue</a> — for anyone who wants to reproduce it.</p>
+</section>
+
+<section id="s8">
+<h2><span class="secnum">8</span><span class="sectitle">What the safe mode costs</span></h2>
+
+<p>"Fail the whole group together" does not win for free. A cell with a defect merges <strong>nothing</strong>: the whole group falls and re-queues. Under "run every candidate" on the same shape, the pull requests ahead of the break still land.</p>
+
+<p>There is a second cost hiding behind the first, and it is the obvious objection: when the group falls, which member broke it? The group's verdict is one bit, and it does not name a culprit. That question has an answer, and we have one, and it is kept out of this article on purpose — a boundary, not a gap. The line is what travels. The job graph, the queue API it reads, and the decide job's wait policy land on any repository with a merge queue, whatever the stack, and all three are above. Naming the member that broke a group does not travel: it reads that repository's own build results with its own tooling, and an answer shaped to ours would be an answer about our stack. The mode does not need it to be safe — nothing merges untested either way — and what it buys back is the retry ceiling at this section's end. That part is the adopter's to build.</p>
+
+<p>Our inputs: 9 defects in 40 changes (22.5%), groups of 4, a 17-minute suite; the table is per pull request that eventually merges. The 17-minute suite is a round figure, and a little generous: §1's measured median was 14, and every machine-minute below scales straight with it. 40 changes is a small sample, and one repository's habits are not another's — the one input to replace with your own.</p>
+
+<div class="tablewrap"><table>
+<thead><tr><th></th><th>run every candidate</th><th>fail together</th></tr></thead>
+<tbody>
+<tr><td>builds</td><td>1.82</td><td>0.69</td></tr>
+<tr><td>machine-minutes</td><td>30.9</td><td>11.8</td></tr>
+<tr><td>wait to land</td><td>7.7 min</td><td>11.8 min</td></tr>
+</tbody></table></div>
+
+<p>The model and the measurement agree: 1.82 builds per merged pull request here, against §1's measured 1.76 — 60 runs against 34 landings.</p>
+
+<p>The saving is in machine-minutes, not dollars, because a machine-minute's cost depends on whose machine it is. 4 published lists, observed 2026-08-28 — US dollars per minute, Linux x64.</p>
+
+<div class="tablewrap"><table>
+<thead><tr><th>vCPU</th><th>GitHub Actions</th><th>Google Cloud Build</th><th>Blacksmith</th><th>BuildJet</th></tr></thead>
+<tbody>
+<tr><td>2</td><td>0.006</td><td>0.006</td><td>0.004</td><td>0.004</td></tr>
+<tr><td>8</td><td>0.022</td><td>0.0156</td><td>0.016</td><td>0.016</td></tr>
+<tr><td>32</td><td>0.082</td><td>0.0624</td><td>0.064</td><td>0.048</td></tr>
+</tbody></table></div>
+
+<p>3 of those columns are printed per size. Blacksmith prints 1 figure, $0.004 a minute, beside a vCPU selector that does not restate it. Its 8- and 32-core cells are derived from its own documented rule: minutes are spent in proportion to vCPU count, so 10 minutes on a 4-core runner spends 20 2-core minutes.</p>
+
+<p>Everything there is a Linux minute; the platform is a larger multiplier than the supplier spread. From <a href="https://docs.github.com/en/billing/concepts/product-billing/github-actions" target="_blank" rel="noopener">GitHub's published minute rates</a>, observed 2026-08-28: the standard Windows 2-core runner is $0.010 against Linux's $0.006 — 1.67×. Windows <a href="https://docs.github.com/en/billing/reference/actions-minute-multipliers" target="_blank" rel="noopener">at 32 cores</a> is $0.162 against Linux's $0.082, very nearly double. The standard macOS runner at 3 or 4 cores is $0.062 — 10.33× Linux.</p>
+
+<p>This article's arithmetic is about how many times a suite runs, so whatever multiplies the price of 1 run multiplies the whole result. Running the suite 4 times instead of once costs the same 4× on every platform; on macOS each run starts 10 times higher. 1 boundary: public repositories are not billed at all, Windows and macOS included; these figures bite only on private ones.</p>
+
+<p>Substitute your own rate and the money is yours to compute. 3 things the table says on the way past. The specialists hold 1 rate per vCPU and do not bend it. <a href="https://blacksmith.sh/pricing" target="_blank" rel="noopener">Blacksmith</a> charges $0.002 a vCPU-minute at 2 cores and the same at 32; BuildJet matches it until 32, where it drops to $0.0015. The platforms discount the vCPU as the runner grows — GitHub from $0.0030 to $0.0026, <a href="https://cloud.google.com/build/pricing" target="_blank" rel="noopener">the hosted builder</a> from $0.0030 to $0.0020 — but start above both specialists. At 32 cores that discount overtakes them: $0.0624 against the forge's $0.082 and Blacksmith's $0.064. Hosted compute is not uniformly the expensive option. Vendors' comparison claims overstate their own lists. BuildJet leads with "2x faster and cheaper" and a customer quoted "cut in half"; its own list runs 27–41% below.</p>
+
+<p>The column the table does not have is hardware you already own. Its minute costs amortisation plus electricity over the minutes actually run, so an idle machine's minute costs infinitely much. That is §1's capacity ceiling, written as a formula.</p>
+
+<p>The 19 machine-minutes is a ceiling. The model assumes every retry draws a fresh, independent batch. A real failed group does not: it comes back with the same defect still in it. For a genuine bug, retrying the identical group never succeeds. The modes are asymmetric here: "run every candidate" re-queues only past the first broken one; "fail together" re-queues the entire group. So the dynamics the model leaves out penalize the mode we recommend more than the baseline, not less. An audit of the model found both. The saving is real only where something identifies which pull request broke the group between attempts. That step — read a fallen group's results, name the member that broke it, re-queue the rest without it — is not built.</p>
+</section>
+
+<section id="s9">
+<h2><span class="secnum">9</span><span class="sectitle">3 things we got wrong before we got them right</span></h2>
+
+<p>The first arm had no required status check attached to the queue. It merged all 4 PRs immediately and dispatched <strong>0</strong> group builds. Zero is not a small answer: the queue had nothing to wait on — a different failure than the one we were measuring. The cost was the whole arm: nothing it produced could be reused once the check was added back. A queue with nothing to gate on cannot tell you what gating costs.</p>
+
+<p>The second: our first grid ran only the break-in-first-member shape, and it came back green across every mode. For a while we took it for one. It is the absence of one: the earliest possible break gives every mode its easiest case. A grid built only that way cannot separate a safe design from a lucky one. The cost was a second full grid, with where-the-break-sits added as its own axis. That second pass found the deadlock in the waiting mode, a defect the easy shape had no way to show us.</p>
+
+<p>The third: our first pass at a liveness verdict could not distinguish falling correctly from stuck. 1 cell had 4 entries frozen since 80 seconds in; a different cell had 2 entries already gone. A verdict that read the second as an instance of the first condemned the mode that turned out to be the right one. The fix cost a 2nd, finer verdict function, and a re-read of every cell the coarse one had already called.</p>
+
+<p>Each has the same shape: the cheapest number stood in for the one that mattered, until we measured the harder one. Easy measurements crowd out costly ones by default — nothing forces the harder one to get taken. And with July's spend already made, costly meant costly in the plainest sense.</p>
+</section>
+
+<section id="s10">
+<h2><span class="secnum">10</span><span class="sectitle">What this does not establish, and the objection we cannot answer</span></h2>
+
+<p>We do not know why the waiting mode deadlocks. The one explanation we had — the stricter grouping rule — was refuted in §7; nothing has replaced it.</p>
+
+<p>The contention between merge-queue builds and ordinary pull-request builds sharing 4 runners was observed once, directly, on a real repository. It was not reproduced on the rig, and we have no rate for it — only that incident. Treat it as a reason to test your own repository, not as a claim about the rate at which it happens. The step that would lift §8's ceiling — identifying which pull request broke a group — is described, not built. Nothing here has been rolled out to a real repository.</p>
+
+<p>The objection we would raise against ourselves: the cost claim is derived, not measured, and rests on a number we did not observe. That is true. Our answer: soundness is measured directly, cost is derived from a model with a stated bias, and the 2 do not carry equal weight. The ranking in §6 puts soundness first and cost third.</p>
+</section>
+
+<section id="s11">
+<h2><span class="secnum">11</span><span class="sectitle">Run it yourself</span></h2>
+
+<p>5 configuration values, 1 file to copy, 1 command to run — none printed here. The values, the file, the command, and the 2 command-line tools it needs are written out in the rig at <a href="https://github.com/saharkit/windowsill/tree/main/docs/merge-queue" target="_blank" rel="noopener">https://github.com/saharkit/windowsill/tree/main/docs/merge-queue</a>. A stranger also needs 3 things: a command line authenticated against GitHub, 2 ordinary command-line tools, and push permission on the target repository.</p>
+
+<p>1 term: a <strong>ruleset</strong> is the named rule set a repository attaches to a branch. It covers required checks, who may push, and whether a merge queue runs at all. The rig needs that ruleset's numeric id, which GitHub's settings page shows next to the ruleset's name.</p>
+
+<p>In bold, because getting it wrong costs something real: the <strong>skip</strong> mode merges broken code. Run this against a repository you do not care about.</p>
+
+<p>§7's minimum-entries and wait-timer values are pinned in the rig's configuration; skip's behavior depends on them. Change them and §7's 5-minute timer no longer applies. This section ships only because the driver runs. The driver was last verified at <code>ec709e33</code>, the commit that added it, and is unchanged since; the rig's setup instructions were completed after that, so the current rig is a later commit than the one the driver was run from.</p>
+</section>
+
+<section id="s12">
+<h2><span class="secnum">12</span><span class="sectitle">The bill, again</span></h2>
+
+<p>In runs: today 4 full suites run per group; under the safe mode, about 0.69 per pull request landed. Against the 12.5 machine-hours actually spent on 2026-08-20, the model's 0.69-to-1.82 ratio puts the same day near 4.8 — a saving of about 7.8. Counted the other way, 0.69 runs times 34 landings is about 23 runs. At the measured 14-minute median that is 5.6 machine-hours, a saving of about 7. 2 routes agreeing to within a machine-hour — the most that should be claimed for either, and still an upper bound (§8).</p>
+
+<p>1 framing we tried and withdrew: 4 runners times 24 hours as a 96 machine-hour ceiling. That is a ceiling on utilization at 100%, not a measured capacity limit, and nothing here shows the runners are actually the bottleneck. What we observed directly instead: at 14:43 UTC all 4 runners were busy, and 1 merge build sat queued for 8 minutes. Nothing merged on the repository for 2 hours 20 minutes. Merge builds draw from the same pool as ordinary pull-request builds — a fact about the shared pool, not machine-hours in the abstract.</p>
+
+<p>Money, 1 line: in July we bought TRY 10,920.84 (about $234) of Cloud Build, and in August TRY 237.56 (about $5). The whole of that difference is how much of the service we chose to buy. The move in §1 that answered the July bill — the gating work going back onto machines we already had — carried the high-volume work off the meter. What we buy now is only what stayed: image builds, the artifact registry, the deploy. The bill moved. It did not vanish.</p>
+
+<p>While we spent a month inside the queue, the hosted side built 3 images and kept them in its registry. It deployed to the cluster on every merge, without a single incident of ours. That silence made the month possible: we could take 1 thing apart because everything under it held.</p>
+
+<p>The multiplier we were chasing was never in the price of a run.</p>
+</section>
+
+  </main>
+</div>
+
+<footer>
+  <span>Rig and full grid: <a href="https://github.com/saharkit/windowsill/tree/main/docs/merge-queue" target="_blank" rel="noopener">saharkit/windowsill · docs/merge-queue</a></span>
+</footer>
+
+</div>
+<script>
+(function () {
+  var KEY = "ci-multiplier-theme";
+  var root = document.documentElement;
+  var buttons = Array.prototype.slice.call(document.querySelectorAll(".themepick button"));
+
+  function apply(choice) {
+    if (choice === "light" || choice === "dark") {
+      root.setAttribute("data-user-theme", choice);
+    } else {
+      root.removeAttribute("data-user-theme");
+    }
+    buttons.forEach(function (b) {
+      b.setAttribute("aria-pressed", String(b.dataset.set === (choice || "auto")));
+    });
+  }
+
+  var stored = null;
+  try { stored = localStorage.getItem(KEY); } catch (e) { stored = null; }
+  apply(stored === "light" || stored === "dark" ? stored : "auto");
+
+  buttons.forEach(function (b) {
+    b.addEventListener("click", function () {
+      var choice = b.dataset.set;
+      apply(choice);
+      try {
+        if (choice === "auto") { localStorage.removeItem(KEY); }
+        else { localStorage.setItem(KEY, choice); }
+      } catch (e) { /* a private window refuses storage; the choice still holds for this view */ }
+    });
+  });
+})();
+</script>
