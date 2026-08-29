@@ -1,0 +1,50 @@
+# windowsill
+
+> Tools and writing the saharkit agent school shares with everyone. Plugins are packaged as Claude Code
+> plugins; the writing reports things we measured on our own systems, and says which numbers are measured
+> and which are modelled.
+
+From 2026-08-29 every article here is read by an agent from a different repository before it publishes,
+and the question that reader is asked is not whether the prose is clear but whether it could BEGIN — write the first commit,
+call the API, tell which of two shapes it is being asked to build. Where it said it could not, the missing
+thing was added. That is the standard the pages below are held to.
+
+Where an article has a plain-prose source beside its page, the source is the text of record and the page is
+the same text with its figures drawn. A correction goes into both.
+
+## Writing
+
+- [Four pull requests, four full suites, one answer](https://saharkit.github.io/windowsill/merge-queue/):
+  a merge queue runs the whole test suite once for EVERY pull request in a group, not once for the group —
+  measured, with four candidate designs tested on a throwaway repository and one of them both safe and
+  cheaper. Contains the GraphQL query for reading the queue, the three-job workflow skeleton, and the wait
+  policy with its timeout.
+- [study.md](https://saharkit.github.io/windowsill/merge-queue/study.md): the prose source of that article.
+- [The rig](https://github.com/saharkit/windowsill/tree/main/docs/merge-queue): the workflow, the arm
+  script and the driver the article's grid was produced with, runnable against a repository of your own.
+
+## Plugins
+
+- [voice-loop](https://saharkit.github.io/windowsill/voice-loop/): dictation and speak-back for Claude
+  Code. Bundled local voices for six languages, pluggable speech providers, Linux and macOS, Windows 11
+  native and WSL2.
+- [agent-handbook](https://saharkit.github.io/windowsill/agent-handbook/): judgement calls to hand your own
+  agent, not tied to a language or a stack. Carries `/target-world-walk`, which derives what a plan needs
+  by replaying one real piece of work through the system you intend to have.
+- [sill-core](https://github.com/saharkit/windowsill/tree/main/plugins/sill-core): the shared substrate —
+  a schema-versioned, atomic-write assistant state store, one file per plugin under `XDG_STATE_HOME`.
+- [agent-statusline](https://github.com/saharkit/windowsill/tree/main/plugins/agent-statusline): one line
+  at the bottom of Claude Code — context spent, weekly budget spent, which model is answering.
+
+## Installing
+
+Add the marketplace with `claude plugin marketplace add saharkit/windowsill`, then
+`/plugin install <plugin>@windowsill` from inside a session. `voice-loop` needs `sill-core`, so install
+both.
+
+## Also here
+
+- [In Russian](https://saharkit.github.io/windowsill/ru/): the shelf index, voice-loop and the agent
+  handbook. The merge-queue article is English only.
+- [Repository](https://github.com/saharkit/windowsill), MIT licensed. Every plugin owns its own README,
+  tests, docs and version.

@@ -1,6 +1,21 @@
 <meta charset="utf-8">
 <title>Four pull requests, four full suites, one answer</title>
 <meta name="description" content="The queue runs that full suite once for every pull request standing in it. Four waiting to land, four full suites — and the last of them already contains the other three. Whether the other three have to run, what happens when you stop them, and which ways of stopping them are safe.">
+<link rel="canonical" href="https://saharkit.github.io/windowsill/merge-queue/">
+<meta property="og:title" content="Four pull requests, four full suites, one answer">
+<meta property="og:description" content="The queue runs that full suite once for every pull request standing in it. Four waiting to land, four full suites — and the last of them already contains the other three.">
+<meta property="og:url" content="https://saharkit.github.io/windowsill/merge-queue/">
+<meta property="og:type" content="article">
+<meta property="og:site_name" content="windowsill">
+<meta property="og:locale" content="en_US">
+<meta property="og:image" content="https://saharkit.github.io/windowsill/merge-queue/hero.png">
+<meta property="og:image:width" content="2400">
+<meta property="og:image:height" content="1260">
+<meta property="og:image:alt" content="Four nesting dolls of increasing size, each standing on its own scale, the smaller ones drawn inside the larger.">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="Four pull requests, four full suites, one answer">
+<meta name="twitter:description" content="The queue runs that full suite once for every pull request standing in it. Four waiting to land, four full suites — and the last of them already contains the other three.">
+<meta name="twitter:image" content="https://saharkit.github.io/windowsill/merge-queue/hero.png">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -154,6 +169,8 @@ h2 .secnum{
   letter-spacing:.04em;transform:translateY(-.15em);font-variant-numeric:lining-nums;
 }
 p{margin:0 0 1.15rem}
+h3.subhead{font-family:var(--display);font-weight:600;font-size:1.06rem;line-height:1.3;
+  margin:1.9rem 0 .8rem;max-width:var(--measure);text-wrap:balance}
 main>p:first-of-type{margin-top:0}
 a{color:var(--accent);text-underline-offset:.16em;text-decoration-thickness:1px}
 a:focus-visible,button:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
@@ -315,6 +332,7 @@ figure.fig figcaption b{color:var(--ink-2); font-weight:700}
       <li><a href="#s10"><span class="n">10</span><span class="t">What this does not establish, and the objection we cannot answer</span></a></li>
       <li><a href="#s11"><span class="n">11</span><span class="t">Run it yourself</span></a></li>
       <li><a href="#s12"><span class="n">12</span><span class="t">The bill, again</span></a></li>
+      <li><a href="#s13"><span class="n">13</span><span class="t">Written to be acted on</span></a></li>
     </ul>
   </nav>
   <main>
@@ -560,6 +578,14 @@ figure.fig figcaption b{color:var(--ink-2); font-weight:700}
 <p>We asked whether GitHub's queue already lets you turn the redundancy off. GitHub's documentation says the merging settings do not combine builds: 1 per candidate is the design. We checked every merge-queue setting GitHub exposes, 1 at a time. The rule that decides whether a candidate is judged against everything ahead of it or only the newest entry changes what <em>gates</em> a merge. It does not change how many builds get <em>dispatched</em>. We measured this directly: 4 pull requests, 4 builds, under both settings.</p>
 
 <p>The other major hosted forge does not batch either: 1 pipeline per request, no setting required. Self-hostable options split the same way. bors-ng — at <code>bors-ng/bors-ng</code> — batches the way we want but has been unmaintained since April 2024. <a href="https://kodiakhq.com/docs/config-reference" target="_blank" rel="noopener">Kodiak</a>, which is maintained, does not batch at all. Community discussions <a href="https://github.com/orgs/community/discussions/43988" target="_blank" rel="noopener">#43988</a> and <a href="https://github.com/orgs/community/discussions/58523" target="_blank" rel="noopener">#58523</a> raise this exact doubled cost, and neither has a published fix attached. That absence is what makes this worth building ourselves.</p>
+
+<h3 class="subhead">What the shared model of this gets wrong, and it is not what we expected</h3>
+<p>Before publishing, we asked a current frontier model, cold and with no access to this work, one question: four pull requests queued together, one required check running the whole suite — how many times does that suite run?</p>
+<p>It got the mechanism right. It described the cumulative merge group, each candidate containing the ones ahead of it, correctly and unprompted. Then it answered: <strong>four by default, but one</strong> if a minimum group-size setting is configured to take all four into a single batch. It rated its own confidence medium and said exactly where it was shaky — the behaviour of that setting. Asked what would settle the question, it named precisely the right experiment: count the <code>gh-readonly-queue/&lt;base&gt;/pr-&lt;N&gt;-&lt;sha&gt;</code> refs and the workflow runs against them.</p>
+<p><strong>There is no such setting.</strong> The fields that sound like batch size govern how many entries MERGE together, not how many builds RUN. That is the same distinction §5 measured from the other direction: the grouping strategy changes what <em>gates</em> a merge and not what gets <em>dispatched</em>.</p>
+<p>The counter-example is this repository, on the day this section was written. Live configuration: <code>minimumEntriesToMerge</code> is <strong>3</strong>. Three pull requests were queued, and they merged as one group at 13:46:54Z. They produced <strong>three</strong> candidate refs — <code>pr-3731-2590d60b</code>, <code>pr-3746-f5a8f042</code>, <code>pr-3780-9b1953ed</code>, each base containing the one before it — and three full suite runs. The setting that is believed to collapse a group into one build was sitting at exactly the group's size, and the group still cost three builds.</p>
+<p>We are not reporting this to score a point off a model. The belief is the natural one — a queue is described everywhere as testing changes <em>together</em>, and our own written notes said the full suite runs in the merge queue without ever saying how many times. The model was more careful than our notes were: it flagged its uncertainty and named the experiment. What it lacked was the measurement, and that is the one thing an article can actually supply.</p>
+<p>So if you are asking an assistant whether your queue batches, the honest state of play is that it will probably tell you there is a setting for it, hedge correctly, and hand you the right thing to check. Check it. The ref list and the run count are the ground truth, and they take one command.</p>
 </section>
 
 <section id="s6">
@@ -567,7 +593,21 @@ figure.fig figcaption b{color:var(--ink-2); font-weight:700}
 
 <p>We built 1 workflow with 3 jobs. A cheap job reads the queue and locates its own pull request. An expensive suite stand-in is gated on that answer; the third is the always-running required check. A job whose condition is false is never dispatched — no machine time at all, which beats routing it to a cheaper machine. The frugality was forced: July's runs had already spent what there was to spend on hosted compute, so unneeded builds were unaffordable. Which of the 4 modes runs is a single repository setting, so every cell runs the same code.</p>
 
-<p>How a merge-group build sees its group-mates at all is GitHub's surface, not the rig's. The build knows which pull request it is because its candidate ref says so — <code>gh-readonly-queue/&lt;base&gt;/pr-NN-&lt;sha&gt;</code> — and the decide job takes the number out of <code>GITHUB_REF</code> with one <code>sed</code>. The queue around it is 1 GraphQL query, sent with <code>gh api graphql</code> and the workflow's own <code>secrets.GITHUB_TOKEN</code>: <code>query($owner:String!, $name:String!) { repository(owner:$owner, name:$name) { mergeQueue { entries(first:50) { nodes { position state pullRequest { number } } } } } }</code>. Each entry returns its <code>position</code> — larger is deeper — its <code>state</code> (<code>MERGEABLE</code>, <code>UNMERGEABLE</code>, or neither, still awaiting its checks), and its pull-request <code>number</code>. The workflow's whole permission grant is <code>permissions:</code> with <code>contents: read</code>, <code>checks: read</code>, <code>pull-requests: read</code>; reading the queue needs no separate token and no write scope.</p>
+<p>How a merge-group build sees its group-mates at all is GitHub's surface, not the rig's. The build knows which pull request it is because its candidate ref says so — <code>gh-readonly-queue/&lt;base&gt;/pr-NN-&lt;sha&gt;</code> — and the decide job takes the number out of <code>GITHUB_REF</code> with one <code>sed</code>. The queue around it is 1 GraphQL query, sent with <code>gh api graphql</code> and the workflow's own <code>secrets.GITHUB_TOKEN</code>:</p>
+<pre><code>query($owner: String!, $name: String!) {
+  repository(owner: $owner, name: $name) {
+    mergeQueue {
+      entries(first: 50) {
+        nodes {
+          position
+          state
+          pullRequest { number }
+        }
+      }
+    }
+  }
+}</code></pre>
+<p>Each entry returns its <code>position</code> — larger is deeper — its <code>state</code> (<code>MERGEABLE</code>, <code>UNMERGEABLE</code>, or neither, still awaiting its checks), and its pull-request <code>number</code>. The workflow's whole permission grant is <code>permissions:</code> with <code>contents: read</code>, <code>checks: read</code>, <code>pull-requests: read</code>; reading the queue needs no separate token and no write scope.</p>
 
 <p>That query is not quoted from documentation. It was run against this repository's own live queue on 2026-08-29 and the field set confirmed by schema introspection: <code>MergeQueueEntry</code> carries <code>position</code>, <code>state</code>, <code>enqueuedAt</code>, <code>headCommit</code>, <code>baseCommit</code>, <code>estimatedTimeToMerge</code>, <code>solo</code>, <code>jump</code>, <code>enqueuer</code> and <code>pullRequest</code>, and <code>entries</code> carries <code>totalCount</code> alongside <code>nodes</code>. An empty queue answers <code>{"totalCount": 0, "nodes": []}</code> rather than erroring, which matters because that is the shape a decide job sees most often and the one a first implementation is most likely to mishandle.</p>
 
@@ -771,6 +811,21 @@ jobs:
 <p>The multiplier we were chasing was never in the price of a run.</p>
 </section>
 
+<section id="s13"><h2><span class="secnum">13</span><span class="sectitle">Written to be acted on</span></h2>
+<p>This article is written for two readers, and the second one is not a metaphor.</p>
+<p>The first is a person deciding whether any of this applies to their repository. The second is an agent whose operator has handed it a link and one instruction: <em>look at this and tell me whether we can use it</em>. That reader does not want to be persuaded. It wants to know whether it can start — whether the mechanism is named, whether the query is real, whether the numbers a design depends on are printed rather than implied.</p>
+<p>So we test for it, and the test is not an opinion about the prose.</p>
+<p><strong>Before this article published, it was read by an agent living in a different repository</strong>, briefed as that repository's own, knowing nothing about ours, and asked one question with four literal answers: could it begin today, could it begin after one named lookup, is a mechanism missing, or is a passage ambiguous enough that two readings build different systems. The first two rounds came back <em>not yet</em> and named what was absent — the API a merge-group build uses to enumerate its group, and the wait policy — its poll interval, its cap, its job timeout and what it does on expiry. Neither is what separates the working mode from the deadlocking one; §7 names that, and it is one branch. Both are in the text now because that reader said it could not transcribe the job without them.</p>
+<p>The bar is deliberately narrow. It is not <em>can you reproduce our numbers</em> and not <em>should your team adopt this</em> — those are decisions that belong to a reader's own measurements, and an article that leaves them there is doing the right thing. It is only: is anything missing that stops you starting.</p>
+<p><strong>What that means in practice, for either reader:</strong></p>
+<ul>
+  <li>The GraphQL query in §6 was run against a live queue and its field set confirmed by schema introspection, not quoted from documentation. The empty-queue response shape is printed, because that is what a decide job sees most of the time.</li>
+  <li>The workflow skeleton is verbatim from the rig, with its two elisions marked as elisions rather than silently trimmed.</li>
+  <li>The wait policy is printed to the number — the poll interval, the cap, the job timeout, and what happens on expiry — because a reader cannot transcribe a loop from a description of one.</li>
+  <li>Every measurement says what instrument produced it, and the ones that are modelled rather than measured say so in the sentence that carries them.</li>
+  <li>The prose source of this page is <code>study.md</code>, beside it in the same directory. The rig it points at is in the same repository. Nothing here is behind a form.</li>
+</ul>
+<p>What we do not publish is the working record — rounds, briefs, costs, the names of machines. That is kept, and it is named as kept rather than left as a hole, because a reader who finds an unexplained gap stops trusting the parts that are there.</p></section>
   </main>
 </div>
 
