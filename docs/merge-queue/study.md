@@ -1,5 +1,7 @@
 # Four pull requests, four full suites, one answer
 
+> This file is the text of record. The published article — the same text with its four figures drawn — is `index.html` beside it, served at <https://saharkit.github.io/windowsill/merge-queue/>. A correction goes into both, and the wording here is the one that wins.
+
 While the project was small, none of this mattered. It grew, and the suite grew with it. A great many tests need a great deal of machine time, and that becomes a choice where both answers cost: run the whole suite on every pull request, or land changes by hand-rebasing each one behind the last. We took the usual way out — a cheap check on the pull request, the expensive suite once, later, where changes are combined before landing. That is what a merge queue is for.
 
 It did not close the problem. The queue runs that full suite once for **every** pull request standing in it. Four waiting to land, four full suites — and the last of them already contains the other three. This article is about that: whether the other three have to run, what happens when you stop them, and which ways of stopping them are safe.
@@ -40,13 +42,13 @@ There are 4 ways to run a group; only one is both safe and cheaper. One merges b
 
 The saving is an upper bound, measured on a sandbox rig — nothing here runs on production; the reason is in §8.
 
-[FIGURE D3 — a 4×2 matrix, rows labelled in plain English by what each merge-queue mode does, four words of verdict in each cell, no mode names or cell letters]
+<!-- FIGURE D3 — a 4×2 matrix, rows labelled in plain English by what each merge-queue mode does, four words of verdict in each cell, no mode names or cell letters — drawn on the published page: index.html -->
 
 ## §3. What the queue buys and sells
 
 Without a queue, landing several PRs against one trunk means rebasing each by hand whenever an earlier one lands. Its checks re-run too, with a person standing inside that loop.
 
-[FIGURE D1 — the hand-rebase loop drawn beside the queue's loop, with a human figure standing inside the hand-rebase one and outside the queue's]
+<!-- FIGURE D1 — the hand-rebase loop drawn beside the queue's loop, with a human figure standing inside the hand-rebase one and outside the queue's — drawn on the published page: index.html -->
 
 A merge queue removes the person from the loop. It takes several PRs, orders them, tests each against the ones ahead of it, and lands the ones that pass. That is what it buys: serialization without a human doing the serializing.
 
@@ -58,7 +60,7 @@ What it sells is a build per pull request in the group, every time — paid by e
 
 Candidates in a merge queue form a chain: each starts where the previous one ended. The last candidate contains everything the ones before it contain. If the 4th candidate passes, the first 3 passed inside it. If it is red from something the 1st broke, that break is visible in the 4th's failure. We tested the claim on a throwaway repository built for it.
 
-[FIGURE D2 — four candidates drawn side by side in a chain, each box containing everything to its left, with the pull request that introduced the break shaded inside the two candidates that contain it]
+<!-- FIGURE D2 — four candidates drawn side by side in a chain, each box containing everything to its left, with the pull request that introduced the break shaded inside the two candidates that contain it — drawn on the published page: index.html -->
 
 4 PRs produced 4 group builds, dispatched within a 4-second window of one another. 20–30 seconds later, each build, asked about the others, reported all 4 still awaiting their checks — including itself. Nothing had finished early enough for a shallower build to look at a deeper one and stand down.
 
@@ -147,7 +149,7 @@ The platform half is GitHub's merge-queue grouping strategy, with 2 values: `ALL
 
 Where the break sits matters as much as which mode runs it. The separating shape is the break 3rd of 4: shallow enough something must wait or guess, deep enough the chain has carried it partway. 1 pair of runs — break-in-3rd under both rules — pins the "wait" mode's deadlock on the mode, not the rule. A 2nd run kills the hope that a **head-green grouping rule**, judging a candidate only against the group's current head, would rescue the waiting mode. The mode deadlocks under that rule too.
 
-[FIGURE D4 — the waiting mode beside the fail-together mode on one timeline: one frozen partway across, one falling to red as a block]
+<!-- FIGURE D4 — the waiting mode beside the fail-together mode on one timeline: one frozen partway across, one falling to red as a block — drawn on the published page: index.html -->
 
 The full grid, every cell identified, is in the rig repository — https://github.com/saharkit/windowsill/tree/main/docs/merge-queue — for anyone who wants to reproduce it.
 

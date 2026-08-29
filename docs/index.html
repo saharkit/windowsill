@@ -274,6 +274,15 @@
 
   <p class="aside">Every plugin owns its own README, its own tests, its own docs and its own version. More will land on the sill over time.</p>
 
+  <h2>What we measured</h2>
+
+  <ul class="shelf">
+    <li>
+      <h3><a href="merge-queue/">Four pull requests, four full suites, one answer</a></h3>
+      <p>A merge queue runs the whole test suite once for every pull request standing in it, and the last of them already contains the other three. We built a rig on a throwaway repository, tested four ways of not running the other three, and one of them is both safe and cheaper. The workflow, the queue API, the wait policy and the full grid are in <a href="https://github.com/saharkit/windowsill/tree/main/docs/merge-queue">docs/merge-queue</a>, so you can run it against a repository of your own.</p>
+    </li>
+  </ul>
+
   <h2>Add the marketplace</h2>
 
   <p>In your shell:</p>
