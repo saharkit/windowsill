@@ -154,7 +154,7 @@ The objection we would raise against ourselves: the cost claim is derived, not m
 
 In bold, because getting it wrong costs something real: the **skip** mode merges broken code. Run this against a repository you do not care about.
 
-§7's minimum-entries and wait-timer values are pinned in the rig's configuration; skip's behavior depends on them. Change them and §7's 5-minute timer no longer applies. This section ships only because the driver runs. The driver was last verified on the rig as it stands at `ec709e33`, the commit that carries it.
+§7's minimum-entries and wait-timer values are pinned in the rig's configuration; skip's behavior depends on them. Change them and §7's 5-minute timer no longer applies. This section ships only because the driver runs. The driver was last verified at `ec709e33`, the commit that added it, and is unchanged since; the rig's setup instructions were completed after that, so the current rig is a later commit than the one the driver was run from.
 
 ## §12. The bill, again
 
