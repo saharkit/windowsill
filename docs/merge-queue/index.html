@@ -593,7 +593,21 @@ figure.fig figcaption b{color:var(--ink-2); font-weight:700}
 
 <p>We built 1 workflow with 3 jobs. A cheap job reads the queue and locates its own pull request. An expensive suite stand-in is gated on that answer; the third is the always-running required check. A job whose condition is false is never dispatched — no machine time at all, which beats routing it to a cheaper machine. The frugality was forced: July's runs had already spent what there was to spend on hosted compute, so unneeded builds were unaffordable. Which of the 4 modes runs is a single repository setting, so every cell runs the same code.</p>
 
-<p>How a merge-group build sees its group-mates at all is GitHub's surface, not the rig's. The build knows which pull request it is because its candidate ref says so — <code>gh-readonly-queue/&lt;base&gt;/pr-NN-&lt;sha&gt;</code> — and the decide job takes the number out of <code>GITHUB_REF</code> with one <code>sed</code>. The queue around it is 1 GraphQL query, sent with <code>gh api graphql</code> and the workflow's own <code>secrets.GITHUB_TOKEN</code>: <code>query($owner:String!, $name:String!) { repository(owner:$owner, name:$name) { mergeQueue { entries(first:50) { nodes { position state pullRequest { number } } } } } }</code>. Each entry returns its <code>position</code> — larger is deeper — its <code>state</code> (<code>MERGEABLE</code>, <code>UNMERGEABLE</code>, or neither, still awaiting its checks), and its pull-request <code>number</code>. The workflow's whole permission grant is <code>permissions:</code> with <code>contents: read</code>, <code>checks: read</code>, <code>pull-requests: read</code>; reading the queue needs no separate token and no write scope.</p>
+<p>How a merge-group build sees its group-mates at all is GitHub's surface, not the rig's. The build knows which pull request it is because its candidate ref says so — <code>gh-readonly-queue/&lt;base&gt;/pr-NN-&lt;sha&gt;</code> — and the decide job takes the number out of <code>GITHUB_REF</code> with one <code>sed</code>. The queue around it is 1 GraphQL query, sent with <code>gh api graphql</code> and the workflow's own <code>secrets.GITHUB_TOKEN</code>:</p>
+<pre><code>query($owner: String!, $name: String!) {
+  repository(owner: $owner, name: $name) {
+    mergeQueue {
+      entries(first: 50) {
+        nodes {
+          position
+          state
+          pullRequest { number }
+        }
+      }
+    }
+  }
+}</code></pre>
+<p>Each entry returns its <code>position</code> — larger is deeper — its <code>state</code> (<code>MERGEABLE</code>, <code>UNMERGEABLE</code>, or neither, still awaiting its checks), and its pull-request <code>number</code>. The workflow's whole permission grant is <code>permissions:</code> with <code>contents: read</code>, <code>checks: read</code>, <code>pull-requests: read</code>; reading the queue needs no separate token and no write scope.</p>
 
 <p>That query is not quoted from documentation. It was run against this repository's own live queue on 2026-08-29 and the field set confirmed by schema introspection: <code>MergeQueueEntry</code> carries <code>position</code>, <code>state</code>, <code>enqueuedAt</code>, <code>headCommit</code>, <code>baseCommit</code>, <code>estimatedTimeToMerge</code>, <code>solo</code>, <code>jump</code>, <code>enqueuer</code> and <code>pullRequest</code>, and <code>entries</code> carries <code>totalCount</code> alongside <code>nodes</code>. An empty queue answers <code>{"totalCount": 0, "nodes": []}</code> rather than erroring, which matters because that is the shape a decide job sees most often and the one a first implementation is most likely to mishandle.</p>
 

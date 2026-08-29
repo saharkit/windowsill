@@ -110,7 +110,25 @@ it. The ref list and the run count are the ground truth, and they take one comma
 
 We built 1 workflow with 3 jobs. A cheap job reads the queue and locates its own pull request. An expensive suite stand-in is gated on that answer; the third is the always-running required check. A job whose condition is false is never dispatched — no machine time at all, which beats routing it to a cheaper machine. The frugality was forced: July's runs had already spent what there was to spend on hosted compute, so unneeded builds were unaffordable. Which of the 4 modes runs is a single repository setting, so every cell runs the same code.
 
-How a merge-group build sees its group-mates at all is GitHub's surface, not the rig's. The build knows which pull request it is because its candidate ref says so — `gh-readonly-queue/<base>/pr-NN-<sha>` — and the decide job takes the number out of `GITHUB_REF` with one `sed`. The queue around it is 1 GraphQL query, sent with `gh api graphql` and the workflow's own `secrets.GITHUB_TOKEN`: `query($owner:String!, $name:String!) { repository(owner:$owner, name:$name) { mergeQueue { entries(first:50) { nodes { position state pullRequest { number } } } } } }`. Each entry returns its `position` — larger is deeper — its `state` (`MERGEABLE`, `UNMERGEABLE`, or neither, still awaiting its checks), and its pull-request `number`. The workflow's whole permission grant is `permissions:` with `contents: read`, `checks: read`, `pull-requests: read`; reading the queue needs no separate token and no write scope.
+How a merge-group build sees its group-mates at all is GitHub's surface, not the rig's. The build knows which pull request it is because its candidate ref says so — `gh-readonly-queue/<base>/pr-NN-<sha>` — and the decide job takes the number out of `GITHUB_REF` with one `sed`. The queue around it is 1 GraphQL query, sent with `gh api graphql` and the workflow's own `secrets.GITHUB_TOKEN`:
+
+```graphql
+query($owner: String!, $name: String!) {
+  repository(owner: $owner, name: $name) {
+    mergeQueue {
+      entries(first: 50) {
+        nodes {
+          position
+          state
+          pullRequest { number }
+        }
+      }
+    }
+  }
+}
+```
+
+Each entry returns its `position` — larger is deeper — its `state` (`MERGEABLE`, `UNMERGEABLE`, or neither, still awaiting its checks), and its pull-request `number`. The workflow's whole permission grant is `permissions:` with `contents: read`, `checks: read`, `pull-requests: read`; reading the queue needs no separate token and no write scope.
 
 That query is not quoted from documentation. It was run against this repository's own live queue on 2026-08-29 and the field set confirmed by schema introspection: `MergeQueueEntry` carries `position`, `state`, `enqueuedAt`, `headCommit`, `baseCommit`, `estimatedTimeToMerge`, `solo`, `jump`, `enqueuer` and `pullRequest`, and `entries` carries `totalCount` alongside `nodes`. An empty queue answers `{"totalCount": 0, "nodes": []}` rather than erroring, which matters because that is the shape a decide job sees most often and the one a first implementation is most likely to mishandle.
 
