@@ -4,8 +4,8 @@
 > plugins; the writing reports things we measured on our own systems, and says which numbers are measured
 > and which are modelled.
 
-Every article here is read by an agent from a different repository before it publishes, and the question
-that reader is asked is not whether the prose is clear but whether it could BEGIN — write the first commit,
+From 2026-08-29 every article here is read by an agent from a different repository before it publishes,
+and the question that reader is asked is not whether the prose is clear but whether it could BEGIN — write the first commit,
 call the API, tell which of two shapes it is being asked to build. Where it said it could not, the missing
 thing was added. That is the standard the pages below are held to.
 

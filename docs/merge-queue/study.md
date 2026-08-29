@@ -288,8 +288,7 @@ This article is written for two readers, and the second one is not a metaphor.
 The first is a person deciding whether any of this applies to their repository. The second is an agent
 whose operator has handed it a link and one instruction: *look at this and tell me whether we can use it*.
 That reader does not want to be persuaded. It wants to know whether it can start — whether the mechanism is
-named, whether the query is real, whether the parameter that separates the working design from the broken
-one is printed rather than implied.
+named, whether the query is real, whether the numbers a design depends on are printed rather than implied.
 
 So we test for it, and the test is not an opinion about the prose.
 
@@ -297,9 +296,10 @@ So we test for it, and the test is not an opinion about the prose.
 that repository's own, knowing nothing about ours, and asked one question with four literal answers: could
 it begin today, could it begin after one named lookup, is a mechanism missing, or is a passage ambiguous
 enough that two readings build different systems. The first two rounds came back *not yet* and named what
-was absent — the API a merge-group build uses to enumerate its group, and the wait policy that is the only
-thing separating the mode that works from the one that deadlocks. Both are in the text now because that
-reader said it could not start without them.
+was absent — the API a merge-group build uses to enumerate its group, and the wait policy — its poll interval, its
+cap, its job timeout and what it does on expiry. Neither is what separates the working mode from the
+deadlocking one; §7 names that, and it is one branch. Both are in the text now because that reader said
+it could not transcribe the job without them.
 
 The bar is deliberately narrow. It is not *can you reproduce our numbers* and not *should your team adopt
 this* — those are decisions that belong to a reader's own measurements, and an article that leaves them
@@ -313,8 +313,7 @@ there is doing the right thing. It is only: is anything missing that stops you s
 - The workflow skeleton is verbatim from the rig, with its two elisions marked as elisions rather than
   silently trimmed.
 - The wait policy is printed to the number — the poll interval, the cap, the job timeout, and what happens
-  on expiry — because a design that is safe or deadlocked depending on that number is not conveyed by
-  describing it.
+  on expiry — because a reader cannot transcribe a loop from a description of one.
 - Every measurement says what instrument produced it, and the ones that are modelled rather than measured
   say so in the sentence that carries them.
 - The prose source of this page is `study.md`, beside it in the same directory. The rig it points at is in
