@@ -4,6 +4,8 @@ We deleted slow tests and made continuous integration faster on every pull reque
 
 Ask yourself one thing first: do your pull requests ever wait behind one another to land? If they never do, none of this applies to you. If they do, keep reading.
 
+## §1. 3 moves, and each one caused the next
+
 A $300 free-trial grant, meant to last months, was gone in 3 days of test runs. That was 1,930 vCPU-hours. On the worst day, 2026-07-26, we burned about $94.
 
 We made 3 moves, and each one caused the next.
