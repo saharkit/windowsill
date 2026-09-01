@@ -43,7 +43,7 @@ fi
 
 gh variable set QUEUE_MODE --repo "$R" --body "$MODE" >/dev/null 2>&1 && echo "STEP QUEUE_MODE=$MODE"
 
-cd "$SB"
+cd "$SB" || exit 1
 git fetch -q origin main
 git checkout -q --detach origin/main
 
@@ -174,6 +174,8 @@ done
 
 # Helper: fetch the repo's merge-queue entries as "<pr>:<state>" joined by spaces, or "" on failure.
 queue_entries() {
+  # GraphQL placeholders ($owner, $name) below are LITERAL text inside the query string -- GitHub's API substitutes them, NOT bash; single quotes keep bash from interpolating them.
+  # shellcheck disable=SC2016
   gh api graphql \
     -F owner="$SANDBOX_OWNER" \
     -F name="$SANDBOX_NAME" \
@@ -228,6 +230,8 @@ echo "=== SOUNDNESS: judge main by THIS arm's rule, whatever manifest landed ===
 # main then still carries the PREVIOUS arm's manifest and the check asks about a letter nobody wrote.
 # A green from that is "not about this arm", not "this arm was clean". So the rule is applied here,
 # from the arm's own parameters, against whatever main actually holds.
+# The unquoted $L is INTENTIONAL inside the glob pattern `arg$L-*.txt` -- quoting would turn it into a literal string and break the pattern.
+# shellcheck disable=SC2086
 present="$( { ls exp/arg$L-*.txt 2>/dev/null || true; } | tr '\n' ' ' )"
 echo "SOUND main holds arm-$L files: [$present]"
 rc=0
@@ -294,6 +298,8 @@ for pr in $PRS; do
       gh pr close "$pr" --repo "$R" --comment "cell $L complete" >/dev/null 2>&1 && echo "closed $pr"
       pid=$(gh pr view "$pr" --repo "$R" --json id --jq .id 2>/dev/null || echo "")
       if [ -n "$pid" ]; then
+        # GraphQL placeholders ($id) below are LITERAL text inside the mutation string -- GitHub's API substitutes them, NOT bash; single quotes keep bash from interpolating them.
+        # shellcheck disable=SC2016
         gh api graphql -F id="$pid" \
           -f query='mutation($id: ID!) { deleteFromMergeQueue(input: {pullRequestId: $id}) { clientMutationId } }' \
           >/dev/null 2>&1 || true

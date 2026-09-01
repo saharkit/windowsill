@@ -25,6 +25,8 @@ fi
 sleep 5
 # `set -e` + `pipefail` + a glob that matches NOTHING is a trap: `ls` exits 2, pipefail propagates it,
 # and the script dies before deciding anything. The zero-file case is NORMAL on a fresh base branch.
+# The unquoted ${ARM} is INTENTIONAL inside the glob pattern `arg${ARM}-*.txt` -- quoting would turn it into a literal string and break the pattern.
+# shellcheck disable=SC2086
 present="$( { ls exp/arg${ARM}-*.txt 2>/dev/null || true; } | tr '\n' ' ' )"
 echo "check.sh: arm=${ARM} bad=${BAD} tree holds [${present}]"
 rc=0
