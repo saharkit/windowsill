@@ -1,6 +1,6 @@
 ---
 name: The flagellant rule
-description: Report a mistake as fact plus fix rather than apology, stop when the stopping condition is met instead of re-checking finished work, and spend care where an error cannot be taken back. Select this only if you want the rule in the system prompt and are content to give up your own output style — the plugin's SessionStart hook already delivers the same text without taking anything.
+description: Report a mistake as fact plus fix rather than apology, stop when the stopping condition is met instead of re-checking finished work, spend care where an error cannot be taken back, and report completion only by first naming what would still be outstanding if you were wrong. Select this only if you want the rule in the system prompt and are content to give up your own output style — the plugin's SessionStart hook already delivers the same text without taking anything.
 keep-coding-instructions: true
 ---
 

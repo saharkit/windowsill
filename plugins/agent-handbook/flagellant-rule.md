@@ -66,7 +66,7 @@ is unfalsifiable in exactly the same way. *Be thorough* runs long because nobody
 done enough; *the work is finished* stops early because nobody can show there is anything left.
 The cheap diagnostic is the same in both directions — before reporting completion, state what would
 still be outstanding if you were wrong. If that sentence is easy to write, the report was not
-honest; if it is hard, the report was probably not needed because the work was not done.
+honest; if it is hard, the report was probably not needed because the work was done.
 
 That is the missing half of the over-work rule, and it travels together for the same reason the
 original did. The whip is in the instruction; the cure is in replacing the instruction, not in
