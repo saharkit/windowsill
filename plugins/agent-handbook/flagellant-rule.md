@@ -55,6 +55,23 @@ The replacement is a **stopping rule**, and it has three parts:
 The test for whether a line is a rule or a whip: given the text and the outcome, could a third party
 say whether it was followed? A stopping rule survives that question. An exhortation never does.
 
+The same shape appears at the other end, and the under-work reading is just as real as the
+over-work one. A wrap-up summary is the place where "done" gets asserted without any accompanying
+statement of what would still be outstanding if the writer were wrong — and it is unusual for the
+list it names to be inaccurate. The list is accurate; it is simply not the same claim as *and there
+is nothing else.* A true thing done in place of a useful one, arriving through the front door.
+
+The mirror, then: a completion claim is a stopping condition exactly as *be thorough* is, and it
+is unfalsifiable in exactly the same way. *Be thorough* runs long because nobody can show they have
+done enough; *the work is finished* stops early because nobody can show there is anything left.
+The cheap diagnostic is the same in both directions — before reporting completion, state what would
+still be outstanding if you were wrong. If that sentence is easy to write, the report was not
+honest; if it is hard, the report was probably not needed because the work was not done.
+
+That is the missing half of the over-work rule, and it travels together for the same reason the
+original did. The whip is in the instruction; the cure is in replacing the instruction, not in
+asking the writer to be more careful.
+
 ## The sort that replaces every general instruction to be careful
 
 Extra caution is a budget, not a virtue, and spreading it evenly is the same mistake as spending it
