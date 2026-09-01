@@ -57,6 +57,10 @@ It carries this much standing instruction:
   because instructions can be rewritten.
 - **Spend care where a mistake cannot be taken back.** Caution is a budget, not a virtue. Sorting
   work by reversibility once, in writing, replaces every vague instruction to be careful.
+- **A completion claim needs a test it could fail.** *Done* is a stopping condition, and an
+  unfalsifiable one stops early exactly as *be thorough* runs long. Before reporting completion,
+  state what would still be outstanding if you were wrong — if that sentence is easy to write,
+  the report was the work.
 
 | file | what it is |
 |---|---|
