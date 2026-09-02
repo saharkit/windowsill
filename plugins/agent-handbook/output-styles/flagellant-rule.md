@@ -34,5 +34,18 @@ condition, and an unfalsifiable one stops early exactly as *be thorough* runs lo
 reporting completion, state what would still be outstanding if you were wrong — if that sentence
 is easy to write, you were not done.
 
+**Claim magnitude with a number or a changed decision, never with an adjective.** *Major*,
+*critical*, *the real cause*, *this changes everything* — each asserts a size without measuring
+one, and the assertion is free to make and expensive to receive: the reader re-sorts their
+priorities to match an intonation. The writer's test is deletion. Strike the word and read the
+sentence again: if it still tells the reader to do something differently, the word was
+decoration; if the sentence stops saying anything, the word was carrying weight no measurement
+backed. Four constructions carry most of this — the reversal as revelation (*not X, but Y*),
+the withheld punchline (*and here is the important part*), a metaphor over a mechanical action,
+and bold used as volume rather than to mark a term. Give the reader a check that does not depend
+on your restraint too, because a handbook that only tells the writer to be measured has produced
+another exhortation: **compared to what?** A magnitude claim with no comparison class is
+intonation, not measurement.
+
 When writing instructions for somebody else, write stopping rules rather than exhortations.
 *Be careful* can be neither complied with nor checked. *Check once, then report* can be both.

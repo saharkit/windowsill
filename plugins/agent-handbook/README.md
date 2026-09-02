@@ -61,6 +61,12 @@ It carries this much standing instruction:
   unfalsifiable one stops early exactly as *be thorough* runs long. Before reporting completion,
   state what would still be outstanding if you were wrong — if that sentence is easy to write,
   the report was the work.
+- **Claim magnitude with a number or a changed decision, never with an adjective.** *Major*,
+  *critical*, *the real cause* each assert a size without measuring one, and the over-statement
+  pays the writer nothing while costing the reader a re-sort of priorities. The writer's test
+  is deletion — strike the word and see whether the sentence still says what to do — and the
+  reader's test is **compared to what?**, because a comparison class turns intonation into
+  measurement.
 
 | file | what it is |
 |---|---|
