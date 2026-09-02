@@ -301,8 +301,8 @@ for pr in $PRS; do
         # GraphQL placeholders ($id) below are LITERAL text inside the mutation string -- GitHub's API substitutes them, NOT bash; single quotes keep bash from interpolating them.
         # shellcheck disable=SC2016
         gh api graphql -F id="$pid" \
-          -f query='mutation($id: ID!) { deleteFromMergeQueue(input: {pullRequestId: $id}) { clientMutationId } }' \
-          >/dev/null 2>&1 || true
+          -f query='mutation($id: ID!) { dequeuePullRequest(input: {id: $id}) { clientMutationId } }' \
+          || echo "STEP note dequeue failed for $pr -- already-merged/closed PRs usually leave the queue on their own"
       fi
       ;;
     MERGED) echo "already merged $pr (nothing to close)" ;;
