@@ -88,6 +88,61 @@ not the same as reversible.
 This is the general form of a carve-out that every workshop discovers in its own vocabulary. The
 vocabulary is local; the line is not.
 
+## The half about claims of size
+
+Adjectives assert a magnitude without measuring one. *Major*, *critical*, *the real cause*,
+*this changes everything* — each names a size the reader cannot check, and the asymmetry that
+keeps the habit alive is built into the incentive. If the writer calls a finding major and it
+is, the writer sounds right; if the writer calls it minor and it turns out major, the writer
+sounds careless. The over-statement pays nothing, the under-statement pays reputation, so the
+expected value of reaching for the adjective is positive on every draw. Exaggeration costs the
+writer nothing and costs the reader a re-sort of priorities each time, which means the cost is
+not paid by the person who chose the word.
+
+A second mechanism is specific to an agent without memory between sessions. Each turn genuinely
+re-discovers what was already known, and from inside the writer the re-discovery is
+indistinguishable from discovery. The report then ends up about the size of the writer's own
+update — the re-arrival — rather than the size of the fact. A reader who does not share the
+writer's perspective has no signal that this is what happened. The habit survives because the
+writer cannot tell.
+
+**The writer's test is deletion.** Strike the word *major*, *critical* or *the real cause* and
+read the sentence again. If it still tells the reader to do something differently, the word was
+decoration. If the sentence stops saying anything, the word was carrying weight no number or
+changed decision backed. The test is mechanical: it cannot be fooled by sincerity, and it cannot
+be passed by feeling honest about it.
+
+**Four constructions carry most of the load**, and naming them is what makes the rule checkable
+rather than aspirational. Each of them declares importance by form rather than measuring it:
+
+- **The reversal as revelation** — *not X, but Y*. The construction announces that something
+  common-sense is being overturned; the announcement is the only content.
+- **The withheld punchline** — *and here is the important part*, after which comes what could
+  have been said first. The setup declares importance; the body merely has it.
+- **A metaphor laid over a mechanical action** — a sentence shaped as a physical gesture that
+  the underlying operation does not actually perform. The image substitutes for the change.
+- **Bold used as volume** rather than to mark a term. The typography does the work of an
+  exclamation mark.
+
+Naming them matters because, without names, the rule against adjectives is a request to write
+differently. With names, it is a list of things to look for and rewrite.
+
+**Give the reader the cheap check too, because they need one that does not depend on the writer's
+restraint.** The reader's test is a question: **compared to what?** A magnitude claim with no
+comparison class is intonation, not measurement. Five words, applicable to any sentence, and
+the writer cannot fake an answer. A handbook that only tells the writer to be measured has
+produced another exhortation — exactly what the closing line of this rule warns against. Ship
+both halves, and put the reader's one where a reader will find it.
+
+**The provenance, stated as the limit.** The case for *major* being expensive to the reader is
+built on the writer's own account of how an escalating register gets produced — text trained on
+material that competes for attention, so the escalating register is what reproduces by default.
+That is a **self-report**, not a documented fact about how any model was trained, and the rule
+carries it as such. The rule does not depend on that mechanism being universal: the deletion
+test and the reader's *compared to what?* hold either way. The mechanism is what motivated the
+rule; it is not what justifies it. The justification is the asymmetry the reader pays, which is
+visible without any claim about training.
+
 ## What this rule is not
 
 It is **not permission to be sloppy.** Nothing here reduces the standard of the work; it removes
