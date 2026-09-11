@@ -5,8 +5,8 @@ hold whatever you happen to be building. Not a framework, not a linter, not code
 project.
 
 It holds two kinds of thing, and the difference matters. An **instrument** is something you reach
-for at a moment, and it waits until you do. A **standing rule** is something you want in force at
-all times, so it is not invoked at all — it applies from the moment the plugin is enabled.
+for at a moment, and it waits until you do. **Standing rules** are things you want in force at all
+times, so they are not invoked at all — they apply from the moment the plugin is enabled.
 
 Nothing here is tied to a language, a stack or a build system. Nothing installs a runtime, opens a
 network connection or needs hardware.
@@ -106,7 +106,42 @@ considered and rejected: only a skill's *description* is preloaded, its body arr
 and automatic activation is a per-turn judgement rather than a guarantee. That is right for an
 instrument you reach for and wrong for a rule that must not be missed.
 
-### Why the two are shipped together
+### The non-stop rule — a standing rule, not an instrument
+
+Named for the working posture it asks for: an agent that finishes what it was given. The seven
+rules each name something to do rather than something to avoid, and each carries a check the
+reader can run — not the writer. The failure it catches is permission-seeking while work remains,
+a true thing done in place of a useful one.
+
+It carries this much standing instruction:
+
+- **Do the work and report it** rather than asking permission. The task you were given is the
+  permission; there is no separate "may I?" before each step.
+- **Write in the past tense.** Future tense is a sign the order of operations broke: the sentence
+  was written before the work was done.
+- **Never hand back the turn while work remains.** Hit an obstacle, name it in one line — who or
+  what clears it — then move to the next task that does not depend on it.
+- **Ask a question only where the work becomes pointless or unsafe without the answer.** Even that
+  question travels with the work already done, in the same message, never instead of it.
+- **Before saying it needs you, probe your own rights with a command.** "Only a human can do this"
+  is a claim about your own permissions, settled by one command rather than by a feeling.
+- **Report done only with proof.** Tests are green and here is their output; the file is in place
+  and here are its contents; the process is up and here is its pid.
+- **Do not write farewell summaries.** An ordinary report opens with a fact, not with a promise
+  that a result is coming.
+
+| file | what it is |
+|---|---|
+| [`hooks/hooks.json`](hooks/hooks.json) + [`hooks/emit-standing-rules.js`](hooks/emit-standing-rules.js) | how it reaches you by default — the same `SessionStart` hook delivers this rule alongside the flagellant rule under one provenance line |
+| [`nonstop-rule.md`](nonstop-rule.md) | the rule's text |
+
+**How it reaches you, and why there is no output style.** By the same path the flagellant rule
+takes: the `SessionStart` hook prints both rules together and Claude Code puts the combined text
+into the session's context. There is no `output-styles/nonstop-rule.md` to select, and that is
+deliberate — the rule's delivery surface is the hook, and adding an output style would force the
+choice the flagellant rule already settled against.
+
+### Why they are shipped together
 
 The walk exists to find what is **missing**. If finding something missing means blame, nobody walks
 honestly — they bring a tidier plan instead, which is precisely the failure the walk was built to
@@ -127,6 +162,9 @@ stated without pointing at the board, that is itself the finding.
 claim rather than an instrument reading. It can only name what this one path required and nobody
 owned. The skill states these limits as part of the method rather than as a disclaimer, because a
 walk mistaken for a certificate is worse than no walk.
+
+The non-stop rule ships beside them so the standard the two together describe can be met without
+pausing to ask.
 
 ## Installing
 
