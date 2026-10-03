@@ -273,15 +273,18 @@ jobs:
           print(f'{len(cases)} coverage_badge boundary cases passed')
           "
 
-  # `claude plugin validate` is the local structural check the plugin directory's review pipeline
-  # runs on every submission: it verifies plugin.json, skill/agent/command frontmatter and
-  # hooks/hooks.json against the schema, with no auth and no model calls. Nothing here ran it, so a
-  # silent validate failure was invisible (windowsill submission readiness). The claude CLI is a
-  # public npm package, so this is obtainable in CI without any credential the repo does not hold.
-  # Intentionally NOT in gate.needs: required-check wiring lives in another repository (the branch
-  # protection config) and is not this change's to make, so the job reports but does not yet gate.
+  # `claude plugin validate --strict` is the local structural check the plugin directory's review
+  # pipeline runs on every submission: it verifies plugin.json, skill/agent/command frontmatter
+  # and hooks/hooks.json against the schema, with no auth and no model calls. The directory
+  # submission readiness depended on the same validator running here on every PR — a silent
+  # validate failure was invisible (windowsill submission readiness, fix(#5816)). The claude CLI
+  # is a public npm package, so this is obtainable in CI without any credential the repo does not
+  # hold. The listing-test step beside it covers the directory rules the strict validator does
+  # not check on its own (no `category`, `icon` resolution, the five-key `classification`,
+  # 256 KiB per-file inspection limit, the 512-file cap). Both are wired into `gate.needs` so
+  # the merge queue cannot open a submission that the directory would hold or warn.
   validate:
-    name: validate plugin manifests (claude plugin validate)
+    name: validate plugin manifests (claude plugin validate --strict + directory listing)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -290,15 +293,23 @@ jobs:
           node-version: "20"
       - name: install the claude CLI (public npm package, no credential needed)
         run: npm install -g @anthropic-ai/claude-code
-      - name: validate both plugins
+      - name: validate all four plugins (strict)
         env:
           # a local check (no auth, no model calls): suppress the CLI's update/telemetry network
           # traffic so the gate is deterministic rather than dependent on external endpoints
           CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
         run: |
-          claude plugin validate ./plugins/voice-loop
-          claude plugin validate ./plugins/sill-core
-          claude plugin validate ./plugins/agent-statusline
+          claude plugin validate --strict ./plugins/voice-loop
+          claude plugin validate --strict ./plugins/sill-core
+          claude plugin validate --strict ./plugins/agent-handbook
+          claude plugin validate --strict ./plugins/agent-statusline
+      # The directory rules the strict validator does not check on its own: no `category`,
+      # `icon` resolution, the five-key `classification`, the 256 KiB per-file inspection limit,
+      # and the 512-file cap. This is the test that fix(#5816) introduced — see
+      # `tests/test_directory_listing.py`.
+      - name: directory listing acceptance (no category, icon, classification, 256 KiB, 512 files)
+        run: |
+          python3 -m pytest tests/test_directory_listing.py
       # `claude plugin validate` checks each manifest's own structure; it does NOT compare the two
       # copies of voice-loop's dependencies — the one in plugin.json and its mirror in the
       # marketplace entry. A change that touches one and forgets the other passes both validations,
@@ -353,10 +364,11 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install --index-url https://download.pytorch.org/whl/cpu torch
-          pip install -r plugins/voice-loop/tests/requirements.txt
-      # Each plugin owns its test run: pytest.ini and .coveragerc live in the plugin directory and
-      # their paths (testpaths, pythonpath, coverage source) are relative to it, so the suite is
-      # invoked from there rather than from the repo root.
+          pip install -r tests/voice-loop/tests/requirements.txt
+      # Each plugin owns its test run: pytest.ini and .coveragerc live in the plugin's test
+      # root (the directory's own test config lives at tests/voice-loop/ for the BINARIES_NOT_INSPECTED
+      # reason documented in CLAUDE.md) and its paths (testpaths, pythonpath, coverage source) are
+      # relative to it, so the suite is invoked from there rather than from the repo root.
       #
       # Coverage measures the server, the helper scripts (dictate.py, speak.py, report_bug.py,
       # tls-probe.py), and the diagnose tool (scripts/doctor.py). The 100% claim for
@@ -368,11 +380,11 @@ jobs:
       # could only ever be red, since these scripts now contain platform-specific code that
       # must be measured by the platform that can reach it.
       - name: pytest with coverage gates (server 100%)
-        working-directory: plugins/voice-loop
+        working-directory: tests/voice-loop
         run: |
           pytest --cov --cov-report=term-missing
           echo "::group::server coverage gate (non-negotiable 100%, asserted on every leg)"
-          python -m coverage report --include='server/voice_server*' --fail-under=100
+          python -m coverage report --include='**/plugins/voice-loop/server/voice_server*' --fail-under=100
           echo "::endgroup::"
           echo "::endgroup::"
 
@@ -387,7 +399,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: coverage-voice-loop-${{ matrix.python }}
-          path: plugins/voice-loop/.coverage
+          path: tests/voice-loop/.coverage
           # .coverage starts with a dot — v4 excludes hidden files by default, which is why
           # `if-no-files-found: error` was firing even on a green matrix leg.
           include-hidden-files: true
@@ -403,7 +415,7 @@ jobs:
         with:
           python-version: "3.12"
       - name: install test dependencies
-        working-directory: plugins/voice-loop
+        working-directory: tests/voice-loop
         run: |
           python -m pip install --upgrade pip
           python -m pip install -r tests/requirements.txt
@@ -412,7 +424,7 @@ jobs:
       # The 100% claim for `scripts/*` is asserted once, against the union of the three platforms,
       # in combined-coverage.
       - name: run the voice-loop unit suite on native Windows (with coverage)
-        working-directory: plugins/voice-loop
+        working-directory: tests/voice-loop
         run: python -m pytest --cov --cov-report=term-missing
       # `.coverage` starts with a dot — v4 excludes hidden files by default, which is why
       # `include-hidden-files: true` is the same dance as on the Linux legs.
@@ -420,7 +432,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: coverage-voice-loop-windows-3.12
-          path: plugins/voice-loop/.coverage
+          path: tests/voice-loop/.coverage
           include-hidden-files: true
           if-no-files-found: error
 
@@ -434,7 +446,7 @@ jobs:
         with:
           python-version: "3.12"
       - name: install test dependencies
-        working-directory: plugins/voice-loop
+        working-directory: tests/voice-loop
         run: |
           python -m pip install --upgrade pip
           python -m pip install -r tests/requirements.txt
@@ -443,13 +455,13 @@ jobs:
       # be red. The 100% claim for `scripts/*` is asserted once, against the union of the
       # three platforms, in combined-coverage.
       - name: run the voice-loop unit suite on macOS (with coverage)
-        working-directory: plugins/voice-loop
+        working-directory: tests/voice-loop
         run: python -m pytest --cov --cov-report=term-missing
       - name: upload coverage for combined report (macos)
         uses: actions/upload-artifact@v4
         with:
           name: coverage-voice-loop-macos-3.12
-          path: plugins/voice-loop/.coverage
+          path: tests/voice-loop/.coverage
           include-hidden-files: true
           if-no-files-found: error
 
@@ -1756,7 +1768,7 @@ jobs:
   gate:
     name: gate
     runs-on: ubuntu-latest
-    needs: [shellcheck, coverage, voice-loop-windows, voice-loop-macos, sill-core-coverage, loopback, combined-coverage]
+    needs: [shellcheck, validate, coverage, voice-loop-windows, voice-loop-macos, sill-core-coverage, loopback, combined-coverage]
     if: always()
     steps:
       - name: every needed job succeeded

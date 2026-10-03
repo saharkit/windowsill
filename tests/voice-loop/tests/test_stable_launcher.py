@@ -15,7 +15,7 @@ from pathlib import Path
 
 import pytest
 
-_SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
+_SCRIPTS = Path(__file__).resolve().parents[3] / "plugins" / "voice-loop" / "scripts"
 _LOADER = importlib.machinery.SourceFileLoader(
     "voice_loop_dictate_launcher", str(_SCRIPTS / "voice-loop-dictate")
 )

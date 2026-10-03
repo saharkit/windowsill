@@ -1,6 +1,8 @@
 # Coverage of the server is a hard gate at 100% (statements AND branches) — see TESTING.md (next to
-# this file) for what that number does and does not claim. Read from this directory: the suite runs
-# as `cd plugins/voice-loop && pytest …`, and `source` resolves through pytest.ini's `pythonpath`.
+# the plugin in plugins/voice-loop/) for what that number does and does not claim. Read from this
+# directory: the suite runs as `cd tests/voice-loop && pytest …`, and `source` resolves through
+# pytest.ini's `pythonpath`. The plugin folder is the install target and ships every file in it,
+# so this test root lives in `tests/voice-loop/` rather than inside the plugin — see CLAUDE.md.
 #
 # scripts/ is also under coverage measurement. The 100% claim for `scripts/*`, `scripts/doctor.py`
 # and `scripts/speak.py` was moved off this file's per-leg gate and onto the union after #276:
@@ -17,7 +19,7 @@
 # `scripts/*`, `scripts/doctor.py` and `scripts/speak.py` run there against the combined data.
 [run]
 branch = True
-source = voice_server, scripts
+source = ../../plugins/voice-loop/server/voice_server, ../../plugins/voice-loop/scripts
 
 [report]
 show_missing = True

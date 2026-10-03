@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512" role="img" aria-labelledby="t">
+  <title id="t">Sahar — dawn over the sill</title>
+  <rect x="16" y="16" width="480" height="480" rx="96" fill="#3d2f73" />
+  <path d="M16 260 H496 V352 H16 Z" fill="#7a4a8f" />
+  <path d="M16 310 H496 V352 H16 Z" fill="#c76a7a" />
+  <circle cx="256" cy="120" r="5" fill="#ffffff" fill-opacity="0.85" />
+  <circle cx="370" cy="92" r="3.5" fill="#ffffff" fill-opacity="0.7" />
+  <circle cx="146" cy="100" r="3" fill="#ffffff" fill-opacity="0.6" />
+  <g stroke="#ffd98a" stroke-width="10" stroke-linecap="round">
+    <line x1="256" y1="204" x2="256" y2="166" />
+    <line x1="170" y1="238" x2="146" y2="210" />
+    <line x1="342" y1="238" x2="366" y2="210" />
+    <line x1="118" y1="300" x2="82" y2="288" />
+    <line x1="394" y1="300" x2="430" y2="288" />
+  </g>
+  <path d="M136 352 A120 120 0 0 1 376 352 Z" fill="#ffbe5c" />
+  <path d="M16 352 H496 V400 A96 96 0 0 1 400 496 H112 A96 96 0 0 1 16 400 Z" fill="#2a1f3d" />
+  <rect x="64" y="342" width="384" height="22" rx="11" fill="#f4e6d0" />
+</svg>

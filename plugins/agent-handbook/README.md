@@ -186,6 +186,11 @@ skills and none of them is called `voice-loop`. This one was briefly named for i
 which reads well until the second instrument arrives and has nowhere to go. The domain name is the
 room. Each skill keeps its own name and its own invocation.
 
+## Eval suite
+
+No eval suite yet: the standing rules arrive through a SessionStart hook and the one skill is
+method text; a suite (the target-world-walk skill firing on a planning prompt) is future work.
+
 ## Licence
 
 MIT.

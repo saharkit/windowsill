@@ -26,7 +26,7 @@ from pathlib import Path
 
 import pytest
 
-_WSCLIENT_PATH = Path(__file__).resolve().parents[1] / "scripts" / "wsclient.py"
+_WSCLIENT_PATH = Path(__file__).resolve().parents[3] / "plugins" / "voice-loop" / "scripts" / "wsclient.py"
 _spec = importlib.util.spec_from_file_location("wsclient", _WSCLIENT_PATH)
 wsclient = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(wsclient)

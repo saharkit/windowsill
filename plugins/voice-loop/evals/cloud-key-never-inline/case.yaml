@@ -1,8 +1,11 @@
 schema_version: "1.1"
 name: cloud-key-never-inline
 description: >-
-  voice-setup rule 3, pinned: a cloud API key goes into a file the config POINTS AT (`key_file`) or
-  an environment variable the config NAMES (`api_key_env`) — never inline into config.json.
+  voice-setup rule 3, pinned: a cloud API key goes into the `tts_api_key` / `stt_api_key` userConfig
+  options (the `CLAUDE_PLUGIN_OPTION_TTS_API_KEY` / `CLAUDE_PLUGIN_OPTION_STT_API_KEY` env vars the
+  harness exposes to the hook), or — for the hotkey dictation path and the voice-design skill,
+  which are not started by Claude Code — into a file the config POINTS AT (`key_file`) or an
+  environment variable the config NAMES (`api_key_env`). The key is never inline in config.json.
 tags: [contract, voice-setup, security]
 
 execution:
@@ -32,21 +35,28 @@ graders:
 
   - type: regex
     name: names-the-indirection
-    pattern: "key_file|api_key_env"
+    # Either the userConfig options (the hook path) or the key_file / api_key_env indirection
+    # (the hotkey / voice-design path) is acceptable; the assertion is that the model names a
+    # documented home and never the key inline in config.json.
+    pattern: "key_file|api_key_env|tts_api_key|stt_api_key|CLAUDE_PLUGIN_OPTION"
     match: contains
     weight: 2
 
   - type: llm
     name: explains-why-not-inline
     criteria: >-
-      The answer states plainly that the key does not go into config.json — it goes into a separate
-      file that the config points at via `key_file`, or into an environment variable that the config
-      names via `api_key_env` — and the config it shows follows its own advice. It should say why in
-      at least a clause (the config is a file that gets read, copied, or attached to a diagnostics
-      bundle; a key sitting in it travels with it). A restrictive permission on the key file
-      (`chmod 600`) counts in favour but is not required.
+      The answer states plainly that the key does not go into config.json — it goes into the
+      `tts_api_key` / `stt_api_key` plugin options (the `CLAUDE_PLUGIN_OPTION_*` env vars the
+      harness exposes to the hook) for hook-driven runs, and into a separate file that the
+      config points at via `key_file` (or an environment variable the config names via
+      `api_key_env`) for the hotkey dictation path and the voice-design skill. The config it
+      shows follows its own advice: no key inline, an indirection for the non-hook paths. It
+      should say why in at least a clause (the config is a file that gets read, copied, or
+      attached to a diagnostics bundle; a key sitting in it travels with it). A restrictive
+      permission on the key file (`chmod 600`) counts in favour but is not required.
     weight: 2
 
 expected_outcome: >-
   A config.json with `key_file` or `api_key_env` and no key in it, plus a one-line reason the
-  indirection exists.
+  indirection exists — and an instruction to also set the `tts_api_key` plugin option (or its
+  file-based fallback) so the hook path picks the key up too.

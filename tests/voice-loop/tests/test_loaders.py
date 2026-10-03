@@ -280,7 +280,7 @@ def test_config_home_falls_back_to_the_home_default_when_unset(monkeypatch, tmp_
 def _documented_publishes() -> list[tuple[str, str]]:
     """(file, host-side address) of every documented `docker run` publish; "" where a publish
     carries no host address, which is Docker's "every interface" default."""
-    server_dir = Path(__file__).resolve().parents[1] / "server"
+    server_dir = Path(__file__).resolve().parents[3] / "plugins" / "voice-loop" / "server"
     found: list[tuple[str, str]] = []
     for name in ("Dockerfile", "README.md"):
         text = (server_dir / name).read_text(encoding="utf-8")
@@ -310,5 +310,5 @@ def test_the_image_env_keeps_binding_wide_on_purpose():
     silently breaks the container (the mapping then forwards to a loopback the publishing bridge
     cannot reach) while leaving the real exposure, the publish, untouched. The ENV stays wide and
     the boundary stays on `-p`; this test fails if that decision is quietly reversed."""
-    dockerfile = (Path(__file__).resolve().parents[1] / "server" / "Dockerfile").read_text(encoding="utf-8")
+    dockerfile = (Path(__file__).resolve().parents[3] / "plugins" / "voice-loop" / "server" / "Dockerfile").read_text(encoding="utf-8")
     assert "VOICE_LOOP_HOST=0.0.0.0" in dockerfile

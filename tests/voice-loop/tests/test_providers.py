@@ -19,7 +19,7 @@ import pytest
 import providers
 import voice_server
 
-_SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
+_SCRIPTS = Path(__file__).resolve().parents[3] / "plugins" / "voice-loop" / "scripts"
 _FIXTURES = Path(__file__).resolve().parent / "fixtures"
 
 
@@ -448,7 +448,7 @@ def test_the_credentials_home_rule_lives_on_the_entry():
 def test_every_registry_entry_has_a_row_in_the_comparison_table():
     """windowsill#94 acceptance criterion 7. A provider a user cannot compare is a provider they
     cannot choose, so PROVIDERS.md is drift-tested against the registry rather than trusted."""
-    doc = (Path(__file__).resolve().parents[1] / "PROVIDERS.md").read_text(encoding="utf-8")
+    doc = (Path(__file__).resolve().parents[3] / "plugins" / "voice-loop" / "PROVIDERS.md").read_text(encoding="utf-8")
     for name in providers.STT_PROVIDERS:
         assert f"`{name}` (STT)" in doc, f"{name} has no STT row in PROVIDERS.md"
     for name in providers.TTS_PROVIDERS:
@@ -605,7 +605,7 @@ class TestTheStreamingVariantIsDocumented:
     """PROVIDERS.md is the human half of the registry, and it drifts the moment nothing checks."""
 
     def test_every_provider_says_whether_it_streams(self):
-        doc = (Path(__file__).resolve().parents[1] / "PROVIDERS.md").read_text(encoding="utf-8")
+        doc = (Path(__file__).resolve().parents[3] / "plugins" / "voice-loop" / "PROVIDERS.md").read_text(encoding="utf-8")
         assert "`stt.cloud.streaming`" in doc
         for name, entry in providers.STT_PROVIDERS.items():
             if entry.streaming is not None:
@@ -615,7 +615,7 @@ class TestTheStreamingVariantIsDocumented:
         """The other direction, the LOG_RULES way. A row promising a live socket that the registry
         cannot open is worse than a missing row: the first sends a user to change a setting that
         does nothing, the second only fails to advertise. Both directions or neither."""
-        doc = (Path(__file__).resolve().parents[1] / "PROVIDERS.md").read_text(encoding="utf-8")
+        doc = (Path(__file__).resolve().parents[3] / "plugins" / "voice-loop" / "PROVIDERS.md").read_text(encoding="utf-8")
         claimed = set(re.findall(r"`([a-z0-9-]+)` \(STT\) \| \*\*yes\*\*", doc))
         streams = {name for name, entry in providers.STT_PROVIDERS.items() if entry.streaming is not None}
         assert claimed == streams, f"PROVIDERS.md claims {sorted(claimed)} stream; the registry says {sorted(streams)}"
@@ -781,14 +781,14 @@ class TestTheTtsStreamingVariantIsDocumented:
     guard the STT side has."""
 
     def test_every_provider_says_whether_it_streams(self):
-        doc = (Path(__file__).resolve().parents[1] / "PROVIDERS.md").read_text(encoding="utf-8")
+        doc = (Path(__file__).resolve().parents[3] / "plugins" / "voice-loop" / "PROVIDERS.md").read_text(encoding="utf-8")
         assert "`tts.cloud.streaming`" in doc
         for name, entry in providers.TTS_PROVIDERS.items():
             if entry.streaming is not None:
                 assert f"`{name}` (TTS) | **yes**" in doc, f"{name} streams but the table does not say so"
 
     def test_and_nothing_claims_to_stream_that_does_not(self):
-        doc = (Path(__file__).resolve().parents[1] / "PROVIDERS.md").read_text(encoding="utf-8")
+        doc = (Path(__file__).resolve().parents[3] / "plugins" / "voice-loop" / "PROVIDERS.md").read_text(encoding="utf-8")
         claimed = set(re.findall(r"`([a-z0-9-]+)` \(TTS\) \| \*\*yes\*\*", doc))
         streams = {name for name, entry in providers.TTS_PROVIDERS.items() if entry.streaming is not None}
         assert claimed == streams, f"PROVIDERS.md claims {sorted(claimed)} stream; the registry says {sorted(streams)}"

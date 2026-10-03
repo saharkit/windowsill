@@ -74,10 +74,13 @@ through) it is the **ear-check** — the agent speaks a line and you confirm you
 custom synthetic voice afterwards: `/voice-design`. To take the whole contour back off:
 [`/voice-remove`](#uninstall).
 
-Supported platforms: Linux, macOS, and **native Windows 11**. On Windows, the hook uses a
-real-interpreter probe (`python3`, `python`, then `py -3`) and native dictation uses DirectShow,
-`clip.exe`, and PowerShell SendKeys. CI runs this unit suite on `windows-latest`; it does not replace
-an attended microphone and speaker pass. WSL2 + WSLg remains supported too: install WSL2 with
+Supported platforms: Linux, macOS, and **native Windows 11**. On Windows, the **hook and the
+`voice-setup` install both need a `python3` on PATH** — the Microsoft Store Python provides one
+out of the box; a python.org install needs a `python3` alias (or the [WSL2 path](#windows-wsl2--wslg)
+below). The dictation toggle `plugins/voice-loop/scripts/dictate-toggle.cmd` is unaffected and
+does not need a `python3`. Native dictation uses DirectShow, `clip.exe`, and PowerShell SendKeys.
+CI runs this unit suite on `windows-latest`; it does not replace an attended microphone and speaker
+pass. WSL2 + WSLg remains supported too: install WSL2 with
 `wsl --install` from elevated PowerShell, then follow this page's Linux quickstart inside the distro.
 WSLg supplies the Linux GUI/audio integration for an attended Windows desktop; the WSL2 verification pass confirmed the marketplace install, the registered hook command,
 CI-style fake-recorder dictation, and a `lan` loopback against a remote server. It ran on
@@ -169,11 +172,23 @@ evaluation, but its synthesis does not speak Russian or Ukrainian; ElevenLabs an
 `/voice-design` (or set `VOICE_LOOP_TTS_API_KEY`), dictation works without a second key. When
 `stt.cloud.provider` is `elevenlabs`, the script looks for a key in this order:
 
-1. Your configured STT key (`stt.cloud.api_key_env` or `stt.cloud.key_file`)
-2. The TTS key (`VOICE_LOOP_TTS_API_KEY`) — one credentials home, not a second one
+1. Your configured STT key: the `stt_api_key` plugin option
+   (`$CLAUDE_PLUGIN_OPTION_STT_API_KEY`, exposed by Claude Code when the plugin runs from a
+   hook — declared `sensitive: true` in the manifest, so it is stored in the secure
+   credential store, never in the settings file), then `stt.cloud.key_file`, then
+   `stt.cloud.api_key_env` (default `VOICE_LOOP_STT_API_KEY`).
+2. The TTS key (same precedence as STT, via `tts_api_key` → `tts.cloud.key_file` →
+   `tts.cloud.api_key_env`) — one credentials home, not a second one.
 
 That shared-key rule is ElevenLabs' alone, because it is the one provider covering both directions
 with one account here: a `deepgram` STT config is never handed an ElevenLabs key.
+
+The hotkey dictation path (`scripts/dictate-toggle.sh` / `.cmd`) and the `voice-design` skill are
+not started by Claude Code, so they read the option's env var, find it unset, and fall through to
+`key_file` then the named env var. Users who need the key on those paths as well point
+`stt.cloud.key_file` (or `tts.cloud.key_file`) at the same key file. The same applies to the
+voice-setup skill — its key step recommends the plugin option AND the key file because the hotkey
+and the skill both bypass the harness.
 
 **A configured endpoint that would carry the key over clear text is refused, not warned about.**
 An `http://` (or `ws://`) `stt.cloud.endpoint` / `tts.cloud.endpoint` together with a configured key
@@ -271,6 +286,15 @@ never stare at a dead microphone wondering why.
 One hop, deliberately. A *cascade* across several cloud providers before the local fallback is its
 own feature with its own config schema, and it is not implemented — see the degrade section of
 [`PROVIDERS.md`](PROVIDERS.md).
+
+### Direct command backend (`tts.command`) — argv, not a shell
+
+When you set `tts.command` to a local TTS executable that reads its prompt on stdin (macOS `say`,
+`espeak`, `piper`…), the script splits the string with `shlex` and spawns it as argv. Shell
+syntax is **not** interpreted: pipes (`|`), redirects (`>`, `<`), command chaining (`&&`, `||`),
+environment assignments (`FOO=bar …`) and globbing (`*`) are passed to the program as literal
+arguments. A user who needs any of those puts the pipeline in a script and sets `tts.command` to
+that script's path.
 
 ## Languages
 
@@ -698,6 +722,39 @@ download.
 
 Deeper reading: [architecture](docs/architecture.md) ·
 [troubleshooting](docs/troubleshooting.md) · [FAQ](docs/faq.md).
+
+## What this plugin reads from your machine
+
+The list is short and every entry has a reason.
+
+- **`report_bug.py`** (the `/report-bug` collector) reads your `USER`/`LOGNAME`/`USERNAME`
+  (usernames, line 295) and every `VOICE_LOOP_*` variable (`collect_environment`, lines 768–776;
+  credential-named ones are reported as `<set>`, the value never leaves your machine). It then
+  files the bundle through your own `gh` login (lines 1093–1133) **after** showing you the bundle
+  in chat and asking before anything is sent.
+- **`tls-probe.py`** reads the `PROXY_VARS` (`configured_proxy`, lines 85 and 135–140) and
+  `SSL_CERT_FILE`/`SSL_CERT_DIR` (line 228), then makes one TLS handshake. The proxy variables
+  are diagnostic only — they are checked but never sent.
+- **The hook command** itself reads the cloud TTS/STT key from `$CLAUDE_PLUGIN_OPTION_TTS_API_KEY`
+  / `$CLAUDE_PLUGIN_OPTION_STT_API_KEY` (the `tts_api_key` / `stt_api_key` plugin options) when
+  voice-loop runs from Claude Code, falling back to `tts.cloud.key_file` /
+  `stt.cloud.key_file` and then to `tts.cloud.api_key_env` / `stt.cloud.api_key_env`. The hotkey
+  dictation path (`scripts/dictate-toggle.sh` / `.cmd`) and the `voice-design` skill are not started
+  by Claude Code and therefore read only the key file and the env var on that path; users who need
+  the key on those paths as well point `key_file` at the same file. Nothing the script reads is
+  stored in `config.json`.
+
+## What this plugin fetches at runtime
+
+- **Silero TTS models** — `torch.hub.load("snakers4/silero-models", …, trust_repo=True)` in
+  `server/voice_server.py:710` on first TTS use, cached in `$TORCH_HOME` after that.
+- **Python packages** — `voice-setup`'s venv step runs `pip install --index-url
+  https://download.pytorch.org/whl/cpu torch` and `pip install -r
+  plugins/voice-loop/server/requirements.txt`.
+- **Windows prerequisites** — `scripts/install.ps1` fetches python.org, Git and Node installers
+  when run from an elevated PowerShell.
+
+A pure-local install downloads nothing else.
 
 ## When it misbehaves — `/report-bug`
 

@@ -29,7 +29,7 @@ from pathlib import Path
 
 import pytest
 
-_POLL_PATH = Path(__file__).resolve().parents[1] / "scripts" / "contour_poll.py"
+_POLL_PATH = Path(__file__).resolve().parents[3] / "plugins" / "voice-loop" / "scripts" / "contour_poll.py"
 _spec = importlib.util.spec_from_file_location("contour_poll", _POLL_PATH)
 contour_poll = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(contour_poll)

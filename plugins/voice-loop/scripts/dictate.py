@@ -522,7 +522,19 @@ def resolve_settings(config: dict, system: str) -> dict:
 
 
 def read_key(key_file: str, key_env: str, environ) -> str:
-    """key_file wins over the env var; the key itself is NEVER stored in config.json."""
+    """The cloud STT key, in priority order.
+
+    When voice-loop runs from a Claude Code hook, the harness exposes the `stt_api_key`
+    userConfig option as ``$CLAUDE_PLUGIN_OPTION_STT_API_KEY`` (the option is declared
+    ``sensitive: true`` in the plugin manifest, so the harness stores it in the secure
+    credential store and never in the settings file). A non-empty value from that env
+    var wins; otherwise ``key_file`` is read; otherwise the named ``key_env`` is read.
+    The key itself is NEVER stored in config.json. Each fallback step logs the type name
+    only — never the key, never its length.
+    """
+    plugin_option = environ.get("CLAUDE_PLUGIN_OPTION_STT_API_KEY", "")
+    if plugin_option.strip():
+        return re.sub(r"[ \t\r\n]", "", plugin_option)
     if key_file:
         path = os.path.expanduser(key_file)
         try:

@@ -32,7 +32,7 @@ from pathlib import Path
 
 import pytest
 
-_SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
+_SCRIPTS = Path(__file__).resolve().parents[3] / "plugins" / "voice-loop" / "scripts"
 _spec = importlib.util.spec_from_file_location("report_bug", _SCRIPTS / "report_bug.py")
 report_bug = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(report_bug)

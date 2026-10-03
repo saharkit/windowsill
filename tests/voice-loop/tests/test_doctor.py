@@ -1243,7 +1243,7 @@ class TestRedactWindowsPathLegacyFallbackLastButOne:
         monkeypatch.delenv("HOMEDRIVE", raising=False)
         monkeypatch.delenv("HOMEPATH", raising=False)
 
-        # ``C:\\Users\\alice`` parses to ``("C:\\", "Users", "alice")`` —
+        # ``C:\\Users\\alice`` parses to ``("C:\", "Users", "alice")`` —
         # users_index is 1, and 1 + 1 == len(parts) - 1 == 2, so the guard
         # fires and the path is returned unchanged.
         assert doctor._redact_windows_path(r"C:\Users\alice") == r"C:\Users\alice"

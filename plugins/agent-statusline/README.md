@@ -86,6 +86,11 @@ rendered outputs:
 Off the happy path: unparseable or empty stdin prints nothing to stdout, prints one line
 naming the parse failure to stderr, and exits 1. Both fixtures exit 0.
 
+## Eval suite
+
+No eval suite: the one skill writes the `statusLine` key of the user's Claude settings,
+which an eval's temporary home isolates, so a case would test the isolation, not the plugin.
+
 ## License
 
 MIT — see [LICENSE](../../LICENSE).

@@ -19,7 +19,7 @@ from pathlib import Path
 
 import pytest
 
-_PLUGINS = Path(__file__).resolve().parents[2]
+_PLUGINS = Path(__file__).resolve().parents[3] / "plugins"
 _SELFTEST = _PLUGINS / "voice-loop" / "scripts" / "selftest.sh"
 
 

@@ -27,7 +27,7 @@ from pathlib import Path
 
 import pytest
 
-_PREVIEW_PATH = Path(__file__).resolve().parents[1] / "scripts" / "preview.py"
+_PREVIEW_PATH = Path(__file__).resolve().parents[3] / "plugins" / "voice-loop" / "scripts" / "preview.py"
 _preview_spec = importlib.util.spec_from_file_location("_preview_under_test", _PREVIEW_PATH)
 preview = importlib.util.module_from_spec(_preview_spec)
 _preview_spec.loader.exec_module(preview)

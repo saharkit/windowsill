@@ -1,6 +1,6 @@
 {
   "name": "voice-loop",
-  "version": "0.8.0",
+  "version": "0.9.0",
   "description": "Two-way voice for Claude Code with pluggable speech providers: a config registry picks OpenAI, ElevenLabs or Deepgram per direction, or keeps every clip local/self-hosted (faster-whisper STT; Silero, XTTS-v2 or Ukrainian TTS on the bundled server) — switching backends is a config entry, never a code change. A Stop hook speaks the lines Claude marks, a push-to-talk hotkey dictates into your prompt, and /voice-setup installs it all.  Requires sill-core (install both: /plugin install voice-loop@windowsill && /plugin install sill-core@windowsill).",
   "author": {
     "name": "Sahar"
@@ -22,8 +22,29 @@
     "self-hosted",
     "accessibility"
   ],
+  "icon": "./assets/icon.svg",
+  "classification": {
+    "object_acted_on": "speech audio",
+    "work_department": "engineering",
+    "industry": "software",
+    "life_area": "work",
+    "subject": "voice dictation and spoken replies for Claude Code"
+  },
+  "userConfig": {
+    "tts_api_key": {
+      "type": "string",
+      "title": "Cloud TTS API key",
+      "description": "API key for the cloud TTS provider selected by `tts.cloud.provider` (OpenAI, ElevenLabs, Deepgram or compatible). Set this rather than the key file or env var when voice-loop is launched by Claude Code — the harness exposes it as $CLAUDE_PLUGIN_OPTION_TTS_API_KEY, ahead of the key file and the named env var. The hotkey dictation path and the voice-design skill still read from the key file or env var because they are not started by Claude Code. Sensitive: stored in the secure credential store, not the settings file.",
+      "sensitive": true
+    },
+    "stt_api_key": {
+      "type": "string",
+      "title": "Cloud STT API key",
+      "description": "API key for the cloud STT provider selected by `stt.cloud.provider` (OpenAI, Deepgram or compatible). Set this rather than the key file or env var when voice-loop is launched by Claude Code — the harness exposes it as $CLAUDE_PLUGIN_OPTION_STT_API_KEY, ahead of the key file and the named env var. The hotkey dictation path still reads from the key file or env var because it is not started by Claude Code. Sensitive: stored in the secure credential store, not the settings file.",
+      "sensitive": true
+    }
+  },
   "dependencies": [
     "sill-core"
-  ],
-  "category": "productivity"
+  ]
 }

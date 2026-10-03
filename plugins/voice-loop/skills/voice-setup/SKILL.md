@@ -25,8 +25,14 @@ the pieces it names actually exist, and finish with a **passing selftest**. Scri
 2. **No root by default.** Everything below runs in user space. The only steps that need `sudo` are
    optional luxuries — for those you **print the exact command and let the user run it** (or approve
    it explicitly). Never slip a `sudo` into a batch.
-3. **Never write a secret into the config.** Cloud keys go in a file the config *points at*
-   (`key_file`) or in an environment variable the config *names* (`api_key_env`).
+3. **Never write a secret into the config.** Cloud keys go into one of three places, in priority
+   order: the `tts_api_key` / `stt_api_key` userConfig options (set through the enable-time dialog
+   or `/config`; Claude Code exposes them to the hook process as `$CLAUDE_PLUGIN_OPTION_TTS_API_KEY`
+   and `$CLAUDE_PLUGIN_OPTION_STT_API_KEY`); a file the config *points at* (`key_file`); or an
+   environment variable the config *names* (`api_key_env`). The hotkey dictation path and the
+   `voice-design` skill are not started by Claude Code, so they read only `key_file` or the named
+   env var on that path; users who need the hook to work without re-entering the option also point
+   `key_file` at the same key file those paths read.
 4. **Ask, do not assume, but pre-answer.** Every question below carries a derived default. Present the
    default and let the user confirm with one keystroke.
 5. **Every step writes a durable checkpoint.** The install ledger at
@@ -332,32 +338,7 @@ cp "${CLAUDE_PLUGIN_ROOT}/server/voice_server.py" \
    "${CLAUDE_PLUGIN_ROOT}/server/stt_hallucinations.txt" ~/.local/share/voice-loop/
 ```
 
-If that path is not there (no plugin root — e.g. you are working from a bare checkout), take the
-files from the repo instead. Either clone it:
-
-```sh
-git clone --depth 1 https://github.com/saharkit/windowsill ~/.local/share/voice-loop/src && \
-cp ~/.local/share/voice-loop/src/plugins/voice-loop/server/voice_server.py \
-   ~/.local/share/voice-loop/src/plugins/voice-loop/server/stt_hallucinations.txt ~/.local/share/voice-loop/
-```
-
-or fetch the three files by raw URL:
-
-```sh
-# REF=main — this repo's layout is plugin-scoped and stable; substitute a tag or a commit sha here
-# if you want a byte-exact pin of the server you install.
-REF=main
-mkdir -p ~/.local/share/voice-loop && \
-curl -fsSL "https://raw.githubusercontent.com/saharkit/windowsill/$REF/plugins/voice-loop/server/voice_server.py" \
-  -o ~/.local/share/voice-loop/voice_server.py && \
-curl -fsSL "https://raw.githubusercontent.com/saharkit/windowsill/$REF/plugins/voice-loop/server/requirements.txt" \
-  -o ~/.local/share/voice-loop/requirements.txt && \
-curl -fsSL "https://raw.githubusercontent.com/saharkit/windowsill/$REF/plugins/voice-loop/server/stt_hallucinations.txt" \
-  -o ~/.local/share/voice-loop/stt_hallucinations.txt
-```
-
-Then build the venv (with the clone,
-`-r ~/.local/share/voice-loop/src/plugins/voice-loop/server/requirements.txt`):
+Then build the venv:
 
 ```sh
 python3 -m venv ~/.local/share/voice-loop/venv && \

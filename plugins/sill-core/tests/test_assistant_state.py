@@ -673,8 +673,9 @@ store.merge({{"reminders": {{"new-key": {{"muted": True}}}}, "padding": "x" * 50
 
         child_script = (
             f"""
-import time
+import sys, time
 from pathlib import Path
+sys.path.insert(0, str(Path.cwd()))
 from sill_core import assistant_state
 from sill_core.assistant_state import AssistantState
 

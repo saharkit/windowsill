@@ -1052,7 +1052,7 @@ class TestLedgerSizeBound:
         # Composition with the skill's entry flow: an oversized ledger keeps the
         # closed CLI contract (state "none" + read_status), so `check` still exits 0
         # and SKILL.md's guard branch keeps parsing it.
-        self._write(ledger_path, b"{\"state\": \"in_progress\", \"steps\": {}} " * 40_000)
+        self._write(ledger_path, b'{"state": "in_progress", "steps": {}} ' * 40_000)
         result = install_ledger.check_state(ledger_path)
         assert result["state"] == "none"
         assert result["read_status"] == "oversized"

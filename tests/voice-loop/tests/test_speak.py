@@ -42,7 +42,7 @@ import pytest
 # not start.
 _REAL_POPEN = subprocess.Popen
 
-_SPEAK_PATH = Path(__file__).resolve().parents[1] / "scripts" / "speak.py"
+_SPEAK_PATH = Path(__file__).resolve().parents[3] / "plugins" / "voice-loop" / "scripts" / "speak.py"
 _spec = importlib.util.spec_from_file_location("speak", _SPEAK_PATH)
 speak = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(speak)
@@ -260,6 +260,39 @@ def test_key_file_wins_over_env(tmp_path):
 def test_missing_key_file_falls_back_to_env(tmp_path):
     assert speak.read_key(str(tmp_path / "absent"), "K_ENV", {"K_ENV": "sk-fromenv"}) == "sk-fromenv"
     assert speak.read_key("", "K_ENV", {}) == ""
+
+
+def test_user_config_option_wins_over_key_file_and_env(tmp_path):
+    """The `tts_api_key` plugin option (exposed as $CLAUDE_PLUGIN_OPTION_TTS_API_KEY by the
+    harness) wins over the key file and the named env var — the option is the documented
+    carrier when voice-loop runs from a Claude Code hook, and `sensitive: true` keeps the value
+    out of the settings file."""
+    key_file = tmp_path / "k"
+    key_file.write_text(" sk-fromfile \n")
+    env = {
+        "CLAUDE_PLUGIN_OPTION_TTS_API_KEY": " sk-from-option \n",
+        "K_ENV": "sk-fromenv",
+    }
+    assert speak.read_key(str(key_file), "K_ENV", env) == "sk-from-option"
+
+
+def test_empty_user_config_option_falls_back_to_key_file(tmp_path):
+    """A non-empty option wins, but a WHITESPACE-only value falls through to key_file — an
+    option the user typed a space into would otherwise win silently."""
+    key_file = tmp_path / "k"
+    key_file.write_text("sk-fromfile\n")
+    env = {"CLAUDE_PLUGIN_OPTION_TTS_API_KEY": "   \t  ", "K_ENV": "sk-fromenv"}
+    assert speak.read_key(str(key_file), "K_ENV", env) == "sk-fromfile"
+
+
+def test_absent_user_config_option_falls_back_to_key_file_then_env(tmp_path):
+    """Without the option env var, the precedence falls back to key_file then the named env."""
+    key_file = tmp_path / "k"
+    key_file.write_text("sk-fromfile\n")
+    env = {"K_ENV": "sk-fromenv"}
+    assert speak.read_key(str(key_file), "K_ENV", env) == "sk-fromfile"
+    assert speak.read_key(str(tmp_path / "absent"), "K_ENV", env) == "sk-fromenv"
+    assert speak.read_key("", "K_ENV", env) == "sk-fromenv"
 
 
 # --- the retry schedule: adaptive, front-loaded, shorter than the old flat tail -----------------
@@ -1760,7 +1793,7 @@ def test_audio_only_popen_intercepts_only_audio_player_argv():
         for argv in (
             ["ps", "-p", "12345", "-o", "command="],
             [sys.executable, os.path.abspath(__file__), "stream-holder-arg", "digest"],
-            ["/bin/sh", "-c", "echo hi"],
+            ["echo", "hi"],
             [],
         ):
             _audio_only_popen(argv)
@@ -1801,7 +1834,7 @@ def test_audio_only_popen_falls_through_to_real_popen_in_production_substitution
     for argv in (
         ["ps", "-p", "12345", "-o", "command="],
         [sys.executable, os.path.abspath(__file__), "stream-holder-arg", "digest"],
-        ["/bin/sh", "-c", "echo hi"],
+        ["echo", "hi"],
         [],
     ):
         _audio_only_popen(argv)
@@ -2453,7 +2486,7 @@ def test_hook_budget_is_a_structural_deadline_not_a_sleep_claim():
 
 
 def test_the_mirrored_hook_timeout_is_the_one_the_manifest_declares():
-    manifest = json.loads((Path(__file__).resolve().parents[1] / "hooks" / "hooks.json").read_text(encoding="utf-8"))
+    manifest = json.loads((Path(__file__).resolve().parents[3] / "plugins" / "voice-loop" / "hooks" / "hooks.json").read_text(encoding="utf-8"))
     declared = {
         entry["timeout"]
         for registrations in manifest["hooks"].values()
@@ -2494,7 +2527,7 @@ def test_hook_commands_probe_a_real_interpreter_before_running_speak(tmp_path):
     speak.py invocations. Still caught structurally: removing the ``import sys`` probes
     fails the probe-presence assert; a probeless command that leans on shell ``||`` alone
     cannot tell a Store ``python3`` alias from a working interpreter."""
-    manifest = json.loads((Path(__file__).resolve().parents[1] / "hooks" / "hooks.json").read_text(encoding="utf-8"))
+    manifest = json.loads((Path(__file__).resolve().parents[3] / "plugins" / "voice-loop" / "hooks" / "hooks.json").read_text(encoding="utf-8"))
     commands: list[str] = []
     for registrations in manifest["hooks"].values():
         for registration in registrations:
@@ -2587,7 +2620,7 @@ def test_windows_install_recipe_exists_and_is_readable():
     nothing to fall back on.  The test verifies the file is present, is valid UTF-8, and carries
     the elevation check and the python3.exe copy — the two steps the manual pass had to discover
     by hand."""
-    install_ps1 = Path(__file__).resolve().parents[1] / "scripts" / "install.ps1"
+    install_ps1 = Path(__file__).resolve().parents[3] / "plugins" / "voice-loop" / "scripts" / "install.ps1"
     assert install_ps1.is_file(), f"install.ps1 not found at {install_ps1}"
     text = install_ps1.read_text(encoding="utf-8")
     # The elevation check must be present — a silent elevation assumption hangs on UAC.
@@ -4048,7 +4081,7 @@ def test_play_text_runs_the_local_tts_command_end_to_end(state, monkeypatch):
     monkeypatch.setattr(speak.subprocess, "Popen", fake_popen)
     s = speak.resolve_settings({"tts": {"command": "say -v Milena"}}, "Linux")
     assert speak.play_text("hello", s, clock(), extract_ms=10) is True
-    assert captured[0][0] == ["/bin/sh", "-c", "say -v Milena"]
+    assert captured[0][0] == ["say", "-v", "Milena"]
     assert captured[0][1]["stdin"] is subprocess.PIPE
     assert captured[0][1]["start_new_session"] is True
     # the 'pg' marker is in the pidfile so _on_sigterm can reach the player inside the shell

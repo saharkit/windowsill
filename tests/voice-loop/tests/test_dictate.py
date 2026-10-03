@@ -30,7 +30,7 @@ import pytest
 
 from test_wsclient import Server, accept_for, parse_client_frame, read_http_head, server_frame
 
-_DICTATE_PATH = Path(__file__).resolve().parents[1] / "scripts" / "dictate.py"
+_DICTATE_PATH = Path(__file__).resolve().parents[3] / "plugins" / "voice-loop" / "scripts" / "dictate.py"
 _spec = importlib.util.spec_from_file_location("dictate", _DICTATE_PATH)
 dictate = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(dictate)
@@ -175,6 +175,30 @@ def test_oversized_config_is_ignored(tmp_path):
 def test_missing_key_file_falls_back_to_env(tmp_path):
     assert dictate.read_key(str(tmp_path / "absent"), "K_ENV", {"K_ENV": "sk-fromenv"}) == "sk-fromenv"
     assert dictate.read_key("", "K_ENV", {}) == ""
+
+
+def test_user_config_option_wins_over_key_file_and_env(tmp_path):
+    """The `stt_api_key` plugin option (exposed as $CLAUDE_PLUGIN_OPTION_STT_API_KEY by the
+    harness) wins over the key file and the named env var — the option is the documented
+    carrier when voice-loop runs from a Claude Code hook, and `sensitive: true` keeps the value
+    out of the settings file. The hotkey dictation path is not started by Claude Code and reads
+    only the key file / env var on that path; this test pins the hook-path precedence."""
+    key_file = tmp_path / "k"
+    key_file.write_text(" sk-fromfile \n")
+    env = {
+        "CLAUDE_PLUGIN_OPTION_STT_API_KEY": " sk-from-option \n",
+        "K_ENV": "sk-fromenv",
+    }
+    assert dictate.read_key(str(key_file), "K_ENV", env) == "sk-from-option"
+
+
+def test_empty_user_config_option_falls_back_to_key_file(tmp_path):
+    """A WHITESPACE-only option value falls through to key_file — an option the user typed a
+    space into would otherwise win silently and starve the file fallback."""
+    key_file = tmp_path / "k"
+    key_file.write_text("sk-fromfile\n")
+    env = {"CLAUDE_PLUGIN_OPTION_STT_API_KEY": "   \t  ", "K_ENV": "sk-fromenv"}
+    assert dictate.read_key(str(key_file), "K_ENV", env) == "sk-fromfile"
 
 
 def test_bounded_text_rejects_a_file_that_cannot_be_read(state, tmp_path):
@@ -1065,10 +1089,10 @@ def test_non_utf8_key_file_falls_back_to_env_and_never_logs_content(state):
 
 
 def test_applescript_escape_handles_quotes_and_backslashes():
-    assert dictate.applescript_escape('press "ctrl+v" to paste') == 'press \\"ctrl+v\\" to paste'
+    assert dictate.applescript_escape('press "ctrl+v" to paste') == 'press \"ctrl+v\" to paste'
     assert dictate.applescript_escape("back\\slash") == "back\\\\slash"
     # backslash first, then the quote — the other order would double-escape
-    assert dictate.applescript_escape('mix\\"ed') == 'mix\\\\\\"ed'
+    assert dictate.applescript_escape('mix\"ed') == 'mix\\\\\"ed'
     assert dictate.applescript_escape("plain text") == "plain text"
 
 
@@ -1077,7 +1101,7 @@ def test_note_interpolates_the_escaped_message_on_darwin(monkeypatch):
     monkeypatch.setattr(dictate.subprocess, "run", lambda argv, **kw: runs.append(argv))
     dictate.note('copied — press "ctrl+v" to paste', "Darwin")
     assert runs[0][:2] == ["osascript", "-e"]
-    assert 'display notification "copied — press \\"ctrl+v\\" to paste" with title "voice-loop"' == runs[0][2]
+    assert 'display notification "copied — press \"ctrl+v\" to paste" with title "voice-loop"' == runs[0][2]
 
 
 # --- paste denial: macOS Accessibility permission detection and graceful degradation -------------

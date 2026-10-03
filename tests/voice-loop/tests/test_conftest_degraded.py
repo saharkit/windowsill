@@ -1,6 +1,6 @@
 """Regression tests for the silent-degradation defect (windowsill#267).
 
-`plugins/voice-loop/tests/conftest.py` carries a hook that drops every test module
+`tests/voice-loop/tests/conftest.py` carries a hook that drops every test module
 except `test_conformance.py` when `voice_server` is not importable. That hook exists so
 the shelf-wide verify gate — which warms pytest + pytest-cov but never installs
 fastapi / torch — can still run the conformance suite on a bare venv. The defect the
@@ -34,7 +34,7 @@ import sys
 from pathlib import Path
 
 _TESTS_DIR = Path(__file__).resolve().parent
-_PLUGIN_DIR = _TESTS_DIR.parent
+_PLUGIN_DIR = _TESTS_DIR.parent.parent / "plugins" / "voice-loop"
 
 # A meta_path finder that raises ImportError for any name under `voice_server`. The
 # string is identical across all three subprocess invocations; keeping it as one
@@ -61,7 +61,7 @@ _BLOCKER_RUNNER = (
 # tests the contract directly.
 _RESET_RUNNER = (
     "import importlib.util, pathlib\n"
-    "path = pathlib.Path('tests/conftest.py').resolve()\n"
+    "path = pathlib.Path('tests/voice-loop/tests/conftest.py').resolve()\n"
     "spec = importlib.util.spec_from_file_location('vl_under_test', path)\n"
     "mod = importlib.util.module_from_spec(spec)\n"
     "spec.loader.exec_module(mod)\n"
@@ -98,7 +98,7 @@ OPT_IN_ENV = "VOICE_LOOP_ALLOW_DEGRADED_COLLECTION"
 
 # The install command the conftest banner advertises; a regression that rewrites the
 # banner should make the assertion below fail.
-_INSTALL_HINT = "pip install -r plugins/voice-loop/tests/requirements.txt"
+_INSTALL_HINT = "pip install -r ../../plugins/voice-loop/tests/requirements.txt"
 
 # The number of server-dependent modules we expect to see dropped. The conftest's
 # `pytest_ignore_collect` returns True for any `.py` file in the tests/ tree whose full

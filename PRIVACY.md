@@ -17,6 +17,31 @@ its models once (from GitHub, Coqui and PyTorch's mirrors); setup makes one HTTP
 fetch from GitHub through Claude Code's marketplace — that traffic belongs to Claude Code
 and GitHub, not to us.
 
+**voice-loop reads from the machine** (none of this is sent anywhere; it is held in process
+and used to run the local function):
+
+- the cloud TTS / STT key from `$CLAUDE_PLUGIN_OPTION_TTS_API_KEY` /
+  `$CLAUDE_PLUGIN_OPTION_STT_API_KEY` (the `tts_api_key` / `stt_api_key` plugin options,
+  `sensitive: true` in the manifest, so the harness stores them in its secure credential
+  store, never in the settings file), then from `tts.cloud.key_file` /
+  `stt.cloud.key_file`, then from the named `api_key_env`. The key is never stored in
+  `config.json`; the script logs the type name only, never the value or its length.
+- `report_bug.py` reads your `USER`/`LOGNAME`/`USERNAME`, every `VOICE_LOOP_*` variable
+  (credential-named ones are reported as `<set>`), and uses your own `gh` login to file —
+  after the bundle has been shown to you in chat and you've approved the send.
+- `tls-probe.py` reads the proxy variables (`PROXY_VARS`, `configured_proxy`) and
+  `SSL_CERT_FILE` / `SSL_CERT_DIR`, then makes one TLS handshake to the host you named.
+
+**voice-loop fetches at runtime**:
+
+- `torch.hub.load("snakers4/silero-models", …, trust_repo=True)` in
+  `server/voice_server.py:710` on first TTS use, cached under `$TORCH_HOME` after that.
+- `voice-setup`'s venv step runs `pip install --index-url
+  https://download.pytorch.org/whl/cpu torch` and
+  `pip install -r plugins/voice-loop/server/requirements.txt`.
+- `scripts/install.ps1` (Windows, user-run) fetches the python.org, Git and Node
+  installers when run from an elevated PowerShell.
+
 Working files stay on your machine, under `~/.local/state` and `~/.config` — and here is
 exactly what they hold, because some of it is the content of your speech: the last recorded
 clip (`dictate-last.wav`), the last spoken line verbatim (`last-spoken`), and the first
