@@ -13,10 +13,15 @@
 # to live here are gone; the markers themselves stay in the source as documentation of what
 # each platform leg is responsible for exercising.
 #
-# The server's 100% is non-negotiable and never dropped, and is asserted on every leg (Linux,
-# Windows, macOS). The combined coverage job downloads this per-plugin .coverage artifact and
-# combines it with sill-core's artifact for the shelf-level report; the three union gates for
-# `scripts/*`, `scripts/doctor.py` and `scripts/speak.py` run there against the combined data.
+# The server's 100% is non-negotiable and never dropped. It is asserted on the four Linux
+# matrix legs (Python 3.10–3.13) — those run `coverage report --include='**/plugins/voice-loop/
+# server/voice_server*' --fail-under=100` after pytest. The Windows and macOS legs collect
+# coverage for the union gate but do NOT re-assert the server 100%, because the per-leg data
+# would be the same statements measured against a second Python on the same code (the gate
+# already fires on every matrix leg). The combined coverage job downloads this per-plugin
+# .coverage artifact and combines it with sill-core's artifact for the shelf-level report;
+# the three union gates for `scripts/*`, `scripts/doctor.py` and `scripts/speak.py` run there
+# against the combined data.
 [run]
 branch = True
 source = voice_server, ../../plugins/voice-loop/scripts

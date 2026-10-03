@@ -451,7 +451,7 @@ def pytest_report_header(config):
         "voice-loop: voice_server is not importable in this environment.",
         "voice-loop: server-dependent test modules will be SKIPPED at collection time.",
         "voice-loop: install server deps with "
-        "`pip install -r ../../plugins/voice-loop/tests/requirements.txt` and re-run for the full suite.",
+        "`pip install -r tests/requirements.txt` and re-run for the full suite.",
     ]
     if _degraded_collection_ok():
         lines.append(
@@ -487,7 +487,7 @@ def pytest_terminal_summary(terminalreporter, exitstatus, config):
     terminalreporter.write_line(
         f"voice-loop: {count} test module(s) were skipped because voice_server is "
         f"not importable. Install server deps with "
-        f"`pip install -r ../../plugins/voice-loop/tests/requirements.txt` to run the full suite."
+        f"`pip install -r tests/requirements.txt` to run the full suite."
     )
     if not _degraded_collection_ok():
         terminalreporter.write_line(

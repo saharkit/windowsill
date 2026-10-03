@@ -92,8 +92,12 @@ queue's `merge_group` ref, and manual:
   `--cov-fail-under`): every coverage threshold below is enforced by a separate `coverage
   report --include=… --fail-under=…` call against the same `.coverage` artifact, so a regression
   in one scope cannot hide behind another's threshold. The 100% gate on this leg is
-  `**/plugins/voice-loop/server/voice_server*` (non-negotiable, never dropped, asserted on every
-  leg that reaches it — the Linux matrix, the Windows leg, and the macOS leg all do). The remaining
+  `**/plugins/voice-loop/server/voice_server*` (non-negotiable, never dropped, asserted on
+  every matrix leg that reaches it — the four Linux python versions, all 3.10–3.13). The
+  Windows and macOS legs collect coverage for the union gate in `combined-coverage` but do
+  NOT re-assert the server 100% (the per-leg data is never the gate's input; the server's
+  coverage is exercised on every matrix leg already, and re-asserting on Windows/macOS would
+  only re-test the same statements against a second Python on the same code). The remaining
   hook scripts
   are deliberately *not* under a per-leg 100% gate on this job: `scripts/*`, `scripts/doctor.py`
   and `scripts/speak.py` were moved off this leg and onto the union (combined-coverage, below)
@@ -176,7 +180,7 @@ review lens is the only thing standing between it and an unearned claim.
   voice-loop's suite, `pytest.ini` and `.coveragerc` live at the repo-root `tests/voice-loop/`,
   not inside the plugin folder — the plugin folder is the install target and every file in it ships,
   and the Anthropic plugin directory holds any shipped file of 256 KiB or more, so the test suite
-  (whose dictation module is 323 596 bytes) lives outside it.
+  (whose dictation module is 324 889 bytes) lives outside it.
 - **CI is shared, per-plugin.** A new plugin adds its own jobs (or matrix entries) to the existing
   workflow rather than a second workflow: scope each job with `working-directory: plugins/<name>` and
   prefix the job id with the plugin name. That shape is for the *second* plugin onward and the tree

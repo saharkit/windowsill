@@ -83,7 +83,7 @@ stop it, it keeps recording, and the desktop notification is your cue.
 
 `/report-bug` builds its bundle on your machine and strips it before you see it. The
 **redaction is code with tests** — [`scripts/report_bug.py`](plugins/voice-loop/scripts/report_bug.py),
-pinned rule by rule in [`tests/test_report_bug.py`](plugins/voice-loop/tests/test_report_bug.py):
+pinned rule by rule in [`tests/voice-loop/tests/test_report_bug.py`](tests/voice-loop/tests/test_report_bug.py):
 API keys and tokens go (by shape and by name), your username (three characters or longer)
 and home paths go, hostnames inside URLs and bare IPv4 addresses go (loopback stays), and
 anything you said or heard keeps its length and loses its words. The honest edges: a bare

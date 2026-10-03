@@ -307,6 +307,8 @@ jobs:
       # manifest, the marketplace-side `icon` path, the 256 KiB per-file inspection limit,
       # and the 512-file cap. This is the test that fix(#5816) introduced — see
       # `tests/test_directory_listing.py`.
+      - name: install pytest (the runner image has python3 but not pytest)
+        run: python3 -m pip install pytest
       - name: directory listing acceptance (no category, marketplace icon, 256 KiB, 512 files)
         run: |
           python3 -m pytest tests/test_directory_listing.py
@@ -581,12 +583,6 @@ jobs:
             sleep 2
           done
           curl -fsS http://127.0.0.1:8355/health
-      - name: dump server log on failure (only when something else failed)
-        if: failure()
-        run: |
-          echo "::group::server log"
-          cat /tmp/voice-loop.log || true
-          echo "::endgroup::"
 
       - name: loopback selftest (TTS -> STT -> compare)
         run: |
@@ -594,6 +590,17 @@ jobs:
             --endpoint http://127.0.0.1:8355 \
             --language "$VOICE_LOOP_LANGUAGE" \
             --strict --threshold 0.7
+      # Placed AFTER the loopback selftest (and before the contour-poll steps) so `if: failure()`
+      # can actually trigger when a later step fails: the "start the server" step that precedes
+      # this one only fails on a missing health endpoint, and a 500 from /stt or /tts does not
+      # surface there. The traceback we want lives in /tmp/voice-loop.log and only materialises
+      # when the loopback run actually exercises those endpoints.
+      - name: dump server log on failure (only when something else failed)
+        if: failure()
+        run: |
+          echo "::group::server log"
+          cat /tmp/voice-loop.log || true
+          echo "::endgroup::"
 
       - name: contour-poll contract (real invocation — quiet, then a REAL demotion page)
         run: |

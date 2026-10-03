@@ -295,6 +295,46 @@ def test_absent_user_config_option_falls_back_to_key_file_then_env(tmp_path):
     assert speak.read_key("", "K_ENV", env) == "sk-fromenv"
 
 
+def test_user_config_option_wins_and_never_logs_the_value(state, monkeypatch):
+    """The CLAUDE_PLUGIN_OPTION_TTS_API_KEY branch wins on the hook path and never logs the key.
+
+    The docstring on read_key claims the type name only, never the key, never its length —
+    the existing test for the key-file branch (`test_non_utf8_key_file_falls_back_to_env_and
+    _never_logs_content`) pins that claim against the only branch that actually logs. The
+    new CLAUDE_PLUGIN_OPTION branch has no log call, so the test exercises the same assertion
+    on a path that is silent by construction: a sentinel that, if it ever leaks into the log,
+    is the only way the docstring can be falsified. A regression that adds a `log(...)` of
+    the key (or its length, or its head) makes this test red.
+    """
+    sentinel = "sk-SENTINEL-option-1234567890"  # a 28-character fake that no real prefix matches
+    # Pre-touch the log so we can read it; speak.log only materialises when log() is called
+    # (the option branch never calls it), and the assertion that follows reads the file.
+    (state / "speak.log").write_text("", encoding="utf-8")
+    # Capture every log() invocation in-memory, regardless of whether it writes to disk.
+    logged_calls: list[str] = []
+
+    def _spy_log(message: str) -> None:
+        logged_calls.append(message)
+
+    monkeypatch.setattr(speak, "log", _spy_log)
+    key_file = state / "k"
+    key_file.write_text("sk-fromfile\n")
+    env = {
+        "CLAUDE_PLUGIN_OPTION_TTS_API_KEY": sentinel,
+        "K_ENV": "sk-fromenv",
+    }
+    # The option wins; key_file and env are not even read.
+    assert speak.read_key(str(key_file), "K_ENV", env) == sentinel
+    # No log call was made on the option path (the only branch that runs is the early return
+    # at the top of read_key), so the spy is empty.
+    assert logged_calls == [], (
+        f"the option branch must not log, but log() was called with: {logged_calls}"
+    )
+    # And the disk file is empty too (a regression that bypasses log() and writes the key
+    # straight to the journal would not be caught by the spy alone).
+    assert (state / "speak.log").read_text(encoding="utf-8") == ""
+
+
 # --- the retry schedule: adaptive, front-loaded, shorter than the old flat tail -----------------
 
 
