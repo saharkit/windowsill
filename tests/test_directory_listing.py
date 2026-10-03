@@ -7,13 +7,15 @@ plugin manifest, but it also enforces rules the validator does not check on its 
     where it is documented;
   * an ``icon`` field pointing at an SVG, or a PNG of exactly 512x512 pixels, inside
     the plugin folder;
-  * a ``classification`` object with exactly the five keys the directory reads:
-    ``object_acted_on``, ``work_department``, ``industry``, ``life_area``, ``subject``,
-    each value a non-empty string;
   * no shipped file in the plugin folder at or above 262 144 bytes (the directory's
     256 KiB inspection limit, plus a one-byte tolerance that makes the boundary
     byte-exact instead of approximate);
   * at most 512 files in the plugin folder — the directory's per-plugin file-count cap.
+
+The ``classification`` block that an earlier draft of this gate asserted on is NOT in the
+manifest — ``claude plugin validate --strict`` rejects it as an unknown field, and the
+directory reads its directory-tab metadata from the marketplace entry, not the plugin
+manifest. So this gate covers only the four rules above.
 
 The directory's own rescan is webhook-driven (saharkit/windowsill#20), so this test
 runs against the PR head and is the gate that catches a regression before a new
@@ -34,11 +36,36 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 PLUGINS_ROOT = REPO_ROOT / "plugins"
+MARKETPLACE_PATH = REPO_ROOT / ".claude-plugin" / "marketplace.json"
 
-PLUGIN_NAMES = ("voice-loop", "sill-core", "agent-handbook", "agent-statusline")
-CLASSIFICATION_KEYS = frozenset(
-    {"object_acted_on", "work_department", "industry", "life_area", "subject"}
-)
+
+def _discover_plugin_names() -> tuple[str, ...]:
+    """Authoritative list of plugins on the shelf, derived from ``marketplace.json``.
+
+    A fifth plugin that bypasses this gate is a regression we cannot afford; the marketplace
+    manifest is the single source of truth for "what's on the shelf" (per CLAUDE.md), so the
+    gate reads it directly. A new plugin appears as soon as its marketplace entry lands, with
+    no need to touch this file. ``glob("plugins/*")`` is the cross-check that would catch a
+    marketplace/PR split (the entry in the marketplace without the plugin folder on disk).
+    """
+    market_names = {
+        entry["name"]
+        for entry in json.loads(MARKETPLACE_PATH.read_text(encoding="utf-8")).get("plugins", [])
+        if entry.get("name")
+    }
+    folder_names = {p.name for p in PLUGINS_ROOT.iterdir() if p.is_dir()}
+    if market_names != folder_names:
+        missing_in_market = sorted(folder_names - market_names)
+        missing_on_disk = sorted(market_names - folder_names)
+        raise AssertionError(
+            "plugin listing is out of sync between .claude-plugin/marketplace.json and "
+            f"the plugins/ folder: missing_from_marketplace={missing_in_market}, "
+            f"missing_from_disk={missing_on_disk}"
+        )
+    return tuple(sorted(market_names))
+
+
+PLUGIN_NAMES = _discover_plugin_names()
 
 # The directory's documented per-file inspection limit is 256 KiB (262 144 bytes).
 # The acceptance criterion in fix(#5816) reads the threshold as 262 144; that is the
@@ -69,31 +96,6 @@ def test_plugin_manifest_has_no_category_key(plugin: str) -> None:
         f"{plugin}: plugin manifest must not carry a `category` key — "
         "the marketplace entry already holds it; the directory's validator warns on it here"
     )
-
-
-@pytest.mark.parametrize("plugin", PLUGIN_NAMES)
-def test_plugin_manifest_classification_has_five_keys(plugin: str) -> None:
-    """The directory reads exactly five classification keys, each a non-empty string.
-
-    The portal has no picker and the listing tab is read-only, so the values come only
-    from the manifest; the test asserts the SHAPE (key set, non-empty strings) without
-    pinning the values themselves — the directory's submission review owns the values.
-    """
-    manifest = _read_manifest(PLUGINS_ROOT / plugin)
-    classification = manifest.get("classification")
-    assert isinstance(classification, dict), (
-        f"{plugin}: plugin manifest must carry a `classification` object; "
-        f"got {type(classification).__name__}"
-    )
-    assert set(classification.keys()) == CLASSIFICATION_KEYS, (
-        f"{plugin}: classification keys must be exactly "
-        f"{sorted(CLASSIFICATION_KEYS)}; got {sorted(classification.keys())}"
-    )
-    for key in CLASSIFICATION_KEYS:
-        value = classification[key]
-        assert isinstance(value, str) and value.strip(), (
-            f"{plugin}: classification.{key} must be a non-empty string; got {value!r}"
-        )
 
 
 @pytest.mark.parametrize("plugin", PLUGIN_NAMES)

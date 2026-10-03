@@ -23,12 +23,5 @@
     "code-review",
     "prompt-engineering"
   ],
-  "icon": "./assets/icon.svg",
-  "classification": {
-    "object_acted_on": "agent instructions",
-    "work_department": "engineering",
-    "industry": "software",
-    "life_area": "work",
-    "subject": "planning and architecture method for coding agents"
-  }
+  "icon": "./assets/icon.svg"
 }

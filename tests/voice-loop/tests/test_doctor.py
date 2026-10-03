@@ -25,8 +25,10 @@ from typing import Any
 
 import pytest
 
-# The engine is in sill-core; add it to the path.
-_plugin_root = Path(__file__).resolve().parent.parent
+# The engine is in sill-core; add it to the path. The plugin folder ships at
+# `../../plugins/voice-loop/` from this test file (the test root lives at `tests/voice-loop/`,
+# the plugin root at the repo root's `plugins/`), so resolve from parents[3].
+_plugin_root = Path(__file__).resolve().parents[3] / "plugins" / "voice-loop"
 _core_root = _plugin_root.parent / "sill-core"
 if str(_core_root) not in sys.path:
     sys.path.insert(0, str(_core_root))

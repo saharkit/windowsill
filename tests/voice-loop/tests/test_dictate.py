@@ -1089,10 +1089,10 @@ def test_non_utf8_key_file_falls_back_to_env_and_never_logs_content(state):
 
 
 def test_applescript_escape_handles_quotes_and_backslashes():
-    assert dictate.applescript_escape('press "ctrl+v" to paste') == 'press \"ctrl+v\" to paste'
+    assert dictate.applescript_escape('press "ctrl+v" to paste') == 'press \\"ctrl+v\\" to paste'
     assert dictate.applescript_escape("back\\slash") == "back\\\\slash"
     # backslash first, then the quote — the other order would double-escape
-    assert dictate.applescript_escape('mix\"ed') == 'mix\\\\\"ed'
+    assert dictate.applescript_escape('mix\\"ed') == 'mix\\\\\\"ed'
     assert dictate.applescript_escape("plain text") == "plain text"
 
 
@@ -1101,7 +1101,7 @@ def test_note_interpolates_the_escaped_message_on_darwin(monkeypatch):
     monkeypatch.setattr(dictate.subprocess, "run", lambda argv, **kw: runs.append(argv))
     dictate.note('copied — press "ctrl+v" to paste', "Darwin")
     assert runs[0][:2] == ["osascript", "-e"]
-    assert 'display notification "copied — press \"ctrl+v\" to paste" with title "voice-loop"' == runs[0][2]
+    assert 'display notification "copied — press \\"ctrl+v\\" to paste" with title "voice-loop"' == runs[0][2]
 
 
 # --- paste denial: macOS Accessibility permission detection and graceful degradation -------------

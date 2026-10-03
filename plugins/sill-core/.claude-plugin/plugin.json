@@ -14,12 +14,5 @@
     "atomic-write",
     "sill-core"
   ],
-  "icon": "./assets/icon.svg",
-  "classification": {
-    "object_acted_on": "local state files",
-    "work_department": "engineering",
-    "industry": "software",
-    "life_area": "work",
-    "subject": "shared state persistence for windowsill plugins"
-  }
+  "icon": "./assets/icon.svg"
 }

@@ -2516,30 +2516,44 @@ def _speak_invocations(log_path: Path) -> list[str]:
     return [line for line in log_path.read_text(encoding="utf-8").splitlines() if "speak.py" in line]
 
 
-@pytest.mark.skipif(sys.platform == "win32", reason="POSIX stub executables and shell grouping")
-def test_hook_commands_probe_a_real_interpreter_before_running_speak(tmp_path):
-    """Runs the hooks.json command under a real shell with stub interpreters on PATH, so the
-    short-circuit is EXECUTED, not string-matched.
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX stub executables")
+def test_hook_commands_invoke_speak_py_via_command_and_args(tmp_path):
+    """Hooks declare ``command: "python3"`` + ``args: ["${CLAUDE_PLUGIN_ROOT}/scripts/speak.py"]`` —
+    the harness spawns them as argv (no shell), so a probe chain would only ever mask which
+    interpreter is real. The mutation gap this pins is REVERTING back to the probe-chain shell
+    string: that shape re-introduces the Store-``python3``-alias failure mode (the probe
+    ``python3 -c 'import sys'`` succeeds on the alias and the script then runs against a
+    interpreter with no stdlib), and it re-introduces shell-injection surface on a string
+    the plugin author fully controls. The new shape has neither hazard; this test pins that.
 
-    Mutation gap this pins (#205): flattening the chain back to
-    ``probe && speak || probe && speak || probe && speak`` fires speak.py once per working
-    interpreter — invisible to a literal-string assert, caught here by counting recorded
-    speak.py invocations. Still caught structurally: removing the ``import sys`` probes
-    fails the probe-presence assert; a probeless command that leans on shell ``||`` alone
-    cannot tell a Store ``python3`` alias from a working interpreter."""
+    The fallback contract is no longer "try the next interpreter" — it is "the hook command
+    fails loudly when ``python3`` is absent," and the README documents the ``python3`` alias
+    install step on Windows. Three scenarios on the same fixture: python3 present and working
+    → speak.py runs once; python3 missing → the spawn fails before reaching speak.py; python3
+    present but speak.py fails → the hook surfaces the speak.py exit (the harness sees a
+    non-zero exit, the retry lives inside speak.py itself, not in the shell)."""
     manifest = json.loads((Path(__file__).resolve().parents[3] / "plugins" / "voice-loop" / "hooks" / "hooks.json").read_text(encoding="utf-8"))
-    commands: list[str] = []
+    invocations: list[tuple[str, str]] = []
     for registrations in manifest["hooks"].values():
         for registration in registrations:
             for entry in registration["hooks"]:
-                commands.append(entry["command"])
-    assert len(commands) >= 2, "expected at least two hook registrations (Stop + PostToolUse)"
+                invocations.append((entry["command"], entry.get("args", [])))
+    assert len(invocations) >= 2, "expected at least two hook registrations (Stop + PostToolUse)"
+    for cmd, args in invocations:
+        assert cmd == "python3", (
+            "the hook command must be a bare interpreter name; no probing shell chain, "
+            f"no shell interpreter. got: {cmd!r}"
+        )
+        assert args == ["${CLAUDE_PLUGIN_ROOT}/scripts/speak.py"], (
+            "the hook args must name exactly the speak.py script, no probe prelude; "
+            f"got: {args!r}"
+        )
 
     plugin_root = tmp_path / "plugin"
     (plugin_root / "scripts").mkdir(parents=True)
     (plugin_root / "scripts" / "speak.py").write_text("# stub target; the interpreter stub logs the run\n")
 
-    def run_command(cmd: str, present: list[str], speak_exit: int = 0) -> tuple[int, list[str]]:
+    def run_hook(present: list[str], speak_exit: int = 0) -> tuple[int, list[str]]:
         stub_dir = tmp_path / "stubs"
         stub_dir.mkdir(exist_ok=True)
         for stale in stub_dir.iterdir():
@@ -2548,44 +2562,49 @@ def test_hook_commands_probe_a_real_interpreter_before_running_speak(tmp_path):
         log.write_text("", encoding="utf-8")
         for name in present:
             _hook_stub_interpreter(stub_dir, name, log, speak_exit)
-        result = subprocess.run(
-            cmd,
-            shell=True,
-            capture_output=True,
-            timeout=30,
-            env={**os.environ, "PATH": str(stub_dir), "CLAUDE_PLUGIN_ROOT": str(plugin_root)},
-        )
-        return result.returncode, _speak_invocations(log)
+        # The harness would substitute ${CLAUDE_PLUGIN_ROOT}; we mirror that here so the test
+        # exercises the same argv a real hook would receive.
+        if not present:
+            argv = ["python3", str(plugin_root / "scripts" / "speak.py")]
+        else:
+            argv = [present[0], str(plugin_root / "scripts" / "speak.py")]
+        try:
+            result = subprocess.run(
+                argv,
+                capture_output=True,
+                timeout=30,
+                env={**os.environ, "PATH": str(stub_dir), "CLAUDE_PLUGIN_ROOT": str(plugin_root)},
+            )
+            return result.returncode, _speak_invocations(log)
+        except FileNotFoundError:
+            # No python3 on PATH — the harness would surface this as a spawn failure rather
+            # than fall through to a different interpreter. A returncode of 127 is the
+            # shell's "command not found", which is what a missing interpreter looks like to
+            # the harness here.
+            return 127, _speak_invocations(log)
 
-    all_three = ["python3", "python", "py"]
-    for cmd in commands:
-        assert cmd.count("import sys") == cmd.count("speak.py"), (
-            "every speak.py run in the hook command must be guarded by its own interpreter probe; "
-            f"got: {cmd!r}"
-        )
+    # Working interpreter: speak.py runs exactly once.
+    code, spoke = run_hook(["python3"])
+    assert code == 0 and len(spoke) == 1, (
+        f"a working python3 must run speak.py once: exit {code}, "
+        f"speak.py ran {len(spoke)} time(s)"
+    )
 
-        # Short-circuit: with every interpreter working and speak.py succeeding, speak.py
-        # runs exactly once. The flattened chain runs it once per working interpreter.
-        code, spoke = run_command(cmd, all_three)
-        assert code == 0 and len(spoke) == 1, (
-            f"first working interpreter must short-circuit the chain: exit {code}, "
-            f"speak.py ran {len(spoke)} time(s); got: {cmd!r}"
-        )
+    # Missing interpreter: the spawn fails before reaching speak.py — the harness surfaces the
+    # error rather than silently picking a different interpreter.
+    code, spoke = run_hook([])
+    assert code != 0 and len(spoke) == 0, (
+        f"no python3 on PATH must fail the spawn, not fall through silently: "
+        f"exit {code}, speak.py ran {len(spoke)} time(s)"
+    )
 
-        # Fallthrough: the first interpreter absent, the second present — still exactly once.
-        code, spoke = run_command(cmd, ["python", "py"])
-        assert code == 0 and len(spoke) == 1, (
-            f"a missing python3 must fall through to the next interpreter, speaking once: "
-            f"exit {code}, speak.py ran {len(spoke)} time(s); got: {cmd!r}"
-        )
-
-        # Pinned as intended: a probe that succeeds but a speak.py that FAILS falls through
-        # to the next interpreter too — the next one may have the stdlib the first lacked.
-        code, spoke = run_command(cmd, all_three, speak_exit=3)
-        assert code == 3 and len(spoke) == 3, (
-            "a speak.py failure on one interpreter is retried on the next (and only) two, "
-            f"with the last exit code surfacing; got exit {code}, {len(spoke)} run(s): {cmd!r}"
-        )
+    # Working interpreter, failing speak.py: the hook surfaces the speak.py exit code; the
+    # retry budget lives inside speak.py (the speak-side handler), not in a shell chain.
+    code, spoke = run_hook(["python3"], speak_exit=3)
+    assert code == 3 and len(spoke) == 1, (
+        f"a failing speak.py must surface its exit code from a single spawn, not be retried "
+        f"by the hook: exit {code}, speak.py ran {len(spoke)} time(s)"
+    )
 
 
 def test_speak_py_exits_zero_when_sibling_modules_missing(tmp_path):
@@ -4055,6 +4074,28 @@ def _fake_player_factory(clock):
     return fake_popen
 
 
+def _communicating_proc() -> "FakePlayerProcess":
+    """A minimal subprocess stand-in whose ``communicate`` returns immediately.
+
+    ``play_text``'s local-command branch calls ``proc.communicate(input=...)`` after the
+    spawn; ``FakePlayerProcess`` (the playback-as-clock-time fixture above) intentionally
+    omits that method because the streaming path doesn't need it. The shlex-branch tests
+    just want a process that the spawn call can return so the assertions can inspect the
+    argv shape without hitting ``AttributeError`` further down the call. Both the
+    end-to-end test (``test_play_text_runs_the_local_tts_command_end_to_end``) and the
+    shlex-branch tests need this shape; the existing test uses a heavier
+    ``FakeCmdProc`` that records stdin separately. ``communicate`` sets ``returncode = 0``
+    so the success branch returns True."""
+    proc = FakePlayerProcess(time.monotonic, 0.0)
+
+    def _communicate(input=None):
+        proc.returncode = 0
+        return (b"", b"")
+
+    proc.communicate = _communicate  # type: ignore[attr-defined]
+    return proc
+
+
 def test_play_text_runs_the_local_tts_command_end_to_end(state, monkeypatch):
     """s["command"] takes the whole turn: one shell, one Popen, one stdin pipe, the pidfile
     carries the 'pg' marker so _on_sigterm's killpg reaches the player inside the shell."""
@@ -4110,6 +4151,66 @@ def test_play_text_returns_false_when_local_command_cannot_spawn(state, monkeypa
     log = (state / "speak.log").read_text(encoding="utf-8")
     assert "local command failed" in log
     assert "no such file" in log
+
+
+def test_play_text_returns_false_when_local_command_is_unparseable(state, monkeypatch):
+    """An unmatched quote in ``tts.command`` raises ValueError from shlex.split — play_text
+    catches it, logs the error, returns False without ever calling Popen. The configured
+    string is the caller's typo; a hard crash here would mask the misconfiguration behind
+    a stack trace, which is what the catch guards against."""
+    spawns: list[list] = []
+
+    def should_not_run(argv, **kwargs):
+        spawns.append(list(argv))
+        return _communicating_proc()
+
+    monkeypatch.setattr(speak.subprocess, "Popen", should_not_run)
+    s = speak.resolve_settings({"tts": {"command": '"unclosed quote'}}, "Linux")
+    assert speak.play_text("hi", s, time.monotonic(), extract_ms=0) is False
+    assert spawns == [], f"Popen must not be invoked on an unparseable command; saw {spawns}"
+    log = (state / "speak.log").read_text(encoding="utf-8")
+    assert "local command unparseable" in log
+
+
+def test_play_text_returns_false_when_local_command_is_empty(state, monkeypatch):
+    """A ``tts.command`` that splits to an empty argv (whitespace-only, or a string of quotes
+    that shlex collapses to nothing) is a configuration accident, not a runtime error — log
+    it and return False. Popen([]) would raise OSError later; failing here keeps the
+    error message actionable ("empty", not "no such file")."""
+    spawns: list[list] = []
+
+    def should_not_run(argv, **kwargs):
+        spawns.append(list(argv))
+        return _communicating_proc()
+
+    monkeypatch.setattr(speak.subprocess, "Popen", should_not_run)
+    s = speak.resolve_settings({"tts": {"command": "   "}}, "Linux")
+    assert speak.play_text("hi", s, time.monotonic(), extract_ms=0) is False
+    assert spawns == [], f"Popen must not be invoked on an empty argv; saw {spawns}"
+    log = (state / "speak.log").read_text(encoding="utf-8")
+    assert "local command is empty" in log
+
+
+def test_play_text_passes_a_literal_pipe_as_argv(state, monkeypatch):
+    """Pipes, redirects, env assignments and globs are NOT interpreted — they are passed
+    as literal arguments to the program. This is the README's claim on tts.command
+    (``argv, not a shell``), and the test pins it: a command string ``"cat | -lm"`` is
+    split by shlex into ``["cat", "|", "-lm"]`` and Popen is invoked with exactly that
+    argv — no shell, no pipeline. A regression to ``["/bin/sh", "-c", ...]`` would either
+    run a real shell (which our test refuses) or change the captured argv shape; both
+    are caught."""
+    captured: list[tuple[list, dict]] = []
+
+    def fake_popen(argv, **kwargs):
+        captured.append((list(argv), kwargs))
+        return _communicating_proc()
+
+    monkeypatch.setattr(speak.subprocess, "Popen", fake_popen)
+    s = speak.resolve_settings({"tts": {"command": "cat | -lm"}}, "Linux")
+    assert speak.play_text("hi", s, time.monotonic(), extract_ms=0) is True
+    assert captured[0][0] == ["cat", "|", "-lm"], (
+        f"argv must be the shlex-split form, NOT a shell invocation; got {captured[0][0]}"
+    )
 
 
 def test_play_text_returns_false_when_cloud_backend_has_no_key(state, monkeypatch):

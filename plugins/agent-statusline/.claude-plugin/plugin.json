@@ -6,12 +6,5 @@
   "homepage": "https://github.com/saharkit/windowsill/tree/main/plugins/agent-statusline",
   "license": "MIT",
   "keywords": ["statusline", "context-window", "budget", "claude-code", "agent-statusline"],
-  "icon": "./assets/icon.svg",
-  "classification": {
-    "object_acted_on": "terminal status line",
-    "work_department": "engineering",
-    "industry": "software",
-    "life_area": "work",
-    "subject": "context window and usage budget display"
-  }
+  "icon": "./assets/icon.svg"
 }

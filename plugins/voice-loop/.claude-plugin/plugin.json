@@ -23,13 +23,6 @@
     "accessibility"
   ],
   "icon": "./assets/icon.svg",
-  "classification": {
-    "object_acted_on": "speech audio",
-    "work_department": "engineering",
-    "industry": "software",
-    "life_area": "work",
-    "subject": "voice dictation and spoken replies for Claude Code"
-  },
   "userConfig": {
     "tts_api_key": {
       "type": "string",
