@@ -5,6 +5,5 @@
   "author": { "name": "Sahar" },
   "homepage": "https://github.com/saharkit/windowsill/tree/main/plugins/agent-statusline",
   "license": "MIT",
-  "keywords": ["statusline", "context-window", "budget", "claude-code", "agent-statusline"],
-  "icon": "./assets/icon.svg"
+  "keywords": ["statusline", "context-window", "budget", "claude-code", "agent-statusline"]
 }

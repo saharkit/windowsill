@@ -99,24 +99,45 @@ def test_plugin_manifest_has_no_category_key(plugin: str) -> None:
 
 
 @pytest.mark.parametrize("plugin", PLUGIN_NAMES)
-def test_plugin_manifest_icon_resolves_to_svg_or_512x512_png(plugin: str) -> None:
-    """The icon must resolve inside the plugin folder to an SVG or a 512x512 PNG.
+def test_plugin_marketplace_entry_icon_resolves_to_svg_or_512x512_png(plugin: str) -> None:
+    """The icon (declared on the marketplace entry, NOT on the plugin manifest) must resolve
+    inside the plugin folder to an SVG or a 512x512 PNG.
 
     An SVG is recognised by the literal ``<svg`` prefix in the first 256 bytes (the
     parser-allowed leading whitespace / XML declaration). A PNG's size is read from
     the IHDR chunk's width and height big-endian uint32s at bytes 16 and 20; a 512x512
     PNG passes, anything else fails.
+
+    The plugin manifest does NOT carry ``icon`` — the directory's strict validator
+    rejects it as an unknown field, and the directory reads the listing's icon from
+    the marketplace entry. So the icon is read here from the marketplace entry; the
+    manifest is asserted to be icon-free separately.
     """
     plugin_dir = PLUGINS_ROOT / plugin
     manifest = _read_manifest(plugin_dir)
-    icon_value = manifest.get("icon")
-    assert isinstance(icon_value, str) and icon_value, (
-        f"{plugin}: plugin manifest must carry an `icon` string path"
+    assert "icon" not in manifest, (
+        f"{plugin}: plugin manifest must not carry `icon` — the directory's strict "
+        "validator rejects it as an unknown field; the listing reads `icon` from the "
+        "marketplace entry instead"
     )
-    icon_path = (plugin_dir / icon_value).resolve()
-    # the directory rejects paths that escape the plugin folder
+
+    market = json.loads(MARKETPLACE_PATH.read_text(encoding="utf-8"))
+    entry = next(
+        (e for e in market.get("plugins", []) if e.get("name") == plugin),
+        None,
+    )
+    assert entry is not None, (
+        f"{plugin}: marketplace entry not found in {MARKETPLACE_PATH.relative_to(REPO_ROOT)}"
+    )
+    icon_value = entry.get("icon")
+    assert isinstance(icon_value, str) and icon_value, (
+        f"{plugin}: marketplace entry must carry an `icon` string path"
+    )
+    # The marketplace icon is repo-root-relative (e.g. ``./plugins/<name>/assets/icon.svg``);
+    # resolve from the repo root and assert the resolved path lands inside the plugin folder.
+    icon_path = (REPO_ROOT / icon_value).resolve()
     assert plugin_dir.resolve() in icon_path.parents, (
-        f"{plugin}: `icon` ({icon_value!r}) must resolve inside the plugin folder"
+        f"{plugin}: marketplace `icon` ({icon_value!r}) must resolve inside the plugin folder"
     )
     assert icon_path.is_file(), f"{plugin}: `icon` path {icon_value!r} does not exist"
     head = icon_path.read_bytes()[:256]

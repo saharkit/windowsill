@@ -22,6 +22,5 @@
     "stop-conditions",
     "code-review",
     "prompt-engineering"
-  ],
-  "icon": "./assets/icon.svg"
+  ]
 }

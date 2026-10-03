@@ -22,7 +22,6 @@
     "self-hosted",
     "accessibility"
   ],
-  "icon": "./assets/icon.svg",
   "userConfig": {
     "tts_api_key": {
       "type": "string",

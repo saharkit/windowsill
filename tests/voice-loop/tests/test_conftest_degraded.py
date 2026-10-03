@@ -34,7 +34,10 @@ import sys
 from pathlib import Path
 
 _TESTS_DIR = Path(__file__).resolve().parent
-_PLUGIN_DIR = _TESTS_DIR.parent.parent / "plugins" / "voice-loop"
+# The pytest root (`pytest.ini` lives here) is one level up; subprocesses that need to invoke
+# `pytest tests/` start there. The plugin folder (`_PLUGIN_DIR`) is reached via that root.
+_TEST_ROOT = _TESTS_DIR.parent
+_PLUGIN_DIR = _TEST_ROOT.parent / "plugins" / "voice-loop"
 
 # A meta_path finder that raises ImportError for any name under `voice_server`. The
 # string is identical across all three subprocess invocations; keeping it as one
@@ -61,7 +64,7 @@ _BLOCKER_RUNNER = (
 # tests the contract directly.
 _RESET_RUNNER = (
     "import importlib.util, pathlib\n"
-    "path = pathlib.Path('tests/voice-loop/tests/conftest.py').resolve()\n"
+    "path = pathlib.Path('tests/conftest.py').resolve()\n"
     "spec = importlib.util.spec_from_file_location('vl_under_test', path)\n"
     "mod = importlib.util.module_from_spec(spec)\n"
     "spec.loader.exec_module(mod)\n"
@@ -129,7 +132,7 @@ def _run_subprocess(args, env_overrides=None, blocker=True, timeout=120):
         env.update(env_overrides)
     return subprocess.run(
         cmd,
-        cwd=_PLUGIN_DIR,
+        cwd=_TEST_ROOT,
         env=env,
         capture_output=True,
         text=True,
@@ -319,7 +322,7 @@ def test_ignored_at_collection_resets_between_runs_in_one_process():
     env.pop(OPT_IN_ENV, None)
     result = subprocess.run(
         [sys.executable, "-c", _RESET_RUNNER],
-        cwd=_PLUGIN_DIR,
+        cwd=_TEST_ROOT,
         env=env,
         capture_output=True,
         text=True,

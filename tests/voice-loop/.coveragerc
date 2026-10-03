@@ -19,7 +19,7 @@
 # `scripts/*`, `scripts/doctor.py` and `scripts/speak.py` run there against the combined data.
 [run]
 branch = True
-source = ../../plugins/voice-loop/server/voice_server, ../../plugins/voice-loop/scripts
+source = voice_server, ../../plugins/voice-loop/scripts
 
 [report]
 show_missing = True

@@ -280,8 +280,8 @@ jobs:
   # validate failure was invisible (windowsill submission readiness, fix(#5816)). The claude CLI
   # is a public npm package, so this is obtainable in CI without any credential the repo does not
   # hold. The listing-test step beside it covers the directory rules the strict validator does
-  # not check on its own (no `category`, `icon` resolution, the five-key `classification`,
-  # 256 KiB per-file inspection limit, the 512-file cap). Both are wired into `gate.needs` so
+  # not check on its own (no `category` on the manifest, the marketplace-side `icon` path,
+  # the 256 KiB per-file inspection limit, the 512-file cap). Both are wired into `gate.needs` so
   # the merge queue cannot open a submission that the directory would hold or warn.
   validate:
     name: validate plugin manifests (claude plugin validate --strict + directory listing)
@@ -303,11 +303,11 @@ jobs:
           claude plugin validate --strict ./plugins/sill-core
           claude plugin validate --strict ./plugins/agent-handbook
           claude plugin validate --strict ./plugins/agent-statusline
-      # The directory rules the strict validator does not check on its own: no `category`,
-      # `icon` resolution, the five-key `classification`, the 256 KiB per-file inspection limit,
+      # The directory rules the strict validator does not check on its own: no `category` on the
+      # manifest, the marketplace-side `icon` path, the 256 KiB per-file inspection limit,
       # and the 512-file cap. This is the test that fix(#5816) introduced — see
       # `tests/test_directory_listing.py`.
-      - name: directory listing acceptance (no category, icon, classification, 256 KiB, 512 files)
+      - name: directory listing acceptance (no category, marketplace icon, 256 KiB, 512 files)
         run: |
           python3 -m pytest tests/test_directory_listing.py
       # `claude plugin validate` checks each manifest's own structure; it does NOT compare the two
@@ -570,7 +570,10 @@ jobs:
 
       - name: start the server
         run: |
-          python plugins/voice-loop/server/voice_server.py &
+          # Redirect server stdout/stderr to a log file so a 500 in /stt or /tts leaves a traceback
+          # in the artifact rather than the bit bucket — without it, the next STT failure is
+          # undiagnosable from the job log.
+          python plugins/voice-loop/server/voice_server.py >/tmp/voice-loop.log 2>&1 &
           echo $! > /tmp/voice-loop.pid
           # `if` keeps a failing poll from tripping the step's `set -e` while the server warms up
           for _ in $(seq 1 60); do
@@ -578,6 +581,12 @@ jobs:
             sleep 2
           done
           curl -fsS http://127.0.0.1:8355/health
+      - name: dump server log on failure (only when something else failed)
+        if: failure()
+        run: |
+          echo "::group::server log"
+          cat /tmp/voice-loop.log || true
+          echo "::endgroup::"
 
       - name: loopback selftest (TTS -> STT -> compare)
         run: |

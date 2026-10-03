@@ -13,6 +13,5 @@
     "reminders",
     "atomic-write",
     "sill-core"
-  ],
-  "icon": "./assets/icon.svg"
+  ]
 }
