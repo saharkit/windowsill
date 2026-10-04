@@ -10,10 +10,7 @@ fastapi>=0.110,<1.0
 uvicorn[standard]>=0.27,<1.0
 python-multipart>=0.0.9          # FastAPI needs it for multipart /stt uploads
 faster-whisper>=1.0,<2.0         # STT (multilingual)
-# Pin PyAV <19: faster-whisper 1.2.x calls av.open(metadata_errors=…), which PyAV 19.0.0
-# removed (SYSTRAN/faster-whisper#1589, fixed only on upstream main, unreleased). Lift the
-# upper bound when a faster-whisper release supports PyAV 19.
-av<19
+av<19                            # PyAV 19.0.1 (2026-09-29) dropped metadata_errors=, which faster-whisper 1.2.1 still passes to av.open — pin until the upstream catch lands
 torch>=2.2                       # Silero TTS runs on torch.hub
 omegaconf>=2.3
 soundfile>=0.12                  # WAV encoding (needs libsndfile on the system)
