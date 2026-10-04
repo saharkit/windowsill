@@ -2,7 +2,7 @@
 
 The Anthropic plugin directory holds windowsill plugins on three findings that
 ``claude plugin validate --strict`` does NOT check on its own (windowsill#5867, the
-post-#5816 rescan at f9a a0fa):
+post-#5816 rescan at f9a0faa):
 
   * ``ALLOWED_TOOLS_BROAD`` — a skill (or plugin command or agent) declares a bare ``Bash``,
     ``Bash(*)``, or a wildcard right after a shell, interpreter, package manager, runner or
@@ -18,7 +18,7 @@ post-#5816 rescan at f9a a0fa):
     a vendor install page or replace it with a download-then-inspect-then-run form.
 
 The directory's own rescan is webhook-driven, and these two rules are the ones that held
-voice-loop and agent-statusline after #5816 merged (windowsill PR 319, f9a a0fa). Both rules
+voice-loop and agent-statusline after #5816 merged (windowsill PR 319, f9a0faa). Both rules
 are expressed as separate test functions here, each with its own
 REFUSAL fixture asserted FIRST so a future regression that swaps a refusal for a pass
 fails loudly with the test name visible.
@@ -64,16 +64,18 @@ _FLOW_LIST_RE = re.compile(r"^\[(.*)\]\s*$")
 
 
 def _strip_one_level_of_matching_quotes(item: str) -> str:
-    """Strip ONE level of matching quotes (``"…"` or ``'…'``) from an allowed-tools item.
+    """Strip ALL leading/trailing matching quotes (``"…"` or ``'…'``) from an allowed-tools
+    item, not just one level.
 
     A bare ``Bash`` quoted as ``"Bash"`` or ``'Bash'`` must NOT evade the directory's
     ALLOWED_TOOLS_BROAD rescan (windowsill#5867): the scan reads literal tool names, and a
     future author who writes ``allowed-tools: ["Bash", Read]`` would otherwise pass the gate
     even though ``claude plugin validate --strict`` accepts both spellings as the same entry.
-    The function strips a SINGLE level — a doubly-quoted ``""Bash""`` becomes ``"Bash"``,
-    not ``Bash`` — so a future author cannot dodge the check by doubling up."""
-    if len(item) >= 2 and item[0] == item[-1] and item[0] in ("'", '"'):
-        return item[1:-1]
+    The function strips repeatedly until no outer matching quotes remain, so a doubly-quoted
+    ``""Bash""`` becomes ``Bash`` and the bare-``Bash`` check in ``_is_bash_item`` sees it —
+    a future author cannot dodge the check by doubling up."""
+    while len(item) >= 2 and item[0] == item[-1] and item[0] in ("'", '"'):
+        item = item[1:-1]
     return item
 
 
@@ -354,6 +356,25 @@ def test_allowed_tools_refuses_a_flow_list_with_bash(tmp_path: Path) -> None:
     assert refusal is not None and "Bash" in refusal, (
         "the flow-list Bash refusal fixture does not refuse its own entry on disk; the "
         f"flow-list parser missed it, refusal={refusal!r}"
+    )
+
+
+def test_skill_files_walker_finds_voice_setup_skill_md() -> None:
+    """Walker-driven fixture (R6): the main assertion iterates ``_skill_files()`` over the
+    plugins tree, and a silent walker regression would pass the main test green over zero
+    files while every named fixture (which hand-builds tmp_path SKILL.md files) still
+    passes — exactly because the fixtures never go through the walker. Pinned first so a
+    regression that turns the walker into a silent empty list fails loudly with this test
+    name visible, not by way of a green main assertion. Asserts the shipped
+    ``voice-setup`` skill file (one of the nine skill files the plugins tree carries today)
+    is reachable through the walker — a regression that filters the wrong directory
+    pattern (``skills/*/SKILL.md`` without the depth-agnostic glob, for example) misses
+    it."""
+    expected = PLUGINS_ROOT / "voice-loop" / "skills" / "voice-setup" / "SKILL.md"
+    found = _skill_files()
+    assert expected in found, (
+        f"the shipped voice-setup SKILL.md is not in the walker output; the glob is blind "
+        f"to one of the nine skill files, found={found!r}"
     )
 
 

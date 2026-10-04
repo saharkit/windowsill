@@ -35,10 +35,14 @@ left the Pages front pages saying something no longer true. Adding a root entry 
 the same change.
 
 A plugin's **version lives in `plugins/<name>/.claude-plugin/plugin.json`** — that is the source.
-It is recorded in **three** places in all: that manifest, its mirror in
-`.claude-plugin/marketplace.json`, and the plugin's row in the root `README.md` catalog table. All
-three must agree, and **nothing in CI checks that they do** — a bump that misses one is caught by a
-reviewer or not at all. Do not add a fourth site (this file deliberately names no version number).
+The minimum update touches three files: that manifest, its mirror in
+`.claude-plugin/marketplace.json`, and the plugin's row in the root `README.md` catalog table.
+Plugins with a `PUBLISHING.md` row, a versioned acceptance checklist (`plugins/<name>/CONFORMANCE.md`),
+or Pages docs that print the version in a colophon add more — voice-loop's 0.9.1 bump touches nine
+files in all (manifest, marketplace mirror, README row, PUBLISHING.md row, the CONFORMANCE.md pin,
+and four Pages colophons under `docs/`). **All sites must agree**, and **nothing in CI checks that
+they do** — the cross-file count varies by plugin, so a bump that misses one is caught by a reviewer
+or not at all. Do not add a fourth site (this file deliberately names no version number).
 
 What is on the shelf is **not written here.** `.claude-plugin/marketplace.json` is the machine's
 answer and the root `README.md` catalog table is the reader's; both are updated by the change that
