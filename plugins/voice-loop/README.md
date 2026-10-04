@@ -168,8 +168,9 @@ coverage (including Russian and Ukrainian) and privacy posture, side by side. Th
 Deepgram is the cheapest and quickest for recognition and the `$200` new-account credit covers an
 evaluation, but its synthesis does not speak Russian or Ukrainian; ElevenLabs and OpenAI do both.
 
-**ElevenLabs STT reuses your existing ElevenLabs API key.** If you already configured
-`/voice-design` (or set `VOICE_LOOP_TTS_API_KEY`), dictation works without a second key. When
+**ElevenLabs STT reuses your existing ElevenLabs API key — when TTS is also ElevenLabs.** If
+you already configured `/voice-design` (or set `VOICE_LOOP_TTS_API_KEY`) and
+`tts.cloud.provider` is `elevenlabs`, dictation works without a second key. When
 `stt.cloud.provider` is `elevenlabs`, the script looks for a key in this order:
 
 1. Your configured STT key: the `stt_api_key` plugin option
@@ -178,10 +179,16 @@ evaluation, but its synthesis does not speak Russian or Ukrainian; ElevenLabs an
    credential store, never in the settings file), then `stt.cloud.key_file`, then
    `stt.cloud.api_key_env` (default `VOICE_LOOP_STT_API_KEY`).
 2. The TTS key (same precedence as STT, via `tts_api_key` → `tts.cloud.key_file` →
-   `tts.cloud.api_key_env`) — one credentials home, not a second one.
+   `tts.cloud.api_key_env`) — one credentials home, not a second one, and **only when the
+   TTS provider is also ElevenLabs** (windowsill#5867). With `tts.cloud.provider` set to
+   `openai` or `deepgram`, the variable the TTS entry points at holds a different vendor's
+   key, and the borrow is OFF so it is never sent to `api.elevenlabs.io`.
 
 That shared-key rule is ElevenLabs' alone, because it is the one provider covering both directions
-with one account here: a `deepgram` STT config is never handed an ElevenLabs key.
+with one account here: a `deepgram` STT config is never handed an ElevenLabs key, and an
+`elevenlabs` STT config is never handed an OpenAI or Deepgram TTS key. A user on a local TTS
+backend who relied on `VOICE_LOOP_TTS_API_KEY` for STT must now set
+`stt.cloud.api_key_env` or `tts.cloud.provider: "elevenlabs"` explicitly.
 
 The hotkey dictation path (`scripts/dictate-toggle.sh` / `.cmd`) and the `voice-design` skill are
 not started by Claude Code, so they read the option's env var, find it unset, and fall through to

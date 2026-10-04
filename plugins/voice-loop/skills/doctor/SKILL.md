@@ -2,7 +2,7 @@
 name: doctor
 description: Three-bin diagnosis for voice-loop — is it a config choice working as chosen, an unfinished install, or a real bug? Runs only when asked; offered (never auto-run) when Claude observes repeated failures in-session.
 argument-hint: "[what is not working — a sentence or two]"
-allowed-tools: [Bash, Read, Edit, AskUserQuestion]
+allowed-tools: [Read, Edit, AskUserQuestion]
 ---
 
 # /doctor — what is actually wrong?

@@ -17,11 +17,19 @@ claude plugin eval plugins/voice-loop
 
 That resolves the plugin from the path and runs every case under `evals/`. To measure
 whether the plugin is actually doing anything, run the ablation — the same prompts with
-and without the plugin loaded, reported as a score delta:
+and without the plugin loaded, reported as a score delta. The ablation runs against the
+checked-out path:
+
+```sh
+claude plugin eval plugins/voice-loop --ablation with-without
+```
+
+If the ablation case needs the installed form rather than the checked-out path, install
+voice-loop as a separate earlier step (it is a separate command — never chained to the
+run itself):
 
 ```sh
 claude plugin install voice-loop@windowsill
-claude plugin eval voice-loop@windowsill --ablation with-without
 ```
 
 A single case, or the whole tag:

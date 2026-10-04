@@ -433,13 +433,33 @@ def test_a_provider_with_no_remote_default_host_falls_back_to_the_local_server()
 
 def test_the_credentials_home_rule_lives_on_the_entry():
     """ElevenLabs is the one provider that accepts the TTS key for STT, and that is a FIELD now —
-    the fallback list, in order, most-specific first."""
-    assert providers.STT_PROVIDERS["elevenlabs"].key_envs("VOICE_LOOP_STT_API_KEY") == (
+    the fallback list, in order, most-specific first. The borrow is gated by the TTS provider name
+    (windowsill#5867), so the predicate is keyed on ``tts_provider`` rather than the entry alone."""
+    assert providers.STT_PROVIDERS["elevenlabs"].key_envs(
+        "VOICE_LOOP_STT_API_KEY", tts_provider="elevenlabs"
+    ) == (
         "VOICE_LOOP_STT_API_KEY",
         "VOICE_LOOP_TTS_API_KEY",
     )
-    assert providers.STT_PROVIDERS["openai"].key_envs("MY_KEY") == ("MY_KEY",)
-    assert providers.STT_PROVIDERS["deepgram"].key_envs("MY_KEY") == ("MY_KEY",)
+    assert providers.STT_PROVIDERS["openai"].key_envs(
+        "MY_KEY", tts_provider="elevenlabs"
+    ) == ("MY_KEY",)
+    assert providers.STT_PROVIDERS["deepgram"].key_envs(
+        "MY_KEY", tts_provider="elevenlabs"
+    ) == ("MY_KEY",)
+
+
+def test_elevenlabs_stt_key_envs_refuses_the_tts_borrow_for_other_vendors():
+    """The same-vendor rule (windowsill#5867) closes the credential leak: an OpenAI or Deepgram
+    TTS key must NEVER be offered to api.elevenlabs.io. An UNSET ``tts_provider`` resolves through
+    the registry's default (OpenAI, ``providers.DEFAULT_TTS``) and so also refuses the borrow —
+    a user on a local TTS backend who relied on ``VOICE_LOOP_TTS_API_KEY`` must now set
+    ``stt.cloud.api_key_env`` or ``tts.cloud.provider: "elevenlabs"`` explicitly."""
+    elevenlabs = providers.STT_PROVIDERS["elevenlabs"]
+    for tts in ("openai", "deepgram", ""):
+        assert elevenlabs.key_envs("VOICE_LOOP_STT_API_KEY", tts_provider=tts) == (
+            "VOICE_LOOP_STT_API_KEY",
+        ), f"tts_provider={tts!r} must not borrow the TTS key"
 
 
 # --- the comparison surface ----------------------------------------------------------------------

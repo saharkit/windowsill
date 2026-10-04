@@ -234,9 +234,18 @@ class SttProvider:
         — that literal is the same address the TTS chain ends at, by a different route."""
         return str(s.get("cloud_endpoint") or self.default_host or s.get("endpoint", ""))
 
-    def key_envs(self, configured: str) -> tuple[str, ...]:
-        """Every env var name this provider will accept a key from, most-specific first."""
-        return (configured, *self.key_env_fallbacks)
+    def key_envs(self, configured: str, tts_provider: str = "") -> tuple[str, ...]:
+        """Every env var name this provider will accept a key from, most-specific first.
+
+        ``key_env_fallbacks`` are appended ONLY when the configured TTS provider is the same vendor
+        — the "same vendor" rule (windowsill#5867). With ``tts.cloud.provider: "openai"`` (the
+        shipped default) the variable the TTS entry points at holds an OpenAI key, and sending
+        that to api.elevenlabs.io is the credential leak the predicate closes. The TTS provider
+        name is the trigger; ``""`` (no default at all) is the same as the default and so
+        defaults the fallback OFF."""
+        if tts_provider == self.name:
+            return (configured, *self.key_env_fallbacks)
+        return (configured,)
 
     def request(self, s: dict, key: str, wav_bytes: bytes, boundary: str) -> SttRequest:
         return self.build(self, s, key, wav_bytes, boundary)
@@ -745,8 +754,9 @@ STT_PROVIDERS: dict[str, SttProvider] = {
         name="elevenlabs",
         default_model="scribe_v1",
         default_host=ELEVENLABS_HOST,
-        # One credentials home: a user who already configured /voice-design for TTS has dictation
-        # working without a second key.
+        # Borrowed ONLY when the TTS provider is also ElevenLabs (see ``SttProvider.key_envs`` and
+        # windowsill#5867). The "same vendor" rule prevents an OpenAI or Deepgram TTS key from
+        # being sent to api.elevenlabs.io when ``tts.cloud.provider`` is set to a different entry.
         key_env_fallbacks=("VOICE_LOOP_TTS_API_KEY",),
         build=_elevenlabs_stt,
         transcript=text_field,

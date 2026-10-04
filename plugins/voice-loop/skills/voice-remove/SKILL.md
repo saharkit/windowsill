@@ -2,7 +2,7 @@
 name: voice-remove
 description: Uninstall the voice-loop contour from this machine — stop and disable the local speech service, unbind the push-to-talk hotkey, delete the config, state and model caches the user confirms (keeping key files unless they say otherwise), take the spoken-summary convention line back out of CLAUDE.md, and print exactly what was intentionally left behind. Use when the user asks to remove, uninstall, disable, undo or clean up voice-loop, voice, dictation or speak-back.
 argument-hint: "[all|service|hotkey|config|models|convention]"
-allowed-tools: [Bash, Read, Edit, Glob, AskUserQuestion]
+allowed-tools: [Read, Edit, Glob, AskUserQuestion]
 ---
 
 # voice-remove — take the contour back off
@@ -37,8 +37,9 @@ what you have not looked at.
    spaces stay quoted.
 5. **No root, ever.** Uninstalling needs none. The one piece setup installed as root (the `ydotoold`
    daemon, tier 3) is **printed for the user to run**, exactly as setup printed the install line.
-6. **Batch.** Target **≤3 permission prompts**: one inventory batch, one removal batch, one verify
-   batch. Chain with `;` (not `&&`) inside a batch so one missing path does not abort the rest.
+6. **Batch.** In auto-approval mode nothing is asked. In manual approval mode each command is
+   approved individually, so batch where you can: chain with `;` (not `&&`) inside a batch so one
+   missing path does not abort the rest. The inventory, removal and verify steps stay one batch each.
 7. **The plugin itself is not yours to remove.** `/plugin uninstall voice-loop@windowsill` does
    that, and it must come **after** this skill — uninstalling first takes this skill away with it.
    Say so at the end.

@@ -898,8 +898,8 @@ def chunk_sentences(text: str, min_chars: int = MIN_CHUNK_CHARS) -> list[str]:
 
 def _post(url: str, headers: dict, payload: dict, timeout: float) -> bytes | None:
     """POST JSON, return the response body (even on an HTTP error — the body is the diagnosis,
-    exactly like ``curl -o`` wrote it). None only when the server was unreachable. Proxies are
-    bypassed (parity with ``curl --noproxy '*'``)."""
+    the same way a non-streaming HTTP fetch records it to its output file). None only when the
+    server was unreachable. Proxies are bypassed (no proxy traffic for this request)."""
     request = urllib.request.Request(
         url,
         data=json.dumps(payload).encode("utf-8"),

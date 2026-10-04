@@ -2218,14 +2218,15 @@ def test_an_unset_stt_prompt_leaves_the_lan_url_unchanged(state, opener):
 
 
 def test_elevenlabs_stt_falls_back_to_tts_key(state, monkeypatch, opener):
-    """When VOICE_LOOP_STT_API_KEY is not set, ElevenLabs STT tries the TTS key —
-    one credentials home, not a second one."""
+    """When VOICE_LOOP_STT_API_KEY is not set AND the TTS provider is also ElevenLabs, ElevenLabs
+    STT tries the TTS key — one credentials home, not a second one (windowsill#5867)."""
     (state / "dictate.wav").write_bytes(b"RIFFfakewav")
     fake = opener(b'{"text": "hello from shared key"}')
     monkeypatch.setenv("VOICE_LOOP_TTS_API_KEY", "shared-xi-key")
     monkeypatch.delenv("VOICE_LOOP_STT_API_KEY", raising=False)
     s = dictate.resolve_settings(
-        {"stt": {"backend": "cloud", "cloud": {"provider": "elevenlabs"}}}, "Linux"
+        {"tts": {"cloud": {"provider": "elevenlabs"}},
+         "stt": {"backend": "cloud", "cloud": {"provider": "elevenlabs"}}}, "Linux"
     )
     assert dictate.transcribe(s) == "hello from shared key"
     request, _ = fake.requests[0]
@@ -2303,12 +2304,16 @@ def test_an_unknown_stt_provider_falls_back_to_the_default_and_says_so(state):
 
 def test_the_no_key_message_names_the_provider_and_every_env_it_tried(state, monkeypatch, opener):
     """One message for every provider, listing that provider's own credential chain — so the
-    ElevenLabs-only wording (and its LOG_RULES row) does not have to be duplicated per provider."""
+    ElevenLabs-only wording (and its LOG_RULES row) does not have to be duplicated per provider.
+    Both env vars appear only when the TTS provider is also ElevenLabs (windowsill#5867)."""
     (state / "dictate.wav").write_bytes(b"RIFFfakewav")
     monkeypatch.delenv("VOICE_LOOP_STT_API_KEY", raising=False)
     monkeypatch.delenv("VOICE_LOOP_TTS_API_KEY", raising=False)
     opener(b'{"text": "whisper fallback"}')
-    s = dictate.resolve_settings({"stt": {"backend": "cloud", "cloud": {"provider": "elevenlabs"}}}, "Linux")
+    s = dictate.resolve_settings(
+        {"tts": {"cloud": {"provider": "elevenlabs"}},
+         "stt": {"backend": "cloud", "cloud": {"provider": "elevenlabs"}}}, "Linux"
+    )
     assert dictate.transcribe(s) == "whisper fallback"
     log_text = (state / "dictate.log").read_text(encoding="utf-8")
     assert "cloud stt: no key for elevenlabs" in log_text

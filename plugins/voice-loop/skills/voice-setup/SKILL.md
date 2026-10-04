@@ -2,7 +2,7 @@
 name: voice-setup
 description: Install and configure the voice-loop contour on this machine — probe the OS and hardware, pick a language and speech backends (local, LAN, or cloud), install dependencies in user space, write ~/.config/voice-loop/config.json, wire a push-to-talk hotkey, and prove it works with the hardware-free loopback selftest. Use when the user asks to set up voice, dictation, speak-back, text-to-speech or speech-to-text for Claude Code.
 argument-hint: "[local|lan|cloud] [language]"
-allowed-tools: [Bash, Read, Write, Edit, Glob, AskUserQuestion]
+allowed-tools: [Read, Write, Edit, Glob, AskUserQuestion]
 ---
 
 # voice-setup — install the voice contour
@@ -18,10 +18,10 @@ the pieces it names actually exist, and finish with a **passing selftest**. Scri
 
 ## Operating rules
 
-1. **Announce the plan first, then batch.** The user may be in default permission mode where every
-   Bash call is a prompt. Target **≤3 permission prompts** for the whole install: one probe batch, one
-   install batch, one verify batch. Chain commands with `&&` inside a single call instead of issuing
-   many small ones.
+1. **Announce the plan first, then batch.** In auto-approval mode nothing is asked. In manual
+   approval mode each command is approved individually, so batch where you can: chain commands
+   with `&&` inside a single call instead of issuing many small ones. The probe, install and
+   verify steps stay one batch each.
 2. **No root by default.** Everything below runs in user space. The only steps that need `sudo` are
    optional luxuries — for those you **print the exact command and let the user run it** (or approve
    it explicitly). Never slip a `sudo` into a batch.
@@ -276,10 +276,14 @@ models. Say this **before** installing, not after.
 **If an ElevenLabs key is already configured** (the probe printed an existing config with
 `tts.cloud.provider: "elevenlabs"` or the env var `VOICE_LOOP_TTS_API_KEY` is set): when
 dictation goes cloud, offer ElevenLabs Scribe as the STT provider (`stt.cloud.provider:
-"elevenlabs"`). The same key covers both TTS and STT — no second key needed. Say plainly that
-cloud STT sends recorded audio clips to ElevenLabs' servers (the privacy row above covers it),
-and that if the cloud call fails the script degrades to local whisper automatically (the
-microphone never goes dead).
+"elevenlabs"`). The same key covers both TTS and STT when TTS is also ElevenLabs — no second
+key needed. Say plainly that cloud STT sends recorded audio clips to ElevenLabs' servers
+(the privacy row above covers it), and that if the cloud call fails the script degrades to
+local whisper automatically (the microphone never goes dead). If `tts.cloud.provider` is
+left unset (resolves to OpenAI, the default) or set to a different vendor, dictation with
+`stt.cloud.provider: "elevenlabs"` still works — the script just borrows the TTS key only
+when TTS is also ElevenLabs, so a user relying on `VOICE_LOOP_TTS_API_KEY` for STT must set
+`stt.cloud.api_key_env` or `tts.cloud.provider: "elevenlabs"` explicitly.
 
 ### Switching away from `local` on a re-run (clean up behind the old choice)
 
@@ -623,11 +627,13 @@ Field notes worth telling the user:
     offer) — one key primes OpenAI's `prompt` field and the local whisper `initial_prompt` alike.
     The top-level `language` (TTS voice selection) stays as the dominant language either way. Say the
     value you wrote and why, in one line, so a user who later switches backend knows to revisit this.
-  - When the user already has an ElevenLabs key configured for TTS (`VOICE_LOOP_TTS_API_KEY`),
-    offer `elevenlabs` for STT as the natural choice — the same key covers both directions with no
-    extra setup. That shared-key rule is ElevenLabs' STT rule alone; every other provider needs its
-    own key, and switching `tts.cloud.provider` means pointing `tts.cloud.api_key_env` at that
-    provider's own key.
+  - When the user already has an ElevenLabs key configured for TTS (`VOICE_LOOP_TTS_API_KEY`) AND
+    `tts.cloud.provider` is also `elevenlabs`, offer `elevenlabs` for STT as the natural choice —
+    the same key covers both directions with no extra setup. That shared-key rule is ElevenLabs'
+    STT rule alone; every other provider needs its own key, and switching `tts.cloud.provider`
+    to a different vendor means dictation borrows the TTS key only when TTS is also ElevenLabs,
+    so a user relying on `VOICE_LOOP_TTS_API_KEY` for STT must set `stt.cloud.api_key_env`
+    or `tts.cloud.provider: "elevenlabs"` explicitly.
   - Say plainly that cloud STT sends the recorded audio clip to the provider's servers — that is
     the privacy trade every cloud backend makes, and it is stated explicitly in the plugin README.
   - If the cloud call fails (network down, quota, expired key) dictation **degrades to the local

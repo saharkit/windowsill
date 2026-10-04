@@ -103,8 +103,11 @@ order, once. The pipeline scripts ship in this repo at `plugins/voice-loop/rvc/t
 they are deployed flat at `~/voice/rvc/` (the layout in §2), beside the venv and Applio they drive.
 
 ```sh
-# 0. uv — install.sh invokes it; nothing else here installs it
-curl -LsSf https://astral.sh/uv/install.sh | sh          # uv lands in ~/.local/bin (install.sh adds it to PATH)
+# 0. uv — install.sh invokes it; nothing else here installs it.
+#    Install uv following the instructions at https://docs.astral.sh/uv/getting-started/installation/
+#    (the vendor's own docs). If you want a one-shot from the command line instead, download the
+#    installer to a file first, read it, then run that file with sh — never pipe a remote script
+#    straight into a shell. uv lands in ~/.local/bin (install.sh adds it to PATH).
 
 # 1. the venv every script hard-codes ($HOME/voice/rvc/venv) — no step creates it otherwise
 python3.12 -m venv ~/voice/rvc/venv

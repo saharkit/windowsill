@@ -335,7 +335,7 @@ def _clear_text_refusal(s: dict) -> str | None:
     if s["backend"] != "cloud":
         return None
     entry = resolve_stt_provider(s["stt_provider"])
-    key_envs = entry.key_envs(s["key_env"])
+    key_envs = entry.key_envs(s["key_env"], s["tts_provider"])
     if not any(read_key(s["key_file"], env, os.environ) for env in key_envs):
         return None  # no credential configured — the cloud path refuses keyless calls itself
     urls = [entry.endpoint(s)]
@@ -502,6 +502,12 @@ def resolve_settings(config: dict, system: str) -> dict:
         # to the API's token cap, the local path sends it whole.
         "stt_prompt": str(cfg(config, "stt.prompt", "")).strip(),
         "stt_provider": entry.name,
+        # Used by ``entry.key_envs`` to gate the TTS-key borrow: an unset ``tts.cloud.provider``
+        # falls through the same unknown-name fallback ``speak.py`` uses and resolves to the
+        # registry's default (see ``providers.DEFAULT_TTS``) — a user on a local TTS backend who
+        # relied on ``VOICE_LOOP_TTS_API_KEY`` must now set ``stt.cloud.api_key_env`` or
+        # ``tts.cloud.provider: "elevenlabs"`` explicitly. Both paths are documented in the README.
+        "tts_provider": str(cfg(config, "tts.cloud.provider", providers.DEFAULT_TTS)),
         "cloud_endpoint": str(cfg(config, "stt.cloud.endpoint", "")),
         "key_env": str(cfg(config, "stt.cloud.api_key_env", cfg(config, "stt.api_key_env", "VOICE_LOOP_STT_API_KEY"))),
         "key_file": str(cfg(config, "stt.cloud.key_file", "")),
@@ -1281,7 +1287,7 @@ def _transcribe_cloud(s: dict, wav_bytes: bytes, boundary: str) -> str | None:
     read off that entry (see providers.py).
     """
     entry = resolve_stt_provider(s["stt_provider"])
-    key_envs = entry.key_envs(s["key_env"])
+    key_envs = entry.key_envs(s["key_env"], s["tts_provider"])
     key = ""
     for env in key_envs:
         key = read_key(s["key_file"], env, os.environ)
@@ -2146,7 +2152,7 @@ def stream_worker(s: dict, args: list[str]) -> int:
     if entry.streaming is None:
         _write_stream_result({"status": "failed", "reason": f"{entry.name} has no streaming variant"})
         return 1
-    key_envs = entry.key_envs(s["key_env"])
+    key_envs = entry.key_envs(s["key_env"], s["tts_provider"])
     key = ""
     for env in key_envs:
         key = read_key(s["key_file"], env, os.environ)
