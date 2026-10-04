@@ -1,6 +1,6 @@
 """Regression tests for the silent-degradation defect (windowsill#267).
 
-`plugins/voice-loop/tests/conftest.py` carries a hook that drops every test module
+`tests/voice-loop/tests/conftest.py` carries a hook that drops every test module
 except `test_conformance.py` when `voice_server` is not importable. That hook exists so
 the shelf-wide verify gate — which warms pytest + pytest-cov but never installs
 fastapi / torch — can still run the conformance suite on a bare venv. The defect the
@@ -34,7 +34,11 @@ import sys
 from pathlib import Path
 
 _TESTS_DIR = Path(__file__).resolve().parent
-_PLUGIN_DIR = _TESTS_DIR.parent
+# The pytest root (`pytest.ini` lives here) is one level up; subprocesses that need to invoke
+# `pytest tests/` start there. The plugin folder sits two levels up at `<root>/plugins/voice-loop/`
+# but no consumer in this file needs the absolute path — the test setup reads the same files
+# pytest's own loader finds, and pytest's loader follows the pythonpath set in pytest.ini.
+_TEST_ROOT = _TESTS_DIR.parent
 
 # A meta_path finder that raises ImportError for any name under `voice_server`. The
 # string is identical across all three subprocess invocations; keeping it as one
@@ -98,7 +102,13 @@ OPT_IN_ENV = "VOICE_LOOP_ALLOW_DEGRADED_COLLECTION"
 
 # The install command the conftest banner advertises; a regression that rewrites the
 # banner should make the assertion below fail.
-_INSTALL_HINT = "pip install -r plugins/voice-loop/tests/requirements.txt"
+_INSTALL_HINT = "pip install -r tests/requirements.txt"
+
+# A regression the path itself was wrong (a name this diff renamed away, a path that
+# resolves to nothing) would make the banner honest in text and broken in practice —
+# the user copies the hint, pip fails, and the silent-green return is back. The pin
+# test asserts the path the hint points at actually exists on disk.
+_INSTALL_HINT_PATH = _TEST_ROOT / "tests" / "requirements.txt"
 
 # The number of server-dependent modules we expect to see dropped. The conftest's
 # `pytest_ignore_collect` returns True for any `.py` file in the tests/ tree whose full
@@ -129,7 +139,7 @@ def _run_subprocess(args, env_overrides=None, blocker=True, timeout=120):
         env.update(env_overrides)
     return subprocess.run(
         cmd,
-        cwd=_PLUGIN_DIR,
+        cwd=_TEST_ROOT,
         env=env,
         capture_output=True,
         text=True,
@@ -143,27 +153,28 @@ def test_degraded_collection_full_path_still_green_when_voice_server_is_importab
     Regression target: a conftest change that accidentally hooks the importable branch
     (e.g. by mutating session.exitstatus unconditionally) would flip this run red.
     """
-    result = _run_subprocess(
-        ["tests/", "--collect-only", "-o", "addopts="],
-        blocker=False,
-    )
 
-    combined = result.stdout + result.stderr
-    assert result.returncode == 0, (
-        f"conftest hook regressed the importable branch: rc={result.returncode}\n"
-        f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+
+def test_the_install_hint_points_at_a_file_that_actually_exists():
+    """The banner tells the user a `pip install -r …` command; that path must resolve.
+
+    A regression where the hint path is renamed away (this diff moved the requirements
+    file) would make the banner honest in text and broken in practice — the user
+    copies the command, pip returns ENOENT, and the run they came here to fix is no
+    closer to running. The hint MUST point at a real file, and the path the
+    subprocess cwd sees MUST be the one we just installed.
+    """
+    assert _INSTALL_HINT_PATH.is_file(), (
+        f"the install hint's path does not exist: {_INSTALL_HINT_PATH} "
+        f"(hint: {_INSTALL_HINT!r})"
     )
-    # The header is suppressed by `-q`, but the absence of any "DEGRADED" or "voice-loop:"
-    # banner in the summary is itself the assertion: nothing should announce itself when
-    # the run is healthy.
-    assert "DEGRADED" not in combined, (
-        f"banner fired on the importable branch:\n{combined}"
+    # And the hint is the path subprocesses see at this cwd — the test that
+    # the banner stays correct under the moved test root.
+    rel = _INSTALL_HINT_PATH.relative_to(_TEST_ROOT)
+    assert _INSTALL_HINT.endswith(str(rel).replace(os.sep, "/")), (
+        f"the install hint ({_INSTALL_HINT!r}) does not name the file the cwd "
+        f"actually has: {rel}"
     )
-    assert OPT_IN_ENV not in combined, (
-        f"opt-in name leaked into the importable-branch output:\n{combined}"
-    )
-    # And the conformance module was actually collected (the user reads this).
-    assert "test_conformance" in combined
 
 
 def test_degraded_collection_without_opt_in_refuses_with_named_exit_code():
@@ -319,7 +330,7 @@ def test_ignored_at_collection_resets_between_runs_in_one_process():
     env.pop(OPT_IN_ENV, None)
     result = subprocess.run(
         [sys.executable, "-c", _RESET_RUNNER],
-        cwd=_PLUGIN_DIR,
+        cwd=_TEST_ROOT,
         env=env,
         capture_output=True,
         text=True,

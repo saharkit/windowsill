@@ -32,7 +32,7 @@ from pathlib import Path
 
 import pytest
 
-_SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
+_SCRIPTS = Path(__file__).resolve().parents[3] / "plugins" / "voice-loop" / "scripts"
 _spec = importlib.util.spec_from_file_location("report_bug", _SCRIPTS / "report_bug.py")
 report_bug = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(report_bug)
@@ -645,6 +645,37 @@ def test_metadata_lines_travel_whole():
         "no recorder available",
     ):
         assert report_bug.scrub_message(message) == (message, True)
+
+
+def test_local_command_failure_log_lines_travel_whole():
+    """The local-command branch has three failure exits, each a metadata event, not a payload.
+
+    `play_text` shlex-splits ``tts.command`` and spawns it as argv. The three failure modes are:
+    an unparseable command (a stray quote — the user typo), an empty argv after the split
+    (whitespace-only or a string of quotes shlex collapses to nothing), and the eventual
+    non-zero exit that the rc= line already names. Each is a configuration accident or a
+    runtime refusal — none of them carries the user's command, the user's text, or anything
+    the bundle should not see — so the LOG_RULES rows for the first two prefixes are
+    ``None`` cut markers and the whole message travels. The redaction test pins each prefix
+    to a real shlex output: a ValueError's ``{err}`` reason and the literal "empty" line
+    the script logs.
+    """
+    # An unparseable command: the {err} substitution is a shlex ValueError reason, which is
+    # the position of the offending character — no user content travels here either.
+    assert report_bug.scrub_message(
+        "local command unparseable: No closing quotation"
+    ) == ("local command unparseable: No closing quotation", True)
+    # The empty-after-split line has no payload at all; the whole string is the event.
+    assert report_bug.scrub_message("local command is empty") == (
+        "local command is empty",
+        True,
+    )
+    # A multi-line variant the unparseable branch could one day log — the prefix covers
+    # everything that starts with the rule's head, so the tail (still metadata, not user
+    # text) travels with the prefix.
+    assert report_bug.scrub_message(
+        "local command unparseable: unmatched quote at pos 4"
+    ) == ("local command unparseable: unmatched quote at pos 4", True)
 
 
 def test_an_unknown_line_is_cut_not_trusted():

@@ -20,7 +20,7 @@ from pathlib import Path
 import providers
 import pytest
 
-_PROBE_PATH = Path(__file__).resolve().parents[1] / "scripts" / "tls-probe.py"
+_PROBE_PATH = Path(__file__).resolve().parents[3] / "plugins" / "voice-loop" / "scripts" / "tls-probe.py"
 _spec = importlib.util.spec_from_file_location("tls_probe", _PROBE_PATH)
 tls_probe = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(tls_probe)

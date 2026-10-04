@@ -4,8 +4,9 @@ from pathlib import Path
 
 
 _ROOT = Path(__file__).resolve().parents[3]
+_TEST_ROOT = _ROOT / "tests" / "voice-loop"
 _SCRIPTS = _ROOT / "plugins" / "voice-loop" / "scripts"
-_COVERAGERC = _ROOT / "plugins" / "voice-loop" / ".coveragerc"
+_COVERAGERC = _TEST_ROOT / ".coveragerc"
 
 
 def _registered_exclude_lines():

@@ -32,7 +32,7 @@ the same text with its figures drawn. A correction goes into both.
   agent, not tied to a language or a stack. Carries `/target-world-walk`, which derives what a plan needs
   by replaying one real piece of work through the system you intend to have.
 - [sill-core](https://github.com/saharkit/windowsill/tree/main/plugins/sill-core): the shared substrate —
-  a schema-versioned, atomic-write assistant state store, one file per plugin under `XDG_STATE_HOME`.
+  a schema-versioned, atomic-write assistant state store, one file per plugin in the user's state directory.
 - [agent-statusline](https://github.com/saharkit/windowsill/tree/main/plugins/agent-statusline): one line
   at the bottom of Claude Code — context spent, weekly budget spent, which model is answering.
 

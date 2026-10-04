@@ -43,7 +43,7 @@ os.environ["USERPROFILE"] = str(_FAKE_HOME)
 # `TMP_DIR` in rvc_server picks /dev/shm when writable, else tempfile.gettempdir() — that decision
 # happens at module import, so let the module choose (no override needed for these tests).
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "rvc" / "serve"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "plugins" / "voice-loop" / "rvc" / "serve"))
 try:
     import rvc_server  # noqa: E402  — import-side-effects are load-bearing; see comment above
 finally:

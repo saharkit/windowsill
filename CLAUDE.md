@@ -16,9 +16,13 @@ Root-level, and this is the whole list (every tracked entry): `README.md` (the c
 face** — the GitHub Pages site, served from this directory; what it contains at any moment is its own
 business and is not enumerated here), `.claude-plugin/` (holds `marketplace.json`, what
 `marketplace add` reads), `.github/` (shared CI), `plugins/`
-(one directory per plugin), `tales/` (story content, not a plugin — the told tales, the `canon/` core
-of universe-model laws and the entity registry, and `CONTRIBUTING.md` for tales), `LICENSE`,
-`.gitignore`, `.gitattributes`, `.claude/`, this file.
+(one directory per plugin), `tests/` (shelf-level tests and test roots that cannot live inside a plugin
+folder — `voice-loop/` (the voice-loop test suite; the plugin folder is shipped as the install target,
+and the directory holds any shipped file of 256 KiB or more, so the suite lives here under
+`voice-loop/` rather than `plugins/voice-loop/tests/`) and `test_directory_listing.py` (the
+directory-listing acceptance test, run by `validate`)), `tales/` (story content, not a plugin — the
+told tales, the `canon/` core of universe-model laws and the entity registry, and `CONTRIBUTING.md`
+for tales), `LICENSE`, `.gitignore`, `.gitattributes`, `.claude/`, this file.
 
 **This list being complete is load-bearing, not tidiness.** A review brief is assembled from it, so a
 root entry missing here is invisible to the lens reading it. That is not hypothetical: on #245 two
@@ -61,9 +65,12 @@ removed; the XTTS engine's own pins are deliberately NOT in it — see `server/R
   security-lens change.
 - `hooks/hooks.json` registers `Stop` and `PostToolUse`; `skills/` ships `voice-setup` and
   `voice-design`.
-- `tests/`, `pytest.ini`, `.coveragerc` live in the plugin directory and are invoked from there. The
-  suite touches **no models, no network and no audio hardware** — expensive dependencies are faked at
-  a seam while the real function bodies run.
+- `pytest.ini`, `.coveragerc` and the suite live in **`tests/voice-loop/`** (the repo-root
+  tests directory, not the plugin folder — every file in the plugin folder ships, and the directory
+  holds any shipped file of 256 KiB or more; see `tests/` under the root list). The suite is invoked
+  from `tests/voice-loop/` (`cd tests/voice-loop && pytest …`). The suite touches **no models, no
+  network and no audio hardware** — expensive dependencies are faked at a seam while the real
+  function bodies run.
 
 ## The gates, as CI runs them today
 
@@ -79,14 +86,19 @@ queue's `merge_group` ref, and manual:
   context: `needs` all three real jobs, `if: always()`, and fails unless every needed result is
   `success` — one fixed-name check that reports on every run (matrix jobs publish per-leg
   display names, which is why the ruleset must not point at them).
-- **`coverage` job** (the voice-loop Linux matrix leg) — `cd plugins/voice-loop && pytest --cov
+- **`coverage` job** (the voice-loop Linux matrix leg) — `cd tests/voice-loop && pytest --cov
   --cov-report=term-missing`, on Python **3.10, 3.11, 3.12 and 3.13**. `.coveragerc` sets
   `branch = True`, so the 100% is **statements *and* branches**. Pytest runs *bare* (no
   `--cov-fail-under`): every coverage threshold below is enforced by a separate `coverage
   report --include=… --fail-under=…` call against the same `.coverage` artifact, so a regression
   in one scope cannot hide behind another's threshold. The 100% gate on this leg is
-  `server/voice_server*` (non-negotiable, never dropped, asserted on every leg that reaches it
-  — the Linux matrix, the Windows leg, and the macOS leg all do). The remaining hook scripts
+  `**/plugins/voice-loop/server/voice_server*` (non-negotiable, never dropped, asserted on
+  every matrix leg that reaches it — the four Linux python versions, all 3.10–3.13). The
+  Windows and macOS legs collect coverage for the union gate in `combined-coverage` but do
+  NOT re-assert the server 100% (the per-leg data is never the gate's input; the server's
+  coverage is exercised on every matrix leg already, and re-asserting on Windows/macOS would
+  only re-test the same statements against a second Python on the same code). The remaining
+  hook scripts
   are deliberately *not* under a per-leg 100% gate on this job: `scripts/*`, `scripts/doctor.py`
   and `scripts/speak.py` were moved off this leg and onto the union (combined-coverage, below)
   when voice-loop bought coverage legs per platform — platform code is MEASURED on the platform
@@ -164,7 +176,11 @@ review lens is the only thing standing between it and an unearned claim.
   `refactor:`, `chore:`, `tales:`. The list is open: a new area names itself in the same style.
 - **Tests live with their plugin**, and **coverage config is per-plugin**
   (`plugins/<name>/.coveragerc`, `plugins/<name>/pytest.ini`) with paths relative to that directory.
-  Plugins never share a test root; adding one never disturbs another.
+  Plugins never share a test root; adding one never disturbs another. **One standing exception:**
+  voice-loop's suite, `pytest.ini` and `.coveragerc` live at the repo-root `tests/voice-loop/`,
+  not inside the plugin folder — the plugin folder is the install target and every file in it ships,
+  and the Anthropic plugin directory holds any shipped file of 256 KiB or more, so the test suite
+  (whose dictation module is 324 889 bytes) lives outside it.
 - **CI is shared, per-plugin.** A new plugin adds its own jobs (or matrix entries) to the existing
   workflow rather than a second workflow: scope each job with `working-directory: plugins/<name>` and
   prefix the job id with the plugin name. That shape is for the *second* plugin onward and the tree

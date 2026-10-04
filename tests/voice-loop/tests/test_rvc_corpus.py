@@ -16,7 +16,9 @@ from pathlib import Path
 import pytest
 
 # The module under test lives in scripts/; add it to the path.
-_scripts_dir = os.path.join(os.path.dirname(__file__), "..", "scripts")
+# The test root sits at tests/voice-loop/tests/, three parents below the repo root, so the
+# plugin's scripts/ is reachable via `../../../plugins/voice-loop/scripts`.
+_scripts_dir = str(Path(__file__).resolve().parents[3] / "plugins" / "voice-loop" / "scripts")
 if _scripts_dir not in sys.path:
     sys.path.insert(0, _scripts_dir)
 

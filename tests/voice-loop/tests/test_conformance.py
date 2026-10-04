@@ -16,7 +16,8 @@ from pathlib import Path
 
 import pytest
 
-_PLUGIN = Path(__file__).resolve().parents[1]
+_ROOT = Path(__file__).resolve().parents[3]
+_PLUGIN = _ROOT / "plugins" / "voice-loop"
 _CONFORMANCE = _PLUGIN / "CONFORMANCE.md"
 _PLUGIN_JSON = _PLUGIN / ".claude-plugin" / "plugin.json"
 _SKILL = _PLUGIN / "skills" / "conformance" / "SKILL.md"
@@ -122,7 +123,7 @@ class TestEveryVersionBearingDocAgreesWithTheManifest:
     fails a test forever rather than depending on somebody noticing.
     """
 
-    _ROOT = _PLUGIN.parents[1]
+    _ROOT = Path(__file__).resolve().parents[3]
 
     def _version(self) -> str:
         return _plugin_version()

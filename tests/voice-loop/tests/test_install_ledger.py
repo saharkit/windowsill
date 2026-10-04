@@ -16,10 +16,14 @@ from datetime import datetime, timezone
 
 import pytest
 
-# The module under test lives in scripts/; add it to the path.
+# The module under test lives in plugins/voice-loop/scripts/; add it to the path.
+# This test root sits at tests/voice-loop/tests/, three parents below the repo root, so the
+# plugin's scripts/ is reachable via `../../../plugins/voice-loop/scripts`.
 import sys
 
-_scripts_dir = os.path.join(os.path.dirname(__file__), "..", "scripts")
+_scripts_dir = os.path.normpath(
+    os.path.join(os.path.dirname(__file__), "..", "..", "..", "plugins", "voice-loop", "scripts")
+)
 if _scripts_dir not in sys.path:
     sys.path.insert(0, _scripts_dir)
 
@@ -1052,7 +1056,7 @@ class TestLedgerSizeBound:
         # Composition with the skill's entry flow: an oversized ledger keeps the
         # closed CLI contract (state "none" + read_status), so `check` still exits 0
         # and SKILL.md's guard branch keeps parsing it.
-        self._write(ledger_path, b"{\"state\": \"in_progress\", \"steps\": {}} " * 40_000)
+        self._write(ledger_path, b'{"state": "in_progress", "steps": {}} ' * 40_000)
         result = install_ledger.check_state(ledger_path)
         assert result["state"] == "none"
         assert result["read_status"] == "oversized"

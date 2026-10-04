@@ -455,6 +455,8 @@ LOG_RULES: tuple[tuple[str, str | None], ...] = (
     ("stop: dropped a read identical to the last spoken line (dedup): ", "(dedup): "),
     ("text: ", "text: "),
     ("local command failed: ", None),
+    ("local command unparseable: ", None),
+    ("local command is empty", None),
     ("local command rc=", None),
     ("timings extract_ms=", None),
     ("cloud tts: no key", None),

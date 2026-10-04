@@ -71,6 +71,10 @@ cd plugins/sill-core
 pytest --cov=sill_core --cov-report=term-missing --cov-fail-under=100
 ```
 
+## Eval suite
+
+No eval suite: sill-core is a library with no skill, hook or command a prompt can reach.
+
 ## License
 
 MIT — see the root [LICENSE](../../LICENSE).
