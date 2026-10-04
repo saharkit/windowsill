@@ -236,10 +236,11 @@ CHECK_MANIFEST: list[dict] = [
             "network path is broken."
         ),
         "fix": (
-            "Check that the server is running: "
-            "`systemctl --user status voice-loop.service` (Linux) or "
-            "`curl http://127.0.0.1:8355/health`.  If it is stopped, "
-            "start it: `systemctl --user start voice-loop.service`."
+            "Check that the server is running with "
+            "`systemctl --user status voice-loop.service` (Linux).  If it "
+            "is stopped, start it: `systemctl --user start "
+            "voice-loop.service`.  Then re-run `/doctor` to confirm the "
+            "diagnosis."
         ),
         "offer_flip": False,
         "check": {
@@ -326,9 +327,9 @@ CHECK_MANIFEST: list[dict] = [
             "cloud key may be missing or invalid."
         ),
         "fix": (
-            "Check the STT endpoint: `curl <stt.endpoint>/health`.  "
             "For cloud STT, check that the key file exists or the "
-            "named environment variable is set."
+            "named environment variable is set, then re-run `/doctor` "
+            "to confirm the diagnosis."
         ),
         "offer_flip": False,
         "check": {
