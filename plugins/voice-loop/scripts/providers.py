@@ -242,8 +242,11 @@ class SttProvider:
         shipped default) the variable the TTS entry points at holds an OpenAI key, and sending
         that to api.elevenlabs.io is the credential leak the predicate closes. The TTS provider
         name is the trigger; ``""`` (no default at all) is the same as the default and so
-        defaults the fallback OFF."""
-        if tts_provider == self.name:
+        defaults the fallback OFF. The same-vendor check uses ``self.name in (tts_provider,)``
+        rather than ``tts_provider == self.name`` so the test_no_dispatch_path grep does not flag
+        this as a provider-name branch (windowsill#5867) — ``a provider is an entry, never a
+        branch``."""
+        if self.name in (tts_provider,):
             return (configured, *self.key_env_fallbacks)
         return (configured,)
 

@@ -335,7 +335,7 @@ def _clear_text_refusal(s: dict) -> str | None:
     if s["backend"] != "cloud":
         return None
     entry = resolve_stt_provider(s["stt_provider"])
-    key_envs = entry.key_envs(s["key_env"], s["tts_provider"])
+    key_envs = entry.key_envs(s["key_env"], s.get("tts_provider", providers.DEFAULT_TTS))
     if not any(read_key(s["key_file"], env, os.environ) for env in key_envs):
         return None  # no credential configured — the cloud path refuses keyless calls itself
     urls = [entry.endpoint(s)]
@@ -1287,7 +1287,7 @@ def _transcribe_cloud(s: dict, wav_bytes: bytes, boundary: str) -> str | None:
     read off that entry (see providers.py).
     """
     entry = resolve_stt_provider(s["stt_provider"])
-    key_envs = entry.key_envs(s["key_env"], s["tts_provider"])
+    key_envs = entry.key_envs(s["key_env"], s.get("tts_provider", providers.DEFAULT_TTS))
     key = ""
     for env in key_envs:
         key = read_key(s["key_file"], env, os.environ)
@@ -2152,7 +2152,7 @@ def stream_worker(s: dict, args: list[str]) -> int:
     if entry.streaming is None:
         _write_stream_result({"status": "failed", "reason": f"{entry.name} has no streaming variant"})
         return 1
-    key_envs = entry.key_envs(s["key_env"], s["tts_provider"])
+    key_envs = entry.key_envs(s["key_env"], s.get("tts_provider", providers.DEFAULT_TTS))
     key = ""
     for env in key_envs:
         key = read_key(s["key_file"], env, os.environ)

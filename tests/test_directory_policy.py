@@ -63,30 +63,18 @@ _ALLOWED_TOOLS_LINE_RE = re.compile(r"^allowed-tools:[ \t]*(.*?)[ \t]*$", re.MUL
 _FLOW_LIST_RE = re.compile(r"^\[(.*)\]\s*$")
 
 
-def _parse_front_matter(path: Path) -> dict[str, str] | None:
-    """A skill/command/agent file's front matter as a flat dict of ``key: value`` lines.
+def _strip_one_level_of_matching_quotes(item: str) -> str:
+    """Strip ONE level of matching quotes (``"…"` or ``'…'``) from an allowed-tools item.
 
-    Only the keys this test cares about (``allowed-tools``) are read; the rest is left as
-    the raw string the matcher compares against. ``None`` when the file has no front
-    matter at all (a plain markdown body) — the allowed-tools check below then has
-    nothing to assert on, so the file is skipped."""
-    try:
-        text = path.read_text(encoding="utf-8")
-    except (OSError, UnicodeError):
-        return None
-    match = _FRONTMATTER_RE.search(text)
-    if not match:
-        return None
-    body = match.group(1)
-    parsed: dict[str, str] = {}
-    for line in body.splitlines():
-        if not line.strip() or line.lstrip().startswith("#"):
-            continue
-        if ":" not in line:
-            continue
-        key, _, value = line.partition(":")
-        parsed[key.strip()] = value.strip()
-    return parsed
+    A bare ``Bash`` quoted as ``"Bash"`` or ``'Bash'`` must NOT evade the directory's
+    ALLOWED_TOOLS_BROAD rescan (windowsill#5867): the scan reads literal tool names, and a
+    future author who writes ``allowed-tools: ["Bash", Read]`` would otherwise pass the gate
+    even though ``claude plugin validate --strict`` accepts both spellings as the same entry.
+    The function strips a SINGLE level — a doubly-quoted ``""Bash""`` becomes ``"Bash"``,
+    not ``Bash`` — so a future author cannot dodge the check by doubling up."""
+    if len(item) >= 2 and item[0] == item[-1] and item[0] in ("'", '"'):
+        return item[1:-1]
+    return item
 
 
 def _flow_list_items(value: str) -> list[str] | None:
@@ -124,7 +112,7 @@ def _flow_list_items(value: str) -> list[str] | None:
             buf.append(char)
     if buf:
         items.append("".join(buf).strip())
-    items = [item for item in items if item]
+    items = [_strip_one_level_of_matching_quotes(item) for item in items if item]
     if not items:
         return [_UNPARSEABLE_SENTINEL]  # an empty ``[...]`` is unparseable too
     return items
@@ -230,7 +218,7 @@ def _is_bash_item(item: str) -> bool:
     directory's rule enforces). ``Bash(...)`` and ``Bash*`` are equivalent under the rule
     (windowsill#5867), so the prefix check covers both — a literal ``Bash`` also fails
     by the same prefix."""
-    return item == "Bash" or item.startswith("Bash(")
+    return item == "Bash" or item.startswith(("Bash(", "Bash*"))
 
 
 def _refusal_for(path: Path) -> list[str] | None:
@@ -342,6 +330,30 @@ def test_allowed_tools_refuses_an_unparseable_value_with_a_brace(tmp_path: Path)
     assert refusal == ["unparseable allowed-tools value"], (
         "the brace-bearing refusal fixture must fail with the unparseable reason; "
         f"refusal={refusal!r}"
+    )
+
+
+def test_allowed_tools_refuses_a_flow_list_with_bash(tmp_path: Path) -> None:
+    """Refusal fixture (R5): the flow-list spelling every shipped skill file uses
+    (``allowed-tools: [Bash, Read]``) is refused on disk, exercised through the real
+    file walker / front-matter parser. A regression that turned the flow-list branch
+    of the parser into a silent pass (e.g. a regex that swallowed the line after the
+    ``[``) would otherwise slip through every block-style fixture here."""
+    skill = tmp_path / "skills" / "flow-list-bash" / "SKILL.md"
+    skill.parent.mkdir(parents=True, exist_ok=True)
+    skill.write_text(
+        "---\n"
+        "allowed-tools: [Bash, Read]\n"
+        "---\n"
+        "\n"
+        "# placeholder\n"
+        "A body paragraph that is enough for the front-matter parser to read.\n",
+        encoding="utf-8",
+    )
+    refusal = _refusal_for(skill)
+    assert refusal is not None and "Bash" in refusal, (
+        "the flow-list Bash refusal fixture does not refuse its own entry on disk; the "
+        f"flow-list parser missed it, refusal={refusal!r}"
     )
 
 
