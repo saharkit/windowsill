@@ -19,9 +19,13 @@ business and is not enumerated here), `.claude-plugin/` (holds `marketplace.json
 (one directory per plugin), `tests/` (shelf-level tests and test roots that cannot live inside a plugin
 folder — `voice-loop/` (the voice-loop test suite; the plugin folder is shipped as the install target,
 and the directory holds any shipped file of 256 KiB or more, so the suite lives here under
-`voice-loop/` rather than `plugins/voice-loop/tests/`) and `test_directory_listing.py` (the
-directory-listing acceptance test, run by `validate`) and `test_credential_policy.py` (the
-credential-closure policy test for the voice-loop plugin, run by `validate`)), `tales/` (story content, not a plugin — the
+`voice-loop/` rather than `plugins/voice-loop/tests/`), `test_directory_listing.py` (the
+directory-listing acceptance test, run by `validate`), `test_directory_policy.py` (the
+directory-policy acceptance test: no `Bash` in any skill's `allowed-tools`, and no fetcher piped into
+a shell anywhere under the plugins tree — both holds windowsill#5867 raised after #5816 merged,
+neither of which `claude plugin validate --strict` catches — run by the same CI job that runs
+`test_directory_listing.py`), and `test_credential_policy.py` (the credential-closure policy test for
+the voice-loop plugin, run by `validate`)), `tales/` (story content, not a plugin — the
 told tales, the `canon/` core of universe-model laws and the entity registry, and `CONTRIBUTING.md`
 for tales), `LICENSE`, `.gitignore`, `.gitattributes`, `.claude/`, this file.
 
@@ -32,10 +36,14 @@ left the Pages front pages saying something no longer true. Adding a root entry 
 the same change.
 
 A plugin's **version lives in `plugins/<name>/.claude-plugin/plugin.json`** — that is the source.
-It is recorded in **three** places in all: that manifest, its mirror in
-`.claude-plugin/marketplace.json`, and the plugin's row in the root `README.md` catalog table. All
-three must agree, and **nothing in CI checks that they do** — a bump that misses one is caught by a
-reviewer or not at all. Do not add a fourth site (this file deliberately names no version number).
+The minimum update touches three files: that manifest, its mirror in
+`.claude-plugin/marketplace.json`, and the plugin's row in the root `README.md` catalog table.
+Plugins with a `PUBLISHING.md` row, a versioned acceptance checklist (`plugins/<name>/CONFORMANCE.md`),
+or Pages docs that print the version in a colophon add more — a voice-loop version bump touches nine
+files in all (manifest, marketplace mirror, README row, PUBLISHING.md row, the CONFORMANCE.md pin,
+and four Pages colophons under `docs/`). **All sites must agree**, and **nothing in CI checks that
+they do** — the cross-file count varies by plugin, so a bump that misses one is caught by a reviewer
+or not at all. Do not add a fourth site (this file deliberately names no version number).
 
 What is on the shelf is **not written here.** `.claude-plugin/marketplace.json` is the machine's
 answer and the root `README.md` catalog table is the reader's; both are updated by the change that

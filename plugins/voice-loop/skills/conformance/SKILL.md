@@ -2,7 +2,7 @@
 name: conformance
 description: Run the voice-loop conformance pass — walk the versioned acceptance checklist interactively, fill every verdict, and emit ONE structured report. The report is then offered through the same three transports as /report-bug (GitHub issue with the conformance label, pre-filled URL, or mailto). Use when the tester says "run the conformance pass", "conformance", "acceptance test", or "validate the release".
 argument-hint: "[--section install|dictation|speak-back|degrade|uninstall]"
-allowed-tools: [Bash, Read, Write, AskUserQuestion, Glob]
+allowed-tools: [Read, Write, AskUserQuestion, Glob]
 ---
 
 # conformance — run the acceptance checklist

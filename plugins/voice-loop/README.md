@@ -168,13 +168,19 @@ coverage (including Russian and Ukrainian) and privacy posture, side by side. Th
 Deepgram is the cheapest and quickest for recognition and the `$200` new-account credit covers an
 evaluation, but its synthesis does not speak Russian or Ukrainian; ElevenLabs and OpenAI do both.
 
-**ElevenLabs STT reuses your existing ElevenLabs API key.** If you already configured
-the `tts_api_key` plugin option in `/config`, dictation works without a second key. When
-`stt.cloud.provider` is `elevenlabs` and `stt_api_key` is empty, the voice-loop MCP relay
-falls back to `CLAUDE_PLUGIN_OPTION_TTS_API_KEY` — one credentials home, not a second one.
+**ElevenLabs STT reuses your existing ElevenLabs API key — when TTS is also ElevenLabs.** If
+you already configured the `tts_api_key` plugin option in `/config` and `tts.cloud.provider` is
+`elevenlabs`, dictation works without a second key. When `stt.cloud.provider` is `elevenlabs`,
+`stt_api_key` is empty, and `tts.cloud.provider` is also `elevenlabs` (windowsill#5867), the
+voice-loop MCP relay falls back to `CLAUDE_PLUGIN_OPTION_TTS_API_KEY` — one credentials home, not a
+second one. With `tts.cloud.provider` set to `openai` or `deepgram`, `tts_api_key` holds a different
+vendor's key, and the borrow is OFF so it is never sent to `api.elevenlabs.io`.
 
 That shared-key rule is ElevenLabs' alone, because it is the one provider covering both directions
-with one account here: a `deepgram` STT config is never handed an ElevenLabs key.
+with one account here: a `deepgram` STT config is never handed an ElevenLabs key, and an
+`elevenlabs` STT config is never handed an OpenAI or Deepgram TTS key. A user on a local TTS
+backend who relied on the TTS key for STT must now set `stt_api_key` in `/config` or
+`tts.cloud.provider: "elevenlabs"` explicitly.
 
 The hotkey dictation path (`scripts/dictate-toggle.sh` / `.cmd`) and the `voice-design` skill are
 not started by Claude Code — they reach the key through the voice-loop plugin MCP server

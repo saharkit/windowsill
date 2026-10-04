@@ -1,4 +1,4 @@
-# voice-loop conformance — v0.9.0
+# voice-loop conformance — v0.9.2
 
 A versioned acceptance checklist for the voice-loop plugin. This file is pinned to the
 plugin version it tests: a release that changes behaviour changes this checklist, and a
@@ -15,7 +15,7 @@ In a Claude Code session with voice-loop installed:
 
 The skill walks this checklist interactively: it asks you for the physical acts (tap the
 hotkey, confirm you heard the sound) and probes the machine for everything else. The result
-is one report file (`conformance-v0.9.0-YYYYMMDD.md`) with every row adjudicated. The
+is one report file (`conformance-v0.9.2-YYYYMMDD.md`) with every row adjudicated. The
 report is then offered through the same three transports as `/report-bug` — a GitHub issue
 (with the `conformance` label), a pre-filled new-issue URL, or a mailto:.
 
@@ -32,7 +32,7 @@ SKIP needs a reason in the evidence cell (e.g. "Wayland-only guard, tested on X1
 | OS / version | _(filled at runtime)_ |
 | WSL | _(if Windows: WSL2 kernel + WSLg versions, else n/a — see TESTING §8)_ |
 | desktop / session (GNOME-Wayland, KDE, X11, macOS) | _(filled at runtime)_ |
-| plugin version | 0.9.0 |
+| plugin version | 0.9.2 |
 | backends chosen (stt / tts) | _(filled at runtime)_ |
 | language | _(filled at runtime)_ |
 
@@ -44,7 +44,7 @@ SKIP needs a reason in the evidence cell (e.g. "Wayland-only guard, tested on X1
 | 1.2 | Plugin install | `/plugin install voice-loop@windowsill` | plugin installs; it appears in `/plugin` | | |
 | 1.3 | Fresh session start | Start a fresh Claude Code session after install | no hook errors in the session preamble; the Stop hook is registered | | |
 | 1.4 | Setup discoverable | `/voice-setup` is offered or listed | the skill is available and can be invoked | | |
-| 1.5 | Setup under default permission mode | Run `/voice-setup` with normal (default) permission mode — not bypass | the agent states its plan before acting; ≤3 permission prompts for the whole install | | |
+| 1.5 | Setup under default permission mode | Run `/voice-setup` with normal (default) permission mode — not bypass | the agent states its plan before acting; ≤3 approval batches in default mode; per-command approval in manual mode | | |
 | 1.6 | Language question | During setup, the language question comes first | one confirm for the common case, pre-answered from the environment | | |
 | 1.7 | Backend choice | The backend choice is offered per direction | cost and privacy tradeoff stated for each; user makes an informed choice | | |
 | 1.8 | No silent root | No `sudo` is ever executed silently during setup | any root step is PRINTED for the user to run, not executed | | |
@@ -119,7 +119,7 @@ SKIP needs a reason in the evidence cell (e.g. "Wayland-only guard, tested on X1
 | # | scenario | steps | expected | verdict | evidence |
 |---|---|---|---|---|---|
 | 5.1 | Inventory first | Run `/voice-remove` on a machine with the full install | inventory printed FIRST — every path with its size — before anything is deleted | | |
-| 5.2 | Permission prompt count | Count the permission prompts during `/voice-remove` | ≤3 | | |
+| 5.2 | Permission prompt count | Count the permission prompts during `/voice-remove` | ≤3 approval batches in default mode; per-command approval in manual mode | | |
 | 5.3 | Service stopped and disabled | After accepting the service removal | `systemctl --user is-active voice-loop.service` → inactive, `is-enabled` → disabled or not found; the unit file is gone | | |
 | 5.3b | Contour schedule stopped | Follow the README's scheduling recipe (timer or cron line), then run `/voice-remove` | the schedule is inventoried in Step 0 and stopped BEFORE the scripts go: `systemctl --user is-enabled voice-loop-contour.timer` → not found, unit files gone; a cron line is PRINTED for the user to delete, never rewritten. A timer still firing a deleted `contour-poll.sh` is a FAIL | | |
 | 5.4 | Hotkey unbound | After accepting the hotkey removal | the binding is gone (GNOME: voice-loop path removed from `custom-keybindings`, user's other shortcuts intact; macOS: dictate-toggle line gone from `skhdrc`) | | |
@@ -134,5 +134,5 @@ SKIP needs a reason in the evidence cell (e.g. "Wayland-only guard, tested on X1
 
 ---
 
-**Checklist version:** 0.9.0 — pinned to `plugins/voice-loop/.claude-plugin/plugin.json`.
+**Checklist version:** 0.9.2 — pinned to `plugins/voice-loop/.claude-plugin/plugin.json`.
 A mismatch between this version and the plugin version is a stale checklist.

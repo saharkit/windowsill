@@ -2,7 +2,7 @@
 name: report-bug
 description: Collect a redacted voice-loop diagnostics bundle (versions, config, log tails, server health, recent job states), show the user the exact bytes, ask for explicit consent, and only then file it — as a GitHub issue via the gh CLI, as a pre-filled new-issue URL, or as a mailto. Use when voice-loop misbehaves and the user asks to report a bug, file an issue, or send diagnostics about dictation or speak-back.
 argument-hint: "[a sentence about what went wrong]"
-allowed-tools: [Bash, Read, AskUserQuestion]
+allowed-tools: [Read, AskUserQuestion]
 ---
 
 # report-bug — assemble the evidence, then ask

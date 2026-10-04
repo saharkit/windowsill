@@ -174,10 +174,11 @@ writes.
 nothing — rewrites `~/.local/state/voice-loop/hook-last-fired`, and the server reports its age:
 
 ```sh
-curl -s http://127.0.0.1:8355/health | python3 -c 'import json,sys; h=json.load(sys.stdin); print(h["hook_last_fired"], h["hook_last_fired_age_s"])'
+curl -s http://127.0.0.1:8355/health
 ```
 
-If `hook_last_fired_age_s` keeps **growing while you chat** — minutes old, then tens of minutes —
+The JSON body's two relevant fields are `hook_last_fired` and `hook_last_fired_age_s`. If
+`hook_last_fired_age_s` keeps **growing while you chat** — minutes old, then tens of minutes —
 the harness is no longer calling the hook, and no plugin-side setting will bring the voice back.
 Both fields are `null` when the heartbeat is not observable: the hook never fired on this
 machine, the server runs on another (the ssh-tunnel setup) and the client's state dir is not

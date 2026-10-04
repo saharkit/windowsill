@@ -312,6 +312,19 @@ jobs:
       - name: directory listing acceptance (no category, marketplace icon, 256 KiB, 512 files)
         run: |
           python3 -m pytest tests/test_directory_listing.py
+      # The directory's ALLOWED_TOOLS_BROAD and RUNTIME_FETCH_EXEC holds (windowsill#5867) are not
+      # something `claude plugin validate --strict` can see — every flagged skill file passed that
+      # validator at f9a0faa, and the directory rescan after #5816 still held voice-loop and
+      # agent-statusline on the two findings. The new test is the instrument: the allowed-tools
+      # check pins the cure on all eight flagged files (no Bash entry in any form), and the
+      # pipe-to-shell check covers the two piped lines the directory named in RUNTIME_FETCH_EXEC.
+      # Each check is a separate test function with its own refusal fixture asserted first, so a
+      # future regression that turns a refusal into a pass fails the named test rather than
+      # silently flipping green. The follow-up credential ticket adds its environment-read check
+      # as its own test file, so the two PRs do not share one.
+      - name: directory policy (no Bash in allowed-tools, no pipe-to-shell)
+        run: |
+          python3 -m pytest tests/test_directory_policy.py
       # fix(#5816) — credential-closure policy: voice-loop takes provider keys only from
       # userConfig; the policy test refuses-first on the pre-change tree (f9a0faa) and
       # passes on the post-change tree, with the OBSOLETE_KEYS / providers.py exemptions
