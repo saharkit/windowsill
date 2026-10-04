@@ -538,22 +538,60 @@ jobs:
           fi
           pip install -r plugins/voice-loop/server/requirements.txt
 
+      # The prefetch wraps each download in a bounded _with_retry helper. The retryable pattern
+      # matches the TEXT of the raised exception rather than its class because neither
+      # faster_whisper nor torch.hub surfaces an HTTP status uniformly: faster_whisper swallows
+      # HfHubHTTPError / ConnectionError and re-tries the same fetch with local_files_only=True,
+      # so a cold-cache HF 403/503 reaches the caller as LocalEntryNotFoundError ("Cannot find an
+      # appropriate cached snapshot folder ... outgoing traffic has been disabled") — a message
+      # carrying no status code and none of 403|429|503|rate limit|Service Unavailable|Temporary
+      # failure. The torch.hub half also gets skip_validation=True and the built-in job token
+      # (no new secret) to drop the anonymous api.github.com ref-lookup rate limit.
       - name: prefetch models for this lane's language (cached across runs)
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           python - <<'PY'
-          import os, sys, torch
+          import os, re, sys, time, torch
           sys.path.insert(0, "plugins/voice-loop/server")
           from voice_server import SILERO_VOICES
           from faster_whisper import WhisperModel
 
+          _RETRYABLE = re.compile(
+              r"403|429|503|rate limit|Service Unavailable|Temporary failure"
+              r"|LocalEntryNotFoundError|outgoing traffic has been disabled"
+          )
+          _BACKOFFS = (5, 15, 45, 120)   # sleeps BETWEEN attempts 1->2, 2->3, 3->4, 4->5
+
+          def _with_retry(fn):
+              """Run fn() with up to 5 attempts. Retry only on errors whose repr() matches the
+              retryable pattern; re-raise anything else immediately. The final attempt's error
+              propagates so a genuinely broken host still fails the job loudly."""
+              for attempt in range(1, 6):
+                  try:
+                      return fn()
+                  except Exception as err:
+                      if not _RETRYABLE.search(repr(err)):
+                          raise
+                      if attempt < 5:
+                          sleep_for = _BACKOFFS[attempt - 1]
+                          print(f"prefetch attempt {attempt}/5 failed: {err}")
+                          time.sleep(sleep_for)
+                      else:
+                          print(f"prefetch attempt {attempt}/5 failed: {err}")
+                          raise
+
           language = os.environ["VOICE_LOOP_LANGUAGE"]
           silero_language, model_id, speaker = SILERO_VOICES[language]
           print(f"prefetching whisper + silero {model_id} ({silero_language}, {speaker}) for {language}")
-          WhisperModel(os.environ["VOICE_LOOP_STT_MODEL"], device="cpu", compute_type="int8")
-          torch.hub.load(
+          _with_retry(lambda: WhisperModel(
+              os.environ["VOICE_LOOP_STT_MODEL"], device="cpu", compute_type="int8",
+          ))
+          _with_retry(lambda: torch.hub.load(
               "snakers4/silero-models", "silero_tts",
               language=silero_language, speaker=model_id, trust_repo=True,
-          )
+              skip_validation=True,
+          ))
           PY
 
       - name: start the server

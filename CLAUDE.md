@@ -41,7 +41,7 @@ before this line replaced it.
 ## Stack, per plugin tree
 
 **voice-loop** — no build step; the plugin is run from its checkout. The hook and hotkey half needs
-no install at all; the server half does — `pip install -r server/requirements.txt` (eight required
+no install at all; the server half does — `pip install -r server/requirements.txt` (nine required
 runtime dependencies, plus two per-language accentuation extras that ship in the file and can be
 removed; the XTTS engine's own pins are deliberately NOT in it — see `server/README.md`).
 
