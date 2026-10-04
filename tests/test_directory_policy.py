@@ -63,9 +63,9 @@ _ALLOWED_TOOLS_LINE_RE = re.compile(r"^allowed-tools:[ \t]*(.*?)[ \t]*$", re.MUL
 _FLOW_LIST_RE = re.compile(r"^\[(.*)\]\s*$")
 
 
-def _strip_one_level_of_matching_quotes(item: str) -> str:
+def _strip_matching_quotes(item: str) -> str:
     """Strip ALL leading/trailing matching quotes (``"…"` or ``'…'``) from an allowed-tools
-    item, not just one level.
+    item.
 
     A bare ``Bash`` quoted as ``"Bash"`` or ``'Bash'`` must NOT evade the directory's
     ALLOWED_TOOLS_BROAD rescan (windowsill#5867): the scan reads literal tool names, and a
@@ -114,7 +114,7 @@ def _flow_list_items(value: str) -> list[str] | None:
             buf.append(char)
     if buf:
         items.append("".join(buf).strip())
-    items = [_strip_one_level_of_matching_quotes(item) for item in items if item]
+    items = [_strip_matching_quotes(item) for item in items if item]
     if not items:
         return [_UNPARSEABLE_SENTINEL]  # an empty ``[...]`` is unparseable too
     return items
@@ -194,6 +194,14 @@ def _allowed_tools_items(path: Path) -> list[str] | None:
     if not line_match:
         return None
     value = line_match.group(1).strip()
+    # A ``#`` in the value is the YAML comment marker — ``allowed-tools: Bash # reason`` is
+    # a bare ``Bash`` to YAML even though the parser sees the whole tail as one opaque item
+    # (and the directory's ALLOWED_TOOLS_BROAD rescan would flag the ``Bash``). Refusing the
+    # value rather than splitting on ``#`` is the fail-closed choice: a future author who
+    # writes ``allowed-tools: [Bash] # reason`` would otherwise pass the gate with the
+    # parser seeing the literal string ``[Bash] # reason`` as one item.
+    if "#" in value:
+        return [_UNPARSEABLE_SENTINEL]
     if "{" in value:
         return [_UNPARSEABLE_SENTINEL]
     if value.startswith("[") and value.endswith("]"):
@@ -333,6 +341,82 @@ def test_allowed_tools_refuses_an_unparseable_value_with_a_brace(tmp_path: Path)
         "the brace-bearing refusal fixture must fail with the unparseable reason; "
         f"refusal={refusal!r}"
     )
+
+
+def test_strip_matching_quotes_strips_all_outer_levels():
+    """Multi-level quote stripping handles all configured levels (windowsill#5867). The function
+    is named ``_strip_matching_quotes`` rather than ``_strip_one_level_…`` because it strips
+    repeatedly until no outer matching quotes remain — a doubly-quoted ``""Bash""`` becomes
+    ``Bash`` and the bare-``Bash`` check in ``_is_bash_item`` sees it. Pinning the behaviour
+    here so a future regression that reverts to single-level stripping (which would silently
+    pass ``""Bash""`` through as ``"Bash"`` and evade the directory's ALLOWED_TOOLS_BROAD rescan)
+    fails this test by name rather than surviving as a silent green main assertion."""
+    assert _strip_matching_quotes('"Bash"') == "Bash"
+    assert _strip_matching_quotes("'Bash'") == "Bash"
+    assert _strip_matching_quotes('""Bash""') == "Bash"
+    assert _strip_matching_quotes("''Bash''") == "Bash"
+    # mixed quotes (one end ' one end ") are NOT matching — the function leaves them alone.
+    assert _strip_matching_quotes('"Bash\'') == '"Bash\''
+    # single-quote characters mid-string are NOT touched; only outer pairs.
+    assert _strip_matching_quotes('"Bash\'more\'"') == "Bash'more'"
+    # empty / too-short strings pass through.
+    assert _strip_matching_quotes("") == ""
+    assert _strip_matching_quotes('"') == '"'
+    # a non-quoted bare item passes through unchanged.
+    assert _strip_matching_quotes("Bash") == "Bash"
+
+
+def test_allowed_tools_refuses_a_doubly_quoted_bash_entry(tmp_path: Path) -> None:
+    """Refusal fixture: a doubly-quoted flow item (``["Bash", Read]`` with the Bash item itself
+    quoted as ``""Bash""``) must NOT evade the directory's ALLOWED_TOOLS_BROAD rescan
+    (windowsill#5867). The on-disk reader parses ``""Bash""`` to ``Bash`` via the
+    multi-level quote stripper and flags it. A regression that reverts to single-level
+    stripping (the dodge the old docstring warned about) would leave it as ``"Bash"`` and
+    pass silently."""
+    skill = tmp_path / "skills" / "doubly-quoted-bash" / "SKILL.md"
+    skill.parent.mkdir(parents=True, exist_ok=True)
+    skill.write_text(
+        "---\n"
+        "allowed-tools: [\"\"Bash\"\", Read]\n"
+        "---\n"
+        "\n"
+        "# placeholder\n"
+        "A body paragraph that is enough for the front-matter parser to read.\n",
+        encoding="utf-8",
+    )
+    refusal = _refusal_for(skill)
+    assert refusal is not None and "Bash" in refusal, (
+        "the doubly-quoted Bash refusal fixture does not refuse its own entry on disk; the "
+        f"quote stripper missed one or both, refusal={refusal!r}"
+    )
+
+
+def test_allowed_tools_refuses_a_comment_bearing_value(tmp_path: Path) -> None:
+    """Refusal fixture: ``allowed-tools: [Bash] # reason`` and ``Bash # reason`` are read by YAML
+    as a bare ``Bash`` (the ``#`` is the comment marker), but a parser that takes the
+    whole tail as one opaque item passes the gate silently — the directory's
+    ALLOWED_TOOLS_BROAD rescan would flag the bare ``Bash``. Refusing the value rather than
+    splitting on ``#`` is the fail-closed choice; pinned here so a regression that reverts to
+    ``split('#')`` (or anything that strips the tail to expose ``Bash`` and then passes the
+    bare item) fails by name."""
+    for allowed_tools_line in (
+        "allowed-tools: [Bash] # reason\n",
+        "allowed-tools: Bash # reason\n",
+    ):
+        skill = tmp_path / "skills" / "comment-bash" / "SKILL.md"
+        skill.parent.mkdir(parents=True, exist_ok=True)
+        skill.write_text(
+            "---\n"
+            + allowed_tools_line
+            + "---\n"
+            "\n# placeholder\nA body paragraph.\n",
+            encoding="utf-8",
+        )
+        refusal = _refusal_for(skill)
+        assert refusal == ["unparseable allowed-tools value"], (
+            f"the comment-bearing value must fail with the unparseable reason; "
+            f"line={allowed_tools_line!r}, refusal={refusal!r}"
+        )
 
 
 def test_allowed_tools_refuses_a_flow_list_with_bash(tmp_path: Path) -> None:

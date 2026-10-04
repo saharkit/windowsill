@@ -226,6 +226,11 @@ class SttProvider:
     # the live-socket variant of this same provider, or None where the vendor has none / we have
     # not built one. The batch path above is unaffected by its presence and is the fallback for it.
     streaming: "SttStreaming | None" = None
+    # The set of tts_provider names for which ``key_env_fallbacks`` is activated. The default
+    # is the empty tuple (never activated); the entry exposes its data and the dispatch site
+    # decides which to use. ElevenLabs is the only entry that opts in, with
+    # ``fallback_vendors=("elevenlabs",)`` — see ``effective_key_envs`` and windowsill#5867.
+    fallback_vendors: tuple[str, ...] = ()
 
     def endpoint(self, s: dict) -> str:
         """One order, both directions (windowsill#270): an explicit stt.cloud.endpoint wins, then
@@ -234,25 +239,43 @@ class SttProvider:
         — that literal is the same address the TTS chain ends at, by a different route."""
         return str(s.get("cloud_endpoint") or self.default_host or s.get("endpoint", ""))
 
-    def key_envs(self, configured: str, tts_provider: str = "") -> tuple[str, ...]:
-        """Every env var name this provider will accept a key from, most-specific first.
+    def key_envs(self, configured: str) -> tuple[str, ...]:
+        """The full list of env var names this entry will accept a key from, most-specific first.
 
-        ``key_env_fallbacks`` are appended ONLY when the configured TTS provider is the same vendor
-        — the "same vendor" rule (windowsill#5867). With ``tts.cloud.provider: "openai"`` (the
-        shipped default) the variable the TTS entry points at holds an OpenAI key, and sending
-        that to api.elevenlabs.io is the credential leak the predicate closes. The TTS provider
-        name is the trigger; ``""`` (no default at all) is the same as the default and so
-        defaults the fallback OFF. The same-vendor check is expressed as containment of a
-        one-tuple (``self.name in (tts_provider,)``) so the dispatch reads as a single equality
-        behind a containment test — the form that does not match the test_no_dispatch_path grep
-        (windowsill#5867), which forbids a provider-named branch on a literal. ``a provider is
-        an entry, never a branch``."""
-        if self.name in (tts_provider,):
-            return (configured, *self.key_env_fallbacks)
-        return (configured,)
+        Each entry owns its own candidate env list as ``key_env_fallbacks``; this method
+        prepends the configured name and returns the full list. Whether to USE the fallback
+        list at all is the caller's decision — the entry exposes its candidates and the
+        dispatch site decides which to activate, the same way the entry exposes its
+        ``default_host`` and the config overrides it through ``stt.cloud.endpoint``. The
+        same-vendor rule (windowsill#5867) is the only example — see ``effective_key_envs``.
+        No provider-name branch lives here."""
+        return (configured, *self.key_env_fallbacks)
 
     def request(self, s: dict, key: str, wav_bytes: bytes, boundary: str) -> SttRequest:
         return self.build(self, s, key, wav_bytes, boundary)
+
+
+def effective_key_envs(
+    entry: SttProvider,
+    configured: str,
+    tts_provider: str,
+) -> tuple[str, ...]:
+    """The env list the dispatch actually consults — the entry's full candidate list
+    filtered by the config's tts_provider, with no provider-name branch in ``key_envs``.
+
+    The same-vendor rule (windowsill#5867) — the only example — is encoded as data on
+    each entry: ``fallback_vendors`` is the set of tts_provider names for which the
+    fallbacks are activated. ElevenLabs sets it to ``("elevenlabs",)``; all other
+    entries either have empty fallbacks or set ``fallback_vendors=()`` so the
+    fallbacks are always activated (and only matter when ``key_env_fallbacks`` is
+    non-empty, which it isn't for those entries). An empty ``fallback_vendors`` set
+    is the "always-on" default — entries that opt in set it to the set of tts
+    provider names that activate the fallbacks. The branch lives at the dispatch
+    site, on a set-membership test against per-entry data, not on a provider-name
+    literal against the entry's name."""
+    activated = not entry.fallback_vendors or tts_provider in entry.fallback_vendors
+    fallbacks = entry.key_env_fallbacks if activated else ()
+    return (configured, *fallbacks)
 
 
 @dataclass(frozen=True)
@@ -758,10 +781,11 @@ STT_PROVIDERS: dict[str, SttProvider] = {
         name="elevenlabs",
         default_model="scribe_v1",
         default_host=ELEVENLABS_HOST,
-        # Borrowed ONLY when the TTS provider is also ElevenLabs (see ``SttProvider.key_envs`` and
+        # Borrowed ONLY when the TTS provider is also ElevenLabs (see ``effective_key_envs`` and
         # windowsill#5867). The "same vendor" rule prevents an OpenAI or Deepgram TTS key from
         # being sent to api.elevenlabs.io when ``tts.cloud.provider`` is set to a different entry.
         key_env_fallbacks=("VOICE_LOOP_TTS_API_KEY",),
+        fallback_vendors=("elevenlabs",),
         build=_elevenlabs_stt,
         transcript=text_field,
         error_summary=_detail_or_document,

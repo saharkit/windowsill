@@ -38,7 +38,7 @@ A plugin's **version lives in `plugins/<name>/.claude-plugin/plugin.json`** — 
 The minimum update touches three files: that manifest, its mirror in
 `.claude-plugin/marketplace.json`, and the plugin's row in the root `README.md` catalog table.
 Plugins with a `PUBLISHING.md` row, a versioned acceptance checklist (`plugins/<name>/CONFORMANCE.md`),
-or Pages docs that print the version in a colophon add more — voice-loop's 0.9.1 bump touches nine
+or Pages docs that print the version in a colophon add more — a voice-loop version bump touches nine
 files in all (manifest, marketplace mirror, README row, PUBLISHING.md row, the CONFORMANCE.md pin,
 and four Pages colophons under `docs/`). **All sites must agree**, and **nothing in CI checks that
 they do** — the cross-file count varies by plugin, so a bump that misses one is caught by a reviewer

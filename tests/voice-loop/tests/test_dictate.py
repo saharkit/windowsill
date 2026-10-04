@@ -2601,6 +2601,7 @@ def test_an_unset_stt_endpoint_logs_misconfiguration_and_never_posts(state, monk
     s = {
         "stt_provider": "openai",
         "key_env": "VOICE_LOOP_STT_API_KEY",
+        "key_envs": ("VOICE_LOOP_STT_API_KEY",),
         "key_file": "",
         # an UNPARSEABLE cloud_endpoint: a value with no scheme or hostname is the only way this
         # guard is still reachable now that every registry row has a default host.
