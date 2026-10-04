@@ -2,7 +2,7 @@
 name: voice-design
 description: Cast a custom synthetic voice for voice-loop using ElevenLabs text-to-voice — turn the user's own description of a timbre into an English voice prompt, generate and present preview samples, iterate on feedback, then save the chosen voice_id into ~/.config/voice-loop/config.json. Use when the user wants to design, choose, audition or change the voice that speaks their Claude Code replies.
 argument-hint: "[a few words about the voice you want]"
-allowed-tools: [Bash, Read, Write, Edit, AskUserQuestion]
+allowed-tools: [Read, Write, Edit, AskUserQuestion, mcp__plugin_voice-loop_voice-loop__design_previews, mcp__plugin_voice-loop_voice-loop__design_save]
 ---
 
 # voice-design — cast the voice that will speak
@@ -26,18 +26,13 @@ cloud is used here for **design** (and afterwards only if they set `tts.backend:
 
 ## Step 0 — key and prerequisites
 
-The key lives in a **file the config points at**, never inline in config.json and never in the chat:
-
-```sh
-mkdir -p ~/.config/voice-loop && install -m 600 /dev/null ~/.config/voice-loop/elevenlabs.key
-# the user pastes their key into that file themselves:
-#   printf '%s' 'YOUR_KEY' > ~/.config/voice-loop/elevenlabs.key
-```
-
-Then `tts.cloud.key_file: "~/.config/voice-loop/elevenlabs.key"` in the config. Read the key
-**inside the process that uses it** — the python snippets below do exactly that, the same way
-`speak.py` does. Never echo it, never put it in a message, and never pass it on a command line
-(argv is visible to every process on the machine).
+The ElevenLabs key lives in the **`tts_api_key` userConfig option** — open `/config`, find
+*voice-loop*, set *Cloud TTS API key*, and Claude Code delivers it to the voice-loop MCP server
+through its env. The skill calls the two MCP tools below; the server reads the key, never the skill,
+never argv, and never on disk. If `/voice-design` reports that the voice-loop MCP tools are
+unavailable (stock Windows has no `python3` on PATH, so the MCP server does not start), the user
+must run voice-design from a session where the MCP server is live, or use the voice-loop
+`/voice-setup` flow to install Python and `python3` first.
 
 You also need the language (from `language` in the config) and a way to play audio
 (`speak.player` — `afplay` on macOS, `mpg123 -q` or `ffplay -autoexit -nodisp -loglevel quiet` on
@@ -65,40 +60,17 @@ Author a sample text **in the user's language**, roughly 300–500 characters (t
 ~100 and this length is what makes a timbre judgeable). Make it neutral and relevant — a few sentences
 of the kind of thing the assistant actually says, not a poem.
 
-One in-process call does the whole round trip — the key is read inside the process (never argv,
-mirroring `speak.py`), the raw response lands in a private `mktemp -d` scratch dir, and the decoded
-previews are saved with the id next to each:
+Call the voice-loop MCP tool `mcp__plugin_voice-loop_voice-loop__design_previews(voice_description, text)`.
+The MCP server posts to `https://api.elevenlabs.io/v1/text-to-voice/create-previews`, writes each
+preview under `~/.local/share/voice-loop/previews/preview-N.mp3`, and returns
+`[{generated_voice_id, path}, ...]`. Present them to the user: list the file paths, play them in order
+if a player is available, and say which numbered preview maps to which id. Never leave the user to
+guess which file was which.
 
-```sh
-python3 - "$(mktemp -d)" <<'PY'
-import base64, json, pathlib, sys, urllib.request
-key = (pathlib.Path.home() / ".config/voice-loop/elevenlabs.key").read_text().strip()
-body = json.dumps({
-    "voice_description": "<english prompt>",
-    "text": "<sample text in the user's language>",
-}).encode()
-req = urllib.request.Request(
-    "https://api.elevenlabs.io/v1/text-to-voice/create-previews",
-    data=body, headers={"xi-api-key": key, "Content-Type": "application/json"})
-opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-raw = opener.open(req, timeout=120).read()
-scratch = pathlib.Path(sys.argv[1])           # mktemp -d — private, unpredictable
-(scratch / "previews.json").write_bytes(raw)  # kept for debugging this run only
-out = pathlib.Path.home() / ".local/share/voice-loop/previews"
-out.mkdir(parents=True, exist_ok=True)
-for i, p in enumerate(json.loads(raw).get("previews", []), 1):
-    f = out / f"preview-{i}.mp3"
-    f.write_bytes(base64.b64decode(p["audio_base_64"]))
-    print(i, f, p["generated_voice_id"])
-PY
-```
-
-**Present them to the user**: list the file paths, play them in order if a player is available, and
-say which numbered preview maps to which id. Never leave the user to guess which file was which.
-
-*If the endpoint returns 404:* ElevenLabs has been renaming this API surface (`/v1/text-to-voice/design`
-+ `/v1/text-to-voice` in newer revisions). Say so, check their current docs, and keep the flow
-identical — the shape (describe → previews → pick → create) is what matters.
+*If the tool reports an `elevenlabs http` error or the endpoint returns 404:* ElevenLabs has been
+renaming this API surface (`/v1/text-to-voice/design` + `/v1/text-to-voice` in newer revisions). Say
+so, check their current docs, and keep the flow identical — the shape (describe → previews → pick →
+create) is what matters.
 
 ## Step 3 — iterate
 
@@ -116,24 +88,10 @@ sample text across rounds so comparison is honest. Stop when they say "this one"
 
 ## Step 4 — mint the voice and wire it in
 
-```sh
-python3 - <<'PY'
-import json, pathlib, urllib.request
-key = (pathlib.Path.home() / ".config/voice-loop/elevenlabs.key").read_text().strip()
-body = json.dumps({
-    "voice_name": "<name the user chose>",
-    "voice_description": "<the english prompt>",
-    "generated_voice_id": "<picked id>",
-}).encode()
-req = urllib.request.Request(
-    "https://api.elevenlabs.io/v1/text-to-voice/create-voice-from-preview",
-    data=body, headers={"xi-api-key": key, "Content-Type": "application/json"})
-opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-print("voice_id:", json.loads(opener.open(req, timeout=120).read())["voice_id"])
-PY
-```
-
-Take the printed `voice_id` and write it into the config:
+Call the voice-loop MCP tool
+`mcp__plugin_voice-loop_voice-loop__design_save(generated_voice_id, voice_name, voice_description)`.
+The MCP server posts to `https://api.elevenlabs.io/v1/text-to-voice/create-voice-from-preview` and
+returns `{voice_id}`. Take the printed `voice_id` and write it into the config:
 
 ```jsonc
 "tts": {
@@ -143,8 +101,7 @@ Take the printed `voice_id` and write it into the config:
     "voice_id": "<voice_id>",
     "model": "eleven_multilingual_v2",
     "output_format": "mp3_44100_128",
-    "voice_settings": { "stability": 0.7, "similarity_boost": 0.8, "style": 0.1, "use_speaker_boost": true },
-    "key_file": "~/.config/voice-loop/elevenlabs.key"
+    "voice_settings": { "stability": 0.7, "similarity_boost": 0.8, "style": 0.1, "use_speaker_boost": true }
   }
 }
 ```
@@ -187,7 +144,7 @@ prefer short spoken summaries — which is what the marker convention gives you 
 
 **If artifacts persist across settings, regenerate — do not keep fighting the knobs.** Previews vary:
 generate a fresh batch from the same (or a slightly varied) description and pick a different candidate.
-Two rounds of that beat an hour of parameter tuning.
+Different previews from the same description beat an hour of parameter tuning.
 
 ### Local (Silero, ru/uk)
 
@@ -222,7 +179,8 @@ the plugin's own `server/README.md` → *XTTS engine (voice cloning)*
 
 This skill designs **cloud** voices; it does not set up XTTS. If the user wants the full arc —
 design the voice here, mint a reference recording from the chosen voice, run XTTS-v2 on their own
-GPU with that reference, then point `tts` at it (`backend: lan`) and **delete the cloud key** —
+GPU with that reference, then point `tts` at it (`backend: lan`) and **clear the `tts_api_key`
+plugin option** —
 finish the cloud design, then hand them to that server doc for the local half. The ethics rule
 travels with it unchanged: a reference must be **a voice they minted themselves or have explicit
 rights to**, never a third party's.

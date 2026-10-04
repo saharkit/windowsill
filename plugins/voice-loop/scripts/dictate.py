@@ -335,8 +335,7 @@ def _clear_text_refusal(s: dict) -> str | None:
     if s["backend"] != "cloud":
         return None
     entry = resolve_stt_provider(s["stt_provider"])
-    key_envs = entry.key_envs(s["key_env"])
-    if not any(read_key(s["key_file"], env, os.environ) for env in key_envs):
+    if not read_key(os.environ):
         return None  # no credential configured — the cloud path refuses keyless calls itself
     urls = [entry.endpoint(s)]
     if s["streaming"] and entry.streaming is not None:
@@ -424,6 +423,17 @@ def resolve_paste_target(value) -> str:
     return "same-window"
 
 
+def resolve_tts_provider(name: str):
+    """Mirror of speak.resolve_tts_provider — kept local so the dictate script does not
+    import speak (speak is the Stop hook process; dictating must not load it)."""
+    if not name:
+        name = providers.DEFAULT_TTS
+    entry = providers.TTS_PROVIDERS.get(name)
+    if entry is None:
+        raise ValueError(f"unknown tts.cloud.provider: {name!r}")
+    return entry
+
+
 def resolve_stt_provider(name: str):
     """The registry entry for a configured provider name — the default entry, loudly, for a name
     the registry has never heard of.
@@ -459,8 +469,17 @@ def resolve_stt_language(config: dict):
 
 def resolve_settings(config: dict, system: str) -> dict:
     """Every knob dictate-toggle.sh honoured, same names, same defaults, same precedence."""
+    # One-time warning for configs that still carry the deleted key_file / api_key_env
+    # settings. The names are read here purely as strings (the OBSOLETE_KEYS table above)
+    # — the policy test allows them ONLY inside that table.
+    for obsolete in OBSOLETE_KEYS:
+        if cfg(config, obsolete, "") not in ("", None):
+            log(f"config ignored: {obsolete} is obsolete — set the stt_api_key plugin option in /config")
     # the provider is an ENTRY, never a branch — every per-provider default below comes off it
     entry = resolve_stt_provider(str(cfg(config, "stt.cloud.provider", providers.DEFAULT_STT)))
+    # tts_vendor rides on the request line to the relay so the relay can apply the
+    # ElevenLabs STT -> TTS-key fallback (#5816, the "one credentials home" rule).
+    tts_entry = resolve_tts_provider(str(cfg(config, "tts.cloud.provider", providers.DEFAULT_TTS)))
     return {
         "mode": str(cfg(config, "dictate.mode", "send")),
         "paste_key": str(cfg(config, "dictate.paste_key", "cmd+v" if system == "Darwin" else "ctrl+shift+v")),
@@ -502,9 +521,8 @@ def resolve_settings(config: dict, system: str) -> dict:
         # to the API's token cap, the local path sends it whole.
         "stt_prompt": str(cfg(config, "stt.prompt", "")).strip(),
         "stt_provider": entry.name,
+        "tts_vendor": tts_entry.name,
         "cloud_endpoint": str(cfg(config, "stt.cloud.endpoint", "")),
-        "key_env": str(cfg(config, "stt.cloud.api_key_env", cfg(config, "stt.api_key_env", "VOICE_LOOP_STT_API_KEY"))),
-        "key_file": str(cfg(config, "stt.cloud.key_file", "")),
         "timeout": contracts.resolve_number(cfg(config, "stt.timeout", 60), 60.0, "stt.timeout", log, minimum=0.000001),
         # Streaming is OPT-IN and defaults OFF (windowsill#99): the batch path is the proven one,
         # and a live socket is a second failure surface a user must ask for. Same "true"/JSON-true
@@ -521,31 +539,29 @@ def resolve_settings(config: dict, system: str) -> dict:
     }
 
 
-def read_key(key_file: str, key_env: str, environ) -> str:
-    """The cloud STT key, in priority order.
+def read_key(environ) -> str:
+    """Whether the STT side has a credential configured.
 
-    When voice-loop runs from a Claude Code hook, the harness exposes the `stt_api_key`
-    userConfig option as ``$CLAUDE_PLUGIN_OPTION_STT_API_KEY`` (the option is declared
-    ``sensitive: true`` in the plugin manifest, so the harness stores it in the secure
-    credential store and never in the settings file). A non-empty value from that env
-    var wins; otherwise ``key_file`` is read; otherwise the named ``key_env`` is read.
-    The key itself is NEVER stored in config.json. Each fallback step logs the type name
-    only — never the key, never its length.
+    This script no longer reads the key itself — the voice-loop MCP server holds it and
+    answers STT over its Unix-domain relay. What this function returns is whether the
+    relay has anything to answer: a non-empty ``$CLAUDE_PLUGIN_OPTION_STT_API_KEY``
+    means the relay will produce a transcript; an empty value means the relay will
+    answer ``no-key`` and the script falls back to local whisper. The function takes
+    ``environ`` for testability; the live caller passes ``os.environ``.
     """
     plugin_option = environ.get("CLAUDE_PLUGIN_OPTION_STT_API_KEY", "")
-    if plugin_option.strip():
-        return re.sub(r"[ \t\r\n]", "", plugin_option)
-    if key_file:
-        path = os.path.expanduser(key_file)
-        try:
-            raw = _read_bounded_text(path, MAX_KEY_BYTES, label="key file")
-            if raw is not None:
-                return re.sub(r"[ \t\r\n]", "", raw)
-        except FileNotFoundError:
-            pass
-        # the type name only — never the file's content (it may be a half-corrupt key)
-        log(f"key file unreadable ({path}) — falling back to ${key_env}")
-    return environ.get(key_env, "")
+    return plugin_option.strip()
+
+
+# Names of settings removed in the credential-closure change. A config that still
+# carries any of them gets one log line — never a read. The policy test (the
+# repo-root tests/test_credential_policy.py) allows the names to appear HERE, as
+# the obsolete-setting warning table, and nowhere else.
+OBSOLETE_KEYS: tuple[str, ...] = (
+    "stt.cloud.key_file",
+    "stt.cloud.api_key_env",
+    "stt.api_key_env",
+)
 
 
 # --- pure decision tables (unit-tested; no I/O) --------------------------------------------------
@@ -1268,74 +1284,139 @@ def _transcribe_lan(endpoint: str, language: str, wav_bytes: bytes, timeout: flo
     return transcript_from_response(raw)
 
 
-def _transcribe_cloud(s: dict, wav_bytes: bytes, boundary: str) -> str | None:
-    """Try cloud transcription. Returns the transcript on success, or None when the
-    caller should degrade to the local whisper path.
+def _relay_socket_path() -> str:
+    """Same path voice_mcp.py binds. Mirrored so the client does not import the server."""
+    runtime = os.environ.get("XDG_RUNTIME_DIR", "").strip()
+    if runtime:
+        return os.path.join(runtime, "voice-loop", "stt.sock")
+    state = os.environ.get("XDG_STATE_HOME", "").strip() or os.path.expanduser(
+        "~/.local/state"
+    )
+    return os.path.join(state, "voice-loop", "relay", "stt.sock")
 
-    The caller logs the degrade reason — this function only logs the specific failure
-    that made the cloud path unusable (missing key, network error, API error document).
 
-    There is NO per-provider branch here and there must never be one: the configured provider is
-    an entry in the registry, and every axis it varies — host, path, body encoding, auth header,
-    which env vars hold its key, where the transcript lives, how its error documents read — is
-    read off that entry (see providers.py).
+def _relay_socket_safe(path: str) -> bool:
+    """Refuse a socket that is not owned by us, or carries group/other access, or whose
+    parent directory is not mode 0700. Same-user processes on a hostile multi-user host
+    are the threat; this is the *client*'s vouch-for-it check. The relay's stale-socket
+    takeover lives on the other side of the connection."""
+    if not hasattr(os, "getuid"):
+        return True  # Windows — no AF_UNIX relay path is attempted (handled below)
+    try:
+        dir_st = os.stat(os.path.dirname(path))
+    except OSError:
+        return False
+    if dir_st.st_uid != os.getuid():
+        return False
+    if (dir_st.st_mode & 0o777) != 0o700:
+        return False
+    try:
+        sock_st = os.lstat(path)
+    except OSError:
+        return False
+    if sock_st.st_uid != os.getuid():
+        return False
+    if (sock_st.st_mode & 0o077) != 0:
+        return False
+    return True
+
+
+def _relay_transcribe(s: dict, entry, wav_bytes: bytes) -> dict | None:
+    """Send one WAV to the voice-loop relay, return its typed reply or None on refusal.
+
+    On Windows / platforms without ``AF_UNIX`` (stock Python), return ``None`` — the
+    desktop dictation has no relay to talk to and falls back to local whisper. With
+    ``AF_UNIX`` present but no relay bound, return ``None`` and let the caller log which
+    path ran. The wire is: one UTF-8 JSON request line (provider/endpoint/model/
+    language/tts_vendor/timeout), a single newline, the raw WAV bytes, then
+    ``shutdown(SHUT_WR)`` — and one UTF-8 JSON reply line. The client's socket
+    timeout is ``stt.timeout + 5 s``; a client-side expiry logs reason ``timeout``.
     """
-    entry = resolve_stt_provider(s["stt_provider"])
-    key_envs = entry.key_envs(s["key_env"])
-    key = ""
-    for env in key_envs:
-        key = read_key(s["key_file"], env, os.environ)
-        if key:
-            break
-    if not key:
-        tried = ", ".join(f"${env}" for env in key_envs)
-        log(f"cloud stt: no key for {entry.name} (key_file unset/unreadable, and {tried} empty)")
+    if not hasattr(_socket, "AF_UNIX"):
         return None
+    path = _relay_socket_path()
+    if not _relay_socket_safe(path):
+        log("cloud stt: relay socket not safe (foreign owner / wrong mode) — falling back to local whisper")
+        return None
+    if not os.path.exists(path):
+        return None  # no relay bound — caller falls back to local whisper
+    request_line = json.dumps(
+        {
+            "provider": entry.name,
+            "endpoint": s.get("cloud_endpoint") or entry.default_host,
+            "model": s["stt_model"],
+            "language": s["language"],
+            "tts_vendor": s.get("tts_vendor", ""),
+            "timeout": s["timeout"],
+        }
+    )
+    sock = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+    sock.settimeout(s["timeout"] + 5.0)
+    try:
+        try:
+            sock.connect(path)
+        except OSError as err:
+            log(f"cloud stt: relay connect refused ({type(err).__name__}) — falling back to local whisper")
+            return None
+        try:
+            sock.sendall(request_line.encode("utf-8") + b"\n")
+            sock.sendall(wav_bytes)
+            sock.shutdown(_socket.SHUT_WR)
+        except OSError as err:
+            log(f"cloud stt: relay write failed ({type(err).__name__})")
+            return None
+        buf = b""
+        try:
+            while not buf.endswith(b"\n"):
+                chunk = sock.recv(65536)
+                if not chunk:
+                    break
+                buf = buf + chunk
+        except OSError as err:
+            log(f"cloud stt: relay silent past deadline ({type(err).__name__})")
+            return {"status": "failed", "reason": "timeout"}
+        if not buf.endswith(b"\n"):
+            return {"status": "failed", "reason": "timeout"}
+    finally:
+        try:
+            sock.close()
+        except OSError:
+            pass
+    try:
+        reply = json.loads(buf[:-1].decode("utf-8"))
+    except ValueError:
+        return {"status": "failed", "reason": "provider-unreachable"}
+    if not isinstance(reply, dict):
+        return {"status": "failed", "reason": "provider-unreachable"}
+    return reply
 
-    request = entry.request(s, key, wav_bytes, boundary)
-    parsed = urllib.parse.urlsplit(request.url)
-    if not parsed.scheme or not parsed.hostname:
-        # The endpoint resolved to nothing: a relative URL urllib turns into an opaque "unknown
-        # url type" — a network error for "you have not configured an endpoint", so say that
-        # instead of reaching for the network. Every registry row has a default_host now
-        # (windowsill#270), so this guard is reached only on an UNPARSEABLE stt.cloud.endpoint —
-        # a value with no scheme or host — which is the one way it stays reachable for the
-        # scripts/* 100% branch gate. The literal head up to the first interpolation is the row id
-        # in ``report_bug.LOG_RULES``; only the tail changes.
-        log(
-            f"cloud stt: no endpoint for {entry.name} — {s.get('cloud_endpoint', '')!r} has no "
-            f"scheme or host"
-        )
+
+def _transcribe_cloud(s: dict, wav_bytes: bytes, boundary: str) -> str | None:
+    """Try cloud transcription through the voice-loop MCP relay.
+
+    The credential-closure change (#5816) moved the key out of this script. Cloud STT
+    is reached by dialing the relay's Unix socket (the voice-loop MCP server, while a
+    Claude Code session is open). On success, the relay returns the transcript; on
+    any typed failure (``no-key``, ``bad-request``, ``provider-http-*``,
+    ``provider-unreachable``, ``timeout``) we fall back to local whisper. With no relay
+    listening (no Claude Code session, or a session without the plugin enabled) we
+    log which path ran and take the local path. The relay owns the wire protocol — see
+    ``voice_mcp.py``. The relay NEVER reads ``config.json``; every setting here is
+    taken from this script's resolved ``s`` and forwarded to it on the request line.
+    """
+    if not read_key(os.environ):
+        log(f"cloud stt: no key (set the stt_api_key plugin option in /config)")
         return None
-    raw = _post_bytes(request.url, request.headers, request.body, request.content_type, s["timeout"])
-    if raw is None:
-        # A failed cloud STT request whose endpoint resolved to a local address gets a diagnostic
-        # line: the failure gate is the request itself, not the spelling — a loopback cloud
-        # endpoint is the supported self-hosted deployment, so the message only fires when the
-        # POST failed. ``parsed.hostname`` (not ``.netloc``) is what ``is_local_host`` reads, so a
-        # port-suffixed ``127.0.0.1:8355`` parses correctly (windowsill#270).
-        if providers.is_local_host(parsed.hostname or ""):
-            log(
-                f"cloud stt: the endpoint resolved to a local address ({parsed.netloc.rsplit('@', 1)[-1]}) "
-                f"— not {entry.name}'s API; set stt.cloud.endpoint to your remote host, or stt.backend to \"lan\" if you meant this machine"
-            )
-        return None  # network error — already logged by _post_bytes
-    data = providers.decode(raw)
-    text = entry.transcript(data)
-    if text is None:
-        # The body carries no transcript field at all — an API error document, an empty body, or
-        # something this provider's parser does not recognise. Log its shape so the operator can
-        # tell a quota error from a bad model name.
-        #
-        # An EMPTY transcript is deliberately NOT this case: a silent clip transcribes to "" and
-        # that is a success. Treating it as a failure logged a cloud error that never happened and
-        # posted the clip a second time, at localhost, on every silent toggle (windowsill#93).
-        if data is None:
-            log(f"cloud stt returned undecodable response: {raw[:200]!r}")
-        else:
-            log(f"cloud stt returned an error: {entry.error_summary(data)}")
-        return None
-    return text
+    entry = resolve_stt_provider(s["stt_provider"])
+    relay_result = _relay_transcribe(s, entry, wav_bytes)
+    if relay_result is None:
+        return None  # relay silent / refused — caller degrades to whisper
+    if relay_result["status"] == "ok":
+        log(f"cloud stt via relay: {relay_result['text']!r}")
+        return relay_result["text"]
+    reason = relay_result.get("reason", "unknown")
+    log(f"cloud stt via relay: reason={reason}")
+    return None
 
 
 # --- the Windows kernel32 boundary ----------------------------------------------------------------
@@ -1724,7 +1805,11 @@ def streaming_wanted(s: dict) -> bool:
     if entry.streaming is None:
         log(f"stt.cloud.streaming is on but {entry.name} has no streaming variant — using the batch path")
         return False
-    return True
+    # Streaming is unreachable from production: the hotkey path holds no key. The relay's
+    # batch path is the substitute. This line is the contract — it tells the operator that
+    # the config asked for streaming and the credential-closure routed them to batch.
+    log("streaming needs a key the hotkey path no longer holds; using batch via the relay")
+    return False
 
 
 def wav_data_offset(head: bytes) -> int:
@@ -2125,11 +2210,16 @@ def run_stream_session(
 
 
 def stream_worker(s: dict, args: list[str]) -> int:
-    """The child process: resolve the key, run the session, write the one answer, exit.
+    """The child process: run the streaming session, write the one answer, exit.
 
-    Spawned by this same script's START toggle and by nothing else. It never touches the recorder,
-    the pidfile mutex, the clipboard or the paste path — its whole output is one JSON document the
-    stop toggle reads, and its whole input is a file somebody else is writing."""
+    The credential-closure change (#5816) made streaming cloud dictation unreachable from
+    the production path: the hotkey dictation script holds no key. The relay's batch path
+    is the substitute (the streaming cloud option logs a batch-only line on the toggle and
+    uses the relay batch path instead). The streaming subsystem (``run_stream_session``,
+    ``wsclient.py``) is kept and remains covered by its direct tests, which pass a key in
+    directly. ``_PREVIEW_PATH``, ``_write_preview`` and ``_clear_preview`` stay for those
+    direct tests; the body of this worker is the typed refusal below.
+    """
     stopping = {"now": False}
 
     def _stop(signum, frame):  # noqa: ARG001 — signal-handler signature
@@ -2137,43 +2227,8 @@ def stream_worker(s: dict, args: list[str]) -> int:
 
     signal.signal(signal.SIGTERM, _stop)
     signal.signal(signal.SIGINT, _stop)
-    try:
-        recorder_pid = int(args[0])
-    except (IndexError, ValueError):
-        recorder_pid = -1
-
-    entry = resolve_stt_provider(s["stt_provider"])
-    if entry.streaming is None:
-        _write_stream_result({"status": "failed", "reason": f"{entry.name} has no streaming variant"})
-        return 1
-    key_envs = entry.key_envs(s["key_env"])
-    key = ""
-    for env in key_envs:
-        key = read_key(s["key_file"], env, os.environ)
-        if key:
-            break
-    if not key:
-        tried = ", ".join(f"${env}" for env in key_envs)
-        _write_stream_result({"status": "failed", "reason": f"no key (key_file unset/unreadable, and {tried} empty)"})
-        return 1
-
-    preview_path = _PREVIEW_PATH if s.get("preview") else ""
-
-    def on_interim(interim: str, assembled: str) -> None:
-        _write_preview({"interim": interim, "assembled": assembled}, preview_path)
-
-    result = run_stream_session(
-        s,
-        entry,
-        key,
-        stopping=lambda: stopping["now"],
-        recorder_alive=lambda: _pid_alive(recorder_pid),
-        on_interim=on_interim if preview_path else None,
-    )
-    if preview_path:
-        _clear_preview(preview_path)
-    _write_stream_result(result)
-    return 0 if result["status"] == "ok" else 1
+    _write_stream_result({"status": "failed", "reason": "streaming needs a key the hotkey path no longer holds"})
+    return 1
 
 
 def debounce_toggle(window: float, now: float | None = None) -> float | None:

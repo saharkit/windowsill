@@ -25,14 +25,15 @@ the pieces it names actually exist, and finish with a **passing selftest**. Scri
 2. **No root by default.** Everything below runs in user space. The only steps that need `sudo` are
    optional luxuries — for those you **print the exact command and let the user run it** (or approve
    it explicitly). Never slip a `sudo` into a batch.
-3. **Never write a secret into the config.** Cloud keys go into one of three places, in priority
-   order: the `tts_api_key` / `stt_api_key` userConfig options (set through the enable-time dialog
-   or `/config`; Claude Code exposes them to the hook process as `$CLAUDE_PLUGIN_OPTION_TTS_API_KEY`
-   and `$CLAUDE_PLUGIN_OPTION_STT_API_KEY`); a file the config *points at* (`key_file`); or an
-   environment variable the config *names* (`api_key_env`). The hotkey dictation path and the
-   `voice-design` skill are not started by Claude Code, so they read only `key_file` or the named
-   env var on that path; users who need the hook to work without re-entering the option also point
-   `key_file` at the same key file those paths read.
+3. **Never write a secret into the config.** Cloud keys go into ONE place: the
+   `tts_api_key` / `stt_api_key` userConfig options (set through the enable-time dialog or
+   `/config`). Claude Code exposes them to the hook processes as
+   `$CLAUDE_PLUGIN_OPTION_TTS_API_KEY` / `$CLAUDE_PLUGIN_OPTION_STT_API_KEY` and to the
+   voice-loop plugin MCP server through its env. The hotkey dictation path and the
+   `voice-design` skill reach the key through that MCP server — there is no longer a
+   `key_file` or `api_key_env` to configure. Older installs may carry a legacy
+   `~/.config/voice-loop/elevenlabs.key` file left behind by an older release; the
+   `voice-remove` skill offers to delete it.
 4. **Ask, do not assume, but pre-answer.** Every question below carries a derived default. Present the
    default and let the user confirm with one keystroke.
 5. **Every step writes a durable checkpoint.** The install ledger at
@@ -516,8 +517,11 @@ module load above is temporary and resets on restart; the config file makes it p
 python3 "${CLAUDE_PLUGIN_ROOT}/scripts/install_ledger.py" step-begin step-4-write-config
 ```
 
-Write `~/.config/voice-loop/config.json` (create the directory; `chmod 600` if a `key_file` is
-referenced). Full schema — omit what you do not need, the scripts have defaults for everything:
+Write `~/.config/voice-loop/config.json` (create the directory with mode 0700). Full
+schema — omit what you do not need, the scripts have defaults for everything. Cloud keys
+are set in the plugin's `/config` panel as `tts_api_key` / `stt_api_key`; do NOT add
+`api_key_env` or `key_file` fields to the config — those keys are gone and a config that
+still carries them gets one log line on next start.
 
 ```json
 {
@@ -531,9 +535,7 @@ referenced). Full schema — omit what you do not need, the scripts have default
     "timeout": 60,
     "cloud": {
       "provider": "openai",
-      "endpoint": "",
-      "api_key_env": "VOICE_LOOP_STT_API_KEY",
-      "key_file": ""
+      "endpoint": ""
     }
   },
   "tts": {
@@ -548,9 +550,7 @@ referenced). Full schema — omit what you do not need, the scripts have default
       "voice_id": "",
       "model": "eleven_multilingual_v2",
       "output_format": "mp3_44100_128",
-      "voice_settings": { "stability": 0.7, "similarity_boost": 0.8, "style": 0.1, "use_speaker_boost": true },
-      "api_key_env": "VOICE_LOOP_TTS_API_KEY",
-      "key_file": "~/.config/voice-loop/elevenlabs.key"
+      "voice_settings": { "stability": 0.7, "similarity_boost": 0.8, "style": 0.1, "use_speaker_boost": true }
     }
   },
   "speak": {
@@ -623,11 +623,11 @@ Field notes worth telling the user:
     offer) — one key primes OpenAI's `prompt` field and the local whisper `initial_prompt` alike.
     The top-level `language` (TTS voice selection) stays as the dominant language either way. Say the
     value you wrote and why, in one line, so a user who later switches backend knows to revisit this.
-  - When the user already has an ElevenLabs key configured for TTS (`VOICE_LOOP_TTS_API_KEY`),
-    offer `elevenlabs` for STT as the natural choice — the same key covers both directions with no
-    extra setup. That shared-key rule is ElevenLabs' STT rule alone; every other provider needs its
-    own key, and switching `tts.cloud.provider` means pointing `tts.cloud.api_key_env` at that
-    provider's own key.
+  - When the user already has an ElevenLabs key set for TTS (in the plugin's `tts_api_key`
+    userConfig option), offer `elevenlabs` for STT as the natural choice — the same userConfig
+    value covers both directions with no extra setup. That shared-key rule is ElevenLabs' STT
+    rule alone; every other provider needs its own `stt_api_key` value. Switching
+    `tts.cloud.provider` means setting the new provider's key in `/config`.
   - Say plainly that cloud STT sends the recorded audio clip to the provider's servers — that is
     the privacy trade every cloud backend makes, and it is stated explicitly in the plugin README.
   - If the cloud call fails (network down, quota, expired key) dictation **degrades to the local

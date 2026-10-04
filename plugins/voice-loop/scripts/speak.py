@@ -552,6 +552,12 @@ def _default_player(system: str) -> str:
 
 def resolve_settings(config: dict, system: str) -> dict:
     """Every knob speak.sh honoured, same names, same defaults, same precedence."""
+    # One-time warning for configs that still carry the deleted key_file / api_key_env
+    # settings. The names are read here purely as strings (the OBSOLETE_KEYS table above)
+    # — the policy test allows them ONLY inside that table.
+    for obsolete in OBSOLETE_KEYS:
+        if cfg(config, obsolete, "") not in ("", None):
+            log(f"config ignored: {obsolete} is obsolete — set the tts_api_key plugin option in /config")
     speaker = str(cfg(config, "tts.speaker", ""))
     # the provider is an ENTRY, never a branch — every per-provider default below comes off it
     entry = resolve_tts_provider(str(cfg(config, "tts.cloud.provider", providers.DEFAULT_TTS)))
@@ -591,8 +597,11 @@ def resolve_settings(config: dict, system: str) -> dict:
         # the audio CONTAINER, and its spelling is provider-private: one opaque token for
         # ElevenLabs, a pair of query parameters for Deepgram — so the default rides the entry
         "output_format": str(cfg(config, "tts.cloud.output_format", entry.default_output_format)),
-        "key_env": str(cfg(config, "tts.cloud.api_key_env", cfg(config, "tts.api_key_env", "VOICE_LOOP_TTS_API_KEY"))),
-        "key_file": str(cfg(config, "tts.cloud.key_file", "")),
+        # Cloud TTS key comes only from CLAUDE_PLUGIN_OPTION_TTS_API_KEY (the manifest's
+        # tts_api_key userConfig value, delivered by the harness to the speak hook processes
+        # and to the voice-loop MCP server). The previous key_file / api_key_env fallbacks were
+        # removed in the credential-closure change — a config that still carries them gets one
+        # log line from OBSOLETE_KEYS and nothing is read.
         # provider-specific synthesis knobs, passed through verbatim (ElevenLabs: stability,
         # similarity_boost, style, use_speaker_boost — see the anti-robovoice notes in voice-design)
         "voice_settings": voice_settings if isinstance(voice_settings, dict) else None,
@@ -618,29 +627,31 @@ def resolve_settings(config: dict, system: str) -> dict:
     }
 
 
-def read_key(key_file: str, key_env: str, environ) -> str:
-    """The cloud TTS key, in priority order.
+def read_key(environ) -> str:
+    """The cloud TTS key.
 
-    When voice-loop runs from a Claude Code hook, the harness exposes the `tts_api_key`
-    userConfig option as ``$CLAUDE_PLUGIN_OPTION_TTS_API_KEY`` (the option is declared
-    ``sensitive: true`` in the plugin manifest, so the harness stores it in the secure
-    credential store and never in the settings file). A non-empty value from that env
-    var wins; otherwise ``key_file`` is read; otherwise the named ``key_env`` is read.
-    The key itself is NEVER stored in config.json. Each fallback step logs the type name
-    only — never the key, never its length.
+    Voice-loop takes the key from ONE source — ``$CLAUDE_PLUGIN_OPTION_TTS_API_KEY``,
+    the harness's delivery of the ``tts_api_key`` userConfig option (sensitive: true).
+    The historical ``key_file`` and ``api_key_env`` fallbacks were removed in the
+    credential-closure change (#5816) — the key never leaves the manifest's userConfig
+    or, transitively, the voice-loop MCP server's env. The function takes ``environ``
+    for testability; the live caller passes ``os.environ``.
     """
     plugin_option = environ.get("CLAUDE_PLUGIN_OPTION_TTS_API_KEY", "")
     if plugin_option.strip():
         return re.sub(r"[ \t\r\n]", "", plugin_option)
-    if key_file:
-        path = os.path.expanduser(key_file)
-        try:
-            with open(path, encoding="utf-8") as fh:
-                return re.sub(r"[ \t\r\n]", "", fh.read())
-        except (OSError, UnicodeDecodeError) as err:
-            # the type name only — never the file's content (it may be a half-corrupt key)
-            log(f"key file unreadable ({path}): {type(err).__name__} — falling back to ${key_env}")
-    return environ.get(key_env, "")
+    return ""
+
+
+# Names of settings removed in the credential-closure change. A config that still
+# carries any of them gets one log line — never a read. The policy test (the
+# repo-root tests/test_credential_policy.py) allows the names to appear HERE, as
+# the obsolete-setting warning table, and nowhere else.
+OBSOLETE_KEYS: tuple[str, ...] = (
+    "tts.cloud.key_file",
+    "tts.cloud.api_key_env",
+    "tts.api_key_env",
+)
 
 
 def assistant_texts(lines) -> list[str]:
@@ -1047,7 +1058,7 @@ def _clear_text_refusal(s: dict) -> str | None:
     if s["backend"] != "cloud":
         return None
     entry = resolve_tts_provider(s["provider"])
-    if not read_key(s["key_file"], s["key_env"], os.environ):
+    if not read_key(os.environ):
         return None  # no credential configured — nothing rides the clear text
     urls = [entry.endpoint(s)]
     if cloud_streaming_wanted(s):
@@ -1823,9 +1834,9 @@ def play_text(text: str, s: dict, t0: float, *, extract_ms: int) -> bool:
 
     key = ""
     if s["backend"] == "cloud":
-        key = read_key(s["key_file"], s["key_env"], os.environ)
+        key = read_key(os.environ)
         if not key:
-            log(f"cloud tts: no key (key_file unset/unreadable and ${s['key_env']} empty)")
+            log("cloud tts: no key (set the tts_api_key plugin option in /config)")
             return False
 
     result = None
@@ -2381,9 +2392,9 @@ def run_holder_main(digest: str) -> int:
     entry = resolve_tts_provider(s["provider"])
     if entry.streaming is None:
         return 1
-    key = read_key(s["key_file"], s["key_env"], os.environ)
+    key = read_key(os.environ)
     if not key:
-        log("stream holder: no key — exiting")
+        log("stream holder: no key (set the tts_api_key plugin option in /config) — exiting")
         return 1
     # The holder is its own process with its own configuration moment — the endpoint policy
     # (#215) applies here too, before the resident socket is dialed.

@@ -20,7 +20,8 @@ business and is not enumerated here), `.claude-plugin/` (holds `marketplace.json
 folder — `voice-loop/` (the voice-loop test suite; the plugin folder is shipped as the install target,
 and the directory holds any shipped file of 256 KiB or more, so the suite lives here under
 `voice-loop/` rather than `plugins/voice-loop/tests/`) and `test_directory_listing.py` (the
-directory-listing acceptance test, run by `validate`)), `tales/` (story content, not a plugin — the
+directory-listing acceptance test, run by `validate`) and `test_credential_policy.py` (the
+credential-closure policy test for the voice-loop plugin, run by `validate`)), `tales/` (story content, not a plugin — the
 told tales, the `canon/` core of universe-model laws and the entity registry, and `CONTRIBUTING.md`
 for tales), `LICENSE`, `.gitignore`, `.gitattributes`, `.claude/`, this file.
 

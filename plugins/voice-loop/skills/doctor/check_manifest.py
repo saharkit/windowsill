@@ -327,8 +327,8 @@ CHECK_MANIFEST: list[dict] = [
         ),
         "fix": (
             "Check the STT endpoint: `curl <stt.endpoint>/health`.  "
-            "For cloud STT, check that the key file exists or the "
-            "named environment variable is set."
+            "For cloud STT, set the `stt_api_key` plugin option in "
+            "`/config` (sensitive: the voice-loop MCP server holds it)."
         ),
         "offer_flip": False,
         "check": {

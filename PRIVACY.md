@@ -21,16 +21,22 @@ and GitHub, not to us.
 and used to run the local function):
 
 - the cloud TTS / STT key from `$CLAUDE_PLUGIN_OPTION_TTS_API_KEY` /
-  `$CLAUDE_PLUGIN_OPTION_STT_API_KEY` (the `tts_api_key` / `stt_api_key` plugin options,
-  `sensitive: true` in the manifest, so the harness stores them in its secure credential
-  store, never in the settings file), then from `tts.cloud.key_file` /
-  `stt.cloud.key_file`, then from the named `api_key_env`. The key is never stored in
-  `config.json`; the script logs the type name only, never the value or its length.
-- `report_bug.py` reads your `USER`/`LOGNAME`/`USERNAME`, every `VOICE_LOOP_*` variable
-  (credential-named ones are reported as `<set>`), and uses your own `gh` login to file —
-  after the bundle has been shown to you in chat and you've approved the send.
-- `tls-probe.py` reads the proxy variables (`PROXY_VARS`, `configured_proxy`) and
-  `SSL_CERT_FILE` / `SSL_CERT_DIR`, then makes one TLS handshake to the host you named.
+  `$CLAUDE_PLUGIN_OPTION_STT_API_KEY`. These are the harness's delivery of the
+  `tts_api_key` / `stt_api_key` plugin userConfig options (`sensitive: true` in the
+  manifest, so the harness stores them in its secure credential store, never in the
+  settings file). The voice-loop MCP server holds them in its env and is the ONLY
+  reader — for the Stop / PostToolUse hooks (`speak.py`), the voice-design calls, and
+  the hotkey cloud STT relay. The key is never stored in `config.json`; the script logs
+  the type name only, never the value or its length. A config that still carries the
+  legacy `key_file` or `api_key_env` settings gets one log line and nothing is read.
+- `report_bug.py` reads your `USER`/`LOGNAME`/`USERNAME`, every non-credential
+  `VOICE_LOOP_*` variable, and uses your own `gh` login to file — after the bundle has
+  been shown to you in chat and you've approved the send. Credential-named
+  `VOICE_LOOP_*` variables are skipped entirely from the bundle (the plugin no longer
+  documents a credential-shaped variable for the installer to set).
+- `tls-probe.py` reads no environment variables. The certificate store comes from
+  `ssl.get_default_verify_paths()`; proxies are bypassed and the OK message says so
+  unconditionally.
 
 **voice-loop fetches at runtime**:
 

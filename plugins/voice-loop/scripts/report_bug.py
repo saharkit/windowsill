@@ -768,13 +768,21 @@ def collect_machine() -> dict[str, object]:
 
 
 def collect_environment() -> dict[str, str]:
-    """The plugin's own environment variables. A credential-named one is reported as SET, never read."""
+    """The plugin's own environment variables, except those that carry a credential.
+
+    The credential-closure change (#5816) removed the named env-var reads from
+    ``speak.py`` / ``dictate.py`` and the voice-loop MCP server holds the userConfig
+    keys. A credential-named ``VOICE_LOOP_*`` variable is therefore skipped entirely
+    from the bundle — not reported as ``<set>``, not redacted. The plugin no longer
+    documents a credential-shaped variable for the installer to set.
+    """
     found = {}
     for name in sorted(os.environ):
         if not name.startswith("VOICE_LOOP_"):
             continue
-        value = os.environ[name]
-        found[name] = "<set>" if _SECRET_KEY_RE.search(name) else redact(value)
+        if _SECRET_KEY_RE.search(name):
+            continue
+        found[name] = redact(os.environ[name])
     return found
 
 

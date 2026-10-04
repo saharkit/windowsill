@@ -246,9 +246,8 @@ The hook side earns its guarantee on a separate axis, so it gets a numbered list
    probe" are pinned without a socket. What a fake cannot prove, **two real invocations in CI** do,
    and they are deliberately kept apart because they reach *different branches* of the diagnosis:
    - both lanes probe a real host and expect green (an unreachable host is exit 2 and warns, not a
-     red), then probe again with `SSL_CERT_FILE`/`SSL_CERT_DIR` pointed at an empty store. That
-     second one proves the **env-override** branch and only that — an override in force is
-     diagnosed first and unconditionally, so this shape can never reach the python.org remedy;
+     red). fix(#5816) removed the env-override probe leg together with the
+     `SSL_CERT_FILE`/`SSL_CERT_DIR` read;
    - so a separate step stands up the **python.org trap itself**: an interpreter that really lives
      under `/Library/Frameworks/Python.framework/Versions/X.Y`, a real
      `Install Certificates.command` at the path the message must name, and a real certificate

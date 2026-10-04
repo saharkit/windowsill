@@ -169,26 +169,20 @@ Deepgram is the cheapest and quickest for recognition and the `$200` new-account
 evaluation, but its synthesis does not speak Russian or Ukrainian; ElevenLabs and OpenAI do both.
 
 **ElevenLabs STT reuses your existing ElevenLabs API key.** If you already configured
-`/voice-design` (or set `VOICE_LOOP_TTS_API_KEY`), dictation works without a second key. When
-`stt.cloud.provider` is `elevenlabs`, the script looks for a key in this order:
-
-1. Your configured STT key: the `stt_api_key` plugin option
-   (`$CLAUDE_PLUGIN_OPTION_STT_API_KEY`, exposed by Claude Code when the plugin runs from a
-   hook — declared `sensitive: true` in the manifest, so it is stored in the secure
-   credential store, never in the settings file), then `stt.cloud.key_file`, then
-   `stt.cloud.api_key_env` (default `VOICE_LOOP_STT_API_KEY`).
-2. The TTS key (same precedence as STT, via `tts_api_key` → `tts.cloud.key_file` →
-   `tts.cloud.api_key_env`) — one credentials home, not a second one.
+the `tts_api_key` plugin option in `/config`, dictation works without a second key. When
+`stt.cloud.provider` is `elevenlabs` and `stt_api_key` is empty, the voice-loop MCP relay
+falls back to `CLAUDE_PLUGIN_OPTION_TTS_API_KEY` — one credentials home, not a second one.
 
 That shared-key rule is ElevenLabs' alone, because it is the one provider covering both directions
 with one account here: a `deepgram` STT config is never handed an ElevenLabs key.
 
 The hotkey dictation path (`scripts/dictate-toggle.sh` / `.cmd`) and the `voice-design` skill are
-not started by Claude Code, so they read the option's env var, find it unset, and fall through to
-`key_file` then the named env var. Users who need the key on those paths as well point
-`stt.cloud.key_file` (or `tts.cloud.key_file`) at the same key file. The same applies to the
-voice-setup skill — its key step recommends the plugin option AND the key file because the hotkey
-and the skill both bypass the harness.
+not started by Claude Code — they reach the key through the voice-loop plugin MCP server
+(declared under `mcpServers` in the manifest, server key `voice-loop`). The MCP server
+holds the two userConfig values in its env and is the ONLY reader of either key. On
+stock Windows where `python3` is not on PATH, the MCP server does not start: `/voice-design`
+reports the voice-loop MCP tools as unavailable, and hotkey dictation takes the local
+whisper path.
 
 **A configured endpoint that would carry the key over clear text is refused, not warned about.**
 An `http://` (or `ws://`) `stt.cloud.endpoint` / `tts.cloud.endpoint` together with a configured key
@@ -732,17 +726,14 @@ The list is short and every entry has a reason.
   credential-named ones are reported as `<set>`, the value never leaves your machine). It then
   files the bundle through your own `gh` login (lines 1093–1133) **after** showing you the bundle
   in chat and asking before anything is sent.
-- **`tls-probe.py`** reads the `PROXY_VARS` (`configured_proxy`, lines 85 and 135–140) and
-  `SSL_CERT_FILE`/`SSL_CERT_DIR` (line 228), then makes one TLS handshake. The proxy variables
-  are diagnostic only — they are checked but never sent.
+- **`tls-probe.py`** makes one TLS handshake to the host you name. Proxies are bypassed
+  and the OK message says so unconditionally; the certificate store comes from
+  `ssl.get_default_verify_paths()`. No environment variables are read.
 - **The hook command** itself reads the cloud TTS/STT key from `$CLAUDE_PLUGIN_OPTION_TTS_API_KEY`
-  / `$CLAUDE_PLUGIN_OPTION_STT_API_KEY` (the `tts_api_key` / `stt_api_key` plugin options) when
-  voice-loop runs from Claude Code, falling back to `tts.cloud.key_file` /
-  `stt.cloud.key_file` and then to `tts.cloud.api_key_env` / `stt.cloud.api_key_env`. The hotkey
-  dictation path (`scripts/dictate-toggle.sh` / `.cmd`) and the `voice-design` skill are not started
-  by Claude Code and therefore read only the key file and the env var on that path; users who need
-  the key on those paths as well point `key_file` at the same file. Nothing the script reads is
-  stored in `config.json`.
+  / `$CLAUDE_PLUGIN_OPTION_STT_API_KEY` (the `tts_api_key` / `stt_api_key` plugin options). The
+  hotkey dictation path (`scripts/dictate-toggle.sh` / `.cmd`) and the `voice-design` skill are not
+  started by Claude Code and reach the key through the voice-loop plugin MCP server. The key never
+  leaves the userConfig or, transitively, the MCP server's env.
 
 ## What this plugin fetches at runtime
 
@@ -769,8 +760,9 @@ you every byte of it in chat and asks before anything is sent**, naming where it
 
 What the collector strips before you ever see it:
 
-- **keys and tokens** — by shape, and by config key name (`api_key` goes; `api_key_env` and
-  `key_file` stay, because "which variable was consulted" is half the diagnosis);
+- **keys and tokens** — by shape, and by config key name (`api_key` goes); credential-named
+  `VOICE_LOOP_*` environment variables are skipped entirely from the bundle (the plugin
+  no longer documents a credential-shaped variable for the installer to set);
 - **you** — your username and home paths, and every host except loopback;
 - **what was said.** A log line carrying speech keeps its event and loses its words:
   `transcript: <redacted 30 chars>`. The length is a diagnostic; the sentence is yours. Third-party
