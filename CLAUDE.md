@@ -19,8 +19,12 @@ business and is not enumerated here), `.claude-plugin/` (holds `marketplace.json
 (one directory per plugin), `tests/` (shelf-level tests and test roots that cannot live inside a plugin
 folder — `voice-loop/` (the voice-loop test suite; the plugin folder is shipped as the install target,
 and the directory holds any shipped file of 256 KiB or more, so the suite lives here under
-`voice-loop/` rather than `plugins/voice-loop/tests/`) and `test_directory_listing.py` (the
-directory-listing acceptance test, run by `validate`)), `tales/` (story content, not a plugin — the
+`voice-loop/` rather than `plugins/voice-loop/tests/`), `test_directory_listing.py` (the
+directory-listing acceptance test, run by `validate`), and `test_directory_policy.py` (the
+directory-policy acceptance test: no `Bash` in any skill's `allowed-tools`, and no fetcher piped into
+a shell anywhere under the plugins tree — both holds windowsill#5867 raised after #5816 merged,
+neither of which `claude plugin validate --strict` catches — run by the same CI job that runs
+`test_directory_listing.py`)), `tales/` (story content, not a plugin — the
 told tales, the `canon/` core of universe-model laws and the entity registry, and `CONTRIBUTING.md`
 for tales), `LICENSE`, `.gitignore`, `.gitattributes`, `.claude/`, this file.
 

@@ -50,8 +50,16 @@ PLUGINS_ROOT = REPO_ROOT / "plugins"
 # --- the allowed-tools check ----------------------------------------------------------------------
 
 
+# The sentinel the parser returns for a value it refuses as unparseable. A refusal is reported
+# as an offender by the main assertion with reason "unparseable allowed-tools value", rather
+# than silently flipping to ``[]`` and passing the check.
+_UNPARSEABLE_SENTINEL = "__UNPARSEABLE_ALLOWED_TOOLS_VALUE__"
+
 _FRONTMATTER_RE = re.compile(r"^---\s*$\n(.*?)\n---\s*$\n", re.DOTALL | re.MULTILINE)
-_ALLOWED_TOOLS_LINE_RE = re.compile(r"^allowed-tools:\s*(.*?)\s*$", re.MULTILINE)
+# `[ \t]` rather than `\s` so the value match does NOT cross the newline: an empty
+# `allowed-tools:` line would otherwise swallow the next ``- item`` line and the block
+# branch would never be reached (R1).
+_ALLOWED_TOOLS_LINE_RE = re.compile(r"^allowed-tools:[ \t]*(.*?)[ \t]*$", re.MULTILINE)
 _FLOW_LIST_RE = re.compile(r"^\[(.*)\]\s*$")
 
 
@@ -84,12 +92,17 @@ def _parse_front_matter(path: Path) -> dict[str, str] | None:
 def _flow_list_items(value: str) -> list[str] | None:
     """The items of a flow-style list, or ``None`` when the value is empty (a block list follows).
 
-    A value that contains ``{`` is refused as unparseable rather than guessed at — that is a
-    f-string or a templated value a future author might write, and the test refuses to
-    invent an answer for it. The check below reports it as a refusal so the holder can
-    rewrite it without thinking the test was being lenient."""
+    A value that contains ``{`` is refused as unparseable — that is an f-string or a templated
+    value a future author might write, and the test refuses to invent an answer for it. The
+    refusal is signalled by returning ``[_UNPARSEABLE_SENTINEL]`` so the main assertion reports
+    the file as an offender with reason ``"unparseable allowed-tools value"`` rather than
+    silently passing the check.
+
+    A value that LOOKS like a flow list (``[...]``) but parses to nothing (e.g. an unclosed
+    bracket ``[Read, Bash``) is also refused: there is no honest way to know what the author
+    meant, and the parser must not guess."""
     if "{" in value:
-        return None
+        return [_UNPARSEABLE_SENTINEL]
     match = _FLOW_LIST_RE.match(value)
     if not match:
         return None
@@ -111,24 +124,31 @@ def _flow_list_items(value: str) -> list[str] | None:
             buf.append(char)
     if buf:
         items.append("".join(buf).strip())
-    return [item for item in items if item]
-
-
-def _block_list_items(front: dict[str, str], key: str) -> list[str]:
-    """The items of a block-style list that follows an empty ``key:`` line — only the
-    immediate ``- item`` lines are read, never a sibling key's list."""
-    body_lines = front.get(f"__{key}_block", "")
-    return [line[1:].strip() for line in body_lines.splitlines() if line.startswith("- ")]
+    items = [item for item in items if item]
+    if not items:
+        return [_UNPARSEABLE_SENTINEL]  # an empty ``[...]`` is unparseable too
+    return items
 
 
 def _block_list_source(text: str) -> dict[str, str]:
     """A front-matter body broken into per-key blocks so a block list following an empty
-    ``key:`` line can be parsed without confusing it with a sibling key's block."""
+    ``key:`` line can be parsed without confusing it with a sibling key's block.
+
+    Lines that start with whitespace (a tab, a space) OR with a literal ``- `` belong to the
+    CURRENT top-level key's block; the next top-level line (no leading whitespace and a ``:``
+    somewhere) flushes the previous block to a ``__{key}_block`` slot and starts a new one.
+    Blank lines and comment lines are kept as part of the current block so they cannot fork it
+    prematurely."""
     result: dict[str, str] = {}
     current: str | None = None
     buf: list[str] = []
     for line in text.splitlines():
-        if line.startswith(" ") or line.startswith("\t") or line.startswith("- "):
+        stripped_left = line.lstrip(" \t")
+        if stripped_left and (
+            stripped_left.startswith("- ")
+            or line.startswith(" ")
+            or line.startswith("\t")
+        ):
             if current is not None:
                 buf.append(line)
             continue
@@ -142,30 +162,66 @@ def _block_list_source(text: str) -> dict[str, str]:
     return result
 
 
+def _block_list_items(front: dict[str, str], key: str) -> list[str]:
+    """The items of a block-style list that follows an empty ``key:`` line — only the
+    immediate ``- item`` lines are read, never a sibling key's list.
+
+    Indentation (tabs or spaces) is stripped before the ``- `` prefix is tested, so an
+    indented YAML list (``allowed-tools:\\n  - Read\\n  - Bash``) is read as a single
+    block rather than being skipped. The check stops at the next top-level key by design:
+    ``_block_list_source`` has already partitioned the body so this function only sees the
+    lines that belong to ``key``."""
+    body_lines = front.get(f"__{key}_block", "")
+    items: list[str] = []
+    for line in body_lines.splitlines():
+        stripped = line.lstrip(" \t")
+        if stripped.startswith("- "):
+            items.append(stripped[2:].strip())
+    return items
+
+
 def _allowed_tools_items(path: Path) -> list[str] | None:
     """The ``allowed-tools`` items this file declares, or ``None`` for a file with no
-    front matter / no ``allowed-tools`` line at all. A file whose flow-list value
-    contains ``{`` is refused (returns ``[]`` so the check still runs against it) and the
-    matcher's whole-word rule fires on the literal ``{``."""
+    front matter / no ``allowed-tools`` line at all.
+
+    Fail-closed behaviour (R2): a value containing ``{``, or a value shaped like a flow
+    list that parses to nothing, is refused by returning ``[_UNPARSEABLE_SENTINEL]``. A
+    bare value with a ``,`` (e.g. ``Bash, Read`` with no brackets) is also refused — it is
+    neither a well-formed flow list nor a single bare tool name, and the parser must not
+    guess. A well-formed single bare name (no ``,``) is returned as a one-item list.
+
+    The return type distinguishes the three outcomes the main assertion needs:
+      * ``None``             — no front matter / no ``allowed-tools`` line: skip the file.
+      * ``[_UNPARSEABLE_…]`` — refuse: flag as an offender with a refusal reason.
+      * a list of items      — well-formed: scan for ``Bash``.
+    """
     text = path.read_text(encoding="utf-8")
     match = _FRONTMATTER_RE.search(text)
     if not match:
         return None
     body_text = match.group(1)
-    front = _parse_front_matter(path) or {}
     line_match = _ALLOWED_TOOLS_LINE_RE.search(body_text)
     if not line_match:
         return None
     value = line_match.group(1).strip()
+    if "{" in value:
+        return [_UNPARSEABLE_SENTINEL]
     if value.startswith("[") and value.endswith("]"):
         items = _flow_list_items(value)
         if items is None:
-            return []
+            return [_UNPARSEABLE_SENTINEL]
         return items
     if value == "":
-        front_blocks = _block_list_source(body_text)
-        return _block_list_items(front_blocks, "allowed-tools")
-    # a single bare name on the same line (not a list at all): treat it as one item
+        items = _block_list_items(_block_list_source(body_text), "allowed-tools")
+        # a block-list item containing ``{`` is a templated value (an f-string or a
+        # future-author shorthand), refuse it — the same fail-closed shape as a flow
+        # value with ``{``.
+        if any("{" in item for item in items):
+            return [_UNPARSEABLE_SENTINEL]
+        return items
+    # a single bare value (not a list at all): a comma here makes it list-shaped — refuse.
+    if "," in value:
+        return [_UNPARSEABLE_SENTINEL]
     return [value]
 
 
@@ -177,57 +233,115 @@ def _is_bash_item(item: str) -> bool:
     return item == "Bash" or item.startswith("Bash(")
 
 
+def _refusal_for(path: Path) -> list[str] | None:
+    """The single shared helper the main assertion and the refusal fixtures use — it runs
+    ``_allowed_tools_items`` over a real SKILL.md file and reports the refusal shape, if
+    any. ``None`` means no refusal (the file has no front matter / no allowed-tools line,
+    or its allowed-tools value is well-formed). A list means refusal, with the list
+    describing what was refused (the bash items, or ``[_UNPARSEABLE_SENTINEL]`` for
+    unparseable values)."""
+    items = _allowed_tools_items(path)
+    if items is None:
+        return None
+    if _UNPARSEABLE_SENTINEL in items:
+        return ["unparseable allowed-tools value"]
+    bash_items = [item for item in items if _is_bash_item(item)]
+    if bash_items:
+        return bash_items
+    return None
+
+
+def _write_skill_md(path: Path, allowed_tools_block: str) -> None:
+    """A tiny SKILL.md writer used by the refusal fixtures: the front matter is built from
+    the ``allowed_tools_block`` argument, and the body is a single placeholder sentence so
+    the file is a well-formed markdown file the matcher parses end-to-end. Indented
+    ``- item`` lines keep their leading whitespace so the block-list path is exercised."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "---\n"
+        f"allowed-tools:\n{allowed_tools_block}\n"
+        "---\n"
+        "\n"
+        "# placeholder\n"
+        "A body paragraph that is enough for the front-matter parser to read.\n",
+        encoding="utf-8",
+    )
+
+
 def _skill_files() -> list[Path]:
     """Every file under the plugins tree whose front matter can declare an
-    ``allowed-tools`` entry — skills (``skills/**/SKILL.md``), commands
-    (``commands/**/*.md``), and agents (``agents/**/*.md``)."""
+    ``allowed-tools`` entry — skills (``skills/**/SKILL.md`` at any depth), commands
+    (``commands/**/*.md``), and agents (``agents/**/*.md``). The depth-agnostic skill
+    glob catches a skill nested under a parent directory (e.g. ``skills/plugin-a/foo/SKILL.md``)."""
     found: list[Path] = []
-    for pattern in ("skills", "commands", "agents"):
-        for path in (PLUGINS_ROOT).rglob(f"{pattern}/*/SKILL.md"):
+    for path in PLUGINS_ROOT.rglob("skills/**/SKILL.md"):
+        found.append(path)
+    for pattern in ("commands", "agents"):
+        for path in (PLUGINS_ROOT).rglob(f"{pattern}/**/*.md"):
             found.append(path)
         for path in (PLUGINS_ROOT).rglob(f"{pattern}/*.md"):
             found.append(path)
-    return sorted(found)
-
-
-def _all_skill_files_with_bash() -> list[Path]:
-    """The set of files THIS test asserts against — every skill/command/agent under the
-    plugins tree. A test that names a single f-string for the post-#5816 tree would
-    silently pass once that one file stops carrying ``Bash`` (a future fix in the same
-    place would not be caught), so the assertion is over the whole file set, and a new
-    file added with ``Bash`` fails this test on its own."""
-    return _skill_files()
+    return sorted(set(found))
 
 
 # --- refusal fixtures (asserted FIRST so a regression that swaps refusal for pass fails loudly) ---
 
 
-def test_allowed_tools_refuses_a_bare_bash_entry() -> None:
-    """Refusal fixture: a flow list with a bare ``Bash`` item fails the check. Pinned
-    first so a future regression that turns the refusal into a pass fails this test by
-    name, not silently."""
-    items = ["Bash", "Read"]
-    assert any(_is_bash_item(item) for item in items), (
-        "the refusal fixture does not refuse its own bare Bash"
+def test_allowed_tools_refuses_a_bare_bash_entry(tmp_path: Path) -> None:
+    """Refusal fixture: a real SKILL.md on tmp_path with a flow list carrying a bare
+    ``Bash`` item fails the check. Pinned first so a future regression that turns the
+    refusal into a pass fails this test by name, not silently. Exercised through the
+    real file walker / front-matter parser — a hand-written in-memory list could pass
+    even if the on-disk reader broke."""
+    skill = tmp_path / "skills" / "bare-bash" / "SKILL.md"
+    _write_skill_md(skill, "  - Bash\n  - Read\n")
+    refusal = _refusal_for(skill)
+    assert refusal is not None and "Bash" in refusal, (
+        "the bare-Bash refusal fixture does not refuse its own entry; the on-disk reader "
+        f"parsed the file but found no Bash, refusal={refusal!r}"
     )
 
 
-def test_allowed_tools_refuses_a_narrowed_bash_entry() -> None:
+def test_allowed_tools_refuses_a_narrowed_bash_entry(tmp_path: Path) -> None:
     """Refusal fixture: ``Bash(git status:*)`` (a permitted-prefix form) also fails the
-    check — the directory's rule does NOT accept narrowing as a cure; the cure is to
-    remove the entry."""
-    items = ["Read", "Bash(git status:*)"]
-    assert any(_is_bash_item(item) for item in items), (
-        "the narrowed-Bash refusal fixture does not refuse its own entry"
+    check on disk — the directory's rule does NOT accept narrowing as a cure; the cure is
+    to remove the entry."""
+    skill = tmp_path / "skills" / "narrowed-bash" / "SKILL.md"
+    _write_skill_md(skill, "  - Bash(git status:*)\n  - Read\n")
+    refusal = _refusal_for(skill)
+    assert refusal is not None and any(item.startswith("Bash") for item in refusal), (
+        "the narrowed-Bash refusal fixture does not refuse its own entry on disk; "
+        f"refusal={refusal!r}"
     )
 
 
-def test_allowed_tools_refuses_a_block_style_bash_entry() -> None:
-    """Refusal fixture: a block-style list with ``- Bash`` fails the check — the same
-    rule covers both spellings so an author cannot dodge it by switching shape."""
-    items = ["Read", "Bash"]
-    assert any(_is_bash_item(item) for item in items), (
-        "the block-list Bash refusal fixture does not refuse its own entry"
+def test_allowed_tools_refuses_a_block_style_bash_entry(tmp_path: Path) -> None:
+    """Refusal fixture: an indented block-style list with ``- Bash`` fails the check on
+    disk — the same rule covers both spellings so an author cannot dodge it by switching
+    shape. This is the regression the R1 / R2 round-trip was written to catch: a regex
+    that swallowed the line after the empty ``allowed-tools:`` (or a block reader that
+    tested ``- `` without first stripping indentation) would parse this to ``[]`` and
+    pass."""
+    skill = tmp_path / "skills" / "block-bash" / "SKILL.md"
+    _write_skill_md(skill, "  - Bash\n")
+    refusal = _refusal_for(skill)
+    assert refusal is not None and "Bash" in refusal, (
+        "the block-list Bash refusal fixture does not refuse its own entry on disk; the "
+        f"block reader missed it, refusal={refusal!r}"
+    )
+
+
+def test_allowed_tools_refuses_an_unparseable_value_with_a_brace(tmp_path: Path) -> None:
+    """Refusal fixture: a flow value containing ``{`` (e.g. ``[Bash, {x}]``) fails the
+    check on disk with reason ``"unparseable allowed-tools value"``. A parser that
+    returned ``[]`` for this would pass silently — that is the R2 failure mode the
+    test is here to catch."""
+    skill = tmp_path / "skills" / "brace-value" / "SKILL.md"
+    _write_skill_md(skill, '  - "{x}"\n')
+    refusal = _refusal_for(skill)
+    assert refusal == ["unparseable allowed-tools value"], (
+        "the brace-bearing refusal fixture must fail with the unparseable reason; "
+        f"refusal={refusal!r}"
     )
 
 
@@ -236,22 +350,20 @@ def test_allowed_tools_refuses_a_block_style_bash_entry() -> None:
 
 def test_no_skill_declares_a_bash_entry_in_allowed_tools() -> None:
     """No skill / command / agent file under the plugins tree declares a bare ``Bash``
-    or ``Bash(...)`` entry in its ``allowed-tools`` front matter. The directory's
-    ALLOWED_TOOLS_BROAD hold (windowsill#5867) names removing the entry as the cure —
-    the user then approves each command through the normal permission prompt. Files
-    with no front matter at all are skipped (the rule is on the value of an existing
-    line, not on the presence of one)."""
+    or ``Bash(...)`` entry in its ``allowed-tools`` front matter, AND no file declares an
+    unparseable ``allowed-tools`` value. The directory's ALLOWED_TOOLS_BROAD hold
+    (windowsill#5867) names removing the entry as the cure — the user then approves each
+    command through the normal permission prompt. Files with no front matter at all are
+    skipped (the rule is on the value of an existing line, not on the presence of one)."""
     offenders: list[tuple[Path, list[str]]] = []
-    for path in _all_skill_files_with_bash():
-        items = _allowed_tools_items(path)
-        if items is None:
-            continue
-        bash_items = [item for item in items if _is_bash_item(item)]
-        if bash_items:
-            offenders.append((path, bash_items))
+    for path in _skill_files():
+        refusal = _refusal_for(path)
+        if refusal is not None:
+            offenders.append((path, refusal))
     assert not offenders, (
-        "skill files declare a Bash entry in allowed-tools (ALLOWED_TOOLS_BROAD hold; "
-        "the cure is to REMOVE the Bash entry, not to narrow it): "
+        "skill files fail the ALLOWED_TOOLS_BROAD hold (the cure is to REMOVE the Bash "
+        "entry, not to narrow it; an unparseable value must be rewritten into a "
+        "well-formed flow list): "
         + ", ".join(
             f"{p.relative_to(REPO_ROOT)} -> {b}" for p, b in offenders
         )
@@ -310,14 +422,47 @@ def _is_pipe_to_shell(line: str) -> bool:
     return False
 
 
-def _plugin_source_files() -> list[Path]:
-    """Every text source file under the plugins tree the pipe check scans — markdown
-    (docs, READMEs, evals), shell scripts, and Python source. Generated files
-    (``.coverage``, ``__pycache__``) and the few non-text binary assets are skipped by
-    the per-file read below."""
+# The suffix allowlist the pipe check scans. Widened over widescreen review (R4) to cover
+# the executable file types the plugins tree ships: ``.cmd`` (Windows launchers — three
+# shipped under ``plugins/voice-loop/scripts/``), ``.bat`` (legacy Windows), ``.ps1`` and
+# ``.psm1`` (PowerShell — ``install.ps1`` downloads then runs the script in one command),
+# and ``.js`` / ``.mjs`` / ``.cjs`` (Node — the agent-statusline renderer). All of these
+# can carry a fetcher piped to an executor under the iwr/irm/iex vocabulary the matcher
+# already carries; the previous allowlist missed them entirely.
+_PIPE_SUFFIX_ALLOWLIST = (
+    ".md",
+    ".sh",
+    ".py",
+    ".txt",
+    ".json",
+    ".yaml",
+    ".yml",
+    ".cmd",
+    ".bat",
+    ".ps1",
+    ".psm1",
+    ".js",
+    ".mjs",
+    ".cjs",
+)
+
+
+def _plugin_source_files(root: Path | None = None) -> list[Path]:
+    """Every text source file under ``root`` (default: the plugins tree) the pipe check
+    scans — markdown (docs, READMEs, evals), shell scripts, Python source, the Windows
+    launcher batch (``cmd``, ``bat``), PowerShell (``ps1``, ``psm1``), and Node
+    (``js``, ``mjs``, ``cjs``). ``root`` is parameterised so refusal fixtures can use a
+    ``tmp_path`` instead — that is the seam R4 needs to exercise the widened suffix
+    allowlist end-to-end against a real file walker rather than against the line matcher
+    alone.
+
+    Generated files (``.coverage``, ``__pycache__``) and the few non-text binary assets
+    are skipped by the per-file read below and the directory skip-list."""
+    if root is None:
+        root = PLUGINS_ROOT
     skip_dirs = {"node_modules", ".git", "__pycache__"}
     found: list[Path] = []
-    for path in PLUGINS_ROOT.rglob("*"):
+    for path in root.rglob("*"):
         if not path.is_file():
             continue
         if any(part in skip_dirs for part in path.parts):
@@ -325,10 +470,28 @@ def _plugin_source_files() -> list[Path]:
         # text-shaped files only — the scan reads each file as text, and a binary read
         # as text either decodes with replacement characters (so the matcher misses it)
         # or fails outright. Restricting by extension keeps the scan deterministic.
-        if path.suffix not in (".md", ".sh", ".py", ".txt", ".json", ".yaml", ".yml"):
+        if path.suffix not in _PIPE_SUFFIX_ALLOWLIST:
             continue
         found.append(path)
     return sorted(found)
+
+
+def _pipe_to_shell_offenders(root: Path | None = None) -> list[tuple[Path, int, str]]:
+    """Every (path, line-number, line-text) tuple in ``root`` that the matcher would flag.
+    Returned as a list so callers can assert against it; ``root`` parameterised so the
+    refusal fixtures can drive it from a tmp_path."""
+    if root is None:
+        root = PLUGINS_ROOT
+    offenders: list[tuple[Path, int, str]] = []
+    for path in _plugin_source_files(root):
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for n, line in enumerate(text.splitlines(), 1):
+            if _is_pipe_to_shell(line):
+                offenders.append((path, n, line))
+    return offenders
 
 
 # --- refusal fixtures (asserted FIRST so a regression that swaps refusal for pass fails loudly) ---
@@ -364,6 +527,20 @@ def test_pipe_to_shell_accepts_a_curl_continued_with_or_exit() -> None:
     assert not _is_pipe_to_shell("curl -fsS https://example.test/health || exit 1")
 
 
+def test_pipe_to_shell_refuses_a_ps1_iwr_to_iex_in_tmp_path(tmp_path: Path) -> None:
+    """Refusal fixture (R4): the widened suffix allowlist catches the same fetcher-to-shell
+    pattern in PowerShell files — exercised through the real file walker, not just the
+    line matcher, so a regression in the suffix allowlist is caught here. A tmp_path with
+    a single ``install.ps1`` carrying ``iwr ... | iex`` must surface in the offenders."""
+    bad = tmp_path / "install.ps1"
+    bad.write_text('iwr https://example.test/i.ps1 | iex\n', encoding="utf-8")
+    offenders = _pipe_to_shell_offenders(tmp_path)
+    assert any(p == bad for p, _n, _l in offenders), (
+        "the .ps1 iwr|iex refusal fixture was not flagged by the walker; the widened "
+        f"suffix allowlist may have lost .ps1 again, offenders={offenders!r}"
+    )
+
+
 # --- the assertion itself -------------------------------------------------------------------------
 
 
@@ -379,16 +556,10 @@ def test_no_plugin_source_pipe_a_fetcher_into_a_shell() -> None:
     matched as WHOLE WORDS and a literal ``|`` required between them, plus the two
     explicit forms ``sh -c "$(curl ...)`` and ``bash <(curl ...)``. The word-boundary
     rule is load-bearing — see the module docstring for the prose sites that would
-    otherwise match a bare ``irm`` substring."""
-    offenders: list[tuple[Path, int, str]] = []
-    for path in _plugin_source_files():
-        try:
-            text = path.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            continue
-        for n, line in enumerate(text.splitlines(), 1):
-            if _is_pipe_to_shell(line):
-                offenders.append((path, n, line))
+    otherwise match a bare ``irm`` substring. The scan reads ``.md``, ``.sh``, ``.py``,
+    ``.txt``, ``.json``, ``.yaml``, ``.yml``, ``.cmd``, ``.bat``, ``.ps1``, ``.psm1``,
+    ``.js``, ``.mjs``, ``.cjs`` — the executable file types the plugins tree ships."""
+    offenders = _pipe_to_shell_offenders()
     assert not offenders, (
         "plugin files pipe a fetcher into a shell (RUNTIME_FETCH_EXEC hold): "
         + ", ".join(

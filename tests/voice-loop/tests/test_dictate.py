@@ -2252,6 +2252,61 @@ def test_elevenlabs_stt_with_no_key_at_all_degrades_to_whisper(state, monkeypatc
     assert "cloud stt failed — falling back to local whisper" in log_text
 
 
+@pytest.mark.parametrize("tts_provider_name", ["", "openai", "deepgram"])
+def test_elevenlabs_stt_does_not_borrow_a_non_elevenlabs_tts_key(
+    state, monkeypatch, opener, tts_provider_name
+):
+    """An ElevenLabs STT config with a NON-ElevenLabs TTS provider must NOT borrow the TTS key
+    (windowsill#5867) — the variable that holds the TTS key points at a different vendor's
+    credentials, and sending it to api.elevenlabs.io is the credential leak this predicate
+    closes. An unset ``tts.cloud.provider`` resolves through the registry default
+    (``providers.DEFAULT_TTS`` = ``openai`` at ``dictate.py:510``), so the borrow is OFF
+    for the shipped-default case as well — a user on a local TTS backend who relied on
+    ``VOICE_LOOP_TTS_API_KEY`` for STT must set ``stt.cloud.api_key_env`` or
+    ``tts.cloud.provider: "elevenlabs"`` explicitly.
+
+    Three things are asserted: ``transcribe`` falls back to local whisper; no request
+    reaches the ElevenLabs host; the no-key log line names ``VOICE_LOOP_STT_API_KEY``
+    and does not name ``VOICE_LOOP_TTS_API_KEY``. Parametrized over the explicit
+    ``openai`` / ``deepgram`` TTS vendors AND the unset case (the shipped default) —
+    three permutations of the same rule. Modelled on the negative
+    ``test_openai_stt_with_no_key_at_all_degrades_to_whisper`` near :2703, which covers
+    the openai side; this one is the elevenlabs side, the one that was vulnerable to
+    the cross-vendor borrow before the fix."""
+    (state / "dictate.wav").write_bytes(b"RIFFfakewav")
+    fake = opener(b'{"text": "whisper fallback"}')
+    # The TTS key is set — but the TTS provider is NOT elevenlabs, so it points at a
+    # different vendor's credentials. Sending that to api.elevenlabs.io would be the
+    # cross-vendor leak the predicate closes.
+    monkeypatch.setenv(
+        "VOICE_LOOP_TTS_API_KEY", "an-openai-key-that-elevenlabs-must-not-be-handed"
+    )
+    monkeypatch.delenv("VOICE_LOOP_STT_API_KEY", raising=False)
+    config: dict = {"stt": {"backend": "cloud", "cloud": {"provider": "elevenlabs"}}}
+    if tts_provider_name:
+        config["tts"] = {"cloud": {"provider": tts_provider_name}}
+    s = dictate.resolve_settings(config, "Linux")
+    assert s["tts_provider"] != "elevenlabs"  # the precondition the borrow checks against
+
+    assert dictate.transcribe(s) == "whisper fallback"
+
+    # Only the LAN degrade made it past the key check — nothing went to elevenlabs.io
+    assert len(fake.requests) == 1
+    request_url = fake.requests[0][0].full_url
+    assert "elevenlabs" not in request_url.lower(), (
+        f"ElevenLabs STT must not have been called when the only key in scope belongs "
+        f"to a different vendor; saw request to {request_url!r}"
+    )
+    assert "/stt?language=en" in request_url  # the LAN degrade path
+    log_text = (state / "dictate.log").read_text(encoding="utf-8")
+    assert "cloud stt: no key for elevenlabs" in log_text
+    assert "VOICE_LOOP_STT_API_KEY" in log_text
+    assert "VOICE_LOOP_TTS_API_KEY" not in log_text, (
+        "the borrow was OFF but the log named the TTS key — the message would point "
+        "the user at a credential they do not have"
+    )
+
+
 def test_deepgram_stt_goes_through_transcribe_with_no_branch_in_the_way(state, monkeypatch, opener):
     """The proof that adding a provider is one ENTRY: Deepgram was added to the registry and
     nothing in this dispatch path learned its name — yet a configured `deepgram` reaches its own
