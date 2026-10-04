@@ -413,7 +413,11 @@ def redact_value(node: object, key: str = "") -> object:
 LOG_RULES: tuple[tuple[str, str | None], ...] = (
     # speak.py
     ("config ignored (", None),
-    ("key file unreadable (", None),
+    # the credential-closure change (#5816): the OBSOLETE_KEYS table in
+    # speak.py / dictate.py names the deleted key_file / api_key_env settings
+    # so a config that still carries them is warned about. The names never
+    # appear in argv or the log; the line is configuration metadata only.
+    ("config ignored: ", None),
     ("bounded input: ", None),
     ("marker with no text", None),
     ("ledger unwritable: ", None),
@@ -459,7 +463,7 @@ LOG_RULES: tuple[tuple[str, str | None], ...] = (
     ("local command is empty", None),
     ("local command rc=", None),
     ("timings extract_ms=", None),
-    ("cloud tts: no key", None),
+    ("cloud tts: no key (set the tts_api_key plugin option in /config)", None),
     # a builder refusing a misconfiguration (an unset ElevenLabs voice) — the reason is fixed prose
     ("cloud tts misconfigured: ", None),
     # a failed cloud request whose resolved endpoint was a local address (windowsill#270). The
@@ -481,7 +485,10 @@ LOG_RULES: tuple[tuple[str, str | None], ...] = (
     ("stream holder could not bind its socket", None),
     ("stream holder idle — exiting", None),
     ("stream holder: a line failed after", None),
-    ("stream holder: no key — exiting", None),
+    # the credential-closure change (#5816): the speak holder's "no key" line
+    # now names the userConfig option in /config, not a key file. The phrase
+    # carries no key, only the operator's path to one.
+    ("stream holder: no key (set the tts_api_key plugin option", None),
     ("played rc=", None),
     ("nothing played via=", None),
     # the contour check (#40): the count is metadata, but the alert text names the operator's
@@ -500,14 +507,27 @@ LOG_RULES: tuple[tuple[str, str | None], ...] = (
     ("stt command failed: ", None),
     # the provider name and the env var names it tried; both are config-shaped metadata, and
     # naming which provider had no key is the whole diagnostic value of the line
-    ("cloud stt: no key for ", None),
-    # a provider with no default host and no endpoint: the line names the provider and fixed prose
-    ("cloud stt: no endpoint for ", None),
-    # a failed cloud STT request whose resolved endpoint was a local address (windowsill#270).
-    # The only host the line can ever name is loopback, which the bundle already redacts whole.
-    ("cloud stt: the endpoint resolved to a local address (", None),
     ("stt.cloud.provider is not a known provider — using ", "instead of "),
     ("cloud stt failed — falling back to local whisper", None),
+    # the relay socket-lifecycle messages (windowsill#5870, R5). The lines
+    # carry only the OS error class name and fixed prose — no host, no path,
+    # no key. They live here so the bundle reads the relay's misbehaviour
+    # without revealing where it is bound.
+    ("cloud stt: relay socket not safe (", None),
+    ("cloud stt: relay connect refused (", None),
+    ("cloud stt: relay write failed (", None),
+    ("cloud stt: relay silent past deadline (", None),
+    # the streaming cloud downgrade (windowsill#5870, R5): the config asked
+    # for streaming, the hotkey holds no key, the relay's batch path is the
+    # substitute. The line is fixed prose — a contract, not a payload.
+    ("streaming needs a key the hotkey path no longer holds", None),
+    # the credential-closure change (#5816): the relay holds the key and the script
+    # never sees the words, so the line carries a character count in the plugin's
+    # existing speech-redaction form (windowsill#5870, R7) rather than the transcript.
+    # Cut at "relay: " — the redaction form is the same ``<redacted N chars>`` shape
+    # the rest of the speech-shaped log lines use, and the line is no different in
+    # what it reveals (the length is metadata; the sentence is the user's).
+    ("cloud stt via relay: ", "relay: "),
     # streaming dictation (#99): the worker's lifecycle and the degrade. Counts, byte totals, pids
     # and socket reasons — the transcript itself travels only through the `transcript: ` row above,
     # which is cut, and the `stream result` file is listed for its size and never opened.
@@ -522,8 +542,6 @@ LOG_RULES: tuple[tuple[str, str | None], ...] = (
     ("streaming stt failed (", None),
     ("streaming stt heard nothing back from the server", None),
     ("dictation latency stop_to_paste_ms=", None),
-    ("cloud stt returned an error: ", "error: "),
-    ("cloud stt returned undecodable response: ", "response: "),
     # the plaintext endpoint warnings (#110) are gone with the warnings themselves (#215): a
     # clear-text endpoint carrying a credential is now REFUSED at configuration time, and that
     # refusal line is built dynamically — so it travels the unknown-line path, cut at its first

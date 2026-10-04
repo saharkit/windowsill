@@ -23,7 +23,6 @@ keeps its key passed directly by the holder process — that path is unchanged.
 
 from __future__ import annotations
 
-import argparse
 import base64
 import json
 import os
@@ -33,7 +32,14 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from typing import Any
+
+# Make the providers registry importable — voice_mcp.py lives in scripts/ and
+# the registry is its sibling. The same sys.path approach speak.py / dictate.py
+# use; no package hierarchy here on purpose (a single file is the contract).
+_PLUGINS_DIR = os.path.dirname(os.path.abspath(__file__))
+if _PLUGINS_DIR not in sys.path:
+    sys.path.insert(0, _PLUGINS_DIR)
+import providers  # noqa: E402 — sys.path injection above is the contract
 
 # --- constants --------------------------------------------------------------
 
@@ -47,29 +53,61 @@ ELEVENLABS_PREVIEWS_URL = "https://api.elevenlabs.io/v1/text-to-voice/create-pre
 ELEVENLABS_CREATE_URL = "https://api.elevenlabs.io/v1/text-to-voice/create-voice-from-preview"
 
 # Wire-protocol enums. ``bad-request`` is exactly the four conditions named in the
-# ticket; nothing else earns that reason.
+# ticket; nothing else earns that reason. ``clear-text-refused`` is the relay's
+# answer to a configured http:// (or ws://) endpoint with a credential, refused
+# at the relay because the key is here, in this process, and the relay holds it.
 _REASONS = {
     "no-key",
     "bad-request",
     "provider-unreachable",
     "timeout",
+    "clear-text-refused",
 }
 
-# Provider names the relay accepts. Mirrored from providers.STT_PROVIDERS (the relay
-# uses the provider's ``endpoint`` method via the registry, but resolves its key
-# itself). The registry's key_envs / key_env_fallbacks are NOT consulted — they would
-# point at exactly the named variable this ticket removes.
-_VALID_PROVIDERS = frozenset({"openai", "elevenlabs", "deepgram"})
+# Provider names the relay accepts — derived from providers.STT_PROVIDERS so the
+# registry is the single source of truth, with an explicit frozenset for the
+# closed-enum test in tests/voice-loop/tests/test_voice_mcp.py.
+_VALID_PROVIDERS = frozenset(providers.STT_PROVIDERS.keys())
 
 # Probe / takeover timings.
 REBIND_RETRY_SECONDS = 30
 SOCKET_PROBE_TIMEOUT_SECONDS = 1
 
+# 64 KiB cap on the bytes before the first newline (the request line). A request
+# line that grows past 64 KiB is malformed — no operator's config is 64 KiB —
+# so the cap doubles as a refusal boundary.
+REQUEST_LINE_MAX_BYTES = 64 * 1024
+
+# 32 MiB cap on the WAV bytes (the body after the first newline). A longer clip
+# is possible but every shipped recorder tops out well under that, and a body
+# without a cap is a memory-exhaustion surface.
+WAV_MAX_BYTES = 32 * 1024 * 1024
+
+
+# --- server version ----------------------------------------------------------
+
+
+def _read_plugin_version() -> str:
+    """Read the version from ``../.claude-plugin/plugin.json`` relative to this
+    file, with a fixed fallback only if the read fails. The three manifest sites
+    (this read, ``.claude-plugin/marketplace.json``, the root ``README.md`` row)
+    agree by being read from the same source — a hardcoded literal here would
+    be a fourth place to keep in step, kept by hand, and is what the brief
+    retired (windowsill#5870, R10).
+    """
+    try:
+        path = os.path.join(_PLUGINS_DIR, "..", ".claude-plugin", "plugin.json")
+        with open(path, encoding="utf-8") as fh:
+            doc = json.load(fh)
+        return str(doc.get("version") or "0.0.0")
+    except (OSError, ValueError):
+        return "0.0.0"
+
 
 # --- key resolution ---------------------------------------------------------
 
 
-def _stt_key_from_env(tts_vendor: str) -> str:
+def _stt_key_from_env(provider: str, tts_vendor: str) -> str:
     """The STT key, resolved in three steps — never through ``key_envs``.
 
     1. ``CLAUDE_PLUGIN_OPTION_STT_API_KEY`` if non-empty.
@@ -84,11 +122,12 @@ def _stt_key_from_env(tts_vendor: str) -> str:
     *names* and ElevenLabs carries ``key_env_fallbacks=("VOICE_LOOP_TTS_API_KEY",)``,
     so a relay calling them would read exactly the named variable this ticket removes.
     """
-    stt = os.environ.get(ENV_STT_KEY, "")
-    if stt.strip():
-        return stt.strip()
-    tts = os.environ.get(ENV_TTS_KEY, "")
-    return tts.strip()
+    stt = os.environ.get(ENV_STT_KEY, "").strip()
+    if stt:
+        return stt
+    if provider == "elevenlabs" and tts_vendor == "elevenlabs":
+        return os.environ.get(ENV_TTS_KEY, "").strip()
+    return ""
 
 
 def _tts_key_from_env() -> str:
@@ -107,8 +146,8 @@ def _ok(text: str) -> dict:
     return {"status": "ok", "text": text}
 
 
-def _failed(reason: str, **detail: Any) -> dict:
-    out = {"status": "failed", "reason": reason}
+def _failed(reason: str, **detail: object) -> dict:
+    out: dict = {"status": "failed", "reason": reason}
     out.update(detail)
     return out
 
@@ -118,8 +157,8 @@ def _validate_request_line(line: str) -> tuple[dict | None, str | None]:
 
     Bad-request covers exactly four conditions:
     1. the line is not valid UTF-8 JSON (we receive str here so utf-8 errors surface as ValueError);
-    2. any of the six keys is missing (``provider``, ``endpoint``, ``model``, ``language``,
-       ``tts_vendor``, ``timeout``);
+    2. any of the seven keys is missing (``provider``, ``endpoint``, ``model``, ``language``,
+       ``tts_vendor``, ``timeout``, ``stt_prompt``);
     3. the named ``provider`` is not in the registry;
     4. zero WAV bytes arrived after the newline (the caller enforces this).
     """
@@ -129,7 +168,15 @@ def _validate_request_line(line: str) -> tuple[dict | None, str | None]:
         return None, f"request line is not valid JSON: {type(err).__name__}"
     if not isinstance(parsed, dict):
         return None, "request line is not a JSON object"
-    required = ("provider", "endpoint", "model", "language", "tts_vendor", "timeout")
+    required = (
+        "provider",
+        "endpoint",
+        "model",
+        "language",
+        "tts_vendor",
+        "timeout",
+        "stt_prompt",
+    )
     missing = [k for k in required if k not in parsed]
     if missing:
         return None, f"missing keys: {missing}"
@@ -138,112 +185,147 @@ def _validate_request_line(line: str) -> tuple[dict | None, str | None]:
     return parsed, None
 
 
+def _socket_timeout() -> type[OSError] | None:
+    """Timeout exception type — ``socket.timeout`` lives under different names on some ports.
+
+    Resolved ONCE at import: as written the except clause was a function call,
+    not a class — the function always returned a type, but the call was never
+    made in an except tuple. Storing the value here lets the except clause name
+    a class, which is what the brief required.
+    """
+    return getattr(_socket, "timeout", None)
+
+
+_SOCKET_TIMEOUT = _socket_timeout() or TimeoutError
+
+
 def _post_provider(
-    endpoint: str,
+    entry: providers.SttProvider,
+    s: dict,
     key: str,
-    model: str,
-    language: str,
     wav_bytes: bytes,
     timeout: float,
-) -> tuple[str | None, str | None]:
-    """Post a WAV to the named provider endpoint. Returns ``(transcript, reason_or_None)``.
+) -> tuple[str | None, str | None, str | None]:
+    """Post a WAV through the provider's own request builder.
+
+    Returns ``(transcript, reason_or_None, detail_or_None)``. ``reason`` is one
+    of the closed-enum members in ``_REASONS`` (and ``provider-http-<code>`` for
+    an HTTP error); ``detail`` is the refusal text the relay surfaces to the
+    client when the entry's transcript is None (an error document, a malformed
+    body, the entry's own ``error_summary`` shape).
 
     Proxies are bypassed the same way the deleted SKILL.md snippets did — via a
-    ProxyHandler({}). The key is added as ``xi-api-key`` for ElevenLabs, ``Authorization``
-    for OpenAI / Deepgram; both spellings are accepted by their respective APIs.
+    ``ProxyHandler({})``. Each provider's own request builder knows its own
+    auth header (Bearer / xi-api-key / Token), its own path, its own field
+    names and its own content type — the relay no longer spells any of those.
     """
-    if not endpoint:
-        return None, "bad-request"
+    # The entry's endpoint() chooses among cloud_endpoint / default_host /
+    # endpoint; the relay hands the entry the request line's "endpoint" under
+    # "cloud_endpoint" so a configured value wins, then the entry's default_host
+    # fills the gap. An empty resolved URL is the only thing that earns a
+    # bad-request here.
+    request_url = entry.endpoint(s)
+    if not request_url:
+        return None, "bad-request", "no endpoint"
     try:
         boundary = "----voice-mcp" + os.urandom(8).hex()
-        parts: list[bytes] = []
-        for name, value in (
-            ("model", model),
-            ("language", language),
-        ):
-            parts.extend((
-                f"--{boundary}\r\n".encode(),
-                f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode(),
-                str(value).encode(),
-                b"\r\n",
-            ))
-        parts.extend((
-            f"--{boundary}\r\n".encode(),
-            b'Content-Disposition: form-data; name="audio"; filename="audio.wav"\r\n',
-            b"Content-Type: audio/wav\r\n\r\n",
-            wav_bytes,
-            b"\r\n",
-            f"--{boundary}--\r\n".encode(),
-        ))
-        body = b"".join(parts)
-        req = urllib.request.Request(
-            endpoint,
-            data=body,
-            headers={
-                "Content-Type": f"multipart/form-data; boundary={boundary}",
-                "xi-api-key": key,
-                "Authorization": f"Bearer {key}",
-            },
-            method="POST",
-        )
-        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-    except (OSError, ValueError):
-        return None, "bad-request"
+        request = entry.request(s, key, wav_bytes, boundary)
+    except (OSError, ValueError, KeyError) as err:
+        return None, "bad-request", type(err).__name__
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    req = urllib.request.Request(
+        request.url,
+        data=request.body,
+        headers=request.headers,
+        method="POST",
+    )
     try:
         with opener.open(req, timeout=timeout) as resp:
             raw = resp.read()
     except urllib.error.HTTPError as err:
-        return None, f"provider-http-{err.code}"
-    except urllib.error.URLError as err:
-        return None, "provider-unreachable"
-    except (TimeoutError, socket_timeout):
-        return None, "timeout"
+        return None, f"provider-http-{err.code}", None
+    except urllib.error.URLError:
+        return None, "provider-unreachable", None
+    except (TimeoutError, _SOCKET_TIMEOUT):
+        return None, "timeout", None
     except OSError:
-        return None, "provider-unreachable"
+        return None, "provider-unreachable", None
     try:
-        doc = json.loads(raw)
+        data = providers.decode(raw)
     except ValueError:
-        return None, "provider-unreachable"
-    transcript = doc.get("text")
-    if not isinstance(transcript, str):
-        return None, "provider-unreachable"
-    return transcript, None
-
-
-def socket_timeout() -> type[OSError] | None:
-    """Timeout exception type — ``socket.timeout`` lives under different names on some ports."""
-    return getattr(_socket, "timeout", None)
+        return None, "provider-unreachable", None
+    if data is None:
+        return None, "provider-unreachable", None
+    try:
+        text = entry.transcript(data)
+    except (AttributeError, TypeError) as err:
+        return None, "provider-unreachable", type(err).__name__
+    if text is None:
+        # The body carries no transcript field at all — an API error document,
+        # an empty body, or something this provider's parser does not recognise.
+        # Log its shape so the operator can tell a quota error from a bad model
+        # name. An EMPTY transcript is deliberately NOT this case: a silent
+        # clip transcribes to "" and that is a success.
+        detail = entry.error_summary(data) if data is not None else None
+        return None, "provider-unreachable", detail
+    return text, None, None
 
 
 def _serve_one_client(client_sock: _socket.socket, addr) -> None:
-    """One connection, one WAV, one JSON reply. Closes the socket on exit."""
+    """One connection, one WAV, one JSON reply. Closes the socket on exit.
+
+    The wire is: one UTF-8 JSON request line (terminated by ``\\n``), then the
+    raw WAV bytes until the client's ``shutdown(SHUT_WR)``, then one UTF-8
+    JSON reply line. We split on the FIRST ``\\n`` anywhere in the buffer —
+    the request line and the WAV can arrive in the same ``recv``, and reading
+    only into a ``buf.endswith(b"\\n")`` loop misses the case where a partial
+    read returned a newline in the middle of the buffer. The 64 KiB cap on the
+    request line is applied ONLY to the bytes before the first newline.
+
+    We never call ``shutdown(SHUT_WR)`` here — the client already half-closed
+    its write side. A relay that half-closes its own write side and then
+    sendall's the reply gets a ``BrokenPipeError`` and the client reads EOF as
+    reason=timeout. The reply is one ``sendall`` followed by ``close()`` in
+    the ``finally`` block, and only that.
+    """
     try:
-        client_sock.settimeout(None)  # bound by request-line timeout below
         buf = b""
-        # Read until newline — the request line is one JSON object terminated by '\n'.
+        # Read until newline appears anywhere in the buffer — the request line
+        # is one JSON object terminated by '\n'. ``buf.find(b"\n")`` returns -1
+        # until the line is complete, regardless of where in the buffer the
+        # newline arrived.
         client_sock.settimeout(5.0)
-        while not buf.endswith(b"\n"):
+        while buf.find(b"\n") == -1:
             try:
                 chunk = client_sock.recv(65536)
             except OSError:
                 client_sock.sendall((json.dumps(_failed("timeout")) + "\n").encode())
                 return
             if not chunk:
-                break
-            buf = buf + chunk
-            if len(buf) > 64 * 1024:
-                client_sock.sendall((json.dumps(_bad_request("request line over 64 KiB")) + "\n").encode())
+                # EOF before a newline — the client never finished the request
+                # line. We send a bad-request and close. (The client half-closes
+                # AFTER its WAV; a missing newline at this point is malformed.)
+                client_sock.sendall(
+                    (json.dumps(_bad_request("no newline in request line")) + "\n").encode()
+                )
                 return
-        if not buf.endswith(b"\n"):
-            client_sock.sendall((json.dumps(_bad_request("no newline in request line")) + "\n").encode())
-            return
-        line = buf[:-1].decode("utf-8", errors="replace")
+            buf = buf + chunk
+            if len(buf) > REQUEST_LINE_MAX_BYTES:
+                client_sock.sendall(
+                    (json.dumps(_bad_request("request line over 64 KiB")) + "\n").encode()
+                )
+                return
+        newline_pos = buf.find(b"\n")
+        line = buf[:newline_pos].decode("utf-8", errors="replace")
+        # The remainder is the start of the WAV; more bytes follow.
+        wav = buf[newline_pos + 1:]
         parsed, err = _validate_request_line(line)
         if err is not None:
             client_sock.sendall((json.dumps(_bad_request(err)) + "\n").encode())
             return
-        # WAV bytes follow the newline — read until shutdown.
-        wav = b""
+        # Read the rest of the WAV — the client has already half-closed its write
+        # side, so EOF on the read side marks the end of the body. We do NOT
+        # call shutdown on our side; that would break the reply's sendall.
         client_sock.settimeout(max(1.0, float(parsed["timeout"]) + 5.0))
         try:
             while True:
@@ -251,7 +333,7 @@ def _serve_one_client(client_sock: _socket.socket, addr) -> None:
                 if not chunk:
                     break
                 wav = wav + chunk
-                if len(wav) > 32 * 1024 * 1024:
+                if len(wav) > WAV_MAX_BYTES:
                     client_sock.sendall(
                         (json.dumps(_bad_request("WAV over 32 MiB")) + "\n").encode()
                     )
@@ -259,27 +341,68 @@ def _serve_one_client(client_sock: _socket.socket, addr) -> None:
         except OSError:
             pass
         if not wav:
-            client_sock.sendall((json.dumps(_bad_request("zero WAV bytes after newline")) + "\n").encode())
+            client_sock.sendall(
+                (json.dumps(_bad_request("zero WAV bytes after newline")) + "\n").encode()
+            )
             return
-        try:
-            client_sock.shutdown(_socket.SHUT_WR)
-        except OSError:
-            pass
-        key = _stt_key_from_env(parsed.get("tts_vendor", ""))
+        # Resolve the provider entry from the registry; the request's "provider"
+        # is the field the relay validates, the entry drives the request build.
+        provider_name = parsed["provider"]
+        entry = providers.stt_provider(provider_name)
+        if entry is None:
+            client_sock.sendall(
+                (json.dumps(_bad_request(f"unknown provider: {provider_name!r}")) + "\n").encode()
+            )
+            return
+        # Build the relay-side `s` dict the entry's build() expects. ``endpoint``
+        # is deliberately empty here so entry.endpoint() picks the default host
+        # from cloud_endpoint / default_host / endpoint order. ``stt_prompt`` is
+        # the lexicon hint that the dictation client resolves from the config.
+        s = {
+            "stt_model": parsed["model"],
+            "language": parsed["language"],
+            "stt_prompt": parsed.get("stt_prompt", ""),
+            "cloud_endpoint": parsed.get("endpoint", ""),
+            "endpoint": "",  # the entry picks the default host from cloud_endpoint first
+        }
+        # Clear-text refusal happens BEFORE we attach the key. The relay holds the
+        # key, and a configured http:// (or ws://) endpoint with a credential is a
+        # configuration error refused here, not a warning sent along (windowsill
+        # #215). The refusal text is the relay's reply detail.
+        clear_text_refusal = providers.clear_text_credential_error(
+            entry.endpoint(s), has_credential=True
+        )
+        if clear_text_refusal is not None:
+            client_sock.sendall(
+                (
+                    json.dumps(
+                        {
+                            "status": "failed",
+                            "reason": "clear-text-refused",
+                            "detail": clear_text_refusal,
+                        }
+                    )
+                    + "\n"
+                ).encode()
+            )
+            return
+        # Three-step STT key resolution (R3): STT key, TTS key only when
+        # provider == "elevenlabs" AND tts_vendor == "elevenlabs", else "".
+        key = _stt_key_from_env(provider_name, parsed.get("tts_vendor", ""))
         if not key:
             client_sock.sendall((json.dumps(_failed("no-key")) + "\n").encode())
             return
-        transcript, reason = _post_provider(
-            parsed["endpoint"],
-            key,
-            parsed["model"],
-            parsed["language"],
-            wav,
-            float(parsed["timeout"]),
+        transcript, reason, detail = _post_provider(
+            entry, s, key, wav, float(parsed["timeout"])
         )
         if reason is not None:
-            client_sock.sendall((json.dumps(_failed(reason)) + "\n").encode())
+            payload: dict = {"status": "failed", "reason": reason}
+            if detail is not None:
+                payload["detail"] = detail
+            client_sock.sendall((json.dumps(payload) + "\n").encode())
             return
+        # transcript is non-None; empty string is a success (windowsill#93
+        # silent-clip rule — an empty transcript is a real transcript).
         client_sock.sendall((json.dumps(_ok(transcript)) + "\n").encode())
     finally:
         try:
@@ -571,7 +694,7 @@ def _dispatch(msg: dict) -> dict | None:
             "id": req_id,
             "result": {
                 "protocolVersion": "2024-11-05",
-                "serverInfo": {"name": "voice-loop", "version": "0.9.1"},
+                "serverInfo": {"name": "voice-loop", "version": _read_plugin_version()},
                 "capabilities": {"tools": {}},
             },
         }
@@ -617,45 +740,22 @@ def _stdio_loop() -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog="voice_mcp", add_help=False)
-    parser.add_argument("--probe-socket-only", action="store_true")
-    parser.add_argument("--once-stt", action="store_true")
-    parser.add_argument("--print-config", action="store_true")
-    args = parser.parse_args(argv)
-    if args.print_config:
-        sys.stdout.write(
-            json.dumps(
-                {
-                    "stt_key_present": bool(os.environ.get(ENV_STT_KEY, "")),
-                    "tts_key_present": bool(os.environ.get(ENV_TTS_KEY, "")),
-                    "socket_path": _socket_path(),
-                    "socket_dir": _socket_dir(),
-                }
-            )
-            + "\n"
+    """The single entry point: the stdio MCP server with the relay as a daemon thread.
+
+    The three flags that lived here (``--probe-socket-only``, ``--once-stt``,
+    ``--print-config``) had no callers; the manifest's ``mcpServers`` block
+    launches this script with no arguments, and the loopback CI starts it the
+    same way. Deleting them is a no-op for the manifest and the loopback; the
+    MCP server, both design tools and the relay all still ship (windowsill#5870, R9).
+    """
+    if argv:
+        # Be loud rather than silent on a flag the manifest does not pass: the
+        # ticket named the three retired flags as the load, but a stray argument
+        # is a configuration error worth surfacing rather than ignoring.
+        sys.stderr.write(
+            f"voice_mcp: unexpected arguments: {argv!r}; the MCP server takes no flags\n"
         )
-        return 0
-    if args.once_stt:
-        # One-shot relay accept for the loopback test. Reads one request line + WAV,
-        # writes one reply, returns. Replaces the loopback's RFC 6455 fake.
-        listener = _bind_socket(_socket_path())
-        if listener is None:
-            sys.stdout.write(json.dumps(_failed("provider-unreachable")) + "\n")
-            return 1
-        listener.listen(1)
-        listener.settimeout(15.0)
-        try:
-            client_sock, _ = listener.accept()
-        except OSError:
-            listener.close()
-            return 2
-        _serve_one_client(client_sock, None)
-        listener.close()
-        return 0
-    if args.probe_socket_only:
-        # Print the socket path the relay would use and exit. Used by doctor / selftest.
-        sys.stdout.write(_socket_path() + "\n")
-        return 0
+        return 2
     _stdio_loop()
     return 0
 

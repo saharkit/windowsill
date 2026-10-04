@@ -1336,14 +1336,36 @@ jobs:
 
           # Start the relay (voice_mcp.py) with the userConfig keys in its env, on its own socket
           # path. The relay binds to $XDG_RUNTIME_DIR/voice-loop/stt.sock and answers the dictation
-          # client.
+          # client. ``_stdio_loop`` returns when stdin hits EOF, so we feed it ``tail -f /dev/null``
+          # — a held-open stream that keeps the MCP stdio loop alive past every dictate toggle.
           export XDG_RUNTIME_DIR="$RUNNER_TEMP/relay-runtime"
           mkdir -p "$XDG_RUNTIME_DIR/voice-loop"
           chmod 700 "$XDG_RUNTIME_DIR/voice-loop"
           export CLAUDE_PLUGIN_OPTION_STT_API_KEY="not-a-real-key-and-never-leaves-this-runner"
           export CLAUDE_PLUGIN_OPTION_TTS_API_KEY=""
-          python3 plugins/voice-loop/scripts/voice_mcp.py > "$RUNNER_TEMP/relay.log" 2>&1 &
+          # The hotkey dictation process is started WITHOUT the STT key — that is the whole
+          # production condition. ``env -u`` strips the variable the relay's parent set,
+          # leaving the child with no STT key of its own and proving the relay holds the only
+          # one. The relay's typed ``no-key`` reply is never the live answer here because the
+          # relay was just started with the key in its own env, so the relay dials the provider
+          # and returns the transcript. The assertion is that the dictation process NEVER had
+          # the key in its own env — the relay path is what we test, not a key-passed-through.
+          tail -f /dev/null | env -u CLAUDE_PLUGIN_OPTION_STT_API_KEY \
+            python3 plugins/voice-loop/scripts/voice_mcp.py > "$RUNNER_TEMP/relay.log" 2>&1 &
           relay_pid=$!
+          # Trap so a failing assertion leaves the relay and the provider dead, never running
+          # into the next job. ``kill -PIDS`` covers the tail -f wrapper AND the python process.
+          trap 'kill "$relay_pid" "$provider_pid" 2>/dev/null || true; pkill -P "$relay_pid" 2>/dev/null || true' EXIT
+
+          # Wait until the relay has bound the socket — ``_relay_loop`` binds after
+          # ``_ensure_dir_mode``, and the dictation client's safety check refuses to
+          # dial a path that does not exist. Bounded like the fake provider's port wait.
+          for _ in $(seq 1 50); do
+            [ -S "$XDG_RUNTIME_DIR/voice-loop/stt.sock" ] && break
+            sleep 0.2
+          done
+          [ -S "$XDG_RUNTIME_DIR/voice-loop/stt.sock" ] \
+            || { echo "the relay never bound the socket"; cat "$RUNNER_TEMP/relay.log"; exit 1; }
 
           export VOICE_LOOP_CONFIG="$RUNNER_TEMP/relay-config.json"
           cat > "$VOICE_LOOP_CONFIG" <<JSON
@@ -1362,6 +1384,19 @@ jobs:
           }
           JSON
           export PATH="$fake:$PATH"
+
+          # The hotkey dictation process must NEVER have the STT key. The relay was
+          # started with the key in its own env block; the toggle subprocess is
+          # started fresh by the runner and inherits the runner's env, which is
+          # the lane default — no STT key. The dictation reaches the relay, the
+          # relay holds the only copy of the key, and the test below is the
+          # assertion that the production condition (key in MCP server only) is
+          # what the loopback is exercising.
+          if env | grep -q "CLAUDE_PLUGIN_OPTION_STT_API_KEY"; then
+            echo "the dictation env still carries the STT key — production condition violated"
+            env | grep CLAUDE_PLUGIN_OPTION || true
+            exit 1
+          fi
 
           python3 plugins/voice-loop/scripts/dictate.py paste \
             || { echo "dictate start toggle failed (exit $?)"; cat "$state/dictate.log" 2>/dev/null || true; exit 1; }
@@ -1387,8 +1422,6 @@ jobs:
             || { echo "the clipboard does not hold what the relay transcribed"; exit 1; }
           [ -s "$state/dictate-last.wav" ] \
             || { echo "the clip was not kept"; exit 1; }
-          kill "$relay_pid" 2>/dev/null || true
-          kill "$provider_pid" 2>/dev/null || true
 
           # THE DEGRADE: with the relay still running, point stt.cloud.endpoint at a discard port.
           # The recording must still become text — by the relay's typed-failure path, falling back to
