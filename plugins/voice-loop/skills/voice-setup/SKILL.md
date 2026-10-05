@@ -283,8 +283,10 @@ key needed. Say plainly that cloud STT sends recorded audio clips to ElevenLabs'
 local whisper automatically (the microphone never goes dead). If `tts.cloud.provider` is
 left unset (resolves to OpenAI, the default) or set to a different vendor, dictation with
 `stt.cloud.provider: "elevenlabs"` still works — the script just borrows the TTS key only
-when TTS is also ElevenLabs, so a user relying on `VOICE_LOOP_TTS_API_KEY` for STT must set
-`stt.cloud.api_key_env` (legacy, removed) or `tts.cloud.provider: "elevenlabs"` explicitly.
+when TTS is also ElevenLabs, so a user relying on the TTS plugin option for STT must set
+`stt_api_key` directly in `/config` or set `tts.cloud.provider: "elevenlabs"` explicitly
+(the legacy `stt.cloud.api_key_env` / `stt.cloud.key_file` settings are gone — they get one
+log line from `OBSOLETE_KEYS` and nothing is read).
 
 ### Switching away from `local` on a re-run (clean up behind the old choice)
 

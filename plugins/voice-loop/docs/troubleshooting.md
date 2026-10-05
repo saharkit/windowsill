@@ -241,7 +241,6 @@ A few neighbours that look identical and are not:
 
 | the probe says | it means |
 |---|---|
-| `env-override` — `SSL_CERT_FILE` / `SSL_CERT_DIR` is set | REMOVED IN #5816 — the probe no longer reads env vars; the cert store comes from `ssl.get_default_verify_paths()` only |
 | `homebrew-certifi` | not python.org Python, so the empty-store trap does not apply — an intercepting proxy's own CA is the usual cause here |
 | `system-trust-store` (Linux) | missing/stale `ca-certificates`, or a proxy MITM |
 | `UNKNOWN … could not be reached` | the network, not TLS. Nothing to fix here |

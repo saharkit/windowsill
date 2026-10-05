@@ -203,8 +203,11 @@ If they accept:
 
 - 4.1–4.3 (server stopped): stop the server, run selftest, trigger speak-back,
   trigger dictation, check the logs, then restart the server.
-- 4.4 (wrong key): if the config uses a cloud backend, temporarily point `key_file`
-  at a deliberately wrong file. Restore after.
+- 4.4 (wrong key): if the config uses a cloud backend, set the `stt_api_key` /
+  `tts_api_key` plugin option in `/config` to a deliberately wrong value, then
+  trigger dictation or end a 🔊 line. The relay (for STT) and the hooks (for TTS)
+  should both surface a typed failure that names the relay or hook without echoing
+  the key. Restore the option after.
 - 4.5–4.8: probe what you can without actually breaking things (e.g. query the
   server for an unsupported language); for the rest, read the code paths to confirm
   they are exercised by CI and mark with evidence referencing the CI job.
