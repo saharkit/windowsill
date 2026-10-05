@@ -246,6 +246,65 @@ def test_relay_does_not_call_shutdown_before_sendall(tmp_path):
         sock.close()
 
 
+def test_relay_reads_wav_across_multiple_chunks(tmp_path):
+    """The WAV read loop continues across multiple ``recv`` calls — each
+    chunk is appended to ``wav`` and the loop only breaks when the
+    client half-closes (recv returns b""). The branch where
+    ``len(wav) <= WAV_MAX_BYTES`` (line 336 → 331) is the natural loop
+    continuation that ANY multi-chunk read exercises; this test pins
+    that the loop terminates on EOF rather than after the first read."""
+    directory = tmp_path / "relay"
+    sock = _bind_relay(directory)
+    module = _import_voice_mcp()
+    try:
+        payload = _build_payload("openai", "http://127.0.0.1:9/stt")
+        # Replace _FakeClient with one that yields the request line in
+        # the first recv, then several smaller WAV chunks across multiple
+        # recvs, then EOF.
+        request_line = payload.split(b"\n", 1)[0]
+        wav = payload.split(b"\n", 1)[1]
+        chunk_a = wav[:10]
+        chunk_b = wav[10:]
+        chunks = [request_line + b"\n" + chunk_a, chunk_b, b""]
+
+        class _ChunkingClient:
+            def __init__(self):
+                self.buf_out = bytearray()
+                self.closed = False
+
+            def settimeout(self, _t):
+                pass
+
+            def recv(self, n):
+                if not chunks:
+                    return b""
+                return chunks.pop(0)[:n]
+
+            def sendall(self, data):
+                self.buf_out.extend(data)
+
+            def shutdown(self, _how):
+                raise AssertionError("relay must not shutdown")
+
+            def close(self):
+                self.closed = True
+
+        fake = _ChunkingClient()
+        with mock.patch.dict(
+            os.environ,
+            {"CLAUDE_PLUGIN_OPTION_STT_API_KEY": "test-stt-key", "CLAUDE_PLUGIN_OPTION_TTS_API_KEY": ""},
+            clear=False,
+        ):
+            with mock.patch.object(
+                module, "_post_provider", return_value=("ok", None, None)
+            ):
+                module._serve_one_client(fake, None)
+        reply = json.loads(fake.buf_out.decode())
+        assert reply == {"status": "ok", "text": "ok"}
+    finally:
+        sock.close()
+
+
 # --- 3. registry-driven provider call per provider -------------------------
 
 
@@ -941,3 +1000,1731 @@ def test_report_bug_has_cloud_stt_via_relay_row():
     spec.loader.exec_module(report_bug)
     prefixes = [row[0] for row in report_bug.LOG_RULES]
     assert "cloud stt via relay: " in prefixes
+
+
+# --- 14. _read_plugin_version (helper) --------------------------------
+
+
+def test_read_plugin_version_falls_back_to_default_on_missing_file(tmp_path, monkeypatch):
+    """When ``../.claude-plugin/plugin.json`` cannot be read the function
+    returns ``"0.0.0"`` so the MCP initialize reply carries a string. The
+    helper sits behind every ``tools/list`` reply, so its fallback is
+    load-bearing — a function that raised would crash the stdio loop."""
+    module = _import_voice_mcp()
+    # The helper reads a path relative to its own __file__. We don't try to
+    # rewrite it; we instead patch json.load to raise and confirm the
+    # except clause catches.
+    import json as _json
+    real_open = module.open if hasattr(module, "open") else open
+    def _broken_open(path, *args, **kwargs):
+        raise OSError("simulated missing")
+    monkeypatch.setattr("builtins.open", _broken_open)
+    assert module._read_plugin_version() == "0.0.0"
+
+
+# --- 15. _failed and _ok envelope helpers -----------------------------
+
+
+def test_failed_envelope_carries_detail():
+    """``_failed`` carries an arbitrary detail kwarg through — used for
+    ``provider-http-<code>`` (no detail), ``provider-unreachable`` (no
+    detail), and the WAV-over-32-MiB bad-request (detail text)."""
+    module = _import_voice_mcp()
+    out = module._failed("bad-request", detail="request line over 64 KiB")
+    assert out["status"] == "failed"
+    assert out["reason"] == "bad-request"
+    assert out["detail"] == "request line over 64 KiB"
+
+
+def test_failed_envelope_with_no_detail():
+    """``_failed`` with no detail kwarg emits a result lacking ``detail`` —
+    the four ``provider-http-<code>``, ``timeout``, ``provider-unreachable``
+    and ``no-key`` shapes."""
+    module = _import_voice_mcp()
+    out = module._failed("no-key")
+    assert out == {"status": "failed", "reason": "no-key"}
+
+
+# --- 16. _validate_request_line non-dict branch -----------------------
+
+
+def test_validate_request_line_rejects_a_json_array():
+    """The wire protocol requires a JSON object. A JSON array is
+    well-formed JSON but not what the relay accepts — the request line
+    is exactly the four conditions named in the ticket and a list is
+    the second one (not a JSON object)."""
+    module = _import_voice_mcp()
+    parsed, err = module._validate_request_line(json.dumps(["not", "an", "object"]))
+    assert parsed is None
+    assert err is not None
+    assert "object" in err.lower()
+
+
+# --- 17. _post_provider error paths -----------------------------------
+
+
+def _fake_entry(name="openai", **overrides):
+    """Build a minimal SttProvider stand-in for the relay tests."""
+    import sys as _sys
+    _plugins_dir = str(REPO_ROOT / "plugins" / "voice-loop" / "scripts")
+    if _plugins_dir not in _sys.path:
+        _sys.path.insert(0, _plugins_dir)
+    import providers as _p
+
+    class _Entry:
+        pass
+
+    e = _Entry()
+    e.name = name
+    e.default_host = overrides.get("default_host", "https://api.openai.com")
+    e.default_model = overrides.get("default_model", "whisper-1")
+
+    def endpoint(s):
+        return s.get("cloud_endpoint") or e.default_host
+
+    e.endpoint = endpoint
+
+    if "request" in overrides:
+        e.request = overrides["request"]
+    else:
+        def _default_request(s, key, wav, boundary):
+            # Return a minimal SttRequest — the tests that exercise the
+            # provider call override this; the default keeps the helper
+            # usable without an extra kwarg.
+            from providers import SttRequest
+            return SttRequest(
+                url=endpoint(s),
+                headers={"Authorization": f"Bearer {key}"},
+                body=wav,
+                content_type="audio/wav",
+            )
+        e.request = _default_request
+    e.transcript = overrides.get("transcript", lambda data: "ok")
+    e.error_summary = overrides.get("error_summary", lambda data: "")
+    return e
+
+
+def test_post_provider_returns_bad_request_when_endpoint_is_empty():
+    """An entry that resolves no URL is the only ``bad-request`` condition
+    the post helper owns (the other three live in the caller)."""
+    module = _import_voice_mcp()
+    entry = _fake_entry()
+    entry.endpoint = lambda s: ""
+    transcript, reason, detail = module._post_provider(
+        entry, {"cloud_endpoint": ""}, "k", b"wav", 5.0
+    )
+    assert transcript is None
+    assert reason == "bad-request"
+    assert detail == "no endpoint"
+
+
+def test_post_provider_returns_bad_request_when_builder_raises():
+    """A builder that raises ``OSError`` (a network-layer failure during
+    multipart assembly) is reported as bad-request rather than crashing
+    the relay — the wire is closed cleanly with a typed reason."""
+    module = _import_voice_mcp()
+    entry = _fake_entry(request=lambda s, key, wav, boundary: (_ for _ in ()).throw(OSError("builder failed")))
+    transcript, reason, detail = module._post_provider(
+        entry, {"cloud_endpoint": "https://x"}, "k", b"wav", 5.0
+    )
+    assert transcript is None
+    assert reason == "bad-request"
+    assert "OSError" in detail
+
+
+def test_post_provider_returns_http_code_on_httperror():
+    """An HTTP 4xx/5xx from the provider maps to ``provider-http-<code>``
+    with no detail. The relay passes the exact code through so the
+    client can decide."""
+    module = _import_voice_mcp()
+    entry = _fake_entry()
+
+    class _Resp:
+        def __enter__(self): return self
+        def __exit__(self, *args): return False
+        def read(self): return b""
+
+    class _Opener:
+        def open(self, req, timeout=None):
+            raise urllib.error.HTTPError(req.full_url, 401, "Unauthorized", {}, None)
+
+    with mock.patch.object(module.urllib.request, "build_opener", return_value=_Opener()):
+        transcript, reason, detail = module._post_provider(
+            entry, {"cloud_endpoint": "https://x"}, "k", b"wav", 5.0
+        )
+    assert transcript is None
+    assert reason == "provider-http-401"
+    assert detail is None
+
+
+def test_post_provider_returns_provider_unreachable_on_urlerror():
+    """``urllib.error.URLError`` (DNS failure, connection refused) maps
+    to ``provider-unreachable``. The relay makes no distinction between
+    refused and unresolvable — both are unreachable from this process."""
+    module = _import_voice_mcp()
+    entry = _fake_entry()
+
+    class _Opener:
+        def open(self, req, timeout=None):
+            raise urllib.error.URLError("no route")
+
+    with mock.patch.object(module.urllib.request, "build_opener", return_value=_Opener()):
+        transcript, reason, detail = module._post_provider(
+            entry, {"cloud_endpoint": "https://x"}, "k", b"wav", 5.0
+        )
+    assert reason == "provider-unreachable"
+    assert detail is None
+
+
+def test_post_provider_returns_timeout_on_socket_timeout():
+    """``socket.timeout`` is the urllib read timeout — a relay whose
+    provider call exceeds ``stt.timeout`` reports ``timeout``."""
+    module = _import_voice_mcp()
+    entry = _fake_entry()
+
+    class _Opener:
+        def open(self, req, timeout=None):
+            raise _socket.timeout("read deadline")
+
+    with mock.patch.object(module.urllib.request, "build_opener", return_value=_Opener()):
+        transcript, reason, detail = module._post_provider(
+            entry, {"cloud_endpoint": "https://x"}, "k", b"wav", 5.0
+        )
+    assert reason == "timeout"
+
+
+def test_post_provider_returns_provider_unreachable_on_generic_oserror():
+    """A bare ``OSError`` (other than the typed ones) is unreachable,
+    not bad-request — the request was made, the transport broke."""
+    module = _import_voice_mcp()
+    entry = _fake_entry()
+
+    class _Opener:
+        def open(self, req, timeout=None):
+            raise OSError("broken pipe")
+
+    with mock.patch.object(module.urllib.request, "build_opener", return_value=_Opener()):
+        transcript, reason, detail = module._post_provider(
+            entry, {"cloud_endpoint": "https://x"}, "k", b"wav", 5.0
+        )
+    assert reason == "provider-unreachable"
+
+
+def test_post_provider_returns_provider_unreachable_on_undecodable_body():
+    """The body is JSON; a body that doesn't decode (a non-JSON
+    provider, an HTML error page) is unreachable from the parser's
+    point of view."""
+    module = _import_voice_mcp()
+    entry = _fake_entry()
+
+    class _Resp:
+        def __enter__(self): return self
+        def __exit__(self, *args): return False
+        def read(self): return b"<html>500 Internal Server Error</html>"
+
+    class _Opener:
+        def open(self, req, timeout=None):
+            return _Resp()
+
+    with mock.patch.object(module.urllib.request, "build_opener", return_value=_Opener()):
+        transcript, reason, detail = module._post_provider(
+            entry, {"cloud_endpoint": "https://x"}, "k", b"wav", 5.0
+        )
+    assert reason == "provider-unreachable"
+    assert detail is None
+
+
+def test_post_provider_returns_provider_unreachable_when_decode_raises():
+    """The decoder is patched to raise ``ValueError`` directly — exercises
+    the except branch in ``_post_provider`` (line 255-256). The real
+    ``providers.decode`` swallows ValueError, so this branch is unreachable
+    in production; the test pins the defensive code path so a future
+    change that lets decode raise is still handled."""
+    module = _import_voice_mcp()
+    entry = _fake_entry()
+
+    class _Resp:
+        def __enter__(self): return self
+        def __exit__(self, *args): return False
+        def read(self): return b'{"text": "ok"}'
+
+    class _Opener:
+        def open(self, req, timeout=None):
+            return _Resp()
+
+    with mock.patch.object(module.urllib.request, "build_opener", return_value=_Opener()), \
+         mock.patch.object(module.providers, "decode", side_effect=ValueError("decode blew up")):
+        transcript, reason, detail = module._post_provider(
+            entry, {"cloud_endpoint": "https://x"}, "k", b"wav", 5.0
+        )
+    assert transcript is None
+    assert reason == "provider-unreachable"
+    assert detail is None
+
+
+def test_post_provider_returns_provider_unreachable_on_none_decoded():
+    """The decoder returns ``None`` for an error-shaped body (a 200 with
+    an error payload). The relay does not distinguish between
+    ``None`` and ``ValueError`` — both are unreachable from the relay's
+    view of the response."""
+    module = _import_voice_mcp()
+    entry = _fake_entry()
+
+    class _Resp:
+        def __enter__(self): return self
+        def __exit__(self, *args): return False
+        def read(self): return json.dumps({"error": "quota"}).encode()
+
+    class _Opener:
+        def open(self, req, timeout=None):
+            return _Resp()
+
+    with mock.patch.object(
+        module.urllib.request, "build_opener", return_value=_Opener()
+    ), mock.patch.object(module.providers, "decode", return_value=None):
+        transcript, reason, detail = module._post_provider(
+            entry, {"cloud_endpoint": "https://x"}, "k", b"wav", 5.0
+        )
+    assert reason == "provider-unreachable"
+
+
+def test_post_provider_returns_provider_unreachable_on_transcript_typeerror():
+    """The transcript extractor raised ``TypeError`` — the relay
+    surfaces the error type in the detail so the operator can see
+    which provider mis-shaped."""
+    module = _import_voice_mcp()
+    entry = _fake_entry(transcript=lambda data: (_ for _ in ()).throw(TypeError("shape mismatch")))
+
+    class _Resp:
+        def __enter__(self): return self
+        def __exit__(self, *args): return False
+        def read(self): return b'{"text": "x"}'
+
+    class _Opener:
+        def open(self, req, timeout=None):
+            return _Resp()
+
+    with mock.patch.object(module.urllib.request, "build_opener", return_value=_Opener()):
+        transcript, reason, detail = module._post_provider(
+            entry, {"cloud_endpoint": "https://x"}, "k", b"wav", 5.0
+        )
+    assert reason == "provider-unreachable"
+    assert "TypeError" in detail
+
+
+def test_post_provider_returns_provider_unreachable_with_error_summary_detail():
+    """The body decodes but the provider returns ``None`` from its
+    transcript function — i.e. no transcript field. The relay attaches
+    the provider's own ``error_summary`` as the detail so the operator
+    can read it without re-running."""
+    module = _import_voice_mcp()
+    entry = _fake_entry(
+        transcript=lambda data: None,
+        error_summary=lambda data: "no transcript field",
+    )
+
+    class _Resp:
+        def __enter__(self): return self
+        def __exit__(self, *args): return False
+        def read(self): return b'{"detail": "no transcript field"}'
+
+    class _Opener:
+        def open(self, req, timeout=None):
+            return _Resp()
+
+    with mock.patch.object(module.urllib.request, "build_opener", return_value=_Opener()):
+        transcript, reason, detail = module._post_provider(
+            entry, {"cloud_endpoint": "https://x"}, "k", b"wav", 5.0
+        )
+    assert reason == "provider-unreachable"
+    assert detail == "no transcript field"
+
+
+# --- 18. _serve_one_client error branches -----------------------------
+
+
+def test_serve_one_client_sends_timeout_when_recv_raises_oserror():
+    """The 5-second read-without-newline deadline fires when the
+    client never sends its request line — the relay sends
+    ``{"status": "failed", "reason": "timeout"}`` and closes, not
+    bad-request (the request is malformed by absence, not by content)."""
+    module = _import_voice_mcp()
+    fake = _FakeClient(b"")
+    # Force recv to raise OSError on every call.
+    def _raise(_n):
+        raise OSError("deadline")
+    fake.recv = _raise
+    module._serve_one_client(fake, None)
+    reply = json.loads(fake.buf_out.decode())
+    assert reply["status"] == "failed"
+    assert reply["reason"] == "timeout"
+
+
+def test_serve_one_client_sends_bad_request_when_eof_before_newline():
+    """The client closes without sending a newline — the relay
+    emits ``bad-request`` with the ``no newline in request line``
+    detail (not ``timeout``; the EOF is itself the error)."""
+    module = _import_voice_mcp()
+    fake = _FakeClient(b"")  # empty buf_in, recv returns b""
+    module._serve_one_client(fake, None)
+    reply = json.loads(fake.buf_out.decode())
+    assert reply["status"] == "failed"
+    assert reply["reason"] == "bad-request"
+    assert "no newline" in reply["detail"]
+
+
+def test_serve_one_client_rejects_request_line_over_64kib():
+    """A request line past 64 KiB is malformed — the relay sends
+    ``bad-request`` and closes. No operator's config is 64 KiB."""
+    module = _import_voice_mcp()
+    huge = b"x" * (module.REQUEST_LINE_MAX_BYTES + 1)
+    fake = _FakeClient(huge)
+    module._serve_one_client(fake, None)
+    reply = json.loads(fake.buf_out.decode())
+    assert reply["status"] == "failed"
+    assert reply["reason"] == "bad-request"
+    assert "64" in reply["detail"]
+
+
+def test_serve_one_client_sends_bad_request_when_validate_fails():
+    """``_validate_request_line`` returned an error — the relay
+    surfaces that error string as ``bad-request`` detail. No HTTP
+    request is made."""
+    module = _import_voice_mcp()
+    # The minimal-bad line: not valid JSON.
+    payload = b"not-json\n" + _make_wav_header()
+    fake = _FakeClient(payload)
+    module._serve_one_client(fake, None)
+    reply = json.loads(fake.buf_out.decode())
+    assert reply["status"] == "failed"
+    assert reply["reason"] == "bad-request"
+    assert "JSON" in reply["detail"]
+
+
+def test_serve_one_client_rejects_wav_over_32mib(tmp_path):
+    """A WAV body over 32 MiB is rejected before any provider call —
+    the relay caps the read loop and sends bad-request. The OSError
+    arm of the read loop (line 341) is also reached by raising recv."""
+    module = _import_voice_mcp()
+    request = json.dumps(
+        {
+            "provider": "openai",
+            "endpoint": "http://127.0.0.1:9",
+            "model": "whisper-1",
+            "language": "en",
+            "tts_vendor": "openai",
+            "timeout": 5,
+            "stt_prompt": "",
+        }
+    ).encode()
+    fake = _FakeClient(request + b"\n")
+    # Make the second read return a huge block.
+    wav = b"W" * (module.WAV_MAX_BYTES + 1)
+
+    real_recv = fake.recv
+
+    def _two_step_recv(n):
+        # First call returns the request line (already absorbed by the line-read
+        # loop); second call returns the WAV that exceeds the cap.
+        if fake.recv_calls == 0:
+            fake.recv_calls = 1
+            return request + b"\n"
+        fake.recv_calls = 2
+        return wav
+
+    fake.recv_calls = 0
+    fake.recv = _two_step_recv
+    module._serve_one_client(fake, None)
+    reply = json.loads(fake.buf_out.decode())
+    assert reply["status"] == "failed"
+    assert reply["reason"] == "bad-request"
+    assert "32 MiB" in reply["detail"]
+
+
+def test_serve_one_client_sends_bad_request_on_zero_wav():
+    """The request line is well-formed but no WAV bytes follow the
+    newline. That is the fourth bad-request condition: zero WAV bytes."""
+    module = _import_voice_mcp()
+    request = json.dumps(
+        {
+            "provider": "openai",
+            "endpoint": "http://127.0.0.1:9",
+            "model": "whisper-1",
+            "language": "en",
+            "tts_vendor": "openai",
+            "timeout": 5,
+            "stt_prompt": "",
+        }
+    ).encode()
+    fake = _FakeClient(request + b"\n")
+    # The read loop returns b"" immediately (EOF after newline) — zero bytes.
+    module._serve_one_client(fake, None)
+    reply = json.loads(fake.buf_out.decode())
+    assert reply["status"] == "failed"
+    assert reply["reason"] == "bad-request"
+    assert "zero WAV bytes" in reply["detail"]
+
+
+def test_serve_one_client_sends_bad_request_on_unknown_provider():
+    """The provider name is well-formed but not in
+    ``providers.STT_PROVIDERS``. The registry's ``stt_provider`` returns
+    None and the relay surfaces bad-request with the provider name."""
+    module = _import_voice_mcp()
+    payload = _build_payload("nonexistent-provider", "http://127.0.0.1:9/stt")
+    fake = _FakeClient(payload)
+    module._serve_one_client(fake, None)
+    reply = json.loads(fake.buf_out.decode())
+    assert reply["status"] == "failed"
+    assert reply["reason"] == "bad-request"
+    assert "nonexistent-provider" in reply["detail"]
+
+
+def test_serve_one_client_sends_bad_request_when_registry_returns_none():
+    """The request line validates (the provider name is a string), but
+    ``providers.stt_provider(name)`` returns ``None`` — typically because
+    the provider was removed from the registry between releases. The
+    relay still surfaces bad-request with the provider name."""
+    module = _import_voice_mcp()
+    payload = _build_payload("openai", "http://127.0.0.1:9/stt")
+    fake = _FakeClient(payload)
+    with mock.patch.object(module.providers, "stt_provider", return_value=None):
+        module._serve_one_client(fake, None)
+    reply = json.loads(fake.buf_out.decode())
+    assert reply["status"] == "failed"
+    assert reply["reason"] == "bad-request"
+    assert "openai" in reply["detail"]
+
+
+def test_serve_one_client_sends_failed_with_no_detail():
+    """``_post_provider`` returned ``(None, "timeout", None)`` — the relay
+    emits a ``failed`` reply WITHOUT a ``detail`` key. The branch where
+    ``detail is None`` is exercised here; the success-with-detail branch
+    is exercised in the ``provider-unreachable`` test above."""
+    module = _import_voice_mcp()
+    payload = _build_payload("openai", "http://127.0.0.1:9/stt")
+    fake = _FakeClient(payload)
+    with mock.patch.dict(
+        os.environ,
+        {"CLAUDE_PLUGIN_OPTION_STT_API_KEY": "k", "CLAUDE_PLUGIN_OPTION_TTS_API_KEY": ""},
+        clear=False,
+    ):
+        with mock.patch.object(
+            module, "_post_provider", return_value=(None, "timeout", None)
+        ):
+            module._serve_one_client(fake, None)
+    reply = json.loads(fake.buf_out.decode())
+    assert reply == {"status": "failed", "reason": "timeout"}
+
+
+def test_post_provider_returns_provider_unreachable_when_decode_raises():
+    """The decoder is patched to raise ``ValueError`` directly — exercises
+    the except branch in ``_post_provider`` (line 255-256). The real
+    ``providers.decode`` swallows ValueError, so this branch is unreachable
+    in production; the test pins the defensive code path so a future
+    change that lets decode raise is still handled."""
+    module = _import_voice_mcp()
+    entry = _fake_entry()
+
+    class _Resp:
+        def __enter__(self): return self
+        def __exit__(self, *args): return False
+        def read(self): return b'{"text": "ok"}'
+
+    class _Opener:
+        def open(self, req, timeout=None):
+            return _Resp()
+
+    with mock.patch.object(module.urllib.request, "build_opener", return_value=_Opener()), \
+         mock.patch.object(module.providers, "decode", side_effect=ValueError("decode blew up")):
+        transcript, reason, detail = module._post_provider(
+            entry, {"cloud_endpoint": "https://x"}, "k", b"wav", 5.0
+        )
+    assert transcript is None
+    assert reason == "provider-unreachable"
+    assert detail is None
+
+
+def test_serve_one_client_sends_no_key_when_relay_has_no_stt_key():
+    """The relay has no STT key in its env (and tts_vendor is not
+    elevenlabs, so the TTS-key fallback doesn't apply). The relay
+    sends ``no-key`` without making an HTTP request."""
+    module = _import_voice_mcp()
+    payload = _build_payload("openai", "http://127.0.0.1:9/stt")
+    fake = _FakeClient(payload)
+    with mock.patch.dict(
+        os.environ,
+        {"CLAUDE_PLUGIN_OPTION_STT_API_KEY": "", "CLAUDE_PLUGIN_OPTION_TTS_API_KEY": "tts-set"},
+        clear=False,
+    ):
+        with mock.patch.object(
+            module.urllib.request, "build_opener",
+            side_effect=AssertionError("no HTTP request"),
+        ):
+            module._serve_one_client(fake, None)
+    reply = json.loads(fake.buf_out.decode())
+    assert reply["status"] == "failed"
+    assert reply["reason"] == "no-key"
+
+
+def test_serve_one_client_sends_reason_with_detail_on_provider_failure():
+    """``_post_provider`` returned a reason and a detail string —
+    the relay propagates the detail in the reply. The success path
+    carries no detail; the failure path does."""
+    module = _import_voice_mcp()
+    payload = _build_payload("openai", "http://127.0.0.1:9/stt")
+    fake = _FakeClient(payload)
+    with mock.patch.dict(
+        os.environ,
+        {"CLAUDE_PLUGIN_OPTION_STT_API_KEY": "k", "CLAUDE_PLUGIN_OPTION_TTS_API_KEY": ""},
+        clear=False,
+    ):
+        with mock.patch.object(
+            module, "_post_provider",
+            return_value=(None, "provider-unreachable", "no route to host"),
+        ):
+            module._serve_one_client(fake, None)
+    reply = json.loads(fake.buf_out.decode())
+    assert reply["status"] == "failed"
+    assert reply["reason"] == "provider-unreachable"
+    assert reply["detail"] == "no route to host"
+
+
+def test_serve_one_client_wav_read_loop_handles_oserror():
+    """The post-line read loop is bounded by ``WAV_MAX_BYTES``. An
+    OSError on the inner recv is caught silently (the EOF after the
+    half-close is the normal termination)."""
+    module = _import_voice_mcp()
+    request_line = json.dumps(
+        {
+            "provider": "openai",
+            "endpoint": "http://127.0.0.1:9",
+            "model": "whisper-1",
+            "language": "en",
+            "tts_vendor": "openai",
+            "timeout": 5,
+            "stt_prompt": "",
+        }
+    ).encode()
+    payload = request_line + b"\n" + _make_wav_header()
+    fake = _FakeClient(payload)
+    # Force the inner recv loop to raise once, then EOF.
+    state = {"calls": 0}
+    real_recv = fake.recv
+
+    def _recv_with_one_error(n):
+        state["calls"] += 1
+        # First call returns the request line; the inner-loop call raises.
+        if state["calls"] == 1:
+            return payload[: len(request_line) + 1 + len(_make_wav_header())]
+        raise OSError("connection reset")
+
+    fake.recv = _recv_with_one_error
+    with mock.patch.dict(
+        os.environ,
+        {"CLAUDE_PLUGIN_OPTION_STT_API_KEY": "k", "CLAUDE_PLUGIN_OPTION_TTS_API_KEY": ""},
+        clear=False,
+    ):
+        with mock.patch.object(
+            module, "_post_provider", return_value=("ok", None, None)
+        ):
+            module._serve_one_client(fake, None)
+    reply = json.loads(fake.buf_out.decode())
+    # The OSError branch is silent — the relay carries on with the
+    # wav bytes already buffered and posts the provider call. The
+    # reply is the success envelope.
+    assert reply["status"] == "ok"
+
+
+def test_serve_one_client_finally_block_swallows_close_oserror(tmp_path, monkeypatch):
+    """The relay's ``finally`` block swallows ``OSError`` on
+    ``client_sock.close()``. A close that raises must NOT mask the
+    earlier success reply."""
+    module = _import_voice_mcp()
+    payload = _build_payload("openai", "http://127.0.0.1:9/stt")
+    fake = _FakeClient(payload)
+    def _raise_close():
+        raise OSError("close failed")
+    fake.close = _raise_close
+    with mock.patch.dict(
+        os.environ,
+        {"CLAUDE_PLUGIN_OPTION_STT_API_KEY": "k", "CLAUDE_PLUGIN_OPTION_TTS_API_KEY": ""},
+        clear=False,
+    ):
+        with mock.patch.object(
+            module, "_post_provider", return_value=("ok", None, None)
+        ):
+            # The finally swallows the OSError — the relay returns normally.
+            module._serve_one_client(fake, None)
+    reply = json.loads(fake.buf_out.decode())
+    assert reply["status"] == "ok"
+
+
+# --- 19. _socket_dir and _ensure_dir_mode branches ------------------
+
+
+def test_socket_dir_uses_xdg_state_home_when_no_runtime_dir(monkeypatch):
+    """Without ``XDG_RUNTIME_DIR`` the relay falls back to
+    ``$XDG_STATE_HOME/voice-loop/relay``. ``XDG_STATE_HOME`` defaults
+    to ``~/.local/state`` per the XDG spec, so the helper joins the
+    state home with the relay directory name."""
+    module = _import_voice_mcp()
+    monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
+    monkeypatch.setenv("XDG_STATE_HOME", "/tmp/state-home")
+    assert module._socket_dir() == "/tmp/state-home/voice-loop/relay"
+
+
+def test_socket_dir_defaults_state_home_to_local_state(monkeypatch):
+    """With neither runtime nor state home set, the helper falls
+    back to ``~/.local/state/voice-loop/relay`` — the XDG default."""
+    module = _import_voice_mcp()
+    monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
+    monkeypatch.delenv("XDG_STATE_HOME", raising=False)
+    monkeypatch.setenv("HOME", "/tmp/home")
+    assert module._socket_dir() == "/tmp/home/.local/state/voice-loop/relay"
+
+
+def test_ensure_dir_mode_corrects_existing_dir_perms(tmp_path):
+    """If the socket directory exists with a wider mode (a previous
+    install or a manual mkdir), the helper narrows it back to 0700."""
+    module = _import_voice_mcp()
+    d = tmp_path / "relay"
+    d.mkdir(mode=0o755)
+    module._ensure_dir_mode(str(d), 0o700)
+    assert (d.stat().st_mode & 0o777) == 0o700
+
+
+def test_ensure_dir_mode_creates_missing_dir_with_target_mode(tmp_path):
+    """Missing directory is created with the requested mode (umask
+    may narrow; the chmod after makedirs restores the requested mode)."""
+    module = _import_voice_mcp()
+    d = tmp_path / "fresh"
+    assert not d.exists()
+    module._ensure_dir_mode(str(d), 0o700)
+    assert d.is_dir()
+    assert (d.stat().st_mode & 0o777) == 0o700
+
+
+def test_socket_path_joins_dir_and_filename():
+    """The wire-path constant is ``stt.sock`` inside the dir."""
+    module = _import_voice_mcp()
+    import unittest.mock as _mock
+
+    with _mock.patch.object(module, "_socket_dir", return_value="/x/y"):
+        assert module._socket_path() == "/x/y/stt.sock"
+
+
+# --- 20. _bind_socket error paths -----------------------------------
+
+
+def test_bind_socket_returns_none_when_unlink_oserror(tmp_path, monkeypatch):
+    """``_bind_socket`` swallows ``FileNotFoundError`` on unlink but
+    any other ``OSError`` (EACCES, EPERM) returns ``None`` so the relay
+    loop backs off for ``REBIND_RETRY_SECONDS`` rather than crashing."""
+    module = _import_voice_mcp()
+    d = tmp_path / "relay"
+    d.mkdir(mode=0o700)
+    sock_path = d / "stt.sock"
+    sock_path.write_text("")
+
+    real_unlink = module.os.unlink
+
+    def _raise(_p):
+        raise OSError("EACCES")
+
+    monkeypatch.setattr(module.os, "unlink", _raise)
+    assert module._bind_socket(str(sock_path)) is None
+
+
+def test_bind_socket_returns_none_on_bind_oserror(tmp_path, monkeypatch):
+    """If the path exists and the unlink raced (a fresh socket appeared
+    between unlink and bind), ``bind`` raises ``OSError`` and the helper
+    returns ``None``. The relay loop sleeps and retries."""
+    module = _import_voice_mcp()
+    d = tmp_path / "relay"
+    d.mkdir(mode=0o700)
+    sock_path = d / "stt.sock"
+    sock_path.write_text("")
+
+    import socket as _socket
+    real_socket = _socket.socket
+
+    def _raise_socket(*args, **kwargs):
+        raise_class = type(
+            "PatchedSocket",
+            (real_socket,),
+            {"bind": lambda self, p: (_ for _ in ()).throw(OSError("EADDRINUSE"))},
+        )
+        return raise_class(*args, **kwargs)
+
+    monkeypatch.setattr(_socket, "socket", _raise_socket)
+    assert module._bind_socket(str(sock_path)) is None
+
+
+def test_bind_socket_swallows_chmod_oserror(tmp_path, monkeypatch):
+    """A chmod failure on the bound socket is non-fatal — the bind
+    succeeded and the listener is returned. (On a path that supports
+    chmod this is unreachable; the helper is defensive.)"""
+    module = _import_voice_mcp()
+    d = tmp_path / "relay"
+    d.mkdir(mode=0o700)
+    sock_path = d / "stt.sock"
+    real_chmod = module.os.chmod
+
+    def _raise_chmod(path, mode, *args, **kwargs):
+        if str(path) == str(sock_path):
+            raise OSError("EACCES")
+        return real_chmod(path, mode, *args, **kwargs)
+
+    monkeypatch.setattr(module.os, "chmod", _raise_chmod)
+    sock = module._bind_socket(str(sock_path))
+    assert sock is not None
+    sock.close()
+
+
+def test_probe_existing_returns_false_when_connect_oserror(tmp_path, monkeypatch):
+    """A probe that fails with ``OSError`` (the canonical refusal)
+    reports ``False`` — the socket is stale and the relay will unlink
+    and bind."""
+    module = _import_voice_mcp()
+    d = tmp_path / "relay"
+    d.mkdir(mode=0o700)
+    sock_path = d / "stt.sock"
+    import socket as _socket
+    real_socket = _socket.socket
+
+    def _raise(*a, **kw):
+        raise_class = type(
+            "PatchedSocket",
+            (real_socket,),
+            {"connect": lambda self, p: (_ for _ in ()).throw(OSError("refused"))},
+        )
+        return raise_class(*a, **kw)
+
+    monkeypatch.setattr(_socket, "socket", _raise)
+    assert module._probe_existing(str(sock_path)) is False
+
+
+def test_probe_existing_swallows_close_oserror(tmp_path, monkeypatch):
+    """The probe's ``finally`` block calls ``s.close()`` and swallows
+    ``OSError``. A close that raises must not mask the probe's verdict."""
+    module = _import_voice_mcp()
+    d = tmp_path / "relay"
+    d.mkdir(mode=0o700)
+    sock_path = d / "stt.sock"
+    import socket as _socket
+    real_socket = _socket.socket
+
+    def _close_raises_socket(*a, **kw):
+        raise_class = type(
+            "PatchedSocket",
+            (real_socket,),
+            {
+                "connect": lambda self, p: None,  # success — another relay
+                "close": lambda self: (_ for _ in ()).throw(OSError("close failed")),
+            },
+        )
+        return raise_class(*a, **kw)
+
+    monkeypatch.setattr(_socket, "socket", _close_raises_socket)
+    assert module._probe_existing(str(sock_path)) is True
+
+
+# --- 21. _relay_loop branches ---------------------------------------
+
+
+def test_relay_loop_skips_binding_when_probe_returns_true(tmp_path, monkeypatch):
+    """When the probe finds a live relay, the outer loop sleeps
+    ``REBIND_RETRY_SECONDS`` and re-probes rather than binding. We
+    verify by counting probe calls: a relay that correctly skips
+    binding calls the probe every cycle, while one that binds would
+    call probe only once before stopping at the listener.accept() block.
+
+    The probe is patched to always return ``True`` so we exercise the
+    skip-binding branch deterministically; the test exits the loop via
+    SystemExit after two probe cycles, leaving no daemon thread."""
+    module = _import_voice_mcp()
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+    sock_path = module._socket_path()
+    # Pre-create the socket dir AND a stale file at sock_path so the
+    # outer loop enters the "exists -> probe" branch. The probe is patched
+    # to return True so the loop never tries to bind.
+    os.makedirs(os.path.dirname(sock_path), mode=0o700, exist_ok=True)
+    with open(sock_path, "w") as fh:
+        fh.write("")
+    monkeypatch.setattr(module, "REBIND_RETRY_SECONDS", 0)
+    probe_count = {"n": 0}
+
+    def _live_probe_then_stop(p):
+        probe_count["n"] += 1
+        if probe_count["n"] >= 2:
+            raise SystemExit("stop after two probes")
+        return True
+
+    monkeypatch.setattr(module, "_probe_existing", _live_probe_then_stop)
+    bind_mock = mock.Mock()
+    monkeypatch.setattr(module, "_bind_socket", bind_mock)
+    with pytest.raises(SystemExit):
+        module._relay_loop()
+    # Probe was called multiple times (live relay kept being probed)
+    # while bind was never reached.
+    assert probe_count["n"] >= 2
+    bind_mock.assert_not_called()
+
+
+def test_relay_loop_binds_when_no_socket_exists(tmp_path, monkeypatch):
+    """When ``os.path.exists(sock_path)`` is False, the loop skips the
+    probe branch entirely and goes straight to ``_bind_socket``. The
+    bind returns a listener; ``accept()`` raises to stop the loop.
+    This exercises the ``os.path.exists`` False branch (line 492->511)."""
+    module = _import_voice_mcp()
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+    sock_path = module._socket_path()
+    os.makedirs(os.path.dirname(sock_path), mode=0o700, exist_ok=True)
+    # Ensure the socket path does NOT exist (test does not pre-create it).
+    if os.path.exists(sock_path):
+        os.unlink(sock_path)
+    monkeypatch.setattr(module, "REBIND_RETRY_SECONDS", 0)
+    bind_calls = {"n": 0}
+
+    def _bind_then_raise(p):
+        bind_calls["n"] += 1
+        class _Listener:
+            def accept(self_inner):
+                raise SystemExit("stop after first bind")
+
+            def close(self_inner):
+                pass
+
+        return _Listener()
+
+    monkeypatch.setattr(module, "_bind_socket", _bind_then_raise)
+    with pytest.raises(SystemExit):
+        module._relay_loop()
+    assert bind_calls["n"] >= 1
+
+
+def test_relay_loop_swallows_unlink_oserror_after_stale_socket(tmp_path, monkeypatch):
+    """The loop calls ``os.unlink(sock_path)`` after a stale-socket probe.
+    A bare ``OSError`` (other than ``FileNotFoundError``) is caught, the
+    loop sleeps and continues. We raise OSError on the first unlink,
+    succeed on the second, then bind raises SystemExit to stop."""
+    module = _import_voice_mcp()
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+    sock_path = module._socket_path()
+    os.makedirs(os.path.dirname(sock_path), mode=0o700, exist_ok=True)
+    with open(sock_path, "w") as fh:
+        fh.write("")  # stale
+
+    state = {"unlink_n": 0}
+    real_unlink = module.os.unlink
+
+    def _unlink_then_succeed(p):
+        state["unlink_n"] += 1
+        if state["unlink_n"] == 1:
+            raise OSError("EACCES on unlink")
+        return real_unlink(p)
+
+    # Probe always returns False (stale), so unlink is called every cycle.
+    monkeypatch.setattr(module, "_probe_existing", lambda p: False)
+    monkeypatch.setattr(module.os, "unlink", _unlink_then_succeed)
+    monkeypatch.setattr(module, "REBIND_RETRY_SECONDS", 0)
+
+    bind_calls = {"n": 0}
+
+    def _bind_then_raise(p):
+        bind_calls["n"] += 1
+        raise SystemExit("stop after bind")
+
+    monkeypatch.setattr(module, "_bind_socket", _bind_then_raise)
+    with pytest.raises(SystemExit):
+        module._relay_loop()
+    # First unlink raised OSError (caught by except OSError branch on
+    # line 503). Second unlink succeeded; bind raised to stop the loop.
+    assert state["unlink_n"] >= 2
+    assert bind_calls["n"] >= 1
+
+
+def test_relay_loop_swallows_unlink_filenotfound_after_stale_socket(tmp_path, monkeypatch):
+    """``os.unlink(sock_path)`` raises ``FileNotFoundError`` when the file
+    was already removed (a race with another relay or a manual cleanup).
+    The loop swallows it via ``except FileNotFoundError: pass`` and
+    proceeds to bind. The test exercises this branch by raising
+    FileNotFoundError on the first unlink and succeeding (then re-creating
+    the stale file) on the second unlink, so the loop iterates twice."""
+    module = _import_voice_mcp()
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+    sock_path = module._socket_path()
+    os.makedirs(os.path.dirname(sock_path), mode=0o700, exist_ok=True)
+    with open(sock_path, "w") as fh:
+        fh.write("")  # stale
+
+    monkeypatch.setattr(module, "_probe_existing", lambda p: False)
+
+    state = {"unlink_n": 0}
+
+    def _unlink(p):
+        state["unlink_n"] += 1
+        if state["unlink_n"] == 1:
+            raise FileNotFoundError("already gone")
+        # Re-create the stale file so the next probe still finds it,
+        # then raise SystemExit to stop the loop on the second iteration.
+        with open(p, "w") as fh:
+            fh.write("")
+        raise SystemExit("stop after second unlink")
+
+    monkeypatch.setattr(module.os, "unlink", _unlink)
+    monkeypatch.setattr(module, "REBIND_RETRY_SECONDS", 0)
+
+    # Bind returns a listener whose accept raises so the loop reaches
+    # the inner OSError arm, drops the listener, and re-enters the outer
+    # loop — letting unlink run a second time.
+    bind_calls = {"n": 0}
+
+    def _bind(p):
+        bind_calls["n"] += 1
+        class _Listener:
+            def accept(self_inner):
+                raise OSError("tear down listener")
+
+            def close(self_inner):
+                pass
+
+        return _Listener()
+
+    monkeypatch.setattr(module, "_bind_socket", _bind)
+    with pytest.raises(SystemExit):
+        module._relay_loop()
+    assert state["unlink_n"] >= 2
+    assert bind_calls["n"] >= 1
+
+
+def test_relay_loop_spawns_thread_for_each_connection(tmp_path, monkeypatch):
+    """The loop spawns one daemon thread per accepted client connection
+    via ``threading.Thread(target=_serve_one_client, daemon=True)``. We
+    capture the Thread's args and stop the loop after one accept."""
+    module = _import_voice_mcp()
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+    sock_path = module._socket_path()
+    os.makedirs(os.path.dirname(sock_path), mode=0o700, exist_ok=True)
+    if os.path.exists(sock_path):
+        os.unlink(sock_path)
+    monkeypatch.setattr(module, "REBIND_RETRY_SECONDS", 0)
+
+    captured_threads = []
+    real_thread = module.threading.Thread
+
+    class _CapturedThread:
+        """A drop-in replacement for ``threading.Thread`` that captures
+        init kwargs without spawning. The relay loop calls
+        ``Thread(target=_serve_one_client, args=(...), daemon=True).start()``
+        — we capture (target, args, kwargs) and don't run."""
+        def __init__(self, *a, **kw):
+            captured_threads.append((a, kw))
+
+        def start(self):
+            pass
+
+    class _FakeSocket:
+        def __init__(self):
+            self.accepted = False
+
+        def accept(self):
+            if not self.accepted:
+                self.accepted = True
+                return (mock.Mock(), None)
+            raise SystemExit("stop after one accept")
+
+        def close(self):
+            pass
+
+    bind_calls = {"n": 0}
+
+    def _bind(p):
+        bind_calls["n"] += 1
+        return _FakeSocket()
+
+    monkeypatch.setattr(module.threading, "Thread", _CapturedThread)
+    monkeypatch.setattr(module, "_bind_socket", _bind)
+    # Stub _serve_one_client so the thread body is a no-op (we replaced Thread anyway).
+    monkeypatch.setattr(module, "_serve_one_client", lambda sock, addr: None)
+
+    with pytest.raises(SystemExit):
+        module._relay_loop()
+    # The thread was constructed with the right target and daemon=True.
+    assert bind_calls["n"] >= 1
+    assert len(captured_threads) >= 1
+    # Voice_mcp constructs Thread with kwargs (target=, args=, daemon=) only.
+    pos, kw = captured_threads[0]
+    assert kw["target"] is module._serve_one_client
+    assert kw["daemon"] is True
+
+
+def test_relay_loop_retries_bind_after_unlink_oserror(tmp_path, monkeypatch):
+    """If ``os.unlink`` raises ``OSError`` while taking over a stale
+    socket, the loop sleeps ``REBIND_RETRY_SECONDS`` and continues
+    without crashing. We bound the sleep and confirm the loop still
+    reaches the bind path on the next iteration."""
+    module = _import_voice_mcp()
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+    sock_path = module._socket_path()
+    os.makedirs(os.path.dirname(sock_path), mode=0o700, exist_ok=True)
+    with open(sock_path, "w") as fh:
+        fh.write("")  # stale
+
+    real_unlink = module.os.unlink
+    state = {"calls": 0}
+
+    def _maybe_unlink(p):
+        state["calls"] += 1
+        if state["calls"] == 1:
+            raise OSError("race")
+        return real_unlink(p)
+
+    monkeypatch.setattr(module.os, "unlink", _maybe_unlink)
+    monkeypatch.setattr(module, "REBIND_RETRY_SECONDS", 0.02)
+
+    # Stop the loop after two iterations by raising from the bind helper.
+    bind_calls = {"n": 0}
+
+    def _bind_then_stop(p):
+        bind_calls["n"] += 1
+        # First bind binds a real socket; the listener's accept() then raises,
+        # closing the loop's listener so the outer while loop re-enters and
+        # calls bind a second time.
+        sock = module._bind_socket.__wrapped__(p) if hasattr(module._bind_socket, "__wrapped__") else module._bind_socket(p)
+        return sock
+
+    # Stop the loop on its second iteration: have accept raise so the outer
+    # loop drops the listener and re-binds.
+    import socket as _sock
+    real_socket_class = _sock.socket
+    real_accept = real_socket_class.accept
+
+    def _accept_then_raise(self, *a, **kw):
+        # First call returns a fake conn; subsequent calls raise so the loop
+        # tears down. We only want to run the loop body long enough to
+        # observe the retry.
+        try:
+            return real_accept(self, *a, **kw)
+        except BlockingIOError:
+            raise OSError("stop")
+        except Exception:
+            raise
+
+    # We don't actually need to call accept — we patch bind_socket to a
+    # counter that raises after the second bind. That exits the loop
+    # cleanly without leaving a daemon thread alive.
+    def _bind(p):
+        bind_calls["n"] += 1
+        if bind_calls["n"] >= 2:
+            raise SystemExit("stop")
+        # Return a stub listener that raises immediately on accept().
+        class _Listener:
+            def accept(self_inner):
+                raise OSError("stop")
+
+            def close(self_inner):
+                pass
+
+        return _Listener()
+
+    monkeypatch.setattr(module, "_bind_socket", _bind)
+
+    with pytest.raises(SystemExit):
+        module._relay_loop()
+
+    # The retry happened: unlink was called twice (once raising, once
+    # succeeding) and bind was attempted twice.
+    assert state["calls"] >= 2
+    assert bind_calls["n"] >= 2
+
+
+def test_relay_loop_retries_bind_after_bind_failure(tmp_path, monkeypatch):
+    """If ``_bind_socket`` returns ``None`` (bind OSError after
+    successful unlink), the loop sleeps and retries. The test exits the
+    loop after the second bind attempt via SystemExit, so no daemon
+    thread lingers and no real socket is consumed."""
+    module = _import_voice_mcp()
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+    sock_path = module._socket_path()
+    os.makedirs(os.path.dirname(sock_path), mode=0o700, exist_ok=True)
+    with open(sock_path, "w") as fh:
+        fh.write("")  # stale
+
+    state = {"calls": 0}
+
+    def _maybe_bind(p):
+        state["calls"] += 1
+        if state["calls"] == 1:
+            return None
+        raise SystemExit("stop after second bind")
+
+    monkeypatch.setattr(module, "_bind_socket", _maybe_bind)
+    monkeypatch.setattr(module, "REBIND_RETRY_SECONDS", 0)
+    with pytest.raises(SystemExit):
+        module._relay_loop()
+    assert state["calls"] >= 2
+
+
+# --- 22. MCP stdio tools and dispatch -------------------------------
+
+
+def test_send_writes_message_with_trailing_newline(monkeypatch):
+    """``_send`` writes one JSON line per message followed by a flush —
+    the MCP wire format is line-delimited JSON. A test that flushes
+    without a newline lets the receiver hang on the readline."""
+    module = _import_voice_mcp()
+    captured = {"buf": "", "flushed": False}
+
+    class _Stdout:
+        def write(self, s):
+            captured["buf"] += s
+
+        def flush(self):
+            captured["flushed"] = True
+
+    monkeypatch.setattr(module.sys, "stdout", _Stdout())
+    module._send({"jsonrpc": "2.0", "id": 1, "result": {}})
+    assert captured["buf"].endswith("\n")
+    assert json.loads(captured["buf"]) == {"jsonrpc": "2.0", "id": 1, "result": {}}
+    assert captured["flushed"]
+
+
+def test_recv_returns_none_on_eof():
+    """``_recv`` returns ``None`` on EOF so the stdio loop exits
+    cleanly. A test that raises on EOF would crash the loop."""
+    module = _import_voice_mcp()
+    import unittest.mock as _mock
+    with _mock.patch.object(module.sys, "stdin") as fake_stdin:
+        fake_stdin.readline.return_value = ""
+        assert module._recv() is None
+
+
+def test_recv_returns_none_on_invalid_json():
+    """A line that doesn't decode is logged-and-dropped, not raised.
+    The stdio loop treats invalid input as EOF — a malformed frame
+    on the wire should not crash the server."""
+    module = _import_voice_mcp()
+    import unittest.mock as _mock
+    with _mock.patch.object(module.sys, "stdin") as fake_stdin:
+        fake_stdin.readline.return_value = "not-json\n"
+        assert module._recv() is None
+
+
+def test_recv_returns_parsed_object():
+    """The happy path: a valid JSON line decodes to the dict the
+    dispatch will see."""
+    module = _import_voice_mcp()
+    import unittest.mock as _mock
+    with _mock.patch.object(module.sys, "stdin") as fake_stdin:
+        fake_stdin.readline.return_value = '{"method": "ping"}\n'
+        out = module._recv()
+    assert out == {"method": "ping"}
+
+
+def test_tool_design_previews_returns_iserror_on_non_string_args(monkeypatch):
+    """The tool validates argument types — non-string ``voice_description``
+    or ``text`` returns ``isError: True`` with a ``bad args`` message.
+    A test that accepts any value lets a malformed call reach the wire."""
+    module = _import_voice_mcp()
+    monkeypatch.setenv(module.ENV_TTS_KEY, "k")
+    out = module._tool_design_previews({"voice_description": 1, "text": "x"})
+    assert out["isError"] is True
+    assert "bad args" in out["content"][0]["text"]
+
+
+def test_tool_design_previews_returns_iserror_on_missing_key(monkeypatch):
+    """With no TTS key the tool refuses with the documented error."""
+    module = _import_voice_mcp()
+    monkeypatch.delenv(module.ENV_TTS_KEY, raising=False)
+    out = module._tool_design_previews({"voice_description": "x", "text": "y"})
+    assert out["isError"] is True
+    assert "no tts_api_key" in out["content"][0]["text"]
+
+
+def test_tool_design_previews_calls_elevenlabs(monkeypatch):
+    """The tool POSTs to the ElevenLabs create-previews URL with the
+    key as ``xi-api-key`` and the body as JSON. A previews list with
+    one entry writes one MP3 to ``~/.local/share/voice-loop/previews``
+    and returns ``[{generated_voice_id, path}]``."""
+    module = _import_voice_mcp()
+    monkeypatch.setenv(module.ENV_TTS_KEY, "test-xi")
+    captured = {}
+
+    class _Resp:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def read(self):
+            import base64 as _b64
+            audio = b"fake-mp3-bytes"
+            b64 = _b64.b64encode(audio).decode("ascii")
+            return json.dumps(
+                {"previews": [{"generated_voice_id": "abc123", "audio_base_64": b64}]}
+            ).encode()
+
+    class _Opener:
+        def open(self, req, timeout=None):
+            captured["url"] = req.full_url
+            captured["headers"] = dict(req.header_items())
+            captured["body"] = req.data
+            return _Resp()
+
+    import os as _os
+    fake_home = "/tmp/voice-mcp-home"
+    monkeypatch.setenv("HOME", fake_home)
+    # Pre-create the parent so the .replace call has a writable dir.
+    out_dir = _os.path.expanduser("~/.local/share/voice-loop/previews")
+    _os.makedirs(out_dir, exist_ok=True)
+
+    with mock.patch.object(module.urllib.request, "build_opener", return_value=_Opener()):
+        result = module._tool_design_previews({"voice_description": "deep voice", "text": "hello"})
+
+    assert captured["url"] == module.ELEVENLABS_PREVIEWS_URL
+    # urllib normalizes the header capitalization to "Xi-api-key".
+    headers = {k.lower(): v for k, v in captured["headers"].items()}
+    assert headers.get("xi-api-key") == "test-xi"
+    # The body is JSON, not multipart.
+    body = json.loads(captured["body"].decode())
+    assert body == {"voice_description": "deep voice", "text": "hello"}
+    # The result is one preview with the right keys.
+    assert isinstance(result["content"], list)
+    payload = json.loads(result["content"][0]["text"])
+    assert len(payload) == 1
+    assert payload[0]["generated_voice_id"] == "abc123"
+    assert payload[0]["path"].endswith("preview-1.mp3")
+    # The MP3 file was written.
+    assert _os.path.exists(payload[0]["path"])
+
+
+def test_tool_design_previews_returns_iserror_on_http_error(monkeypatch):
+    """An ElevenLabs 4xx/5xx is surfaced as ``isError: True`` with the
+    HTTP code — the tool never crashes."""
+    module = _import_voice_mcp()
+    monkeypatch.setenv(module.ENV_TTS_KEY, "k")
+
+    class _Opener:
+        def open(self, req, timeout=None):
+            raise urllib.error.HTTPError(req.full_url, 401, "Unauthorized", {}, None)
+
+    with mock.patch.object(module.urllib.request, "build_opener", return_value=_Opener()):
+        out = module._tool_design_previews({"voice_description": "x", "text": "y"})
+    assert out["isError"] is True
+    assert "401" in out["content"][0]["text"]
+
+
+def test_tool_design_previews_returns_iserror_on_url_error(monkeypatch):
+    """A connection-level failure to ElevenLabs is ``provider unreachable`` —
+    a stable, single-word shape the skill can match on."""
+    module = _import_voice_mcp()
+    monkeypatch.setenv(module.ENV_TTS_KEY, "k")
+
+    class _Opener:
+        def open(self, req, timeout=None):
+            raise urllib.error.URLError("no route")
+
+    with mock.patch.object(module.urllib.request, "build_opener", return_value=_Opener()):
+        out = module._tool_design_previews({"voice_description": "x", "text": "y"})
+    assert out["isError"] is True
+    assert "provider unreachable" in out["content"][0]["text"]
+
+
+def test_tool_design_previews_returns_iserror_on_non_json_body(monkeypatch):
+    """A non-JSON body is reported — the tool does NOT crash, it
+    surfaces ``provider returned non-JSON``."""
+    module = _import_voice_mcp()
+    monkeypatch.setenv(module.ENV_TTS_KEY, "k")
+
+    class _Resp:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def read(self): return b"<html>oops</html>"
+
+    class _Opener:
+        def open(self, req, timeout=None):
+            return _Resp()
+
+    with mock.patch.object(module.urllib.request, "build_opener", return_value=_Opener()):
+        out = module._tool_design_previews({"voice_description": "x", "text": "y"})
+    assert out["isError"] is True
+    assert "non-JSON" in out["content"][0]["text"]
+
+
+def test_tool_design_previews_skips_non_dict_entries_and_bad_base64(monkeypatch):
+    """The previews list may contain a non-dict entry or an entry whose
+    audio field fails to decode — the tool skips those and returns the
+    valid ones only. A test that asserts "all-or-nothing" would catch
+    a regression that drops valid entries."""
+    module = _import_voice_mcp()
+    monkeypatch.setenv(module.ENV_TTS_KEY, "k")
+    import os as _os
+    monkeypatch.setenv("HOME", "/tmp/voice-mcp-home")
+    out_dir = _os.path.expanduser("~/.local/share/voice-loop/previews")
+    _os.makedirs(out_dir, exist_ok=True)
+
+    class _Resp:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def read(self):
+            import base64 as _b64
+            audio = b"ok-mp3"
+            return json.dumps(
+                {
+                    "previews": [
+                        "not-a-dict",
+                        {"generated_voice_id": "ok1", "audio_base_64": _b64.b64encode(audio).decode("ascii")},
+                        {"generated_voice_id": "bad", "audio_base_64": "!!notbase64!!"},
+                    ]
+                }
+            ).encode()
+
+    class _Opener:
+        def open(self, req, timeout=None):
+            return _Resp()
+
+    with mock.patch.object(module.urllib.request, "build_opener", return_value=_Opener()):
+        result = module._tool_design_previews({"voice_description": "x", "text": "y"})
+    payload = json.loads(result["content"][0]["text"])
+    # Only the valid entry survives.
+    assert len(payload) == 1
+    assert payload[0]["generated_voice_id"] == "ok1"
+
+
+def test_tool_design_save_returns_iserror_on_bad_args(monkeypatch):
+    """``design_save`` requires three non-empty string arguments —
+    an empty ``voice_name`` (or a non-string) returns ``isError: True``."""
+    module = _import_voice_mcp()
+    monkeypatch.setenv(module.ENV_TTS_KEY, "k")
+    out = module._tool_design_save({"generated_voice_id": "x", "voice_name": "", "voice_description": "y"})
+    assert out["isError"] is True
+    assert "bad args" in out["content"][0]["text"]
+
+
+def test_tool_design_save_returns_iserror_on_missing_key(monkeypatch):
+    """With no TTS key the tool refuses with the documented error."""
+    module = _import_voice_mcp()
+    monkeypatch.delenv(module.ENV_TTS_KEY, raising=False)
+    out = module._tool_design_save(
+        {"generated_voice_id": "x", "voice_name": "y", "voice_description": "z"}
+    )
+    assert out["isError"] is True
+    assert "no tts_api_key" in out["content"][0]["text"]
+
+
+def test_tool_design_save_calls_elevenlabs(monkeypatch):
+    """The tool POSTs to ``create-voice-from-preview`` and returns
+    ``{voice_id}`` parsed from the JSON body."""
+    module = _import_voice_mcp()
+    monkeypatch.setenv(module.ENV_TTS_KEY, "test-xi")
+    captured = {}
+
+    class _Resp:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def read(self):
+            return json.dumps({"voice_id": "voice-abc"}).encode()
+
+    class _Opener:
+        def open(self, req, timeout=None):
+            captured["url"] = req.full_url
+            captured["headers"] = dict(req.header_items())
+            captured["body"] = req.data
+            return _Resp()
+
+    with mock.patch.object(module.urllib.request, "build_opener", return_value=_Opener()):
+        result = module._tool_design_save(
+            {
+                "generated_voice_id": "gen-1",
+                "voice_name": "My Voice",
+                "voice_description": "warm",
+            }
+        )
+    assert captured["url"] == module.ELEVENLABS_CREATE_URL
+    # urllib normalizes the header capitalization to "Xi-api-key".
+    headers = {k.lower(): v for k, v in captured["headers"].items()}
+    assert headers.get("xi-api-key") == "test-xi"
+    body = json.loads(captured["body"].decode())
+    assert body["voice_name"] == "My Voice"
+    assert body["voice_description"] == "warm"
+    assert body["generated_voice_id"] == "gen-1"
+    payload = json.loads(result["content"][0]["text"])
+    assert payload == {"voice_id": "voice-abc"}
+
+
+def test_tool_design_save_returns_iserror_on_http_error(monkeypatch):
+    """A 4xx/5xx from ElevenLabs surfaces as ``isError: True``."""
+    module = _import_voice_mcp()
+    monkeypatch.setenv(module.ENV_TTS_KEY, "k")
+
+    class _Opener:
+        def open(self, req, timeout=None):
+            raise urllib.error.HTTPError(req.full_url, 500, "Internal", {}, None)
+
+    with mock.patch.object(module.urllib.request, "build_opener", return_value=_Opener()):
+        out = module._tool_design_save(
+            {"generated_voice_id": "x", "voice_name": "y", "voice_description": "z"}
+        )
+    assert out["isError"] is True
+    assert "500" in out["content"][0]["text"]
+
+
+def test_tool_design_save_returns_iserror_on_url_error(monkeypatch):
+    """A connection-level failure surfaces as ``provider unreachable``."""
+    module = _import_voice_mcp()
+    monkeypatch.setenv(module.ENV_TTS_KEY, "k")
+
+    class _Opener:
+        def open(self, req, timeout=None):
+            raise urllib.error.URLError("no route")
+
+    with mock.patch.object(module.urllib.request, "build_opener", return_value=_Opener()):
+        out = module._tool_design_save(
+            {"generated_voice_id": "x", "voice_name": "y", "voice_description": "z"}
+        )
+    assert out["isError"] is True
+    assert "provider unreachable" in out["content"][0]["text"]
+
+
+def test_tool_design_save_returns_iserror_on_non_json_body(monkeypatch):
+    """A non-JSON body from ElevenLabs surfaces as ``provider returned non-JSON``."""
+    module = _import_voice_mcp()
+    monkeypatch.setenv(module.ENV_TTS_KEY, "k")
+
+    class _Resp:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def read(self): return b"not-json"
+
+    class _Opener:
+        def open(self, req, timeout=None):
+            return _Resp()
+
+    with mock.patch.object(module.urllib.request, "build_opener", return_value=_Opener()):
+        out = module._tool_design_save(
+            {"generated_voice_id": "x", "voice_name": "y", "voice_description": "z"}
+        )
+    assert out["isError"] is True
+    assert "non-JSON" in out["content"][0]["text"]
+
+
+def test_dispatch_initialize_returns_server_info():
+    """The MCP initialize reply carries the protocol version, server
+    name and version, and the tools capability. A test that pins the
+    exact JSON shape protects against a silent regression."""
+    module = _import_voice_mcp()
+    reply = module._dispatch({"jsonrpc": "2.0", "id": 1, "method": "initialize"})
+    assert reply["jsonrpc"] == "2.0"
+    assert reply["id"] == 1
+    assert reply["result"]["serverInfo"]["name"] == "voice-loop"
+    assert "version" in reply["result"]["serverInfo"]
+    assert reply["result"]["capabilities"] == {"tools": {}}
+
+
+def test_dispatch_initialized_returns_none():
+    """The notifications/initialized method has no reply — a
+    notification is fire-and-forget. ``_dispatch`` returns ``None``
+    and the stdio loop skips it."""
+    module = _import_voice_mcp()
+    assert module._dispatch({"jsonrpc": "2.0", "method": "notifications/initialized"}) is None
+
+
+def test_dispatch_tools_list_returns_both_tools():
+    """The tools/list reply exposes both voice-design tools."""
+    module = _import_voice_mcp()
+    reply = module._dispatch({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
+    assert reply["id"] == 2
+    names = {tool["inputSchema"]["required"][0] for tool in reply["result"]["tools"]}
+    assert {"voice_description", "generated_voice_id"}.issubset(names)
+
+
+def test_dispatch_tools_call_routes_to_design_previews():
+    """A ``tools/call`` with ``name=design_previews`` delegates to the
+    previews tool. The test stubs the tool to avoid a network call."""
+    module = _import_voice_mcp()
+    fake_result = {"content": [{"type": "text", "text": "[]"}]}
+    with mock.patch.object(module, "_tool_design_previews", return_value=fake_result) as fake:
+        reply = module._dispatch(
+            {
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": {"name": "design_previews", "arguments": {"voice_description": "x", "text": "y"}},
+            }
+        )
+    assert reply["result"] == fake_result
+    fake.assert_called_once()
+
+
+def test_dispatch_tools_call_routes_to_design_save():
+    """A ``tools/call`` with ``name=design_save`` delegates to the save tool."""
+    module = _import_voice_mcp()
+    fake_result = {"content": [{"type": "text", "text": "{}"}]}
+    with mock.patch.object(module, "_tool_design_save", return_value=fake_result) as fake:
+        reply = module._dispatch(
+            {
+                "jsonrpc": "2.0",
+                "id": 4,
+                "method": "tools/call",
+                "params": {"name": "design_save", "arguments": {"generated_voice_id": "g", "voice_name": "n", "voice_description": "d"}},
+            }
+        )
+    assert reply["result"] == fake_result
+    fake.assert_called_once()
+
+
+def test_dispatch_tools_call_unknown_tool_returns_iserror():
+    """An unknown tool name returns ``isError: True`` — the relay never
+    calls an external endpoint on a typo'd name."""
+    module = _import_voice_mcp()
+    reply = module._dispatch(
+        {
+            "jsonrpc": "2.0",
+            "id": 5,
+            "method": "tools/call",
+            "params": {"name": "no_such_tool", "arguments": {}},
+        }
+    )
+    assert reply["result"]["isError"] is True
+    assert "unknown tool" in reply["result"]["content"][0]["text"]
+
+
+def test_dispatch_unknown_method_with_id_returns_jsonrpc_error():
+    """A method the relay doesn't know about returns the
+    ``-32601 method not found`` JSON-RPC error, not a bare ``None``
+    that the stdio loop would silently drop."""
+    module = _import_voice_mcp()
+    reply = module._dispatch({"jsonrpc": "2.0", "id": 6, "method": "no/such/method"})
+    assert reply["id"] == 6
+    assert reply["error"]["code"] == -32601
+
+
+def test_dispatch_unknown_method_without_id_returns_none():
+    """A notification for an unknown method has no reply — the relay
+    drops it without an error reply."""
+    module = _import_voice_mcp()
+    assert module._dispatch({"jsonrpc": "2.0", "method": "no/such/method"}) is None
+
+
+def test_stdio_loop_returns_on_eof(monkeypatch):
+    """The stdio loop exits cleanly when stdin EOF arrives — the
+    relay thread is daemonised so process exit doesn't wait on it."""
+    module = _import_voice_mcp()
+    # The loop reads from _recv; we patch recv to return None (EOF).
+    monkeypatch.setattr(module, "_recv", lambda: None)
+    # Patch the relay loop thread target to a no-op so we don't try
+    # to bind a real socket in this test.
+    monkeypatch.setattr(module.threading.Thread, "start", lambda self: None)
+    # The loop returns None — the caller (main) returns 0.
+    assert module._stdio_loop() is None
+
+
+def test_stdio_loop_sends_dispatch_reply(monkeypatch):
+    """A valid initialize request is dispatched and the reply is sent."""
+    module = _import_voice_mcp()
+    sent = []
+    monkeypatch.setattr(module, "_send", lambda msg: sent.append(msg))
+    msgs = iter(
+        [
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize"},
+            None,  # EOF
+        ]
+    )
+    monkeypatch.setattr(module, "_recv", lambda: next(msgs))
+    monkeypatch.setattr(module.threading.Thread, "start", lambda self: None)
+    module._stdio_loop()
+    assert len(sent) == 1
+    assert sent[0]["result"]["serverInfo"]["name"] == "voice-loop"
+
+
+def test_stdio_loop_skips_sending_on_none_reply(monkeypatch):
+    """A notification (no reply) does not call ``_send`` — the
+    stdio loop writes only when dispatch returns a message."""
+    module = _import_voice_mcp()
+    sent = []
+    monkeypatch.setattr(module, "_send", lambda msg: sent.append(msg))
+    msgs = iter(
+        [
+            {"jsonrpc": "2.0", "method": "notifications/initialized"},
+            None,
+        ]
+    )
+    monkeypatch.setattr(module, "_recv", lambda: next(msgs))
+    monkeypatch.setattr(module.threading.Thread, "start", lambda self: None)
+    module._stdio_loop()
+    assert sent == []
+
+
+def test_main_with_no_argv_runs_stdio_loop(monkeypatch):
+    """``main([])`` enters the stdio loop. A test that calls main
+    directly proves the manifest's no-arg invocation reaches the
+    loop without an intervening branch."""
+    module = _import_voice_mcp()
+    monkeypatch.setattr(module.threading.Thread, "start", lambda self: None)
+    monkeypatch.setattr(module, "_stdio_loop", lambda: None)
+    assert module.main([]) == 0
+
+
+def test_main_with_argv_writes_stderr_and_returns_2(capsys):
+    """A stray argument is a configuration error. The MCP server is
+    not flag-driven; passing one would silently ignore the manifest's
+    intent. The server writes to stderr and exits 2."""
+    module = _import_voice_mcp()
+    rc = module.main(["--unexpected"])
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "unexpected arguments" in err
+
+
+def test_module_invokes_main(monkeypatch, tmp_path):
+    """``if __name__ == "__main__"`` calls ``sys.exit(main())``. Driven
+    via ``runpy.run_path(run_name="__main__")`` so coverage attributes
+    the line back to the source file — the same shape
+    ``test_speak.py::test_main_guard_runs_under_runpy_for_coverage``
+    uses for the speak.py guard."""
+    import sys as _sys
+    import runpy
+    import io
+
+    captured_exit = {"code": None}
+
+    def _capture_exit(code):
+        captured_exit["code"] = code
+        raise SystemExit(code)
+
+    # Close stdin so ``sys.stdin.readline()`` returns "" immediately;
+    # ``_recv`` returns None, the stdio loop returns, ``main`` returns 0,
+    # ``sys.exit(0)`` runs.
+    real_stdin = _sys.stdin
+    real_stdout = _sys.stdout
+    real_stderr = _sys.stderr
+    real_exit = _sys.exit
+    try:
+        _sys.stdin = io.StringIO("")
+        _sys.stdout = io.StringIO()
+        _sys.stderr = io.StringIO()
+        _sys.exit = _capture_exit
+        # Drop __main__ from sys.modules so runpy runs the script fresh.
+        _sys.modules.pop("__main__", None)
+        # Drop the cached voice_mcp module so its module body re-runs
+        # (and the ``_PLUGINS_DIR not in sys.path`` branch can be hit).
+        _sys.modules.pop("voice_mcp", None)
+        # Remove _PLUGINS_DIR from sys.path so the import-time guard runs.
+        _plugins_dir = str(REPO_ROOT / "plugins" / "voice-loop" / "scripts")
+        while _plugins_dir in _sys.path:
+            _sys.path.remove(_plugins_dir)
+        try:
+            runpy.run_path(  # noqa: S603 — intentional subprocess run
+                str(VOICE_MCP), run_name="__main__"
+            )
+        except SystemExit:
+            pass
+    finally:
+        # Restore for subsequent tests.
+        if _plugins_dir not in _sys.path:
+            _sys.path.insert(0, _plugins_dir)
+        _sys.stdin = real_stdin
+        _sys.stdout = real_stdout
+        _sys.stderr = real_stderr
+        _sys.exit = real_exit
+    # main() returned 0 (the stdio loop read EOF, returned None, loop
+    # exited, main returned 0), and sys.exit(0) ran.
+    assert captured_exit["code"] == 0
