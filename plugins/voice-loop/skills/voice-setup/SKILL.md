@@ -284,7 +284,7 @@ local whisper automatically (the microphone never goes dead). If `tts.cloud.prov
 left unset (resolves to OpenAI, the default) or set to a different vendor, dictation with
 `stt.cloud.provider: "elevenlabs"` still works — the script just borrows the TTS key only
 when TTS is also ElevenLabs, so a user relying on `VOICE_LOOP_TTS_API_KEY` for STT must set
-`stt.cloud.api_key_env` or `tts.cloud.provider: "elevenlabs"` explicitly.
+`stt.cloud.api_key_env` (legacy, removed) or `tts.cloud.provider: "elevenlabs"` explicitly.
 
 ### Switching away from `local` on a re-run (clean up behind the old choice)
 

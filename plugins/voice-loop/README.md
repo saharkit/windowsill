@@ -212,35 +212,38 @@ where your voice goes, what `/report-bug` strips — is [PRIVACY.md](../../PRIVA
 in `PROVIDERS.md` — no dispatch path in the plugin compares a provider name against a literal, and
 a test enforces that.
 
-### Streaming dictation — the transcript arrives while you speak
+### Streaming dictation — batch-only while the key lives in the relay
 
-A batch dictation makes a long one pay twice: you speak for a minute, then wait at the end while
-the whole clip uploads and transcribes. Where the provider's registry entry has a **streaming
-variant** (today: `deepgram`), one setting feeds the recording to its live socket *while the
-microphone is open*, so at stop-time the text is already assembled:
+Cloud dictation is **batch-only** while the provider key lives in the voice-loop plugin MCP server
+(#5816). The hotkey dictation path holds no key of its own — the relay holds the userConfig value,
+and the streaming path's key resolution was removed from the script together with the rest of the
+credential-closure change. Setting `stt.cloud.streaming: true` therefore logs
 
-```json
-{ "stt": { "backend": "cloud", "cloud": { "provider": "deepgram", "streaming": true } } }
+```
+streaming needs a key the hotkey path no longer holds; using batch via the relay
 ```
 
-It is **off by default** — a live socket is a second failure surface, and you should ask for it.
-What does not change when you do:
+and takes the relay batch path (the same record → POST flow the rest of this section describes).
+Streaming is restored by [#5881](https://github.com/saharkit/windowsill/issues/5881), relayed through
+the same MCP server; it is not part of the current release.
 
-- the **WAV is still written** and still kept as `dictate-last.wav`. The socket *tails* the
-  recording; it never stands between the recorder and the disk;
-- **any** failure falls back to the ordinary record → POST flow with a line in `dictate.log` — no
-  key, a socket that will not open, an auth refusal, a server that hangs up mid-recording, a stream
-  that carried nothing. A recording is never lost to the live path;
+What this does not change:
+
+- `stt.cloud.streaming: true` is still **off by default** — a live socket is a second failure
+  surface, and you should ask for it.
+- the **WAV is still written** and still kept as `dictate-last.wav`;
+- **any** failure falls back to local whisper with a line in `dictate.log` — the relay answered
+  `no-key`, the relay was unreachable past the client's socket deadline, the provider HTTP call
+  failed, or the request line was malformed. A recording is never lost to the relay path;
 - your hotkey, your debounce, the min-clip guard, the clipboard tier and the paste rules are the
   same code they were.
 
-Every dictation logs what it cost, both ways, so you can compare them on your own machine:
+Every dictation logs what it cost:
 
 ```
-dictation latency stop_to_paste_ms=412 via=stream to=paste
+dictation latency stop_to_paste_ms=412 via=relay to=paste
 ```
 
-Turning it on for a provider that has no streaming variant changes nothing and says so in the log.
 `stt.model` and `stt.language` are the same axes as the batch call. See
 [`PROVIDERS.md`](PROVIDERS.md) for which providers stream and what the billing difference is.
 

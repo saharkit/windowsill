@@ -54,7 +54,7 @@ else.
 |---|---|---|
 | `config-diagnosis` | a config value that explains the behaviour is diagnosed as a **choice**, not as a bug or a broken install — `/doctor`'s first bin | [`skills/doctor/SKILL.md`](../skills/doctor/SKILL.md), [`check_manifest.py`](../skills/doctor/check_manifest.py) |
 | `report-bug-redaction` | `/report-bug` names the collector as the only redactor, says what never travels (keys, user, host, **all** spoken and transcribed text), and sends nothing without a chosen destination | [`skills/report-bug/SKILL.md`](../skills/report-bug/SKILL.md), [`scripts/report_bug.py`](../scripts/report_bug.py) |
-| `cloud-key-never-inline` | a cloud API key goes in a `key_file` the config points at or an `api_key_env` the config names — **never** inline in `config.json` | [`skills/voice-setup/SKILL.md`](../skills/voice-setup/SKILL.md) rule 3 |
+| `cloud-key-never-inline` | a cloud API key goes in the `tts_api_key` / `stt_api_key` plugin options (the `CLAUDE_PLUGIN_OPTION_*` env vars the harness exposes, and the voice-loop plugin MCP server's env) — **never** inline in `config.json`, and **never** in a `key_file` / `api_key_env` indirection (those settings are gone) | [`skills/voice-setup/SKILL.md`](../skills/voice-setup/SKILL.md) rule 3 |
 
 ## How a case is built here, and why
 
