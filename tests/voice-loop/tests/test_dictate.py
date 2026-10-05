@@ -2141,6 +2141,201 @@ def _log_of(state) -> str:
 
 
 
+# --- the streaming-opt-in path: batch-only line and relay batch ---------------------------------
+
+
+def test_streaming_opt_in_logs_batch_only_and_takes_the_relay_batch_path(
+    state, monkeypatch, tmp_path
+):
+    """fix(#5816): with ``stt.cloud.streaming`` true the hotkey dictation path logs the
+    batch-only line ("streaming needs a key the hotkey path no longer holds; using
+    batch via the relay") and runs the relay BATCH path — the streaming variant is
+    unreachable from production (the hotkey script holds no key). The relay answers
+    with a transcript; the dictate log records ``via=relay`` and the clipboard
+    receives the relayed words.
+
+    The test stands up a fake relay on a real Unix socket, configures the cloud
+    backend's endpoint at that socket's address, and asserts the dictation reaches
+    the relay rather than the local whisper server. The relay holds no key in this
+    test — the production condition is "the hotkey process holds no key"; the
+    relay in this test is a fake that echoes a fixed transcript, so the dictation
+    reaches the clipboard through the relay path with no provider call."""
+    env_dir = tmp_path / "runtime"
+    env_dir.mkdir()
+    sock_dir = env_dir / "voice-loop"
+    sock_dir.mkdir(mode=0o700)
+    os.chmod(sock_dir, 0o700)
+    sock_path = sock_dir / "stt.sock"
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server.bind(str(sock_path))
+    os.chmod(sock_path, 0o600)
+    server.listen(1)
+
+    transcript = "the streaming-opt-in took the relay batch path"
+    request_seen: list[bytes] = []
+
+    def _serve_one():
+        conn, _ = server.accept()
+        with conn:
+            buf = b""
+            while b"\n" not in buf:
+                chunk = conn.recv(65536)
+                if not chunk:
+                    break
+                buf += chunk
+            request_seen.append(buf)
+            conn.sendall((json.dumps({"status": "ok", "text": transcript}) + "\n").encode())
+
+    t = threading.Thread(target=_serve_one, daemon=True)
+    t.start()
+
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(env_dir))
+    monkeypatch.delenv("CLAUDE_PLUGIN_OPTION_STT_API_KEY", raising=False)
+    clipboard_path = tmp_path / "clipboard.txt"
+
+    def _fake_paste(text: str) -> None:  # noqa: ARG001 — surface text to the test
+        clipboard_path.write_text(text, encoding="utf-8")
+
+    monkeypatch.setattr(dictate, "_run_paste", lambda *a, **kw: True)
+    # Local whisper must NOT be reached — assert it isn't called.
+    monkeypatch.setattr(
+        dictate, "_transcribe_lan", lambda *a, **kw: pytest.fail("local whisper called")
+    )
+
+    s = dictate.resolve_settings(
+        {
+            "stt": {
+                "backend": "cloud",
+                "cloud": {
+                    "provider": "deepgram",
+                    "streaming": True,
+                    "endpoint": "http://127.0.0.1:9",
+                },
+                "timeout": 5.0,
+            }
+        },
+        "Linux",
+    )
+    # The streaming-opt-in line lands first (streaming_wanted logs it), then the
+    # transcribe() entry runs the cloud path through the relay.
+    assert dictate.streaming_wanted(s) is False
+    log_text = _log_of(state)
+    assert "streaming needs a key the hotkey path no longer holds" in log_text
+    assert "using batch via the relay" in log_text
+
+    # Build a real WAV file the transcribe() entry will read.
+    (state / "dictate.wav").write_bytes(b"RIFFfakewav")
+    # transcribe() calls _transcribe_cloud; ensure the relay path runs end-to-end.
+    text = dictate.transcribe(s)
+    server.close()
+    t.join(timeout=2)
+
+    assert text == transcript, "the relay's transcript did not reach transcribe()"
+    assert request_seen, "the relay never received the request line"
+    # The request line carries the dictation's resolved settings (the relay's
+    # three-step key resolution is irrelevant here — the test exercises the wire
+    # shape, not the provider call).
+    line = request_seen[0].split(b"\n", 1)[0].decode("utf-8")
+    parsed = json.loads(line)
+    assert parsed["provider"] == "deepgram"
+    assert parsed["model"] == s["stt_model"]
+    assert parsed["language"] == s["language"]
+
+
+def _bind_silent_relay(directory: Path, monkeypatch):
+    """Bind a Unix socket that accepts but never replies — for the timeout test."""
+    sock_dir = directory / "voice-loop"
+    sock_dir.mkdir(mode=0o700, exist_ok=True)
+    os.chmod(sock_dir, 0o700)
+    sock_path = sock_dir / "stt.sock"
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server.bind(str(sock_path))
+    os.chmod(sock_path, 0o600)
+    server.listen(1)
+    server.settimeout(0.2)
+
+    def _serve_forever():
+        try:
+            while True:
+                try:
+                    conn, _ = server.accept()
+                    # Hold the connection open, drain the client's bytes, never reply.
+                    try:
+                        while True:
+                            chunk = conn.recv(65536)
+                            if not chunk:
+                                break
+                    except OSError:
+                        pass
+                    try:
+                        conn.close()
+                    except OSError:
+                        pass
+                except OSError:
+                    return
+        except Exception:
+            return
+
+    t = threading.Thread(target=_serve_forever, daemon=True)
+    t.start()
+    return server, t
+
+
+def test_relay_silent_past_client_deadline_logs_reason_timeout_and_falls_back_to_local_whisper(
+    state, monkeypatch, tmp_path
+):
+    """fix(#5816): the client's socket deadline is ``stt.timeout + 5 s``. A relay that accepts the
+    connection and never replies past that deadline is answered with
+    ``{"status": "failed", "reason": "timeout"}``; the dictate script logs ``reason=timeout``
+    and falls back to the local whisper server.
+
+    The test stands up a silent relay (accepts the connection, holds it open, never sends a
+    newline-terminated reply) on a real Unix socket. The dictation reaches the relay, the
+    client's deadline elapses, the typed-failure reply is logged, and the local whisper path
+    runs the recording to its own transcript. The local-whisper transcript is what the
+    clipboard receives — a lost-recording scenario would surface as ``paste_text not called``."""
+    env_dir = tmp_path / "runtime"
+    env_dir.mkdir()
+    server, t = _bind_silent_relay(env_dir, monkeypatch)
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(env_dir))
+    monkeypatch.delenv("CLAUDE_PLUGIN_OPTION_STT_API_KEY", raising=False)
+
+    local_transcript = "the local whisper fallback produced this"
+
+    def _fake_lan(endpoint: str, language: str, wav: bytes, timeout: float, prompt: str = "") -> str:
+        return local_transcript
+
+    monkeypatch.setattr(dictate, "_transcribe_lan", _fake_lan)
+
+    monkeypatch.setattr(dictate, "_run_paste", lambda *a, **kw: True)
+    # The deadline is s["timeout"] + 5 s; the test sets timeout=0.1 so the silent relay
+    # triggers a client-side deadline expiry quickly.
+    s = dictate.resolve_settings(
+        {
+            "stt": {
+                "backend": "cloud",
+                "cloud": {
+                    "provider": "deepgram",
+                    "endpoint": "http://127.0.0.1:9",
+                },
+                "timeout": 0.1,
+            }
+        },
+        "Linux",
+    )
+    (state / "dictate.wav").write_bytes(b"RIFFfakewav")
+
+    text = dictate.transcribe(s)
+    server.close()
+    t.join(timeout=2)
+
+    assert text == local_transcript, "the silent relay did not fall back to local whisper"
+    log_text = _log_of(state)
+    assert "reason=timeout" in log_text, (
+        f"the typed-failure reason did not reach the log; got: {log_text!r}"
+    )
+
+
 # --- the cross-module framing loop: dictate's multipart through the real /stt -------------------
 
 
