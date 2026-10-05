@@ -1503,13 +1503,16 @@ def test_run_holder_swallows_listener_close_error_in_outer_finally(monkeypatch, 
 
 def test_run_holder_main_refuses_when_clear_text_policy_rejects(state, monkeypatch, tmp_path):
     """The endpoint-policy (#215) check in run_holder_main runs after key+provider, and a
-    clear-text credential over a non-local host is refused before the loop starts."""
+    clear-text credential over a non-local host is refused before the loop starts.
+
+    fix(#5816): the cloud TTS key is now $CLAUDE_PLUGIN_OPTION_TTS_API_KEY only. The test
+    sets the userConfig env (the holder's source) and the policy seam refuses."""
     cfg = tmp_path / "config.json"
     cfg.write_text(json.dumps({
         "tts": {"backend": "cloud", "cloud": {"provider": "elevenlabs", "streaming": True}}
     }))
     monkeypatch.setenv("VOICE_LOOP_CONFIG", str(cfg))
-    monkeypatch.setenv("VOICE_LOOP_TTS_API_KEY", "k")
+    monkeypatch.setenv("CLAUDE_PLUGIN_OPTION_TTS_API_KEY", "k")
 
     # monkeypatch the policy seam to refuse — without it the real resolver would either allow
     # localhost or run into the real network
@@ -1522,11 +1525,13 @@ def test_run_holder_main_refuses_when_clear_text_policy_rejects(state, monkeypat
 def test_run_holder_main_folds_speed_into_voice_settings(state, monkeypatch, tmp_path):
     """The last step before run_holder: speed is folded into voice_settings so the BOS carries
     it on the held socket's first frame. Without this, a config-level speed knob never reaches
-    the websocket."""
+    the websocket.
+
+    fix(#5816): the cloud TTS key is now $CLAUDE_PLUGIN_OPTION_TTS_API_KEY only."""
     cfg = tmp_path / "config.json"
     cfg.write_text(json.dumps({"tts": {"backend": "cloud", "cloud": {"provider": "elevenlabs", "streaming": True}}}))
     monkeypatch.setenv("VOICE_LOOP_CONFIG", str(cfg))
-    monkeypatch.setenv("VOICE_LOOP_TTS_API_KEY", "k")
+    monkeypatch.setenv("CLAUDE_PLUGIN_OPTION_TTS_API_KEY", "k")
 
     captured: dict = {}
 

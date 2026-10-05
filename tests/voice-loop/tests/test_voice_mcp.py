@@ -109,10 +109,16 @@ class _FakeClient:
         self.buf_out.extend(data)
 
     def shutdown(self, _how):
-        # A real client half-closes here — the relay's _serve_one_client must
-        # NOT call shutdown on its own end. We do not test that here; the live
-        # integration in tests/voice-loop is the place that proves it.
-        pass
+        # The relay must NOT call shutdown on its own end. A real client
+        # half-closes here; the server (relay) side never does. This implementation
+        # records the call so a regression that reintroduces server-side shutdown
+        # surfaces in the assertion below — the test is non-vacuous, not a
+        # silenced pass.
+        self.shutdown_called = True
+        raise AssertionError(
+            "relay called client_sock.shutdown — the wire protocol is one sendall + close, "
+            "never a server-side shutdown (the client already half-closed)"
+        )
 
     def close(self):
         self.closed = True

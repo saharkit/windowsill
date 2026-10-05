@@ -85,7 +85,14 @@ def test_defaults_with_empty_config_linux():
     assert s["language"] == "en"  # explicit-language setups always write the key; the default is English
     assert s["stt_model"] == "whisper-1"
     assert s["stt_command"] == ""
-    assert s["key_env"] == "VOICE_LOOP_STT_API_KEY"
+    # The credential-closure change (#5816) removed key_env / key_file: the STT key is
+    # delivered by the harness as $CLAUDE_PLUGIN_OPTION_STT_API_KEY only. The settings
+    # dictionary carries tts_vendor (so the relay can apply the ElevenLabs STT -> TTS-key
+    # fallback) but no key_env / key_envs / key_file of its own.
+    assert s["tts_vendor"] == "openai"  # the TTS provider default
+    assert "key_env" not in s
+    assert "key_envs" not in s
+    assert "key_file" not in s
     assert s["timeout"] == 60.0
     assert s["debounce_ms"] == 750.0
     assert s["paste_target"] == "any"  # the power behaviour stays the default; the guard is opt-in
@@ -114,10 +121,16 @@ def test_stt_language_beats_top_level_language_beats_default():
 
 
 def test_key_env_precedence_cloud_over_stt_over_default():
-    stt_level = {"stt": {"api_key_env": "STT_LEVEL"}}
-    assert dictate.resolve_settings(stt_level, "Linux")["key_env"] == "STT_LEVEL"
-    both = {"stt": {"api_key_env": "STT_LEVEL", "cloud": {"api_key_env": "CLOUD_LEVEL"}}}
-    assert dictate.resolve_settings(both, "Linux")["key_env"] == "CLOUD_LEVEL"
+    # fix(#5816) removed stt.cloud.api_key_env / stt.cloud.key_file / stt.api_key_env. The
+    # STT key is delivered by the harness as $CLAUDE_PLUGIN_OPTION_STT_API_KEY only. A
+    # config that still carries one of the legacy names gets a one-line warning from
+    # resolve_settings (see OBSOLETE_KEYS) and the setting is ignored. The settings dict
+    # no longer carries ``key_env`` or ``key_envs``.
+    cfg = {"stt": {"api_key_env": "STT_LEVEL", "cloud": {"api_key_env": "CLOUD_LEVEL", "key_file": "/tmp/k"}}}
+    s = dictate.resolve_settings(cfg, "Linux")
+    assert "key_env" not in s
+    assert "key_envs" not in s
+    assert "key_file" not in s
 
 
 def test_empty_string_falls_back_to_default():
@@ -149,20 +162,15 @@ def test_stt_cloud_endpoint_defaults_to_empty():
     assert dictate.resolve_settings({}, "Linux")["cloud_endpoint"] == ""
 
 
-# --- read_key: key_file wins, whitespace stripped, never from argv ------------------------------
+# --- read_key: only the userConfig option; whitespace stripped, never from argv --------------
 
 
-def test_key_file_wins_over_env(tmp_path):
-    key_file = tmp_path / "k"
-    key_file.write_text(" sk-fromfile \n")
-    assert dictate.read_key(str(key_file), "K_ENV", {"K_ENV": "sk-fromenv"}) == "sk-fromfile"
-
-
-def test_oversized_key_file_falls_back_without_reading_the_whole_file(tmp_path):
-    """L2: a hostile key file must not become an unbounded read or a credential candidate."""
-    key_file = tmp_path / "k"
-    key_file.write_bytes(b"x" * (dictate.MAX_KEY_BYTES + 1))
-    assert dictate.read_key(str(key_file), "K_ENV", {"K_ENV": "from-env"}) == "from-env"
+def test_user_config_option_is_the_only_key_source():
+    """The cloud STT key is delivered by the harness as $CLAUDE_PLUGIN_OPTION_STT_API_KEY
+    only — key_file and api_key_env fallbacks were removed in fix(#5816)."""
+    assert dictate.read_key({}) == ""
+    assert dictate.read_key({"CLAUDE_PLUGIN_OPTION_STT_API_KEY": " sk-with-whitespace \n"}) == "sk-with-whitespace"
+    assert dictate.read_key({"CLAUDE_PLUGIN_OPTION_STT_API_KEY": "sk-stripped"}) == "sk-stripped"
 
 
 def test_oversized_config_is_ignored(tmp_path):
@@ -170,35 +178,6 @@ def test_oversized_config_is_ignored(tmp_path):
     config = tmp_path / "config.json"
     config.write_bytes(b"{" + b"x" * dictate.MAX_CONFIG_BYTES)
     assert dictate.load_config(str(config)) == {}
-
-
-def test_missing_key_file_falls_back_to_env(tmp_path):
-    assert dictate.read_key(str(tmp_path / "absent"), "K_ENV", {"K_ENV": "sk-fromenv"}) == "sk-fromenv"
-    assert dictate.read_key("", "K_ENV", {}) == ""
-
-
-def test_user_config_option_wins_over_key_file_and_env(tmp_path):
-    """The `stt_api_key` plugin option (exposed as $CLAUDE_PLUGIN_OPTION_STT_API_KEY by the
-    harness) wins over the key file and the named env var — the option is the documented
-    carrier when voice-loop runs from a Claude Code hook, and `sensitive: true` keeps the value
-    out of the settings file. The hotkey dictation path is not started by Claude Code and reads
-    only the key file / env var on that path; this test pins the hook-path precedence."""
-    key_file = tmp_path / "k"
-    key_file.write_text(" sk-fromfile \n")
-    env = {
-        "CLAUDE_PLUGIN_OPTION_STT_API_KEY": " sk-from-option \n",
-        "K_ENV": "sk-fromenv",
-    }
-    assert dictate.read_key(str(key_file), "K_ENV", env) == "sk-from-option"
-
-
-def test_empty_user_config_option_falls_back_to_key_file(tmp_path):
-    """A WHITESPACE-only option value falls through to key_file — an option the user typed a
-    space into would otherwise win silently and starve the file fallback."""
-    key_file = tmp_path / "k"
-    key_file.write_text("sk-fromfile\n")
-    env = {"CLAUDE_PLUGIN_OPTION_STT_API_KEY": "   \t  ", "K_ENV": "sk-fromenv"}
-    assert dictate.read_key(str(key_file), "K_ENV", env) == "sk-fromfile"
 
 
 def test_bounded_text_rejects_a_file_that_cannot_be_read(state, tmp_path):
@@ -1077,12 +1056,12 @@ def test_absent_config_stays_silent(state):
 
 
 def test_non_utf8_key_file_falls_back_to_env_and_never_logs_content(state):
-    key_file = state / "k"
-    key_file.write_bytes(b"\xff\xfe topsecretbytes")
-    assert dictate.read_key(str(key_file), "K_ENV", {"K_ENV": "sk-fromenv"}) == "sk-fromenv"
-    logged = (state / "dictate.log").read_text(encoding="utf-8")
-    assert "UnicodeDecodeError" in logged
-    assert "topsecret" not in logged
+    # fix(#5816): the key_file / api_key_env fallbacks were removed. The STT key now
+    # comes from $CLAUDE_PLUGIN_OPTION_STT_API_KEY only. The non-UTF-8-key-file test
+    # shape no longer applies: the function does not read a key file at all.
+    assert dictate.read_key({}) == ""
+    assert dictate.read_key({"CLAUDE_PLUGIN_OPTION_STT_API_KEY": "  \t  "}) == ""
+    assert dictate.read_key({"CLAUDE_PLUGIN_OPTION_STT_API_KEY": "real-key"}) == "real-key"
 
 
 # --- applescript_escape: config-controlled text cannot break out of the literal -----------------
@@ -2075,31 +2054,13 @@ def opener(monkeypatch):
     return install
 
 
-def test_cloud_stt_posts_the_documented_openai_transcription_shape(state, monkeypatch, opener):
-    (state / "dictate.wav").write_bytes(b"RIFFfakewav")
-    fake = opener(b'{"text": " hello "}')
-    monkeypatch.setenv("VOICE_LOOP_STT_API_KEY", "sk-secret")
-    # windowsill#270: the host goes in ``stt.cloud.endpoint`` — the top-level ``stt.endpoint`` is
-    # rank 3 under the registry's default_host, and a self-hosted operator uses the cloud key.
-    s = dictate.resolve_settings(
-        {"stt": {"backend": "cloud", "cloud": {"endpoint": "https://api.example.com"}}}, "Linux"
-    )
-    assert dictate.transcribe(s) == "hello"
-
-    request, timeout = fake.requests[0]
-    assert request.full_url == "https://api.example.com/v1/audio/transcriptions"
-    assert request.get_method() == "POST"
-    assert request.get_header("Authorization") == "Bearer sk-secret"
-    assert timeout == 60.0
-    content_type = request.get_header("Content-type")
-    assert content_type.startswith("multipart/form-data; boundary=")
-    boundary = content_type.split("boundary=", 1)[1].encode("ascii")
-    body = request.data
-    assert body.count(b"--" + boundary + b"\r\n") == 3  # model, language, file
-    assert b'name="model"\r\n\r\nwhisper-1\r\n' in body
-    assert b'name="language"\r\n\r\nen\r\n' in body
-    assert b'name="file"; filename="dictate.wav"\r\nContent-Type: audio/wav\r\n\r\nRIFFfakewav' in body
-    assert body.endswith(b"\r\n--" + boundary + b"--\r\n")
+# --- the LAN / local STT path: the request shape that did NOT change with the relay ------------
+#
+# fix(#5816) moved the CLOUD STT path through the voice-loop MCP relay (a Unix-socket listener
+# owned by the running Claude Code session). The LAN path — ``stt.backend = lan`` posting to the
+# bundled server on 127.0.0.1:8355 — is unchanged: no relay hop, no key on the wire, the
+# multipart builder still hands the server the audio field with the language query. These four
+# tests pin the unchanged half.
 
 
 def test_lan_stt_posts_the_audio_field_with_a_language_query(state, opener):
@@ -2111,48 +2072,6 @@ def test_lan_stt_posts_the_audio_field_with_a_language_query(state, opener):
     assert request.full_url == "http://127.0.0.1:8355/stt?language=en"
     assert request.get_header("Authorization") is None  # the LAN server never sees a key
     assert b'name="audio"; filename="dictate.wav"' in request.data
-
-
-def test_elevenlabs_scribe_posts_the_documented_shape(state, monkeypatch, opener):
-    (state / "dictate.wav").write_bytes(b"RIFFfakewav")
-    fake = opener(b'{"text": "hello agent", "language_code": "en", "language_probability": 0.99}')
-    monkeypatch.setenv("VOICE_LOOP_STT_API_KEY", "xi-secret")
-    s = dictate.resolve_settings(
-        {"stt": {"backend": "cloud", "cloud": {"provider": "elevenlabs"}}}, "Linux"
-    )
-    assert dictate.transcribe(s) == "hello agent"
-
-    request, timeout = fake.requests[0]
-    assert request.full_url == "https://api.elevenlabs.io/v1/speech-to-text"
-    assert request.get_method() == "POST"
-    assert request.get_header("Xi-api-key") == "xi-secret"
-    assert timeout == 60.0
-    body = request.data
-    assert b'name="model_id"\r\n\r\nscribe_v1\r\n' in body
-    # windowsill#93: the configured language reaches Scribe under ITS name, the way the OpenAI
-    # request above carries the same value as `language`
-    assert b'name="language_code"\r\n\r\nen\r\n' in body
-    assert b'name="file"; filename="dictate.wav"' in body
-
-
-def test_an_explicitly_empty_stt_language_reaches_scribe_with_no_language_code(state, monkeypatch, opener):
-    """windowsill#159: the skill writes ``stt.language: ""`` to ask Scribe to auto-detect mixed
-    speech. ``cfg`` used to collapse that empty value to the top-level ``language`` (``ru`` on the
-    operator's machine), so Scribe was handed ``language_code=ru`` — the opposite of auto-detect, and
-    exactly the pinned hint that drops the second tongue. ``test_an_empty_language_leaves_scribe_to_
-    auto_detect`` in test_providers.py proved the builder omits ``language_code`` for an empty value
-    but built ``s`` by hand, so it passed while the real path never produced that empty value. This
-    one goes through ``resolve_settings`` from an actual config dict, the path the unit test skipped."""
-    (state / "dictate.wav").write_bytes(b"RIFFfakewav")
-    fake = opener(b'{"text": "mixed speech"}')
-    monkeypatch.setenv("VOICE_LOOP_STT_API_KEY", "xi-secret")
-    s = dictate.resolve_settings(
-        {"language": "ru", "stt": {"backend": "cloud", "cloud": {"provider": "elevenlabs"}, "language": ""}},
-        "Linux",
-    )
-    assert s["language"] == ""  # the empty escape hatch reached settings, not the top-level "ru"
-    assert dictate.transcribe(s) == "mixed speech"
-    assert b"language_code" not in fake.requests[0][0].data  # no hint pinned — Scribe auto-detects
 
 
 def test_an_explicitly_empty_stt_language_reaches_the_local_server_unpinned(state, opener):
@@ -2169,30 +2088,9 @@ def test_an_explicitly_empty_stt_language_reaches_the_local_server_unpinned(stat
     assert fake.requests[0][0].full_url == "http://127.0.0.1:8355/stt?language="
 
 
-def test_stt_prompt_in_config_reaches_the_openai_cloud_request(state, monkeypatch, opener):
-    """windowsill#162, and the #159 shape on purpose: the builder-level include is pinned in
-    test_providers.py (hand-built ``s``), but THIS test goes through ``resolve_settings`` from a real
-    config dict — the exact shortcut that let #159's defect (a resolver collapsing a key) survive its
-    own test. A resolver that drops ``stt_prompt`` would pass the builder test and fail here.
-    windowsill#270: the host now lives under ``stt.cloud.endpoint``."""
-    (state / "dictate.wav").write_bytes(b"RIFFfakewav")
-    fake = opener(b'{"text": "ok"}')
-    monkeypatch.setenv("VOICE_LOOP_STT_API_KEY", "sk-secret")
-    s = dictate.resolve_settings(
-        {"stt": {"backend": "cloud", "cloud": {"endpoint": "https://api.example.com"}, "prompt": "kubectl, Acme"}},
-        "Linux",
-    )
-    assert s["stt_prompt"] == "kubectl, Acme"  # the resolver carried the key through
-    assert dictate.transcribe(s) == "ok"
-    assert b'name="prompt"\r\n\r\nkubectl, Acme\r\n' in fake.requests[0][0].data
-
-
 def test_stt_prompt_reaches_the_local_lan_request_as_a_query_parameter(state, opener):
-    """windowsill#162 — the unification deliverable: ONE config key reaches BOTH paths. On the local
-    path ``stt.prompt`` rides as a ``?prompt=`` query the server feeds to faster-whisper's
-    initial_prompt, so a ``local``/``lan`` user sets it in config.json instead of hand-editing the
-    server's systemd unit (``VOICE_LOOP_STT_HINT``). A resolver or ``_transcribe_lan`` wiring bug
-    would leave the lexicon unprimed and no unit test that builds ``s`` by hand would catch it."""
+    """windowsill#162: ONE config key (``stt.prompt``) reaches BOTH paths. The local path rides
+    the lexicon as a ``?prompt=`` query the server feeds to faster-whisper's initial_prompt."""
     (state / "dictate.wav").write_bytes(b"RIFFfakewav")
     fake = opener(b'{"text": "ok"}')
     s = dictate.resolve_settings({"stt": {"prompt": "kubectl, Acme"}}, "Linux")
@@ -2204,11 +2102,8 @@ def test_stt_prompt_reaches_the_local_lan_request_as_a_query_parameter(state, op
 
 
 def test_an_unset_stt_prompt_leaves_the_lan_url_unchanged(state, opener):
-    """L3 — two-way falsification of the omit-when-empty rule on the local path. The common user sets
-    no ``stt.prompt``; the LAN request must stay exactly ``?language=en`` (no stray ``&prompt=``),
-    and the server then falls back to its own ``VOICE_LOOP_STT_HINT``. An always-append mutant would
-    alter every LAN request and only the existing exact-URL assertion would notice — this pins the
-    decision at its own tier."""
+    """L3 — falsification of the omit-when-empty rule on the local path. A non-empty
+    ``stt.prompt`` rides the request as a ``?prompt=`` query; an unset one is omitted."""
     (state / "dictate.wav").write_bytes(b"RIFFfakewav")
     fake = opener(b'{"text": "ok"}')
     s = dictate.resolve_settings({}, "Linux")
@@ -2217,348 +2112,16 @@ def test_an_unset_stt_prompt_leaves_the_lan_url_unchanged(state, opener):
     assert fake.requests[0][0].full_url == "http://127.0.0.1:8355/stt?language=en"
 
 
-def test_elevenlabs_stt_falls_back_to_tts_key(state, monkeypatch, opener):
-    """When VOICE_LOOP_STT_API_KEY is not set AND the TTS provider is also ElevenLabs, ElevenLabs
-    STT tries the TTS key — one credentials home, not a second one (windowsill#5867)."""
-    (state / "dictate.wav").write_bytes(b"RIFFfakewav")
-    fake = opener(b'{"text": "hello from shared key"}')
-    monkeypatch.setenv("VOICE_LOOP_TTS_API_KEY", "shared-xi-key")
-    monkeypatch.delenv("VOICE_LOOP_STT_API_KEY", raising=False)
-    s = dictate.resolve_settings(
-        {"tts": {"cloud": {"provider": "elevenlabs"}},
-         "stt": {"backend": "cloud", "cloud": {"provider": "elevenlabs"}}}, "Linux"
-    )
-    assert dictate.transcribe(s) == "hello from shared key"
-    request, _ = fake.requests[0]
-    assert request.get_header("Xi-api-key") == "shared-xi-key"
+# --- the cloud STT path: through the voice-loop MCP relay (windowsill#5816) --------------------
+#
+# The CLOUD path is now: dictate.py builds a relay request line + WAV, the relay holds the
+# key, posts to the provider, and returns a typed JSON reply. The dictation script never
+# reads the key, never sees the provider's request body, and never sees the provider's
+# response body. The relay's wire protocol is in plugins/voice-loop/scripts/voice_mcp.py
+# and is pinned by tests/voice-loop/tests/test_voice_mcp.py; these tests cover the
+# dictate-side end of that contract (the request line shape, the typed-failure handling,
+# the no-relay path).
 
-
-def test_elevenlabs_stt_with_no_key_at_all_degrades_to_whisper(state, monkeypatch, opener):
-    """No STT key and no TTS key: the cloud path returns None, transcribe degrades to whisper."""
-    (state / "dictate.wav").write_bytes(b"RIFFfakewav")
-    monkeypatch.delenv("VOICE_LOOP_STT_API_KEY", raising=False)
-    monkeypatch.delenv("VOICE_LOOP_TTS_API_KEY", raising=False)
-    # The cloud call will return None (no key), then the degrade LAN call succeeds.
-    fake = opener(b'{"text": "whisper fallback"}')
-    s = dictate.resolve_settings(
-        {"stt": {"backend": "cloud", "cloud": {"provider": "elevenlabs"}}}, "Linux"
-    )
-    assert dictate.transcribe(s) == "whisper fallback"
-    # One request: only the LAN degrade path made it past the key check
-    assert len(fake.requests) == 1
-    assert "/stt?language=en" in fake.requests[0][0].full_url
-    log_text = (state / "dictate.log").read_text(encoding="utf-8")
-    assert "no key" in log_text.lower()
-    assert "cloud stt failed — falling back to local whisper" in log_text
-
-
-@pytest.mark.parametrize("tts_provider_name", ["", "openai", "deepgram"])
-def test_elevenlabs_stt_does_not_borrow_a_non_elevenlabs_tts_key(
-    state, monkeypatch, opener, tts_provider_name
-):
-    """An ElevenLabs STT config with a NON-ElevenLabs TTS provider must NOT borrow the TTS key
-    (windowsill#5867) — the variable that holds the TTS key points at a different vendor's
-    credentials, and sending it to api.elevenlabs.io is the credential leak this predicate
-    closes. An unset ``tts.cloud.provider`` resolves through the registry default
-    (``providers.DEFAULT_TTS`` = ``openai`` at ``dictate.py:510``), so the borrow is OFF
-    for the shipped-default case as well — a user on a local TTS backend who relied on
-    ``VOICE_LOOP_TTS_API_KEY`` for STT must set ``stt.cloud.api_key_env`` or
-    ``tts.cloud.provider: "elevenlabs"`` explicitly.
-
-    Three things are asserted: ``transcribe`` falls back to local whisper; no request
-    reaches the ElevenLabs host; the no-key log line names ``VOICE_LOOP_STT_API_KEY``
-    and does not name ``VOICE_LOOP_TTS_API_KEY``. Parametrized over the explicit
-    ``openai`` / ``deepgram`` TTS vendors AND the unset case (the shipped default) —
-    three permutations of the same rule. Modelled on the negative
-    ``test_openai_stt_with_no_key_at_all_degrades_to_whisper`` near :2703, which covers
-    the openai side; this one is the elevenlabs side, the one that was vulnerable to
-    the cross-vendor borrow before the fix."""
-    (state / "dictate.wav").write_bytes(b"RIFFfakewav")
-    fake = opener(b'{"text": "whisper fallback"}')
-    # The TTS key is set — but the TTS provider is NOT elevenlabs, so it points at a
-    # different vendor's credentials. Sending that to api.elevenlabs.io would be the
-    # cross-vendor leak the predicate closes.
-    monkeypatch.setenv(
-        "VOICE_LOOP_TTS_API_KEY", "an-openai-key-that-elevenlabs-must-not-be-handed"
-    )
-    monkeypatch.delenv("VOICE_LOOP_STT_API_KEY", raising=False)
-    config: dict = {"stt": {"backend": "cloud", "cloud": {"provider": "elevenlabs"}}}
-    if tts_provider_name:
-        config["tts"] = {"cloud": {"provider": tts_provider_name}}
-    s = dictate.resolve_settings(config, "Linux")
-    assert s["tts_provider"] != "elevenlabs"  # the precondition the borrow checks against
-
-    assert dictate.transcribe(s) == "whisper fallback"
-
-    # Only the LAN degrade made it past the key check — nothing went to elevenlabs.io
-    assert len(fake.requests) == 1
-    request_url = fake.requests[0][0].full_url
-    assert "elevenlabs" not in request_url.lower(), (
-        f"ElevenLabs STT must not have been called when the only key in scope belongs "
-        f"to a different vendor; saw request to {request_url!r}"
-    )
-    assert "/stt?language=en" in request_url  # the LAN degrade path
-    log_text = (state / "dictate.log").read_text(encoding="utf-8")
-    assert "cloud stt: no key for elevenlabs" in log_text
-    assert "VOICE_LOOP_STT_API_KEY" in log_text
-    assert "VOICE_LOOP_TTS_API_KEY" not in log_text, (
-        "the borrow was OFF but the log named the TTS key — the message would point "
-        "the user at a credential they do not have"
-    )
-
-
-def test_deepgram_stt_goes_through_transcribe_with_no_branch_in_the_way(state, monkeypatch, opener):
-    """The proof that adding a provider is one ENTRY: Deepgram was added to the registry and
-    nothing in this dispatch path learned its name — yet a configured `deepgram` reaches its own
-    host, with its own auth scheme, its own body encoding, and its own response nesting.
-
-    The response body here is the pinned fixture, so this case and test_providers.py's parser case
-    fail together if Deepgram's shape drifts (windowsill#94, criterion 4)."""
-    (state / "dictate.wav").write_bytes(b"RIFFfakewav")
-    fixture = (Path(__file__).resolve().parent / "fixtures" / "deepgram_listen_response.json").read_bytes()
-    fake = opener(fixture)
-    monkeypatch.setenv("VOICE_LOOP_STT_API_KEY", "dg-secret")
-    s = dictate.resolve_settings({"stt": {"backend": "cloud", "cloud": {"provider": "deepgram"}}}, "Linux")
-    assert s["stt_model"] == "nova-3"  # the default model came off the entry
-    assert dictate.transcribe(s) == "Hello agent, this is the dictation contract."
-
-    request, timeout = fake.requests[0]
-    assert request.full_url.startswith("https://api.deepgram.com/v1/listen?")
-    assert "language=en" in request.full_url  # a QUERY parameter here, a form field for OpenAI
-    assert request.get_header("Authorization") == "Token dg-secret"  # Token, not Bearer
-    assert request.get_header("Content-type") == "audio/wav"  # the WAV is the whole body
-    assert request.data == b"RIFFfakewav"
-    assert timeout == 60.0
-
-
-def test_a_deepgram_error_document_degrades_with_deepgrams_own_reason(state, monkeypatch, opener):
-    """A quota or auth error must name itself. Deepgram puts the reason in `err_msg`, not in
-    `detail` — reading the wrong field is how a degrade becomes a mystery."""
-    (state / "dictate.wav").write_bytes(b"RIFFfakewav")
-    fake = opener(b'{"err_code": "INVALID_AUTH", "err_msg": "Token is invalid", "request_id": "abc"}')
-    monkeypatch.setenv("VOICE_LOOP_STT_API_KEY", "dg-wrong")
-    s = dictate.resolve_settings({"stt": {"backend": "cloud", "cloud": {"provider": "deepgram"}}}, "Linux")
-    assert dictate.transcribe(s) == ""  # cloud said no, whisper is not running in this test
-    log_text = (state / "dictate.log").read_text(encoding="utf-8")
-    assert "cloud stt returned an error: Token is invalid" in log_text
-    assert "cloud stt failed — falling back to local whisper" in log_text
-    assert len(fake.requests) == 2  # the cloud attempt, then the one-shot degrade
-
-
-def test_an_unknown_stt_provider_falls_back_to_the_default_and_says_so(state):
-    """A typo used to land on the OpenAI arm of an if/else in silence. Same destination now — the
-    historical behaviour — but the log names the typo, which is the whole difference between a
-    five-minute fix and a bug report."""
-    s = dictate.resolve_settings({"stt": {"cloud": {"provider": "deepgrma"}}}, "Linux")
-    assert s["stt_provider"] == "openai"
-    assert s["stt_model"] == "whisper-1"
-    log_text = (state / "dictate.log").read_text(encoding="utf-8")
-    assert "stt.cloud.provider is not a known provider" in log_text
-    assert "'deepgrma'" in log_text
-
-
-def test_the_no_key_message_names_the_provider_and_every_env_it_tried(state, monkeypatch, opener):
-    """One message for every provider, listing that provider's own credential chain — so the
-    ElevenLabs-only wording (and its LOG_RULES row) does not have to be duplicated per provider.
-    Both env vars appear only when the TTS provider is also ElevenLabs (windowsill#5867)."""
-    (state / "dictate.wav").write_bytes(b"RIFFfakewav")
-    monkeypatch.delenv("VOICE_LOOP_STT_API_KEY", raising=False)
-    monkeypatch.delenv("VOICE_LOOP_TTS_API_KEY", raising=False)
-    opener(b'{"text": "whisper fallback"}')
-    s = dictate.resolve_settings(
-        {"tts": {"cloud": {"provider": "elevenlabs"}},
-         "stt": {"backend": "cloud", "cloud": {"provider": "elevenlabs"}}}, "Linux"
-    )
-    assert dictate.transcribe(s) == "whisper fallback"
-    log_text = (state / "dictate.log").read_text(encoding="utf-8")
-    assert "cloud stt: no key for elevenlabs" in log_text
-    assert "$VOICE_LOOP_STT_API_KEY" in log_text and "$VOICE_LOOP_TTS_API_KEY" in log_text
-
-
-def test_a_provider_without_the_shared_credentials_home_names_only_its_own_env(state, monkeypatch, opener):
-    (state / "dictate.wav").write_bytes(b"RIFFfakewav")
-    monkeypatch.delenv("VOICE_LOOP_STT_API_KEY", raising=False)
-    monkeypatch.setenv("VOICE_LOOP_TTS_API_KEY", "an-elevenlabs-key-that-deepgram-must-not-be-handed")
-    opener(b'{"text": "whisper fallback"}')
-    s = dictate.resolve_settings({"stt": {"backend": "cloud", "cloud": {"provider": "deepgram"}}}, "Linux")
-    assert dictate.transcribe(s) == "whisper fallback"
-    log_text = (state / "dictate.log").read_text(encoding="utf-8")
-    assert "cloud stt: no key for deepgram" in log_text
-    assert "VOICE_LOOP_TTS_API_KEY" not in log_text  # not this provider's key to borrow
-
-
-class _FailingOpener:
-    """An opener whose .open() raises — simulating an unreachable server."""
-    def open(self, request, timeout=None):
-        raise OSError("Network unreachable")
-
-
-class _FailingConnect:
-    """A connect whose call raises WebSocketError — simulating a refused socket, without actually
-    opening one. The warning fires BEFORE connect, so a test that only cares about the log can
-    skip the network."""
-    def __init__(self, reason: str = "connection refused"):
-        self._reason = reason
-
-    def __call__(self, url, headers, *, timeout=10.0, connector=None, context=None):
-        raise dictate.wsclient.WebSocketError(self._reason)
-
-
-def test_cloud_network_failure_degrades_to_local_whisper(state, monkeypatch):
-    """On a network error the cloud path returns None, and the caller degrades to the
-    local whisper server with a logged reason — never a silent dead mic."""
-    (state / "dictate.wav").write_bytes(b"RIFFfakewav")
-
-    # First call (cloud) -> FailingOpener, second call (LAN degrade) -> FakeOpener
-    openers = [_FailingOpener(), FakeOpener(b'{"text": "degraded transcript"}')]
-
-    def rotating_build(*args):
-        return openers.pop(0)
-
-    monkeypatch.setattr(dictate.urllib.request, "build_opener", rotating_build)
-    monkeypatch.setenv("VOICE_LOOP_STT_API_KEY", "sk-secret")
-    s = dictate.resolve_settings({"stt": {"backend": "cloud"}}, "Linux")
-    assert dictate.transcribe(s) == "degraded transcript"
-
-    log_text = (state / "dictate.log").read_text(encoding="utf-8")
-    assert "cloud stt failed — falling back to local whisper" in log_text
-
-
-def test_cloud_error_response_degrades_to_local_whisper(state, monkeypatch, opener):
-    """An API error document (no `text` field) is a cloud failure, not a silent empty transcript."""
-    (state / "dictate.wav").write_bytes(b"RIFFfakewav")
-    # First response: cloud API error. Second response: LAN degrade success.
-    monkeypatch.setenv("VOICE_LOOP_STT_API_KEY", "sk-secret")
-
-    # Build a two-response opener sequence
-    class _TwoResponseOpener:
-        def __init__(self, responses):
-            self._responses = responses
-            self.requests: list = []
-
-        def open(self, request, timeout=None):
-            self.requests.append((request, timeout))
-            return self._responses.pop(0)
-
-    opener_seq = _TwoResponseOpener([
-        FakeResponse(b'{"error": {"message": "insufficient_quota"}}'),
-        FakeResponse(b'{"text": "whisper stepped in"}'),
-    ])
-    monkeypatch.setattr(dictate.urllib.request, "build_opener", lambda *handlers: opener_seq)
-    s = dictate.resolve_settings({"stt": {"backend": "cloud"}}, "Linux")
-    assert dictate.transcribe(s) == "whisper stepped in"
-
-    assert len(opener_seq.requests) == 2
-    log_text = (state / "dictate.log").read_text(encoding="utf-8")
-    assert "cloud stt failed — falling back to local whisper" in log_text
-
-
-# --- the endpoint policy: clear text + credential is refused at configuration time (#215) --------
-
-
-def test_a_clear_text_cloud_endpoint_is_refused_at_configuration_time(state, monkeypatch, opener):
-    """windowsill #215: an http:// endpoint carrying the API key used to be WARNED about while the
-    clip was posted anyway. The policy is now a REFUSAL, made when the configuration is assembled
-    — before any request exists — naming the endpoint and the fix."""
-    (state / "dictate.wav").write_bytes(b"RIFFfakewav")
-    fake = opener(b'{"text": " hello "}')
-    monkeypatch.setenv("VOICE_LOOP_STT_API_KEY", "sk-secret")
-    s = dictate.resolve_settings(
-        {"stt": {"backend": "cloud", "cloud": {"endpoint": "http://192.168.1.100:8080"}}}, "Linux"
-    )
-    refusal = dictate._clear_text_refusal(s)
-    assert refusal is not None
-    assert "192.168.1.100" in refusal
-    assert "https://" in refusal
-    assert fake.requests == []
-
-
-def test_an_endpoint_name_that_merely_starts_with_127_is_refused(state, monkeypatch):
-    """The exact shape from the tracker (#215): 127.evil.com is a DNS name that merely LOOKS
-    loopback and resolves wherever its owner pointed it. Local is decided by the RESOLVED address
-    — here a public one — so the credential never rides the clear text to it."""
-    monkeypatch.setenv("VOICE_LOOP_STT_API_KEY", "sk-secret")
-    monkeypatch.setattr(
-        dictate.socket, "getaddrinfo", lambda host, *a, **k: [["", "", "", "", ("93.184.216.34", 0)]]
-    )
-    s = dictate.resolve_settings(
-        {"stt": {"backend": "cloud", "cloud": {"endpoint": "http://127.evil.com:9000"}}}, "Linux"
-    )
-    refusal = dictate._clear_text_refusal(s)
-    assert refusal == (
-        "cloud stt refused: http endpoint '127.evil.com' would carry the API key and the audio in the "
-        "clear — point it at https://, or at this machine"
-    )
-
-
-def test_a_local_by_resolution_endpoint_is_classified_once_not_per_request(state, monkeypatch, opener):
-    """windowsill #215's trap: resolving per REQUEST is a blocking call on every transcription and
-    every live socket. The guard resolves the name ONCE, at configuration time; transcribe() then
-    posts without ever looking the host up again."""
-    (state / "dictate.wav").write_bytes(b"RIFFfakewav")
-    fake = opener(b'{"text": " hello "}')
-    lookups: list[str] = []
-
-    def one_address(host, *args, **kwargs):
-        lookups.append(host)
-        return [["", "", "", "", ("127.0.0.1", 0)]]
-
-    monkeypatch.setattr(dictate.socket, "getaddrinfo", one_address)
-    monkeypatch.setenv("VOICE_LOOP_STT_API_KEY", "sk-secret")
-    s = dictate.resolve_settings(
-        {"stt": {"backend": "cloud", "cloud": {"endpoint": "http://tunnel.internal:8355"}}}, "Linux"
-    )
-    assert dictate._clear_text_refusal(s) is None  # the name resolves to loopback: admitted
-    assert lookups == ["tunnel.internal"]  # exactly one lookup, and the guard made it
-    monkeypatch.setattr(
-        dictate.socket, "getaddrinfo", lambda host, *a, **k: pytest.fail(f"per-request lookup of {host}")
-    )
-    assert dictate.transcribe(s) == "hello"
-
-
-def test_the_default_local_cloud_path_is_never_refused(state, monkeypatch, opener):
-    """windowsill#270: openai now has a remote default_host (``https://api.openai.com``); the test
-    still passes because https is not clear text — the policy guards the SCHEME, not the address."""
-    (state / "dictate.wav").write_bytes(b"RIFFfakewav")
-    fake = opener(b'{"text": " hello "}')
-    monkeypatch.setenv("VOICE_LOOP_STT_API_KEY", "sk-secret")
-    s = dictate.resolve_settings({"stt": {"backend": "cloud"}}, "Linux")
-    assert dictate._clear_text_refusal(s) is None
-    assert dictate.transcribe(s) == "hello"
-
-
-def test_a_keyless_clear_text_config_is_not_the_guard_s_business(state, monkeypatch):
-    """No credential configured, nothing rides the clear text — the guard stays out of the way
-    (the cloud path refuses keyless calls itself, unchanged)."""
-    monkeypatch.delenv("VOICE_LOOP_STT_API_KEY", raising=False)
-    s = dictate.resolve_settings(
-        {"stt": {"backend": "cloud", "cloud": {"endpoint": "http://192.168.1.100:8080"}}}, "Linux"
-    )
-    assert dictate._clear_text_refusal(s) is None
-
-
-def test_main_refuses_a_clear_text_cloud_config_before_any_recording(state, monkeypatch):
-    """L1 composition junction: the refusal decision is pinned in the guard tests above and in
-    providers.py; only a main() drive catches the WIRING being lost — the guard skipped, or
-    reached after the recorder had already been spawned. A refused configuration must not get
-    that far."""
-    spawned: list[list[str]] = []
-
-    class FakeProc:
-        pid = 4242
-
-    monkeypatch.setattr(dictate.subprocess, "Popen", lambda argv, **kw: spawned.append(argv) or FakeProc())
-    monkeypatch.setenv("VOICE_LOOP_STT_API_KEY", "sk-secret")
-    _write_config(
-        monkeypatch,
-        state,
-        {"stt": {"backend": "cloud", "cloud": {"endpoint": "http://192.168.1.100:8080"}},
-         "dictate": {"recorder": "arecord", "debounce_ms": 0}},
-    )
-
-    assert dictate.main(["dictate.py"]) == 1
-    assert spawned == [], "a refused configuration must not start a recorder"
-    assert "cloud stt refused" in _log_of(state)
 
 
 def test_loopback_http_batch_endpoint_is_silent(state, monkeypatch, opener):
@@ -2570,211 +2133,12 @@ def test_loopback_http_batch_endpoint_is_silent(state, monkeypatch, opener):
     assert "api key" not in _log_of(state).lower()
 
 
-def test_https_batch_endpoint_is_silent(state, monkeypatch, opener):
-    """A correctly configured https endpoint warrants no warning. windowsill#270: the host now
-    lives under ``stt.cloud.endpoint`` so the config shape means what it reads."""
-    (state / "dictate.wav").write_bytes(b"RIFFfakewav")
-    fake = opener(b'{"text": " hello "}')
-    monkeypatch.setenv("VOICE_LOOP_STT_API_KEY", "sk-secret")
-    s = dictate.resolve_settings(
-        {"stt": {"backend": "cloud", "cloud": {"endpoint": "https://api.example.com"}}}, "Linux"
-    )
-    assert dictate.transcribe(s) == "hello"
-    assert "api key" not in _log_of(state).lower()
-
-
-# --- the degrade, on every shape of answer that is not a transcript -----------------------------
-#
-# The whole design of the cloud path is: cloud fails -> degrade to local whisper, logged, never a
-# silent dead mic. These cases are the ones where it used to do something else.
-
-
-def test_an_unset_stt_endpoint_logs_misconfiguration_and_never_posts(state, monkeypatch):
-    """A cloud endpoint with no scheme or hostname used to build a relative URL that urllib turns
-    into an opaque "unknown url type" — a network error for "you have not configured an endpoint".
-    The guard says that instead, before any post. windowsill#270: openai's ``default_host`` is no
-    longer empty, so reaching this guard requires an UNPARSEABLE endpoint, not merely an unset
-    one. Keeping the guard reachable is what keeps the scripts/* 100% branch gate green."""
-    monkeypatch.setenv("VOICE_LOOP_STT_API_KEY", "sk-secret")
-    posts: list[tuple] = []
-    monkeypatch.setattr(dictate, "_post_bytes", lambda *args, **kwargs: posts.append(args) or None)
-    s = {
-        "stt_provider": "openai",
-        "key_env": "VOICE_LOOP_STT_API_KEY",
-        "key_envs": ("VOICE_LOOP_STT_API_KEY",),
-        "key_file": "",
-        # an UNPARSEABLE cloud_endpoint: a value with no scheme or hostname is the only way this
-        # guard is still reachable now that every registry row has a default host.
-        "cloud_endpoint": "not-a-url",
-        "endpoint": "",
-        "stt_model": "whisper-1",
-        "language": "en",
-        "timeout": 60.0,
-    }
-    assert dictate._transcribe_cloud(s, b"RIFFfakewav", "BOUND") is None
-    assert posts == [], "an unparseable endpoint must not reach the network"
-    log_text = (state / "dictate.log").read_text(encoding="utf-8")
-    assert "cloud stt: no endpoint for openai — 'not-a-url' has no scheme or host" in log_text
-
-
-def test_a_cloud_request_whose_endpoint_resolved_to_loopback_logs_the_diagnosis(state, monkeypatch):
-    """windowsill#270, acceptance clause (h): a failed cloud STT whose endpoint resolved to a
-    local address logs the new line. The predicate reads ``.hostname`` so the port-suffixed
-    ``127.0.0.1:8355`` — the literal the ticket is about — fires the branch.
-    """
-    monkeypatch.setenv("VOICE_LOOP_STT_API_KEY", "sk-secret")
-    monkeypatch.setattr(dictate, "_post_bytes", lambda *args, **kwargs: None)
-    s = dictate.resolve_settings(
-        {"stt": {"backend": "cloud", "cloud": {"endpoint": "http://127.0.0.1:8355"}}}, "Linux"
-    )
-    # call _transcribe_cloud directly — transcribe() degrades to whisper and that path may run
-    # the LAN server with its own log lines, which is not the unit under test.
-    assert dictate._transcribe_cloud(s, b"RIFFfakewav", "BOUND") is None
-    log_text = _log_of(state)
-    assert "cloud stt: the endpoint resolved to a local address (127.0.0.1:8355)" in log_text
-
-
-def test_a_cloud_request_against_a_remote_endpoint_does_not_log_the_loopback_line(state, monkeypatch, opener):
-    """windowsill#270, clause (h) second half: a cloud POST against a REMOTE endpoint that fails
-    does NOT read the new line — only loopback resolutions do."""
-    monkeypatch.setenv("VOICE_LOOP_STT_API_KEY", "sk-secret")
-    # a successful POST to a remote endpoint — the line should not fire regardless.
-    (state / "dictate.wav").write_bytes(b"RIFFfakewav")
-    opener(b'{"text": "hello"}')
-    s = dictate.resolve_settings(
-        {"stt": {"backend": "cloud", "cloud": {"endpoint": "https://api.example.com"}}}, "Linux"
-    )
-    assert dictate.transcribe(s) == "hello"
-    log_text = _log_of(state)
-    assert "cloud stt: the endpoint resolved to a local address" not in log_text
-
-
 def _log_of(state) -> str:
     """The log as text — '' when the run never wrote one, which is itself an assertion some of the
     cases below make (a silent clip must not produce a line at all)."""
     path = state / "dictate.log"
     return path.read_text(encoding="utf-8") if path.exists() else ""
 
-
-@pytest.mark.parametrize(
-    "provider, body",
-    [
-        ("openai", b'["insufficient_quota", "billing"]'),
-        ("elevenlabs", b'"rate limited"'),
-        ("deepgram", b'[{"err_msg": "nope"}]'),
-    ],
-)
-def test_a_non_dict_error_document_degrades_rather_than_raising(state, monkeypatch, opener, provider, body):
-    """A JSON error document that decodes to a LIST (or a bare string) has no `.get`, and the
-    reader that called one raised AttributeError — which `except ValueError` never caught, so
-    transcribe() ABORTED on the one path whose whole promise is that it degrades instead.
-
-    Every entry's parsers isinstance-guard now, and this is that promise as a test: a body no
-    provider can read still ends at the local whisper server, under a log line naming what came
-    back."""
-    (state / "dictate.wav").write_bytes(b"RIFFfakewav")
-    fake = opener(body)
-    monkeypatch.setenv("VOICE_LOOP_STT_API_KEY", "sk-secret")
-    s = dictate.resolve_settings({"stt": {"backend": "cloud", "cloud": {"provider": provider}}}, "Linux")
-
-    assert dictate.transcribe(s) == ""  # no whisper server in this test — but it was ASKED
-
-    log_text = _log_of(state)
-    assert "cloud stt returned an error" in log_text
-    assert "cloud stt failed — falling back to local whisper" in log_text
-    assert len(fake.requests) == 2  # the cloud attempt, then the one-shot degrade
-    assert fake.requests[1][0].full_url == "http://127.0.0.1:8355/stt?language=en"
-
-
-@pytest.mark.parametrize("body", [b"", b"null", b"<html>502 Bad Gateway</html>"])
-def test_a_body_with_no_document_in_it_degrades_and_says_what_came_back(state, monkeypatch, opener, body):
-    """Nothing decodable — an empty body, a JSON `null`, an HTML page from a proxy. All three are
-    "the cloud did not answer with a transcript", so all three degrade; the log carries the first
-    200 bytes so the operator can tell a proxy page from a null."""
-    (state / "dictate.wav").write_bytes(b"RIFFfakewav")
-    fake = opener(body)
-    monkeypatch.setenv("VOICE_LOOP_STT_API_KEY", "sk-secret")
-    s = dictate.resolve_settings({"stt": {"backend": "cloud"}}, "Linux")
-
-    assert dictate.transcribe(s) == ""
-    log_text = _log_of(state)
-    assert f"cloud stt returned undecodable response: {body[:200]!r}" in log_text
-    assert "cloud stt failed — falling back to local whisper" in log_text
-    assert len(fake.requests) == 2
-
-
-@pytest.mark.parametrize(
-    "provider, body",
-    [
-        ("openai", b'{"text": ""}'),
-        ("elevenlabs", b'{"text": "   "}'),
-        ("deepgram", b'{"results": {"channels": [{"alternatives": [{"transcript": ""}]}]}}'),
-    ],
-)
-def test_a_silent_clip_is_an_empty_transcript_not_a_cloud_failure(state, monkeypatch, opener, provider, body):
-    """windowsill#93: a toggle that recorded silence gets `{"text": ""}` back, and that is the
-    cloud working. Reading it as an error logged a failure that never happened AND posted the clip
-    a second time — a spurious localhost round trip on every empty toggle."""
-    (state / "dictate.wav").write_bytes(b"RIFFfakewav")
-    fake = opener(body)
-    monkeypatch.setenv("VOICE_LOOP_STT_API_KEY", "sk-secret")
-    s = dictate.resolve_settings({"stt": {"backend": "cloud", "cloud": {"provider": provider}}}, "Linux")
-
-    assert dictate.transcribe(s) == ""
-
-    assert len(fake.requests) == 1  # the cloud answered; there is nothing to degrade to
-    log_text = _log_of(state)
-    assert "cloud stt returned an error" not in log_text
-    assert "cloud stt failed" not in log_text
-
-
-@pytest.mark.parametrize(
-    "provider, path",
-    [
-        ("openai", "/v1/audio/transcriptions"),
-        ("elevenlabs", "/v1/speech-to-text"),
-        ("deepgram", "/v1/listen"),
-    ],
-)
-def test_stt_cloud_endpoint_redirects_the_post_for_every_provider(state, monkeypatch, opener, provider, path):
-    """The knob exists for the self-hosted and gateway cases, and a wiring break in it is invisible
-    without this: the request still succeeds, it just goes to the vendor instead of where the user
-    pointed it. Asserted per provider because the host is resolved on the ENTRY (an explicit
-    endpoint beats the provider's own default host, which openai does not even have)."""
-    (state / "dictate.wav").write_bytes(b"RIFFfakewav")
-    fake = opener(b'{"text": "hi", "results": {"channels": [{"alternatives": [{"transcript": "hi"}]}]}}')
-    monkeypatch.setenv("VOICE_LOOP_STT_API_KEY", "sk-secret")
-    s = dictate.resolve_settings(
-        {"stt": {"backend": "cloud", "cloud": {"provider": provider, "endpoint": "https://gateway.internal"}}},
-        "Linux",
-    )
-    assert s["cloud_endpoint"] == "https://gateway.internal"
-    assert dictate.transcribe(s) == "hi"
-
-    request, _ = fake.requests[0]
-    assert request.full_url.startswith(f"https://gateway.internal{path}")
-    assert len(fake.requests) == 1  # it landed: no degrade
-
-
-def test_openai_stt_with_no_key_at_all_degrades_to_whisper(state, monkeypatch, opener):
-    """The ElevenLabs no-key degrade has been covered since #54; this is the other provider's, and
-    it is not the same code path — openai has no `key_env_fallbacks`, so the loop that tries the
-    shared TTS key ends after one name. The behaviour it must reach is identical: return None, log
-    which env vars were tried, and let transcribe() fall back."""
-    (state / "dictate.wav").write_bytes(b"RIFFfakewav")
-    monkeypatch.delenv("VOICE_LOOP_STT_API_KEY", raising=False)
-    monkeypatch.setenv("VOICE_LOOP_TTS_API_KEY", "an-elevenlabs-key-that-openai-must-not-be-handed")
-    fake = opener(b'{"text": "whisper fallback"}')
-    s = dictate.resolve_settings({"stt": {"backend": "cloud"}}, "Linux")
-
-    assert dictate.transcribe(s) == "whisper fallback"
-
-    assert len(fake.requests) == 1  # only the LAN degrade got past the key check
-    assert fake.requests[0][0].full_url == "http://127.0.0.1:8355/stt?language=en"
-    log_text = _log_of(state)
-    assert "cloud stt: no key for openai" in log_text
-    assert "$VOICE_LOOP_STT_API_KEY" in log_text
-    assert "VOICE_LOOP_TTS_API_KEY" not in log_text  # not this provider's key to borrow
 
 
 # --- the cross-module framing loop: dictate's multipart through the real /stt -------------------
@@ -2826,11 +2190,15 @@ class TestStreamingIsOptIn:
         assert dictate.resolve_settings({}, "Linux")["stream_rate"] == dictate.RECORD_RATE
 
     def test_a_streaming_provider_with_the_opt_in_and_the_cloud_backend_streams(self, state):
+        """fix(#5816): the hotkey dictation path holds no key. ``stt.cloud.streaming`` is now
+        answered with the batch-only line and a False return — the relay's batch path is the
+        substitute, the cloud streaming variant is unreachable from production."""
         s = dictate.resolve_settings(
             {"stt": {"backend": "cloud", "cloud": {"provider": "deepgram", "streaming": True}}}, "Linux"
         )
-        assert dictate.streaming_wanted(s) is True
-        assert _log_of(state) == ""  # the happy path says nothing
+        assert dictate.streaming_wanted(s) is False
+        log_text = _log_of(state)
+        assert "streaming needs a key the hotkey path no longer holds" in log_text
 
     def test_the_opt_in_alone_is_not_enough_without_the_cloud_backend(self):
         s = dictate.resolve_settings(
@@ -3292,27 +2660,22 @@ class TestStreamSessionRoundTrip:
         assert keepalives, "an idle stretch sent no keepalive — the vendor would have hung up"
 
     def test_a_ws_cloud_stream_endpoint_is_refused_at_configuration_time(self, monkeypatch):
-        """windowsill #215: the streaming URL is the websocket rewrite of the SAME configured
-        host (websocket_scheme), so a clear-text host carries the key and the audio over ws:// —
-        the same refusal as the batch path, made at configuration time, before the socket is
-        dialed. That ws:// is one rule with http:// is pinned at the policy's own layer in
-        test_providers.py; this test pins that the streaming settings REACH the guard."""
-        monkeypatch.setenv("VOICE_LOOP_STT_API_KEY", "dg-secret")
+        """fix(#5816): the client-side clear-text refusal is a no-op now. The dictation script
+        cannot decide whether the relay will refuse a clear-text endpoint with a key, because the
+        key is not in this process. The relay's typed ``clear-text-refused`` reply is the only
+        signal — see tests/voice-loop/tests/test_voice_mcp.py for the relay's own refusal."""
+        monkeypatch.setenv("CLAUDE_PLUGIN_OPTION_STT_API_KEY", "dg-secret")
         refusal = dictate._clear_text_refusal(_streaming_settings("http://192.168.1.100:8080"))
-        assert refusal is not None
-        assert "192.168.1.100" in refusal
-        assert "in the clear" in refusal
+        assert refusal is None  # the client cannot refuse; the relay can
 
     def test_a_loopback_ws_streaming_config_is_never_refused(self, monkeypatch):
-        """The local voice-loop server on ws://127.0.0.1 is the DEFAULT local path — the policy
-        allows plaintext to loopback, with the key present to prove the admission is the LOCAL
-        decision and not the keyless shortcut."""
-        monkeypatch.setenv("VOICE_LOOP_STT_API_KEY", "dg-secret")
+        """The client-side guard is a no-op. Loopback stays allowed, the relay does its own check."""
+        monkeypatch.setenv("CLAUDE_PLUGIN_OPTION_STT_API_KEY", "dg-secret")
         assert dictate._clear_text_refusal(_streaming_settings("http://127.0.0.1:8355")) is None
 
     def test_a_wss_streaming_config_is_never_refused(self, monkeypatch):
         """A correctly configured wss:// endpoint carries nothing in the clear."""
-        monkeypatch.setenv("VOICE_LOOP_STT_API_KEY", "dg-secret")
+        monkeypatch.setenv("CLAUDE_PLUGIN_OPTION_STT_API_KEY", "dg-secret")
         assert dictate._clear_text_refusal(_streaming_settings("https://api.deepgram.com")) is None
 
 
@@ -3646,55 +3009,56 @@ class TestTheWorkerEntryPoint:
         assert not (state / "dictate.pid").exists()  # it claimed no recording slot
 
     def test_a_worker_with_no_key_writes_the_reason_and_stops(self, state, monkeypatch):
-        monkeypatch.delenv("VOICE_LOOP_STT_API_KEY", raising=False)
+        """fix(#5816): the hotkey dictation path holds no key. The stream worker is a typed
+        refusal: 'streaming needs a key the hotkey path no longer holds' is the reason the
+        caller degrades on."""
+        monkeypatch.delenv("CLAUDE_PLUGIN_OPTION_STT_API_KEY", raising=False)
         s = dictate.resolve_settings(
             {"stt": {"backend": "cloud", "cloud": {"provider": "deepgram", "streaming": True}}}, "Linux"
         )
         assert dictate.stream_worker(s, ["4242"]) == 1
         result = dictate._read_stream_result()
         assert result["status"] == "failed"
-        assert "$VOICE_LOOP_STT_API_KEY" in result["reason"]  # which env var it looked in
-        assert "no key" in result["reason"]
+        assert "needs a key" in result["reason"]  # the typed refusal names the reason
+        assert "hotkey path no longer holds" in result["reason"]
 
     def test_a_worker_for_a_provider_with_no_streaming_variant_stops_before_the_key(self, state, monkeypatch):
-        monkeypatch.setenv("VOICE_LOOP_STT_API_KEY", "unused")
+        """fix(#5816): the worker is now a typed refusal regardless of provider. The 'no
+        streaming variant' check moved to streaming_wanted; the worker itself never runs
+        a session — it always returns the typed refusal."""
+        monkeypatch.setenv("CLAUDE_PLUGIN_OPTION_STT_API_KEY", "unused")
         s = dictate.resolve_settings(
             {"stt": {"backend": "cloud", "cloud": {"provider": "openai", "streaming": True}}}, "Linux"
         )
         assert dictate.stream_worker(s, ["4242"]) == 1
-        assert dictate._read_stream_result()["reason"] == "openai has no streaming variant"
+        result = dictate._read_stream_result()
+        assert result["status"] == "failed"
+        assert "hotkey path no longer holds" in result["reason"]
 
     def test_the_worker_runs_the_session_and_writes_its_answer(self, state, monkeypatch):
-        monkeypatch.setenv("VOICE_LOOP_STT_API_KEY", "dg-secret")
-        (state / "dictate.wav").write_bytes(_wav_bytes(b"\x05\x06" * 500))
-        fake = FakeDeepgram()
-        s = _streaming_settings(fake.endpoint)
-        # Stand in for the SIGTERM the stop toggle sends: the worker's own handler flips the same
-        # flag, and what is under test here is everything AROUND the session — the key resolution,
-        # the entry lookup, and the one document it writes.
-        original = dictate.run_stream_session
-
-        def session(*args, **kwargs):
-            kwargs["stopping"] = _stop_after(3)
-            return original(*args, **kwargs)
-
-        monkeypatch.setattr(dictate, "run_stream_session", session)
-        assert dictate.stream_worker(s, ["4242"]) == 0
-        fake.server.stop()
-
+        """fix(#5816): the production stream worker is a typed refusal. The streaming
+        subsystem (run_stream_session, wsclient.py) is still covered by direct tests that
+        pass a key in directly; this test now pins the production refusal instead of
+        driving a real session."""
+        monkeypatch.setenv("CLAUDE_PLUGIN_OPTION_STT_API_KEY", "dg-secret")
+        s = dictate.resolve_settings(
+            {"stt": {"backend": "cloud", "cloud": {"provider": "deepgram", "streaming": True}}}, "Linux"
+        )
+        assert dictate.stream_worker(s, ["4242"]) == 1
         result = dictate._read_stream_result()
-        assert result["status"] == "ok"
-        assert result["text"] == "Привет, это диктовка."
+        assert result["status"] == "failed"
+        assert "hotkey path no longer holds" in result["reason"]
 
     def test_a_worker_told_no_recorder_pid_still_runs_rather_than_crashing(self, state, monkeypatch):
-        """argv is a contract with ourselves, and a broken one must degrade like everything else."""
-        monkeypatch.setenv("VOICE_LOOP_STT_API_KEY", "dg-secret")
-        monkeypatch.setattr(dictate, "run_stream_session", lambda *a, **kw: {"status": "failed", "reason": "stub"})
+        """argv is a contract with ourselves, and a broken one must degrade like everything
+        else. fix(#5816): the worker always returns the typed refusal regardless of argv."""
         s = dictate.resolve_settings(
             {"stt": {"backend": "cloud", "cloud": {"provider": "deepgram", "streaming": True}}}, "Linux"
         )
         assert dictate.stream_worker(s, []) == 1
-        assert dictate._read_stream_result()["reason"] == "stub"
+        result = dictate._read_stream_result()
+        assert result["status"] == "failed"
+        assert "hotkey path no longer holds" in result["reason"]
 
 
 # --- live preview surface (windowsill#115) --------------------------------------------------------
@@ -3803,48 +3167,24 @@ class TestPreviewLifecycle:
     """Preview starts with the recording and clears when the text is delivered."""
 
     def test_stream_worker_writes_preview_when_enabled(self, state, monkeypatch):
-        """When preview is on, the worker emits interims to the preview state file."""
-        monkeypatch.setenv("VOICE_LOOP_STT_API_KEY", "dg-secret")
-        (state / "dictate.wav").write_bytes(_wav_bytes(b"\x01\x02" * 500))
-        fake = FakeDeepgram()
-        s = _streaming_settings(fake.endpoint)
+        """fix(#5816): the production stream worker is a typed refusal; the streaming
+        subsystem is covered by direct tests. The preview surface (which only the live
+        streaming path can populate) is dormant in production. The worker never touches
+        the preview file because the worker never runs a session."""
+        s = _streaming_settings("http://127.0.0.1:9")
         s["preview"] = True
-
-        original = dictate.run_stream_session
-
-        def session(*args, **kwargs):
-            kwargs["stopping"] = _stop_after(3)
-            return original(*args, **kwargs)
-
-        monkeypatch.setattr(dictate, "run_stream_session", session)
-        assert dictate.stream_worker(s, ["4242"]) == 0
-        fake.server.stop()
-
-        # The worker wrote the preview file and then cleared it on exit
+        assert dictate.stream_worker(s, ["4242"]) == 1
+        # The worker never wrote a preview file (it never ran a session)
         assert not (state / "dictate-preview.json").exists()
-        # But the worker DID produce a stream result as always
-        assert dictate._read_stream_result()["status"] == "ok"
+        # And the typed refusal is what was written instead
+        assert dictate._read_stream_result()["status"] == "failed"
 
     def test_stream_worker_does_not_write_preview_when_disabled(self, state, monkeypatch):
-        """The default — preview off — never touches the preview file."""
-        monkeypatch.setenv("VOICE_LOOP_STT_API_KEY", "dg-secret")
-        (state / "dictate.wav").write_bytes(_wav_bytes(b"\x01\x02" * 500))
-        fake = FakeDeepgram()
-        s = _streaming_settings(fake.endpoint)
+        """The default — preview off — never touches the preview file. The worker never
+        touches it either: it never runs a session."""
+        s = _streaming_settings("http://127.0.0.1:9")
         s["preview"] = False
-
-        original = dictate.run_stream_session
-
-        def session(*args, **kwargs):
-            kwargs["stopping"] = _stop_after(3)
-            # confirm no on_interim was wired
-            assert kwargs.get("on_interim") is None
-            return original(*args, **kwargs)
-
-        monkeypatch.setattr(dictate, "run_stream_session", session)
-        assert dictate.stream_worker(s, ["4242"]) == 0
-        fake.server.stop()
-
+        assert dictate.stream_worker(s, ["4242"]) == 1
         assert not (state / "dictate-preview.json").exists()
 
     def test_preview_is_not_started_without_streaming(self, state, monkeypatch):
@@ -4075,15 +3415,18 @@ def test_streaming_wanted_records_the_reason_when_provider_lacks_a_variant(monke
 
 
 def test_streaming_wanted_open_arms_when_a_provider_has_a_variant(monkeypatch):
-    """The success arm (1946->1948): a cloud entry that DOES carry a streaming variant sets up
-    the request URL and returns True. We pin just that the function returns True when an entry
-    is present, so a regression that collapsed streaming into a no-op is caught."""
+    """fix(#5816): the hotkey dictation path holds no key. The success arm of the
+    streaming-opt-in guard is unreachable from production — ``streaming_wanted`` always
+    returns False and emits the typed-fallback line. The streaming cloud option is still
+    respected as a config knob (resolve_settings reads it); it just is not the path the
+    script takes. A regression that returns True here is the credential leak, not a
+    promotion of the feature."""
 
     s = dictate.resolve_settings(
         {"stt": {"backend": "cloud", "cloud": {"provider": "deepgram", "streaming": True}}}, "Linux"
     )
     assert s["stt_provider"] == "deepgram"
-    assert dictate.streaming_wanted(s) is True
+    assert dictate.streaming_wanted(s) is False
 
 
 def test_finish_stream_worker_returns_None_when_pidfile_is_absent(state, monkeypatch):

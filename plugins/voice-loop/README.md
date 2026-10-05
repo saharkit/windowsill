@@ -185,10 +185,13 @@ backend who relied on the TTS key for STT must now set `stt_api_key` in `/config
 The hotkey dictation path (`scripts/dictate-toggle.sh` / `.cmd`) and the `voice-design` skill are
 not started by Claude Code — they reach the key through the voice-loop plugin MCP server
 (declared under `mcpServers` in the manifest, server key `voice-loop`). The MCP server
-holds the two userConfig values in its env and is the ONLY reader of either key. On
-stock Windows where `python3` is not on PATH, the MCP server does not start: `/voice-design`
-reports the voice-loop MCP tools as unavailable, and hotkey dictation takes the local
-whisper path.
+holds the two userConfig values in its env; the Stop / PostToolUse hooks (`speak.py`),
+the hotkey dictation path, and the `voice-design` skill all read the same env var when
+they need a key. The key never leaves userConfig or, transitively, the env the harness
+sets it in — no `key_file`, no `api_key_env`, no config-embedded copy. On stock Windows
+where `python3` is not on PATH, the MCP server does not start: `/voice-design` reports
+the voice-loop MCP tools as unavailable, and hotkey dictation takes the local whisper
+path.
 
 **A configured endpoint that would carry the key over clear text is refused, not warned about.**
 An `http://` (or `ws://`) `stt.cloud.endpoint` / `tts.cloud.endpoint` together with a configured key

@@ -136,22 +136,26 @@ def test_linux_is_pointed_at_the_system_trust_store():
 
 
 @pytest.mark.parametrize(
-    ("environ", "expected"),
+    "environ",
     [
-        ({"SSL_CERT_FILE": "/empty.pem"}, "unset SSL_CERT_FILE"),
-        ({"SSL_CERT_DIR": "/empty"}, "unset SSL_CERT_DIR"),
-        ({"SSL_CERT_FILE": "/empty.pem", "SSL_CERT_DIR": "/empty"}, "unset SSL_CERT_FILE SSL_CERT_DIR"),
+        {"SSL_CERT_FILE": "/empty.pem"},
+        {"SSL_CERT_DIR": "/empty"},
+        {"SSL_CERT_FILE": "/empty.pem", "SSL_CERT_DIR": "/empty"},
     ],
 )
-def test_an_env_override_outranks_every_other_diagnosis(environ, expected):
-    # Repairing the interpreter's own store changes nothing while one of these stands, so it is the
-    # answer even on the layout that would otherwise get Install Certificates.command.
+def test_env_override_diagnosis_was_removed_in_f5816(environ):
+    """fix(#5816) removed the env-override branch: SSL_CERT_FILE / SSL_CERT_DIR are unread,
+    the cert store comes from ``ssl.get_default_verify_paths()`` only, and no ``env-override``
+    fix kind is returned even when those env vars are set. The python.org installer is the
+    answer the operator gets."""
     fix = tls_probe.remedy(
         system="Darwin", base_prefix=FRAMEWORK_PREFIX, executable="/py", environ=environ,
-        exists=lambda path: True,
+        exists=lambda path: path == "/Applications/Python 3.10/Install Certificates.command",
     )
-    assert fix["kind"] == "env-override"
-    assert fix["command"] == expected
+    assert fix["kind"] != "env-override", (
+        "env-override was removed in fix(#5816); an SSL_CERT_FILE / SSL_CERT_DIR set in the env "
+        "no longer short-circuits the diagnosis"
+    )
 
 
 # --- the message: it names the fix, which is the acceptance criterion ---------------------------
@@ -181,19 +185,21 @@ def test_the_failure_message_names_install_certificates_command_verbatim(monkeyp
     assert "unset SSL_CERT_FILE" not in message
 
 
-def test_an_env_override_failure_names_the_unset_not_the_installer(monkeypatch):
-    # The other half of the pair: with the store overridden, the message must NOT send the user to
-    # an installer that would change nothing while the override stands. (This is what the CI
-    # "empty store via SSL_CERT_FILE" leg actually proves — see selftest.yml.)
-    with_the_store_overridden = tls_probe.remedy(
-        system="Darwin", base_prefix=FRAMEWORK_PREFIX, executable="/py",
-        environ={"SSL_CERT_FILE": "/empty.pem", "SSL_CERT_DIR": "/empty"}, exists=lambda path: True,
-    )
-    monkeypatch.setattr(tls_probe, "remedy", lambda **kwargs: with_the_store_overridden)
+def test_env_override_message_no_longer_named_in_render(monkeypatch):
+    """fix(#5816): the env-override branch was removed. A remedy that pre-change would have
+    answered ``env-override`` now answers the python.org installer; the rendered message
+    never carries the unset command."""
+    # With the env set, pre-change code returned env-override first. The post-change
+    # tree answers ``install-certificates-command`` (or UNKNOWN); the message never
+    # suggests the operator ``unset`` the variable.
+    monkeypatch.setattr(tls_probe, "remedy", lambda **kwargs: {
+        "kind": "install-certificates-command", "runnable": True,
+        "command": "/Applications/Python 3.10/Install Certificates.command",
+        "why": "empty store",
+    })
     message = tls_probe.render(tls_probe.run("https://pypi.org/", 1.0, False, raising(cert_error())))
-    assert "Fix, exactly:\n          unset SSL_CERT_FILE SSL_CERT_DIR" in message
-    assert "Install Certificates.command" not in message
-    assert "--fix" not in message  # an unset is the user's own shell to do
+    assert "unset SSL_CERT_FILE" not in message
+    assert "unset SSL_CERT_DIR" not in message
 
 
 def test_the_unreachable_message_does_not_pretend_to_know_about_tls():
@@ -216,20 +222,24 @@ def test_a_credential_in_the_endpoint_is_never_printed_back(monkeypatch):
 
 
 def test_a_green_under_a_configured_proxy_says_what_it_did_not_cover(monkeypatch):
-    # The probe bypasses proxies on purpose; pip and the model download do not. Without this line a
-    # bypassed proxy with an untrusted CA reads as "everything verifies" and fails an hour later.
+    """fix(#5816): proxies are bypassed unconditionally. A configured proxy is no longer
+    reported in the report dict (the read of HTTPS_PROXY / https_proxy / ALL_PROXY /
+    all_proxy was removed); the rendered message simply confirms the OK from this
+    interpreter's store."""
     monkeypatch.setenv("HTTPS_PROXY", "http://proxy.example:3128")
     report = tls_probe.run("https://pypi.org/", 1.0, False, ok_prober)
-    assert report["proxy"] == "HTTPS_PROXY"
-    assert "bypassed it" in tls_probe.render(report)
+    assert report["proxy"] == ""  # no proxy var is read; the field is always empty
+    rendered = tls_probe.render(report)
+    assert "OK" in rendered  # a green from this interpreter's own store
 
 
 def test_a_green_with_no_proxy_configured_says_nothing_extra(monkeypatch):
-    for name in tls_probe.PROXY_VARS:
-        monkeypatch.delenv(name, raising=False)
+    """fix(#5816): PROXY_VARS is no longer a module attribute (the read was removed). The
+    rendered OK message never includes a proxy-related line."""
     report = tls_probe.run("https://pypi.org/", 1.0, False, ok_prober)
     assert report["proxy"] == ""
     assert "bypassed" not in tls_probe.render(report)
+    assert not hasattr(tls_probe, "PROXY_VARS")  # the read was removed entirely
 
 
 # --- --fix: red to green, and the second probe that proves it -----------------------------------

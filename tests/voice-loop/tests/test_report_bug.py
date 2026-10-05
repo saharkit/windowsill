@@ -201,9 +201,14 @@ def test_secrets_named_by_their_config_key_are_dropped_but_pointers_are_kept(ins
 
 
 def test_environment_reports_a_credential_variable_as_set_never_as_its_value(install, offline):
+    """fix(#5816): a credential-shaped ``VOICE_LOOP_*`` env var is SKIPPED entirely from
+    the bundle. The plugin no longer documents a credential-shaped variable for the
+    installer to set, and the bundle reflects that by not reporting the value at all —
+    not even as ``<set>``. Non-credential variables are still reported as their value."""
     environment = bundle_for(install)["environment"]
-    assert environment["VOICE_LOOP_TTS_API_KEY"] == "<set>"
-    assert environment["VOICE_LOOP_STT_MODEL"] == "small"
+    assert "VOICE_LOOP_TTS_API_KEY" not in environment
+    # Non-credential VOICE_LOOP_* variables are still reported (their value, not "<set>").
+    assert environment.get("VOICE_LOOP_STT_MODEL") == "small"
 
 
 def test_unreachable_endpoints_are_a_reported_fact_not_an_exception(install, offline):
