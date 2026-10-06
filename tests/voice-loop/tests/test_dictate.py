@@ -120,17 +120,66 @@ def test_stt_language_beats_top_level_language_beats_default():
     assert dictate.resolve_settings(both, "Linux")["language"] == "de"
 
 
-def test_key_env_precedence_cloud_over_stt_over_default():
+def test_key_env_precedence_cloud_over_stt_over_default(monkeypatch):
     # fix(#5816) removed stt.cloud.api_key_env / stt.cloud.key_file / stt.api_key_env. The
     # STT key is delivered by the harness as $CLAUDE_PLUGIN_OPTION_STT_API_KEY only. A
     # config that still carries one of the legacy names gets a one-line warning from
     # resolve_settings (see OBSOLETE_KEYS) and the setting is ignored. The settings dict
     # no longer carries ``key_env`` or ``key_envs``.
+    logged_calls: list[str] = []
+
+    def _spy_log(message: str) -> None:
+        logged_calls.append(message)
+
+    monkeypatch.setattr(dictate, "log", _spy_log)
     cfg = {"stt": {"api_key_env": "STT_LEVEL", "cloud": {"api_key_env": "CLOUD_LEVEL", "key_file": "/tmp/k"}}}
     s = dictate.resolve_settings(cfg, "Linux")
     assert "key_env" not in s
     assert "key_envs" not in s
     assert "key_file" not in s
+    # The OBSOLETE_KEYS warning fires once per legacy name. A regression that
+    # drops the warning loop is silent to every other test in the suite.
+    assert any("config ignored: stt.cloud.key_file is obsolete" in line for line in logged_calls)
+    assert any("config ignored: stt.cloud.api_key_env is obsolete" in line for line in logged_calls)
+    assert any("config ignored: stt.api_key_env is obsolete" in line for line in logged_calls)
+
+
+def test_obsolete_keys_warning_logs_one_line_per_name(monkeypatch):
+    """fix(#5816) OBSOLETE_KEYS — dictation side. The warn loop in resolve_settings
+    emits exactly one ``config ignored: <name> is obsolete`` line per name, ONLY
+    when the config still carries that name, and never when the config is clean.
+    A regression that drops the loop is silent to every other test in the suite.
+    Mirrored in test_speak.py for the speak side.
+    """
+    logged_calls: list[str] = []
+
+    def _spy_log(message: str) -> None:
+        logged_calls.append(message)
+
+    monkeypatch.setattr(dictate, "log", _spy_log)
+    # Clean config: no legacy keys -> no warning.
+    dictate.resolve_settings({}, "Linux")
+    assert not any("is obsolete" in line for line in logged_calls)
+    logged_calls.clear()
+    # All three legacy keys present: one line per name, in OBSOLETE_KEYS order.
+    dictate.resolve_settings(
+        {
+            "stt": {
+                "api_key_env": "T",
+                "cloud": {
+                    "api_key_env": "C",
+                    "key_file": "/tmp/k",
+                },
+            }
+        },
+        "Linux",
+    )
+    obsolete_lines = [line for line in logged_calls if "is obsolete" in line]
+    assert obsolete_lines == [
+        "config ignored: stt.cloud.key_file is obsolete — set the stt_api_key plugin option in /config",
+        "config ignored: stt.cloud.api_key_env is obsolete — set the stt_api_key plugin option in /config",
+        "config ignored: stt.api_key_env is obsolete — set the stt_api_key plugin option in /config",
+    ]
 
 
 def test_empty_string_falls_back_to_default():

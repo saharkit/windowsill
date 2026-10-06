@@ -236,18 +236,64 @@ def test_the_output_format_default_follows_the_provider_too():
     assert deepgram["output_format"] == "encoding=linear16&container=wav"
 
 
-def test_key_env_precedence_cloud_over_tts_over_default():
+def test_key_env_precedence_cloud_over_tts_over_default(monkeypatch):
     # fix(#5816) removed the tts.cloud.api_key_env / tts.cloud.key_file fallbacks. The
     # cloud TTS key is delivered by the harness as $CLAUDE_PLUGIN_OPTION_TTS_API_KEY only.
     # A config that still carries one of the legacy names gets a one-line warning from
     # resolve_settings (see OBSOLETE_KEYS) and the setting is ignored.
+    logged_calls: list[str] = []
+
+    def _spy_log(message: str) -> None:
+        logged_calls.append(message)
+
+    monkeypatch.setattr(speak, "log", _spy_log)
     cfg = {"tts": {"cloud": {"api_key_env": "CLOUD_LEVEL", "key_file": "/tmp/k"}}}
     s = speak.resolve_settings(cfg, "Linux")
     assert "key_env" not in s
     assert "key_file" not in s
-    # The OBSOLETE_KEYS warning fires; the log line is the only evidence.
-    # assert "config ignored: tts.cloud.api_key_env" in ...  (covered by the dictation
-    # test for the same OBSOLETE_KEYS table).
+    # The OBSOLETE_KEYS warning fires once per legacy name. A regression that
+    # drops the warning loop is silent to every other test in the suite.
+    assert any("config ignored: tts.cloud.api_key_env is obsolete" in line for line in logged_calls)
+    assert any("config ignored: tts.cloud.key_file is obsolete" in line for line in logged_calls)
+
+
+def test_obsolete_keys_warning_logs_one_line_per_name(monkeypatch):
+    """fix(#5816) OBSOLETE_KEYS: the resolve_settings warn loop emits exactly one
+    `config ignored: <name> is obsolete` line per name, ONLY when the config still
+    carries that name, and never when the config is clean. A regression that drops
+    the loop is silent to every other test in the suite — this is the discriminating
+    assertion. Mirrored in test_dictate.py for the dictation side.
+    """
+    logged_calls: list[str] = []
+
+    def _spy_log(message: str) -> None:
+        logged_calls.append(message)
+
+    monkeypatch.setattr(speak, "log", _spy_log)
+    # Clean config: no legacy keys -> no warning.
+    speak.resolve_settings({}, "Linux")
+    assert not any("is obsolete" in line for line in logged_calls)
+    logged_calls.clear()
+    # All three legacy keys present: one line per name, in the order they appear
+    # in OBSOLETE_KEYS (which is also the order the loop visits them).
+    speak.resolve_settings(
+        {
+            "tts": {
+                "api_key_env": "T",
+                "cloud": {
+                    "api_key_env": "C",
+                    "key_file": "/tmp/k",
+                },
+            }
+        },
+        "Linux",
+    )
+    obsolete_lines = [line for line in logged_calls if "is obsolete" in line]
+    assert obsolete_lines == [
+        "config ignored: tts.cloud.key_file is obsolete — set the tts_api_key plugin option in /config",
+        "config ignored: tts.cloud.api_key_env is obsolete — set the tts_api_key plugin option in /config",
+        "config ignored: tts.api_key_env is obsolete — set the tts_api_key plugin option in /config",
+    ]
 
 
 def test_voice_settings_passthrough_is_a_dict_or_none():
