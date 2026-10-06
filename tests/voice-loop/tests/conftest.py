@@ -9,9 +9,11 @@ end to end against objects that answer instantly.
 from __future__ import annotations
 
 import io
+import json
 import os
 import shutil
 import socket
+import struct
 import sys
 import tempfile
 import threading
@@ -60,6 +62,98 @@ def short_socket_dir():
         yield Path(directory)
     finally:
         shutil.rmtree(directory, ignore_errors=True)
+
+
+# --- a fake live-transcription provider, on a real websocket ------------------------------------
+#
+# Two test modules need the same provider: the dictation worker's own websocket client dials it
+# directly in one, and the relay dials it through that same client in the other while the worker
+# drives the relay's AF_UNIX leg. The wire helpers come from the websocket client's own test
+# module — one hand-written RFC 6455 server side, not a second one that could agree with the
+# first by sharing a bug.
+
+# ``test_wsclient`` sits in this directory, and pytest puts it on sys.path for this
+# conftest — but the conftest-degraded suite also loads this file STANDALONE (importlib,
+# straight from its path), where no runner inserts the directory. Add it ourselves so
+# both loaders find the module.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from test_wsclient import (  # noqa: E402 — same directory; on sys.path for this conftest, see above
+    Server,
+    accept_for,
+    parse_client_frame,
+    read_http_head,
+    server_frame,
+)
+from test_wsclient import wsclient as _wsclient
+
+
+def _deepgram_results(text: str, *, final: bool) -> bytes:
+    """A Deepgram live message, in the shape the registry entry parses."""
+    return json.dumps(
+        {"type": "Results", "is_final": final, "channel": {"alternatives": [{"transcript": text}]}}
+    ).encode("utf-8")
+
+
+class FakeDeepgram:
+    """A listening socket that answers like a live-transcription API.
+
+    It speaks once the audio starts flowing (an interim, then a final — proving interims are not
+    assembled twice), and answers CloseStream with the last final the server still owed, a
+    Metadata message and a close frame. That order IS the contract the drain exists for: the tail
+    of a dictation arrives AFTER the client has stopped sending.
+    """
+
+    def __init__(self, *, close_early: bool = False, reset_early: bool = False) -> None:
+        self.audio = bytearray()
+        self.close_early = close_early
+        # reset_early is the DEATH the close frame is not: SO_LINGER 0 makes close() send a TCP
+        # RST, so the client meets a dead socket rather than a polite goodbye — which is what a
+        # provider dropping out mid-dictation actually looks like.
+        self.reset_early = reset_early
+        self.server = Server(self._handle)
+
+    @property
+    def endpoint(self) -> str:
+        return f"http://127.0.0.1:{self.server.port}"
+
+    def _handle(self, server, conn) -> None:
+        head = read_http_head(conn)
+        conn.sendall(
+            b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n"
+            b"Sec-WebSocket-Accept: " + accept_for(head).encode() + b"\r\n\r\n"
+        )
+        spoke = False
+        buf = bytearray()
+        while True:
+            chunk = conn.recv(65536)
+            if not chunk:
+                return
+            buf += chunk
+            while True:
+                frame = parse_client_frame(buf)
+                if frame is None:
+                    break
+                opcode, payload = frame
+                server.frames.append(frame)
+                if opcode == _wsclient.OP_BINARY:
+                    self.audio += payload
+                    if self.reset_early:
+                        conn.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+                        conn.close()
+                        return
+                    if self.close_early:
+                        conn.sendall(server_frame(_wsclient.OP_CLOSE, struct.pack("!H", 1011)))
+                        return
+                    if not spoke:
+                        spoke = True
+                        conn.sendall(server_frame(_wsclient.OP_TEXT, _deepgram_results("привет это", final=False)))
+                        conn.sendall(server_frame(_wsclient.OP_TEXT, _deepgram_results("Привет, это", final=True)))
+                elif opcode == _wsclient.OP_TEXT and b"CloseStream" in payload:
+                    conn.sendall(server_frame(_wsclient.OP_TEXT, _deepgram_results("диктовка.", final=True)))
+                    conn.sendall(server_frame(_wsclient.OP_TEXT, b'{"type":"Metadata","duration":1.5}'))
+                    conn.sendall(server_frame(_wsclient.OP_CLOSE, struct.pack("!H", 1000)))
+                    return
 
 
 class GateHeldTwice(RuntimeError):

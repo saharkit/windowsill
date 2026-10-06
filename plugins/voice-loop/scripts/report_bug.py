@@ -516,10 +516,6 @@ LOG_RULES: tuple[tuple[str, str | None], ...] = (
     ("cloud stt: relay connect refused (", None),
     ("cloud stt: relay write failed (", None),
     ("cloud stt: relay silent past deadline (", None),
-    # the streaming cloud downgrade (windowsill#5870, R5): the config asked
-    # for streaming, the hotkey holds no key, the relay's batch path is the
-    # substitute. The line is fixed prose — a contract, not a payload.
-    ("streaming needs a key the hotkey path no longer holds", None),
     # the credential-closure change (#5816): the relay holds the key and the script
     # never sees the words, so the line carries a character count in the plugin's
     # existing speech-redaction form (windowsill#5870, R7) rather than the transcript.
@@ -531,6 +527,10 @@ LOG_RULES: tuple[tuple[str, str | None], ...] = (
     # and socket reasons — the transcript itself travels only through the `transcript: ` row above,
     # which is cut, and the `stream result` file is listed for its size and never opened.
     ("stt.cloud.streaming is on but ", None),
+    # fix(#5881) — streaming opt-in on a platform without AF_UNIX (Windows without AF_UNIX in
+    # the stdlib build): the worker logs the platform line and takes the batch path. The line
+    # is fixed prose — a contract, not a payload.
+    ("stt.cloud.streaming: AF_UNIX unavailable on this platform", None),
     ("stream worker started pid=", None),
     ("stream worker did not start: ", None),
     ("stream worker did not finish within ", None),

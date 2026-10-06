@@ -23,6 +23,7 @@ import socket as _socket
 import socketserver
 import struct
 import threading
+import time
 import urllib.error
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -32,7 +33,7 @@ from unittest import mock
 import pytest
 
 import providers
-from conftest import needs_af_unix
+from conftest import FakeDeepgram, needs_af_unix
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 VOICE_MCP = REPO_ROOT / "plugins" / "voice-loop/scripts/voice_mcp.py"
@@ -903,6 +904,66 @@ def test_validate_request_line_covers_four_conditions():
     assert "unknown" in err.lower() or "provider" in err.lower()
 
 
+@pytest.mark.parametrize(
+    "mode",
+    ["bogus", 5, None],
+    ids=["a_string_mode", "a_number_mode", "a_null_mode"],
+)
+def test_a_request_line_naming_an_unknown_mode_gets_one_bad_request_reply(mode):
+    """A line that carries ``mode`` with any value other than ``"stream"`` is malformed, and the
+    batch validator answers for it: one ``bad-request`` reply naming the value. Without this the
+    line sails past the seven-key check (it has a ``mode``, so the batch contract reads as N/A)
+    and the handler dies on the first key it indexes — a dead connection with no reply at all."""
+    module = _import_voice_mcp()
+    payload = json.dumps({"mode": mode, "provider": "deepgram"}) + "\n"
+    fake = _FakeClient(payload.encode())
+    # The reply is one JSON line — no KeyError, no second reply, no thread left hanging.
+    module._serve_one_client(fake, None)
+    lines = [line for line in fake.buf_out.decode().splitlines() if line]
+    assert len(lines) == 1, f"expected exactly one reply line, got {lines!r}"
+    reply = json.loads(lines[0])
+    assert reply["reason"] == "bad-request"
+    assert f"unknown mode: {mode!r}" in reply.get("detail", "")
+    assert fake.closed is True
+
+
+def test_a_mode_less_line_still_gets_the_missing_keys_reply():
+    """The batch contract is unchanged by the mode check: a line with no ``mode`` at all and a
+    missing batch key still answers ``missing keys`` through the same one-reply shape."""
+    module = _import_voice_mcp()
+    fake = _FakeClient(json.dumps({"provider": "deepgram"}).encode() + b"\n")
+    module._serve_one_client(fake, None)
+    lines = [line for line in fake.buf_out.decode().splitlines() if line]
+    assert len(lines) == 1, f"expected exactly one reply line, got {lines!r}"
+    reply = json.loads(lines[0])
+    assert reply["reason"] == "bad-request"
+    assert "missing keys" in reply.get("detail", "")
+
+
+def test_a_stream_line_reaches_the_stream_validator_through_the_batch_validator():
+    """``_validate_request_line`` is total: a ``mode == "stream"`` line delegates to the stream
+    validator rather than skipping validation, so a line that ever lands here without the
+    connection-handler's dispatch is still checked against the streaming contract."""
+    module = _import_voice_mcp()
+    good = json.dumps(
+        {
+            "mode": "stream",
+            "provider": "deepgram",
+            "url": "wss://api.deepgram.com/v1/listen",
+            "tts_vendor": "openai",
+            "timeout": 5,
+        }
+    )
+    parsed, err = module._validate_request_line(good)
+    assert parsed is not None and err is None
+    broken = json.dumps(
+        {"mode": "stream", "provider": "deepgram", "tts_vendor": "openai", "timeout": 5}
+    )
+    parsed, err = module._validate_request_line(broken)
+    assert parsed is None
+    assert err is not None and "missing keys" in err.lower()
+
+
 # --- 6. clear-text refusal (R4) ------------------------------------------
 
 
@@ -1223,9 +1284,14 @@ def test_dictate_does_not_gate_relay_on_its_own_env(tmp_path, monkeypatch):
 # --- 11. streaming cloud log line + client-side timeout -----------------
 
 
-def test_streaming_cloud_logs_batch_only_line():
-    """``streaming_wanted`` returns False on the hotkey path with a log
-    line stating that streaming needs a key the hotkey path no longer holds."""
+@needs_af_unix
+def test_streaming_cloud_returns_true_when_provider_has_a_streaming_variant():
+    """fix(#5881): ``streaming_wanted`` returns True on the hotkey path when
+    the registry entry has a streaming variant — the relay holds the key and
+    the worker dials it. The credential-closure path goes through the relay,
+    not through the local whisper server. The open arm is the AF_UNIX-present
+    one: where the socket module has no AF_UNIX the product answers False by
+    design, so this pin skips there."""
     module = _import_dictate()
     s = {
         "streaming": True,
@@ -1238,10 +1304,7 @@ def test_streaming_cloud_logs_batch_only_line():
         entry.name = "deepgram"
         entry.streaming = mock.Mock()  # provider HAS a streaming variant
         resolve.return_value = entry
-        with mock.patch.object(module, "log") as fake_log:
-            assert module.streaming_wanted(s) is False
-    log_calls = [str(c) for c in fake_log.call_args_list]
-    assert any("streaming needs a key the hotkey path no longer holds" in c for c in log_calls)
+        assert module.streaming_wanted(s) is True
 
 
 @needs_af_unix
@@ -3169,3 +3232,954 @@ def test_module_invokes_main(monkeypatch, tmp_path):
     # main() returned 0 (the stdio loop read EOF, returned None, loop
     # exited, main returned 0), and sys.exit(0) ran.
     assert captured_exit["code"] == 0
+
+
+# --- streaming dictation (windowsill#5881) ---------------------------------------------------
+#
+# The streaming leg of the relay: one stream line in, an ``ok`` line or a typed failure out,
+# then bidirectional frame forwarding until both sides say goodbye. The worker-side adapter
+# lives in scripts/dictate.py; the relay-side guard and dial-failure mapping live here.
+
+
+def _build_stream_line(provider: str = "deepgram", url: str = "wss://api.deepgram.com/v1/listen", **overrides) -> bytes:
+    """The stream-line wire shape the worker sends."""
+    request = {
+        "mode": "stream",
+        "provider": provider,
+        "url": url,
+        "tts_vendor": overrides.get("tts_vendor", "openai"),
+        "timeout": overrides.get("timeout", 5.0),
+    }
+    return json.dumps(request).encode() + b"\n"
+
+
+class _FakeStreamClient:
+    """A fake the relay's ``_serve_one_client`` writes to and reads from on the stream leg.
+
+    The relay reads one UTF-8 JSON stream line terminated by ``\\n``, then either:
+    - writes an ``ok`` line and begins bidirectional frame pumping, or
+    - writes a typed-failure line and closes.
+
+    This fake collects the frames the relay forwards to it (the worker side of the stream) so a
+    test can assert the relay did NOT forward anything until it answered ok, did forward after
+    ok, and closed both legs on a close frame."""
+
+    def __init__(self, payload: bytes) -> None:
+        self.buf_out = bytearray()
+        self.buf_in = bytearray(payload)
+        self.closed = False
+        self.shutdown_called = False
+
+    def settimeout(self, _t):
+        pass
+
+    def recv(self, n):
+        if not self.buf_in:
+            return b""
+        chunk = bytes(self.buf_in[:n])
+        self.buf_in = self.buf_in[n:]
+        return chunk
+
+    def sendall(self, data):
+        self.buf_out.extend(data)
+
+    def shutdown(self, _how):
+        self.shutdown_called = True
+        raise AssertionError(
+            "relay called client_sock.shutdown — the wire protocol is one sendall + close, "
+            "never a server-side shutdown"
+        )
+
+    def close(self):
+        self.closed = True
+
+
+class _RecordingWS:
+    """A provider websocket the relay's converters can drive: ``poll`` is scriptable (a quiet
+    slice by default, a list of frames per call, or one raised error), and the send/close
+    surface records what the relay did with it. This is the shape the converters read — the
+    websocket's public methods, never its raw socket."""
+
+    def __init__(self, *, frames: list | None = None, poll_error: BaseException | None = None) -> None:
+        self.closed = False
+        self.binary: list[bytes] = []
+        self.texts: list[str] = []
+        self.close_calls = 0
+        self._frames = list(frames or [])
+        self._poll_error = poll_error
+
+    def poll(self, _timeout: float) -> list[tuple[int, bytes]]:
+        if self._poll_error is not None:
+            raise self._poll_error
+        return self._frames.pop(0) if self._frames else []
+
+    def send_binary(self, payload: bytes) -> None:
+        self.binary.append(payload)
+
+    def send_text(self, text: str) -> None:
+        self.texts.append(text)
+
+    def close(self) -> None:
+        self.close_calls += 1
+        self.closed = True
+
+
+def test_stream_line_parsing_rejects_unknown_provider():
+    """The stream validator answers bad-request for an unknown provider, the same way the batch
+    validator does. The relay does not name a provider's existence differently per leg."""
+    module = _import_voice_mcp()
+    parsed, err = module._validate_stream_line(
+        json.dumps(
+            {
+                "mode": "stream",
+                "provider": "nonexistent",
+                "url": "wss://example.com/listen",
+                "tts_vendor": "openai",
+                "timeout": 5,
+            }
+        )
+    )
+    assert parsed is None
+    assert err is not None
+    assert "unknown provider" in err.lower() or "nonexistent" in err
+
+
+def test_stream_line_parsing_rejects_provider_without_streaming_variant():
+    """``openai`` has no streaming variant. The stream validator answers bad-request and names the
+    provider — a silently-ignored setting is the failure class #5816 was careful to avoid."""
+    module = _import_voice_mcp()
+    parsed, err = module._validate_stream_line(
+        json.dumps(
+            {
+                "mode": "stream",
+                "provider": "openai",
+                "url": "wss://example.com/listen",
+                "tts_vendor": "openai",
+                "timeout": 5,
+            }
+        )
+    )
+    assert parsed is None
+    assert err is not None
+    assert "no streaming variant" in err.lower()
+
+
+def test_stream_line_parsing_rejects_missing_url():
+    """``url`` is one of the four required keys (provider, url, tts_vendor, timeout). A stream
+    line without it is malformed and the relay answers the bad-request condition the validator
+    owns (windowsill#5881 R1)."""
+    module = _import_voice_mcp()
+    parsed, err = module._validate_stream_line(
+        json.dumps(
+            {"mode": "stream", "provider": "deepgram", "tts_vendor": "openai", "timeout": 5}
+        )
+    )
+    assert parsed is None
+    assert err is not None
+    assert "missing keys" in err.lower() or "url" in err.lower()
+
+
+def test_stream_line_parsing_accepts_deepgram_streaming():
+    """Deepgram is the one shipped STT entry with a streaming variant. The stream validator
+    accepts the line and returns the parsed shape — the relay then resolves the key and dials."""
+    module = _import_voice_mcp()
+    parsed, err = module._validate_stream_line(
+        json.dumps(
+            {
+                "mode": "stream",
+                "provider": "deepgram",
+                "url": "wss://api.deepgram.com/v1/listen",
+                "tts_vendor": "openai",
+                "timeout": 5,
+            }
+        )
+    )
+    assert parsed is not None
+    assert err is None
+
+
+def test_stream_leg_answers_no_key_when_relay_has_no_stt_key():
+    """The stream leg applies the same three-step key resolution as the batch dial. No
+    key in the relay's env -> ``no-key`` reply, before any clear-text check or dial —
+    a missing key and a plain-text endpoint are two different configuration errors."""
+    module = _import_voice_mcp()
+    payload = _build_stream_line("deepgram", "wss://api.deepgram.com/v1/listen")
+    fake = _FakeStreamClient(payload)
+    with mock.patch.dict(
+        os.environ,
+        {"CLAUDE_PLUGIN_OPTION_STT_API_KEY": "", "CLAUDE_PLUGIN_OPTION_TTS_API_KEY": ""},
+        clear=False,
+    ):
+        module._serve_one_client(fake, None)
+    reply = json.loads(fake.buf_out.decode())
+    assert reply["status"] == "failed"
+    assert reply["reason"] == "no-key"
+
+
+def test_stream_leg_answers_clear_text_refused_for_non_local_ws_endpoint():
+    """A configured ``ws://`` endpoint (non-loopback) with a credential is REFUSED at the relay
+    before the dial. The reply is the exact token the batch dial already uses:
+    ``{"status": "failed", "reason": "clear-text-refused"}``. No websocket dial is made."""
+    module = _import_voice_mcp()
+    payload = _build_stream_line("deepgram", "ws://api.deepgram.com/v1/listen")
+    fake = _FakeStreamClient(payload)
+    captured = {"dialed": False}
+
+    def _no_dial(*args, **kwargs):
+        captured["dialed"] = True
+        raise AssertionError("no dial should be made on clear-text refusal")
+
+    with mock.patch.dict(
+        os.environ,
+        {"CLAUDE_PLUGIN_OPTION_STT_API_KEY": "test-stt-key", "CLAUDE_PLUGIN_OPTION_TTS_API_KEY": ""},
+        clear=False,
+    ):
+        with mock.patch.object(module, "wsclient", wraps=module.wsclient) as ws_mod:
+            ws_mod.connect = _no_dial
+            module._serve_one_client(fake, None)
+    reply = json.loads(fake.buf_out.decode())
+    assert reply["status"] == "failed"
+    assert reply["reason"] == "clear-text-refused"
+    assert captured["dialed"] is False
+
+
+def test_stream_leg_admits_loopback_ws_endpoint():
+    """Loopback http:// / ws:// stays allowed — the CI fake on 127.0.0.1 and the pytest fake
+    provider rely on it. A relay that refuses loopback breaks the harness."""
+    module = _import_voice_mcp()
+    payload = _build_stream_line("deepgram", "ws://127.0.0.1:9999/v1/listen")
+    fake = _FakeStreamClient(payload)
+    fake_ws = _RecordingWS()
+    with mock.patch.dict(
+        os.environ,
+        {"CLAUDE_PLUGIN_OPTION_STT_API_KEY": "test-stt-key", "CLAUDE_PLUGIN_OPTION_TTS_API_KEY": ""},
+        clear=False,
+    ):
+        with mock.patch.object(module.wsclient, "connect", return_value=fake_ws):
+            module._serve_one_client(fake, None)
+    # The relay wrote an ``ok`` line; we did NOT get a typed failure.
+    reply = json.loads(fake.buf_out.decode())
+    assert reply["status"] == "ok"
+
+
+def test_stream_leg_maps_dial_failure_to_provider_unreachable():
+    """Any WebSocketError from the dial that is not a timeout maps to ``provider-unreachable``,
+    the same token the batch dial returns for a transport-level failure. Batch and stream
+    cannot drift (windowsill#5881 R6)."""
+    module = _import_voice_mcp()
+    payload = _build_stream_line("deepgram", "ws://127.0.0.1:9/v1/listen")
+    fake = _FakeStreamClient(payload)
+
+    def _refuse(*args, **kwargs):
+        raise module.wsclient.WebSocketError("could not reach 127.0.0.1:9: connection refused")
+
+    with mock.patch.dict(
+        os.environ,
+        {"CLAUDE_PLUGIN_OPTION_STT_API_KEY": "test-stt-key", "CLAUDE_PLUGIN_OPTION_TTS_API_KEY": ""},
+        clear=False,
+    ):
+        with mock.patch.object(module.wsclient, "connect", side_effect=_refuse):
+            module._serve_one_client(fake, None)
+    reply = json.loads(fake.buf_out.decode())
+    assert reply["status"] == "failed"
+    assert reply["reason"] == "provider-unreachable"
+
+
+def test_stream_leg_maps_dial_timeout_to_timeout():
+    """A connect timeout is reported as ``timeout`` — the dial-failure mapping rule
+    (windowsill#5881 R6). The relay enforces the line's timeout as a wall-clock bound around
+    the provider dial; on breach the relay answers ``timeout``. Other WebSocketError messages
+    from the dial map to ``provider-unreachable``."""
+    module = _import_voice_mcp()
+    # ``timeout=0`` on the line forces an immediate breach regardless of dial speed.
+    payload = _build_stream_line("deepgram", "ws://127.0.0.1:9/v1/listen", timeout=0.0)
+    fake = _FakeStreamClient(payload)
+
+    def _hang(*args, **kwargs):
+        # Sleep past the deadline; the relay's wall-clock bound will mark this as timeout.
+        time.sleep(0.05)
+        raise module.wsclient.WebSocketError("could not reach 127.0.0.1:9: timeout")
+
+    with mock.patch.dict(
+        os.environ,
+        {"CLAUDE_PLUGIN_OPTION_STT_API_KEY": "test-stt-key", "CLAUDE_PLUGIN_OPTION_TTS_API_KEY": ""},
+        clear=False,
+    ):
+        with mock.patch.object(module.wsclient, "connect", side_effect=_hang):
+            module._serve_one_client(fake, None)
+    reply = json.loads(fake.buf_out.decode())
+    assert reply["status"] == "failed"
+    assert reply["reason"] == "timeout"
+
+
+def test_stream_leg_dispatches_on_mode_stream():
+    """A request line with ``mode == "stream"`` reaches ``_serve_stream_client`` and never
+    runs the batch parser. A batch line (no ``mode``) reaches the batch parser and never
+    runs the stream validator. The dispatch is the one the relay sees first."""
+    module = _import_voice_mcp()
+    # stream line goes through the stream validator. Without a key, that path
+    # answers no-key; we use that as the marker for "the stream path ran".
+    payload = _build_stream_line("deepgram", "wss://api.deepgram.com/v1/listen")
+    fake = _FakeStreamClient(payload)
+    with mock.patch.dict(
+        os.environ,
+        {"CLAUDE_PLUGIN_OPTION_STT_API_KEY": "", "CLAUDE_PLUGIN_OPTION_TTS_API_KEY": ""},
+        clear=False,
+    ):
+        module._serve_one_client(fake, None)
+    reply = json.loads(fake.buf_out.decode())
+    assert reply["status"] == "failed"
+    assert reply["reason"] == "no-key"
+    # A batch line without mode keys reaches the batch parser and the four-key check.
+    payload_batch = json.dumps(
+        {
+            "provider": "deepgram",
+            "endpoint": "ws://127.0.0.1:9",
+            "model": "nova-3",
+            "language": "en",
+            "tts_vendor": "openai",
+            "timeout": 5,
+            "stt_prompt": "",
+        }
+    ).encode() + b"\n" + _make_wav_header()
+    fake2 = _FakeClient(payload_batch)
+    module._serve_one_client(fake2, None)
+    reply2 = json.loads(fake2.buf_out.decode())
+    # The batch parser with no STT key returns no-key (when the provider
+    # has no streaming variant, the validator reaches bad-request); here
+    # we set the keys to empty in the env, so no-key wins regardless.
+    assert reply2["status"] == "failed"
+
+
+def test_stream_leg_writes_ok_then_closes_when_no_frames_follow():
+    """A stream leg that receives the ``ok`` line but no follow-up frames closes both legs
+    cleanly. The relay never holds a metered provider socket open past the worker."""
+    module = _import_voice_mcp()
+    payload = _build_stream_line("deepgram", "ws://127.0.0.1:9/v1/listen")
+    fake = _FakeStreamClient(payload)
+    fake_ws = _RecordingWS()
+    with mock.patch.dict(
+        os.environ,
+        {"CLAUDE_PLUGIN_OPTION_STT_API_KEY": "test-stt-key", "CLAUDE_PLUGIN_OPTION_TTS_API_KEY": ""},
+        clear=False,
+    ):
+        with mock.patch.object(module.wsclient, "connect", return_value=fake_ws):
+            module._serve_one_client(fake, None)
+    # The relay wrote ok then exited (no follow-up frames from the client side).
+    reply = json.loads(fake.buf_out.decode())
+    assert reply["status"] == "ok"
+    # The provider leg was closed — a metered connection never outlives the worker.
+    assert fake_ws.closed is True
+
+
+# --- the frame converters, one direction at a time ----------------------------------------------
+#
+# The relay's stream leg is a CONVERTER, not a copier: the worker's 5-byte framing stays on the
+# AF_UNIX leg and RFC 6455 stays on the provider leg. Each direction is its own function, and
+# these tests drive each one directly — a fake websocket recording its public-method calls, and
+# the client leg as a plain buffer of 5-byte frames.
+
+
+def _client_frame(opcode: int, payload: bytes = b"") -> bytes:
+    """One 5-byte client-leg frame: opcode, big-endian length, payload."""
+    return bytes([opcode]) + len(payload).to_bytes(4, "big") + payload
+
+
+def test_the_client_leg_pump_converts_each_opcode_onto_the_websocket_surface():
+    """The worker's frames reach the provider through the websocket's public methods: binary
+    audio as ``send_binary``, the registry's text control messages as ``send_text``, a close
+    opcode as ``ws.close()`` and the end of the session. Nothing here writes the provider's raw
+    socket, because the 5-byte framing is not the provider's wire."""
+    module = _import_voice_mcp()
+    ws = _RecordingWS()
+    fake_client = _FakeStreamClient(
+        _client_frame(module.wsclient.OP_BINARY, b"\x01\x02\x03")
+        + _client_frame(module.wsclient.OP_TEXT, b'{"type":"KeepAlive"}')
+        + _client_frame(module.wsclient.OP_CLOSE, b"")
+    )
+    stop = threading.Event()
+    errors: list = []
+    module._pump_client_to_provider(
+        fake_client, ws, name="client->provider", errors=errors, stop=stop
+    )
+    assert ws.binary == [b"\x01\x02\x03"]
+    assert ws.texts == ['{"type":"KeepAlive"}']
+    assert errors == []
+    assert ws.closed is True and stop.is_set()
+
+
+def test_the_client_leg_pump_refuses_a_frame_over_the_cap_before_its_payload():
+    """The declared length is checked against the cap BEFORE the payload is read — a bound
+    applied after the read is not a bound. The refusal lands in ``errors`` and ends the
+    session."""
+    module = _import_voice_mcp()
+    ws = _RecordingWS()
+    oversized = module.STREAM_FRAME_MAX_BYTES + 1
+    fake_client = _FakeStreamClient(
+        bytes([module.wsclient.OP_BINARY]) + oversized.to_bytes(4, "big")
+    )
+    stop = threading.Event()
+    errors: list = []
+    module._pump_client_to_provider(
+        fake_client, ws, name="client->provider", errors=errors, stop=stop
+    )
+    assert len(errors) == 1 and "frame over" in errors[0]
+    assert ws.binary == []  # nothing was forwarded — and nothing was read past the head
+    assert ws.closed is True
+
+
+def test_the_client_leg_pump_ends_the_session_on_an_unknown_opcode():
+    """An opcode the converter has no translation for is a wire violation from a peer that is
+    not the worker. The session ends with the opcode named rather than a guess at a meaning."""
+    module = _import_voice_mcp()
+    ws = _RecordingWS()
+    fake_client = _FakeStreamClient(_client_frame(0x3, b"?"))
+    stop = threading.Event()
+    errors: list = []
+    module._pump_client_to_provider(
+        fake_client, ws, name="client->provider", errors=errors, stop=stop
+    )
+    assert len(errors) == 1 and "unknown opcode" in errors[0]
+    assert ws.closed is True
+
+
+def test_the_client_leg_pump_ends_the_session_when_the_websocket_refuses_a_send():
+    """A websocket send failure is the provider leg dying; it is named in ``errors`` and takes
+    the session down, so the worker's next read sees an ended stream rather than a stall."""
+    module = _import_voice_mcp()
+    ws = _RecordingWS()
+    ws.send_binary = lambda payload: (_ for _ in ()).throw(  # type: ignore[assignment]
+        module.wsclient.WebSocketError("send failed")
+    )
+    fake_client = _FakeStreamClient(_client_frame(module.wsclient.OP_BINARY, b"\x01"))
+    stop = threading.Event()
+    errors: list = []
+    module._pump_client_to_provider(
+        fake_client, ws, name="client->provider", errors=errors, stop=stop
+    )
+    assert len(errors) == 1 and "send failed" in errors[0]
+    assert ws.closed is True
+
+
+def test_the_client_leg_pump_ends_the_session_on_a_text_frame_that_is_not_utf8():
+    """A text frame whose payload is not UTF-8 cannot become a ``send_text`` string; decoding
+    it on the provider's behalf would hide a corrupt peer. The failure is named and the session
+    ends."""
+    module = _import_voice_mcp()
+    ws = _RecordingWS()
+    fake_client = _FakeStreamClient(_client_frame(module.wsclient.OP_TEXT, b"\xff\xfe"))
+    stop = threading.Event()
+    errors: list = []
+    module._pump_client_to_provider(
+        fake_client, ws, name="client->provider", errors=errors, stop=stop
+    )
+    assert len(errors) == 1 and "utf-8" in errors[0].lower()
+    assert ws.texts == []
+    assert ws.closed is True
+
+
+def test_the_client_leg_pump_closes_the_provider_leg_when_the_worker_ends():
+    """EOF on the client leg — a head that never arrives, or a frame cut in half — is the
+    worker going away. The pump returns promptly and takes the metered provider connection down
+    with it; a provider socket never outlives the worker that asked for it."""
+    module = _import_voice_mcp()
+    # the worker said nothing at all and closed
+    ws = _RecordingWS()
+    stop = threading.Event()
+    module._pump_client_to_provider(
+        _FakeStreamClient(b""), ws, name="client->provider", errors=[], stop=stop
+    )
+    assert ws.closed is True and stop.is_set()
+    # the head declared four payload bytes and delivered two
+    ws_cut = _RecordingWS()
+    stop_cut = threading.Event()
+    partial = bytes([module.wsclient.OP_BINARY]) + (4).to_bytes(4, "big") + b"\x01\x02"
+    module._pump_client_to_provider(
+        _FakeStreamClient(partial), ws_cut, name="client->provider", errors=[], stop=stop_cut
+    )
+    assert ws_cut.closed is True and stop_cut.is_set()
+
+
+def test_the_provider_leg_pump_converts_websocket_messages_to_client_frames():
+    """Every complete message the websocket hands back becomes one 5-byte frame on the client
+    leg, opcodes intact, and a close frame is forwarded rather than swallowed — it is how the
+    worker learns the provider hung up. A quiet slice between deliveries is waited out, not
+    read as an end."""
+    module = _import_voice_mcp()
+    ws = _RecordingWS(
+        frames=[
+            [(module.wsclient.OP_TEXT, b'{"a":1}')],
+            [],  # the quiet slice
+            [
+                (module.wsclient.OP_BINARY, b"\x07"),
+                (module.wsclient.OP_CLOSE, b"\x04\xe8"),
+            ],
+        ]
+    )
+    fake_client = _FakeStreamClient(b"")
+    stop = threading.Event()
+    errors: list = []
+    module._pump_provider_to_client(
+        ws, fake_client, name="provider->client", errors=errors, stop=stop
+    )
+    assert errors == []
+    expected = (
+        _client_frame(module.wsclient.OP_TEXT, b'{"a":1}')
+        + _client_frame(module.wsclient.OP_BINARY, b"\x07")
+        + _client_frame(module.wsclient.OP_CLOSE, b"\x04\xe8")
+    )
+    assert bytes(fake_client.buf_out) == expected
+    assert ws.closed is True and stop.is_set()
+
+
+def test_the_provider_leg_pump_names_a_websocket_read_failure():
+    """A websocket read failure is the provider leg dying mid-stream; it is named in ``errors``
+    and nothing further is written to the worker."""
+    module = _import_voice_mcp()
+    ws = _RecordingWS(poll_error=module.wsclient.WebSocketError("the provider vanished"))
+    fake_client = _FakeStreamClient(b"")
+    stop = threading.Event()
+    errors: list = []
+    module._pump_provider_to_client(
+        ws, fake_client, name="provider->client", errors=errors, stop=stop
+    )
+    assert len(errors) == 1 and "the provider vanished" in errors[0]
+    assert fake_client.buf_out == b""
+
+
+def test_the_provider_leg_pump_names_a_worker_write_failure():
+    """A write failure toward the worker is the client leg dying; it is named too, and the
+    provider connection comes down with it."""
+    module = _import_voice_mcp()
+    ws = _RecordingWS(frames=[[(module.wsclient.OP_TEXT, b"x")]])
+
+    class _DeadClient(_FakeStreamClient):
+        def sendall(self, data):
+            raise OSError("broken pipe")
+
+    fake_client = _DeadClient(b"")
+    stop = threading.Event()
+    errors: list = []
+    module._pump_provider_to_client(
+        ws, fake_client, name="provider->client", errors=errors, stop=stop
+    )
+    assert len(errors) == 1 and "broken pipe" in errors[0]
+    assert ws.closed is True
+
+
+def test_the_provider_leg_pump_returns_without_polling_once_stopped():
+    """The metered-connection bound from the other side: once the client leg has ended and set
+    ``stop``, this direction must not sit in a poll waiting for the next provider frame — it
+    comes down immediately, or within the slice it is already in."""
+    module = _import_voice_mcp()
+    ws = _RecordingWS(frames=[[(module.wsclient.OP_TEXT, b"never polled")]])
+    fake_client = _FakeStreamClient(b"")
+    stop = threading.Event()
+    stop.set()
+    module._pump_provider_to_client(
+        ws, fake_client, name="provider->client", errors=[], stop=stop
+    )
+    assert ws.closed is True
+    assert fake_client.buf_out == b""
+
+
+def test_read_exact_waits_out_an_idle_slice_rather_than_reading_it_as_eof():
+    """A recv timeout is the quiet slice a stopped-for peer leaves the reader in; it is waited
+    out, not read as EOF — the frames after it still arrive."""
+    module = _import_voice_mcp()
+
+    class _StallingClient:
+        def __init__(self):
+            self.calls = 0
+
+        def settimeout(self, _t):
+            pass
+
+        def recv(self, _n):
+            self.calls += 1
+            if self.calls == 1:
+                raise TimeoutError("timed out")
+            return b""
+
+    stalling = _StallingClient()
+    assert module._read_exact(stalling, 5) is None
+    assert stalling.calls == 2  # the timeout was waited out, then the real EOF was read
+
+
+def test_read_exact_returns_without_touching_the_socket_once_stopped():
+    """A stopped session must not read its socket again — the stop flag is checked on every
+    pass, including the one a quiet socket would block in."""
+    module = _import_voice_mcp()
+
+    class _MustNotBeRead:
+        def settimeout(self, _t):
+            raise AssertionError("a stopped session must not touch its socket")
+
+        def recv(self, _n):
+            raise AssertionError("a stopped session must not touch its socket")
+
+    stop = threading.Event()
+    stop.set()
+    assert module._read_exact(_MustNotBeRead(), 5, stop=stop) is None
+
+
+# --- end-to-end: the real worker, the real relay, a real websocket provider ----------------------
+#
+# The acceptance criterion for the streaming leg: the real ``stream_worker`` drives the real
+# relay on a temporary AF_UNIX socket, and the relay dials a REAL websocket provider —
+# ``FakeDeepgram``, an RFC 6455 server on loopback shared with the dictation tests through
+# conftest — with the real ``wsclient.connect``, reached through the endpoint the settings carry
+# and patched nowhere. The relay's two legs speak different framings, and this is the one place
+# the difference is visible from outside: the worker's 5-byte frames must arrive at the provider
+# as masked websocket frames (the fake decodes them itself and asserts the mask bit), and the
+# provider's unmasked frames must arrive at the worker as 5-byte frames its adapter can read.
+
+
+def _stream_state(client_module, monkeypatch, tmp_path):
+    """The worker's every state path, owned by the test — never the live state dir."""
+    state = tmp_path / "state"
+    state.mkdir()
+    monkeypatch.setattr(client_module, "_STATE_DIR", str(state))
+    monkeypatch.setattr(client_module, "_LOG_PATH", str(state / "dictate.log"))
+    monkeypatch.setattr(client_module, "_WAV_PATH", str(state / "dictate.wav"))
+    monkeypatch.setattr(client_module, "_PREVIEW_PATH", str(state / "dictate-preview.json"))
+    monkeypatch.setattr(client_module, "_STREAM_RESULT_PATH", str(state / "dictate-stream.json"))
+    monkeypatch.setattr(client_module, "_STREAM_PID_PATH", str(state / "dictate-stream.pid"))
+    return state
+
+
+def _wav_bytes(pcm: bytes) -> bytes:
+    """A real, canonical 44-byte-header WAV around some PCM."""
+    body = b"WAVEfmt " + struct.pack("<I", 16) + b"\x00" * 16 + b"data" + struct.pack("<I", len(pcm)) + pcm
+    return b"RIFF" + struct.pack("<I", len(body) + 4) + body
+
+
+@needs_af_unix
+def test_stream_worker_drives_the_full_relay_stream_leg_through_voice_mcp(
+    short_socket_dir, monkeypatch, tmp_path
+):
+    """The full streaming wire, end to end. The worker tails a real WAV file and frames its PCM
+    onto the relay's AF_UNIX socket; the relay converts each frame into a masked RFC 6455 frame
+    toward the fake provider and converts the provider's text frames back into 5-byte frames;
+    the worker surfaces the interim through the preview hook and assembles the finals into its
+    result document. Every hop is the shipping code — the only fake is the provider itself."""
+    module = _import_voice_mcp()
+    client_module = _import_dictate()
+    fake = FakeDeepgram()
+
+    # The relay socket, the way the proxy hands the worker a vouched path: 0700 dir,
+    # 0600 socket, owned by the current uid. The directory sits under short_socket_dir
+    # because the kernel caps a bound sun_path and pytest's temporary tree can overshoot
+    # that cap on its own.
+    runtime = short_socket_dir
+    sock_dir = runtime / "voice-loop"
+    sock_dir.mkdir(mode=0o700)
+    os.chmod(sock_dir, 0o700)
+    relay_listener = module._bind_socket(str(sock_dir / "stt.sock"))
+    assert relay_listener is not None
+    relay_listener.settimeout(15.0)
+
+    state = _stream_state(client_module, monkeypatch, tmp_path)
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(runtime))
+    # The key lives in the relay's environment; the worker reads none of it.
+    monkeypatch.setenv("CLAUDE_PLUGIN_OPTION_STT_API_KEY", "test-stt-key")
+    monkeypatch.setenv("CLAUDE_PLUGIN_OPTION_TTS_API_KEY", "")
+
+    # Capture every preview update — the file is overwritten as the transcript grows, so
+    # the interim is only visible to a hook that records each write.
+    real_write_preview = client_module._write_preview
+    preview_updates: list[dict] = []
+
+    def _record_preview(data, path):
+        preview_updates.append(dict(data))
+        real_write_preview(data, path)
+
+    monkeypatch.setattr(client_module, "_write_preview", _record_preview)
+
+    # A complete recording: the session is about the wire, not about waiting on a recorder.
+    # 1 MiB of PCM — several times an AF_UNIX send buffer — so the worker's burst of sends
+    # meets a FULL buffer before the clip is out: a poll that leaves the socket non-blocking
+    # fails right here (the send turns EAGAIN and the session degrades), a poll that keeps
+    # the socket's own timeout mode just waits for the relay to drain.
+    pcm = b"\x01\x02" * 524288
+    (state / "dictate.wav").write_bytes(_wav_bytes(pcm))
+
+    s = client_module.resolve_settings(
+        {
+            "stt": {
+                "backend": "cloud",
+                "model": "nova-3",
+                "cloud": {"provider": "deepgram", "streaming": True, "endpoint": fake.endpoint},
+            },
+            "dictate": {"preview": True},
+        },
+        "Linux",
+    )
+    assert client_module.streaming_wanted(s) is True
+
+    def _serve_relay():
+        conn, addr = relay_listener.accept()
+        try:
+            module._serve_one_client(conn, addr)
+        finally:
+            try:
+                conn.close()
+            except OSError:
+                pass
+
+    relay_thread = threading.Thread(target=_serve_relay, daemon=True)
+    relay_thread.start()
+
+    # A recorder pid of 0 is a recorder that is already gone: the worker streams the whole
+    # file, its tail wait ends deterministically, and it sends CloseStream — no live process
+    # to leak or race. The session still exercises the full read-tail-drain shape.
+    rc = client_module.stream_worker(s, ["0"])
+    assert rc == 0, f"stream_worker returned {rc}"
+
+    relay_thread.join(timeout=5)
+    assert not relay_thread.is_alive(), "the relay outlived the worker's session"
+    fake.server.stop()
+    assert fake.server.failure is None
+
+    # BOTH DIRECTIONS, on the provider's own wire. The PCM arrived as masked binary websocket
+    # frames — the fake's decoder asserts the mask bit — whole and in order…
+    assert bytes(fake.audio) == pcm
+    # …and the CloseStream control message arrived as a text frame, dispatched through the
+    # websocket's send_text rather than written as raw bytes.
+    texts = [payload for opcode, payload in fake.server.frames if opcode == module.wsclient.OP_TEXT]
+    assert any(b"CloseStream" in payload for payload in texts), f"text frames seen: {texts!r}"
+
+    # The worker's result document carries the assembled finals — the one the fake spoke
+    # while the audio flowed, and the trailing one it owed after CloseStream — and a clean
+    # status, which is what pins the round trip rather than a partial one.
+    result = client_module._read_stream_result()
+    assert result is not None, "stream worker wrote no result document"
+    assert result.get("status") == "ok", (
+        f"unexpected status: {result.get('status')!r} reason={result.get('reason')!r}"
+    )
+    finals = result.get("text", "")
+    assert "Привет, это" in finals, f"mid-stream final missing from worker result: {finals!r}"
+    assert "диктовка." in finals, f"trailing final missing from worker result: {finals!r}"
+
+    # The interim the provider spoke mid-stream reached the preview hook before the finals
+    # settled the span — interims are surfaced, not swallowed by the first final.
+    interims_seen = [u.get("interim") for u in preview_updates if u.get("interim")]
+    assert "привет это" in interims_seen, (
+        f"the interim never appeared in any preview update: {preview_updates!r}"
+    )
+    assert (state / "dictate-preview.json").exists(), "preview state file was never written"
+
+
+@needs_af_unix
+def test_a_provider_that_hangs_up_mid_stream_names_the_open_microphone(
+    short_socket_dir, monkeypatch, tmp_path
+):
+    """A provider closing the websocket while the recording is still live is a typed failure,
+    not a silence: the close opcode is forwarded through the converter, the worker's result
+    document carries the reason, and the worker exits 1 — the path the hotkey toggle answers by
+    degrading to the recorded clip."""
+    module = _import_voice_mcp()
+    client_module = _import_dictate()
+    fake = FakeDeepgram(close_early=True)
+
+    runtime = short_socket_dir
+    sock_dir = runtime / "voice-loop"
+    sock_dir.mkdir(mode=0o700)
+    os.chmod(sock_dir, 0o700)
+    relay_listener = module._bind_socket(str(sock_dir / "stt.sock"))
+    assert relay_listener is not None
+    relay_listener.settimeout(15.0)
+
+    state = _stream_state(client_module, monkeypatch, tmp_path)
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(runtime))
+    monkeypatch.setenv("CLAUDE_PLUGIN_OPTION_STT_API_KEY", "test-stt-key")
+    monkeypatch.setenv("CLAUDE_PLUGIN_OPTION_TTS_API_KEY", "")
+
+    pcm = b"\x01\x02" * 64
+    (state / "dictate.wav").write_bytes(_wav_bytes(pcm))
+
+    s = client_module.resolve_settings(
+        {
+            "stt": {
+                "backend": "cloud",
+                "model": "nova-3",
+                "cloud": {"provider": "deepgram", "streaming": True, "endpoint": fake.endpoint},
+            },
+        },
+        "Linux",
+    )
+    assert client_module.streaming_wanted(s) is True
+
+    def _serve_relay():
+        conn, addr = relay_listener.accept()
+        try:
+            module._serve_one_client(conn, addr)
+        finally:
+            try:
+                conn.close()
+            except OSError:
+                pass
+
+    relay_thread = threading.Thread(target=_serve_relay, daemon=True)
+    relay_thread.start()
+
+    # This test's own pid stands for a recorder that lives through the whole session, so the
+    # close the fake sends after the first audio frame arrives while the microphone is open —
+    # exactly the condition the typed reason names.
+    rc = client_module.stream_worker(s, [str(os.getpid())])
+    assert rc == 1, f"stream_worker returned {rc}"
+
+    relay_thread.join(timeout=5)
+    assert not relay_thread.is_alive(), "the relay outlived the worker's session"
+    fake.server.stop()
+
+    result = client_module._read_stream_result()
+    assert result is not None, "stream worker wrote no result document"
+    assert result.get("status") == "failed"
+    assert result.get("reason") == "the server closed the stream while the microphone was open"
+
+
+def test_stream_line_parsing_rejects_a_line_that_is_not_json():
+    """A stream line that does not parse is answered bad-request, not crashed on — the same
+    refusal the batch validator gives a malformed request line."""
+    module = _import_voice_mcp()
+    parsed, err = module._validate_stream_line("{not json")
+    assert parsed is None
+    assert err is not None and err.startswith("stream line is not valid JSON")
+
+
+def test_stream_line_parsing_rejects_a_line_that_is_not_a_json_object():
+    """A stream line that parses to a non-object (an array, a bare string) is not a request;
+    the validator refuses it rather than keying into a type the relay never speaks to."""
+    module = _import_voice_mcp()
+    parsed, err = module._validate_stream_line("[1, 2]")
+    assert parsed is None
+    assert err == "stream line is not a JSON object"
+
+
+def test_read_exact_returns_none_when_the_socket_read_raises():
+    """A read error is an ended stream, not a crash: the reader answers None so the caller
+    falls through to its typed failure — the same answer EOF gets."""
+    module = _import_voice_mcp()
+
+    class _BrokenClient:
+        def settimeout(self, _t):
+            pass
+
+        def recv(self, _n):
+            raise OSError("the worker's socket was reset")
+
+    assert module._read_exact(_BrokenClient(), 5) is None
+
+
+@needs_af_unix
+def test_stream_reply_failure_writes_the_reason_and_the_detail():
+    """The failure line carries the detail field whenever one is given — the client surfaces
+    that text to the operator, so a dropped detail is a lost diagnosis. The wire here is a
+    real AF_UNIX socketpair, so the platform without AF_UNIX has no wire to pin."""
+    module = _import_voice_mcp()
+    ours, theirs = _socket.socketpair(_socket.AF_UNIX, _socket.SOCK_STREAM)
+    try:
+        module._stream_reply_failure(ours, "provider-http-500", "the provider's refusal")
+        buf = b""
+        while not buf.endswith(b"\n"):
+            buf += theirs.recv(65536)
+        reply = json.loads(buf.decode())
+        assert reply == {
+            "status": "failed",
+            "reason": "provider-http-500",
+            "detail": "the provider's refusal",
+        }
+    finally:
+        ours.close()
+        theirs.close()
+
+
+def test_stream_reply_failure_swallows_a_dead_client_socket():
+    """The client may already be gone when the relay answers; the failure write must not
+    raise past the session's cleanup."""
+    module = _import_voice_mcp()
+
+    class _DeadClient:
+        def sendall(self, _data):
+            raise OSError("the worker hung up first")
+
+    assert module._stream_reply_failure(_DeadClient(), "no-key") is None
+
+
+def test_the_client_leg_pump_returns_without_reading_once_stopped():
+    """A session already stopped before the pump's first pass takes no frame and still
+    closes the provider leg — the metered connection never outlives the stop decision."""
+    module = _import_voice_mcp()
+
+    class _MustNotBeRead:
+        def settimeout(self, _t):
+            pass  # the pump sets its poll slice before it checks stop — that touch is fine
+
+        def recv(self, _n):
+            raise AssertionError("a stopped pump must not read a frame")
+
+    ws = _RecordingWS()
+    stop = threading.Event()
+    stop.set()
+    errors: list = []
+    module._pump_client_to_provider(
+        _MustNotBeRead(), ws, name="client->provider", errors=errors, stop=stop
+    )
+    assert errors == []
+    assert ws.binary == [] and ws.texts == []
+    assert ws.closed is True and stop.is_set()
+
+
+def test_stream_leg_answers_bad_request_for_a_stream_line_missing_its_keys():
+    """The stream leg validates its own line before anything is dialed: a request missing
+    the stream keys gets the bad-request reply on the stream wire, and no provider socket
+    is opened for it."""
+    module = _import_voice_mcp()
+    payload = json.dumps({"mode": "stream", "provider": "deepgram"})
+    fake = _FakeStreamClient(b"")
+    captured = {"dialed": False}
+
+    def _no_dial(*args, **kwargs):
+        captured["dialed"] = True
+        raise AssertionError("no dial should be made for a malformed stream line")
+
+    with mock.patch.dict(
+        os.environ,
+        {"CLAUDE_PLUGIN_OPTION_STT_API_KEY": "test-stt-key", "CLAUDE_PLUGIN_OPTION_TTS_API_KEY": ""},
+        clear=False,
+    ):
+        with mock.patch.object(module.wsclient, "connect", side_effect=_no_dial):
+            module._serve_stream_client(fake, payload, None)
+    reply = json.loads(fake.buf_out.decode())
+    assert reply["status"] == "failed"
+    assert reply["reason"] == "bad-request"
+    assert captured["dialed"] is False
+
+
+def test_stream_leg_closes_the_provider_leg_when_the_ok_line_write_fails():
+    """A worker that vanishes between its request line and the relay's ``ok`` leaves a dead
+    client socket; the write fails, and the provider connection the dial just opened comes
+    down with it — the session never reaches the frame pumps."""
+    module = _import_voice_mcp()
+    payload = _build_stream_line("deepgram", "ws://127.0.0.1:9/v1/listen")
+    fake_ws = _RecordingWS()
+
+    class _VanishedClient:
+        def settimeout(self, _t):
+            pass
+
+        def recv(self, _n):
+            return b""
+
+        def sendall(self, _data):
+            raise OSError("the worker closed its end")
+
+    with mock.patch.dict(
+        os.environ,
+        {"CLAUDE_PLUGIN_OPTION_STT_API_KEY": "test-stt-key", "CLAUDE_PLUGIN_OPTION_TTS_API_KEY": ""},
+        clear=False,
+    ):
+        with mock.patch.object(module.wsclient, "connect", return_value=fake_ws):
+            module._serve_stream_client(_VanishedClient(), payload.decode(), None)
+    assert fake_ws.closed is True, "the provider leg stayed open past the dead client"

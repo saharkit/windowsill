@@ -105,6 +105,7 @@ import ntpath
 import os
 import platform
 import re
+import select
 import shlex
 import shutil
 import signal
@@ -114,6 +115,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -1787,18 +1789,22 @@ def streaming_wanted(s: dict) -> bool:
     if: the cloud backend is the one that has a socket to open, ``stt.cloud.streaming`` is the
     opt-in, and the configured provider's entry actually carries a streaming variant. A config that
     asks for streaming from a provider that has none is answered by the batch path — with a line in
-    the log, because a silently ignored setting is how a user concludes the feature is broken."""
+    the log, because a silently ignored setting is how a user concludes the feature is broken.
+
+    On a platform without ``AF_UNIX`` (Windows, or stock Python without the socket module's
+    AF_UNIX constant) the worker is the actual no-op skill path: log the batch-only line and take
+    the batch path. The relay that the stream worker dials is an AF_UNIX socket, and a platform
+    without AF_UNIX is exactly the platform windowsill#5816 says cannot stream."""
     if not s["streaming"] or s["backend"] != "cloud" or s["stt_command"]:
         return False
     entry = resolve_stt_provider(s["stt_provider"])
     if entry.streaming is None:
         log(f"stt.cloud.streaming is on but {entry.name} has no streaming variant — using the batch path")
         return False
-    # Streaming is unreachable from production: the hotkey path holds no key. The relay's
-    # batch path is the substitute. This line is the contract — it tells the operator that
-    # the config asked for streaming and the credential-closure routed them to batch.
-    log("streaming needs a key the hotkey path no longer holds; using batch via the relay")
-    return False
+    if not hasattr(_socket, "AF_UNIX"):
+        log("stt.cloud.streaming: AF_UNIX unavailable on this platform — using batch via the relay")
+        return False
+    return True
 
 
 def wav_data_offset(head: bytes) -> int:
@@ -2201,13 +2207,17 @@ def run_stream_session(
 def stream_worker(s: dict, args: list[str]) -> int:
     """The child process: run the streaming session, write the one answer, exit.
 
-    The credential-closure change (#5816) made streaming cloud dictation unreachable from
-    the production path: the hotkey dictation script holds no key. The relay's batch path
-    is the substitute (the streaming cloud option logs a batch-only line on the toggle and
-    uses the relay batch path instead). The streaming subsystem (``run_stream_session``,
-    ``wsclient.py``) is kept and remains covered by its direct tests, which pass a key in
-    directly. ``_PREVIEW_PATH``, ``_write_preview`` and ``_clear_preview`` stay for those
-    direct tests; the body of this worker is the typed refusal below.
+    After #5881 the streaming path is reachable again: the worker dials the voice-loop MCP relay,
+    which holds the key, and the provider websocket is reached through the relay: the worker's
+    private 5-byte frames and the provider's RFC 6455 frames are converted inside the relay, so
+    ``run_stream_session`` runs UNCHANGED — the ``connect=`` argument takes the relay adapter in
+    place of ``wsclient.connect``, so every behaviour windowsill#99 and #115 test (interim
+    parsing, keepalive, close_message, drain) is exactly the same code.
+
+    The relay adapter reads ``run_stream_session``'s contract and ignores the headers argument
+    (``streaming.headers(key)`` would build auth headers from an empty key, which is the exact
+    thing the credential-closure removed). The relay builds the provider headers with the key it
+    holds.
     """
     stopping = {"now": False}
 
@@ -2216,8 +2226,332 @@ def stream_worker(s: dict, args: list[str]) -> int:
 
     signal.signal(signal.SIGTERM, _stop)
     signal.signal(signal.SIGINT, _stop)
-    _write_stream_result({"status": "failed", "reason": "streaming needs a key the hotkey path no longer holds"})
-    return 1
+    # The recorder PID is the second argv token, with no qualifier needed: the worker's only
+    # caller is this script's START toggle, which passes the live pid.
+    try:
+        recorder_pid = int(args[0]) if args else 0
+    except ValueError:
+        recorder_pid = 0
+    recorder_alive = lambda: bool(recorder_pid) and _pid_alive(recorder_pid)  # noqa: E731
+    entry = resolve_stt_provider(s["stt_provider"])
+    if entry.streaming is None:
+        _write_stream_result(
+            {"status": "failed", "reason": f"provider {entry.name!r} has no streaming variant"}
+        )
+        return 1
+    # The provider URL the registry would have built is the URL the relay dials (windowsill#5881
+    # R1, the same-user rule): the worker takes the URL the registry computes today. The relay
+    # resolves the key.
+    try:
+        url = entry.streaming.url(entry.streaming, entry, s)
+    except (AttributeError, KeyError, TypeError) as err:
+        _write_stream_result({"status": "failed", "reason": f"streaming url build failed: {err}"})
+        return 1
+    adapter = _RelayStreamAdapter(
+        s,
+        provider_name=entry.name,
+        url=url,
+        tts_vendor=s.get("tts_vendor", ""),
+        timeout=STREAM_CONNECT_TIMEOUT,
+    )
+    outcome: dict = {"status": "failed", "reason": "stream session did not run"}
+
+    def _run() -> None:
+        try:
+            adapter.open()
+        except wsclient.WebSocketError as err:
+            outcome.clear()
+            outcome.update({"status": "failed", "reason": str(err)})
+            return
+        try:
+            outcome.clear()
+            outcome.update(
+                run_stream_session(
+                    s,
+                    entry,
+                    "",  # no key: the relay holds it (windowsill#5881 R3)
+                    stopping=lambda: stopping["now"],
+                    recorder_alive=recorder_alive,
+                    wav_path=_WAV_PATH,
+                    connect=adapter.connect_to_provider,  # noqa: E501 — slot used by the adapter
+                    on_interim=_preview_writer(s),
+                )
+            )
+        except wsclient.WebSocketError as err:
+            outcome.clear()
+            outcome.update({"status": "failed", "reason": str(err)})
+        except OSError as err:
+            outcome.clear()
+            outcome.update({"status": "failed", "reason": f"recording could not be read: {err}"})
+        finally:
+            # ``_RelayStreamAdapter.close`` swallows OSError on both of its own socket calls,
+            # so there is no failure left for this arm to catch.
+            adapter.close()
+
+    run_thread = threading.Thread(target=_run, daemon=True)
+    run_thread.start()
+    while run_thread.is_alive():
+        time.sleep(STREAM_IDLE_POLL)
+    _write_stream_result(outcome)
+    return 0 if outcome.get("status") == "ok" else 1
+
+
+# --- the relay adapter (windowsill#5881) -----------------------------------------------------
+#
+# ``run_stream_session`` expects a ``connect=`` callable whose shape is ``wsclient.connect``:
+# ``(url, headers, timeout=...)`` -> an object with ``send_binary``, ``send_text``, ``poll``,
+# ``close``, ``closed``. The worker dials the relay over the vouched AF_UNIX socket and asks the
+# relay to dial the provider; the relay CONVERTS between this adapter's 5-byte frames and the
+# provider's RFC 6455 websocket, so the adapter speaks only the private framing. The adapter
+# EXPOSES the wsclient methods over that socket and IGNORES ``headers`` (the relay builds them
+# with the key it holds).
+#
+# Every adapter failure (no socket, a vouching refusal, a failed stream line, EOF mid-stream) is
+# raised in the adapter as ``wsclient.WebSocketError`` — ``run_stream_session`` already maps that
+# to a ``failed`` snapshot, and the stop toggle (the cycle that called this worker) takes the
+# batch fallback. A recording is never lost to the stream path.
+
+
+class _RelayStreamAdapter:
+    """A ``wsclient.WebSocket``-shaped object backed by the relay's AF_UNIX socket.
+
+    The adapter owns the receipt's wire envelope: one UTF-8 JSON stream line terminated by
+    ``\\n``, then one UTF-8 JSON reply line ``{"status": "ok"}`` or
+    ``{"status": "failed", "reason": R}``. After ``ok``, both sides carry framed bytes
+    (1-byte opcode, 4-byte big-endian length, payload).
+
+    The methods ``send_binary`` / ``send_text`` / ``poll`` / ``close`` and the attribute
+    ``closed`` are the contract ``run_stream_session`` reads from ``wsclient.WebSocket`` —
+    the adapter implements only those and nothing else.
+    """
+
+    OP_TEXT = wsclient.OP_TEXT
+    OP_BINARY = wsclient.OP_BINARY
+    OP_CLOSE = wsclient.OP_CLOSE
+
+    def __init__(
+        self,
+        s: dict,
+        *,
+        provider_name: str,
+        url: str,
+        tts_vendor: str,
+        timeout: float,
+    ) -> None:
+        self._s = s
+        self._provider_name = provider_name
+        self._url = url
+        self._tts_vendor = tts_vendor
+        self._timeout = float(timeout)
+        self._sock: _socket.socket | None = None
+        self.closed = False
+        # Where the stop-side adapter writes its bytes — the same frame the relay
+        # reads on the client->provider leg. ``_buf_out`` is the queue of whole frames
+        # the worker has SENT, ``_buf_in`` is the queue of frames the relay has
+        # FORWARDED FROM THE PROVIDER. ``poll`` returns up to ``_buf_in``'s frames
+        # without blocking — the worker is a polling loop, not a recv thread.
+        self._buf_in: list[tuple[int, bytes]] = []
+
+    def open(self) -> None:
+        """Dial the relay and parse the ok/fail reply line.
+
+        Every failure here is a ``wsclient.WebSocketError`` so the caller's one
+        ``except`` covers every transport-level problem (a refused connect, a
+        ``no-key``, a ``clear-text-refused``, a malformed line, a ``timeout`` from
+        the relay's wall-clock bound)."""
+        if not hasattr(_socket, "AF_UNIX"):
+            raise wsclient.WebSocketError("AF_UNIX unavailable on this platform")
+        path = _relay_socket_path()
+        if not _relay_socket_safe(path):
+            raise wsclient.WebSocketError("relay socket not safe (foreign owner / wrong mode)")
+        sock = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+        # The whole stream must fit in the relay's connect-time wall-clock bound
+        # (``STREAM_CONNECT_TIMEOUT``) plus 5 seconds, so the adapter's socket
+        # timeout sits there too.
+        sock.settimeout(self._timeout + 5.0)
+        try:
+            sock.connect(path)
+        except OSError as err:
+            try:
+                sock.close()
+            except OSError:
+                pass
+            raise wsclient.WebSocketError(f"relay connect refused: {err}") from err
+        line = json.dumps(
+            {
+                "mode": "stream",
+                "provider": self._provider_name,
+                "url": self._url,
+                "tts_vendor": self._tts_vendor,
+                "timeout": self._timeout,
+            }
+        )
+        try:
+            sock.sendall(line.encode("utf-8") + b"\n")
+        except OSError as err:
+            sock.close()
+            raise wsclient.WebSocketError(f"relay write failed: {err}") from err
+        # Read one JSON reply line, terminated by ``\n``.
+        buf = b""
+        try:
+            while not buf.endswith(b"\n"):
+                chunk = sock.recv(65536)
+                if not chunk:
+                    break
+                buf += chunk
+                if len(buf) > 65536:
+                    sock.close()
+                    raise wsclient.WebSocketError("relay reply over 64 KiB")
+        except OSError as err:
+            sock.close()
+            raise wsclient.WebSocketError(f"relay read failed: {err}") from err
+        if not buf.endswith(b"\n"):
+            sock.close()
+            raise wsclient.WebSocketError("relay closed before sending a reply line")
+        try:
+            reply = json.loads(buf[:-1].decode("utf-8"))
+        except (ValueError, UnicodeDecodeError) as err:
+            sock.close()
+            raise wsclient.WebSocketError(f"relay reply not JSON: {err}") from err
+        if not isinstance(reply, dict):
+            sock.close()
+            raise wsclient.WebSocketError("relay reply is not a JSON object")
+        if reply.get("status") != "ok":
+            reason = reply.get("reason", "provider-unreachable")
+            sock.close()
+            raise wsclient.WebSocketError(f"relay refused stream: {reason}")
+        self._sock = sock
+
+    def connect_to_provider(self, url, headers, *, timeout=10.0):  # noqa: ARG002 — URL/headers live at open() time
+        """The ``connect=`` slot ``run_stream_session`` reads. Returns self."""
+        # ``run_stream_session`` calls ``connect(url, streaming.headers(key), timeout=...)``;
+        # the URL and headers are the worker's local computation, but the relay already
+        # dialed using them. We keep the method shape (``url``, ``headers``, ``timeout``)
+        # so the seam is identical and a swap-in of ``wsclient.connect`` works without
+        # any signature drift; the second-and-third arg are deliberately unused here.
+        del url, headers, timeout
+        if self._sock is None:
+            raise wsclient.WebSocketError("relay stream adapter was not opened")
+        if self.closed:
+            raise wsclient.WebSocketError("the relay stream is closed")
+        return self
+
+    # --- wsclient.WebSocket-shaped surface -----------------------------------------
+
+    def send_binary(self, payload: bytes) -> None:
+        self._send(self.OP_BINARY, payload)
+
+    def send_text(self, text: str) -> None:
+        self._send(self.OP_TEXT, text.encode("utf-8"))
+
+    def _send(self, opcode: int, payload: bytes) -> None:
+        if self.closed or self._sock is None:
+            raise wsclient.WebSocketError("the relay stream is closed")
+        if len(payload) > wsclient.MAX_FRAME_BYTES:
+            raise wsclient.WebSocketError(
+                f"frame over {wsclient.MAX_FRAME_BYTES} bytes"
+            )
+        try:
+            self._sock.sendall(bytes([opcode]) + len(payload).to_bytes(4, "big") + payload)
+        except OSError as err:
+            self.closed = True
+            raise wsclient.WebSocketError(f"relay write failed: {err}") from err
+
+    def _recv_exact(self, count: int) -> bytes | None:
+        """Read exactly ``count`` bytes in the socket's own timeout mode.
+
+        None is the typed failure — an EOF mid-read or a dead socket — so the
+        caller ends the stream instead of handing a partial frame up. The socket
+        keeps the timeout ``open()`` gave it; this helper never touches the
+        blocking mode."""
+        buf = b""
+        while len(buf) < count:
+            try:
+                chunk = self._sock.recv(count - len(buf))  # type: ignore[union-attr] — guarded by poll
+            except OSError:
+                return None
+            if not chunk:
+                return None
+            buf += chunk
+        return buf
+
+    def poll(self, timeout: float) -> list[tuple[int, bytes]]:
+        """The frames already available within ``timeout``, and nothing more.
+
+        ``run_stream_session`` polls with a small positive timeout (idle) or 0.0
+        (active). Frames already in the buffer drain first. The socket's blocking
+        mode is NEVER touched: readability is ``select``'s question, not a reason
+        to flip the socket to non-blocking — a poll that left it there would turn
+        the next ``sendall`` into an EAGAIN the moment the send buffer was full,
+        and the session into a batch fallback. When a frame has started arriving
+        it is read WHOLE in the socket's own timeout mode; a frame that cannot
+        complete is a dead stream, and the adapter closes. A quiet socket answers
+        an empty list, so the polling loop owns the clock."""
+        frames = list(self._buf_in)
+        self._buf_in.clear()
+        if frames:
+            return frames
+        if self._sock is None or self.closed:
+            return []
+        try:
+            ready, _, _ = select.select([self._sock], [], [], timeout)
+        except (OSError, ValueError):
+            self.closed = True
+            return []
+        if not ready:
+            return []
+        head = self._recv_exact(5)
+        if head is None:
+            self.closed = True
+            return []
+        opcode = head[0]
+        length = int.from_bytes(head[1:5], "big")
+        payload = self._recv_exact(length) if length else b""
+        if payload is None:
+            self.closed = True
+            return []
+        # A control frame is meaningful with an empty payload: a bare close
+        # opcode and a zero length is the provider hanging up, so the length
+        # guard must not swallow it — the session ends on that frame.
+        if length > 0 or opcode == self.OP_CLOSE:
+            frames.append((opcode, payload))
+        return frames
+
+    def close(self) -> None:
+        if self._sock is not None and not self.closed:
+            try:
+                self._sock.sendall(bytes([self.OP_CLOSE]) + (0).to_bytes(4, "big"))
+            except OSError:
+                pass
+        self.closed = True
+        if self._sock is not None:
+            try:
+                self._sock.close()
+            except OSError:
+                pass
+            self._sock = None
+
+
+def _preview_writer(s: dict):
+    """The live-preview hook ``run_stream_session`` calls after every transcript update.
+
+    ``s`` carries the preview opt-in — when ``dictate.preview`` is on, the hook writes the
+    current interim and the assembled finals to the preview file (``_PREVIEW_PATH``) for the
+    ``preview.py`` overlay to read. When the opt-in is off, returns None, and ``run_stream_session``
+    does not call the hook."""
+    if not s.get("preview"):
+        return None
+
+    def _hook(interim: str, assembled: str) -> None:
+        try:
+            _write_preview(
+                {"interim": interim, "assembled": assembled, "ts": time.time()},
+                _PREVIEW_PATH,
+            )
+        except OSError:
+            pass
+
+    return _hook
 
 
 def debounce_toggle(window: float, now: float | None = None) -> float | None:

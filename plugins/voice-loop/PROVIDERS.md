@@ -59,6 +59,12 @@ the whole clip uploads and transcribes. A provider whose entry carries a **strea
 be fed the recording *while the microphone is open*, so by the time you stop, the transcript is
 already assembled and the only wait left is the server flushing its last words.
 
+The hotkey dictation path holds no provider key — the voice-loop plugin MCP server does, and the
+streaming path runs **through** the same Unix-domain socket the batch path uses
+([#5881](https://github.com/saharkit/windowsill/issues/5881)). The wire is one UTF-8 JSON stream
+line, then framed bytes both ways. The relay holds the credentials and dials the provider's
+websocket — the worker holds none.
+
 | provider | streaming variant | what turning it on does |
 |---|---|---|
 | `openai` (STT) | — | nothing: the setting is ignored, with a line in `dictate.log` saying so |
