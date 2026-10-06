@@ -212,19 +212,28 @@ def test_stt_cloud_endpoint_defaults_to_empty():
     assert dictate.resolve_settings({}, "Linux")["cloud_endpoint"] == ""
 
 
+def test_unknown_stt_cloud_provider_falls_back_to_the_default_entry_loudly(state):
+    """A typo in ``stt.cloud.provider`` lands on the default provider entry, and says so in the
+    dictate log — silently landing on a wrong provider's wire shape is the historical failure this
+    guard exists to name."""
+    s = dictate.resolve_settings({"stt": {"cloud": {"provider": "no-such-provider"}}}, "Linux")
+    assert s["stt_provider"] == providers.STT_PROVIDERS[providers.DEFAULT_STT].name
+    assert "stt.cloud.provider is not a known provider" in _log_of(state)
+
+
+def test_unknown_tts_cloud_provider_raises_at_configuration_time(state):
+    """A typo in ``tts.cloud.provider`` is a hard error, not a silent default: the STT provider
+    falls back loudly, but the TTS side raises, and the raise is what resolve_settings surfaces
+    to the caller. Pinned as the current contract of the mirror lookup."""
+    with pytest.raises(ValueError, match="unknown tts.cloud.provider"):
+        dictate.resolve_settings({"tts": {"cloud": {"provider": "no-such-provider"}}}, "Linux")
+
+
 def test_oversized_config_is_ignored(tmp_path):
     """L2: a malformed giant config must fail closed instead of consuming the hotkey process."""
     config = tmp_path / "config.json"
     config.write_bytes(b"{" + b"x" * dictate.MAX_CONFIG_BYTES)
     assert dictate.load_config(str(config)) == {}
-
-
-def test_bounded_text_rejects_a_file_that_cannot_be_read(state, tmp_path):
-    """L2: an input that exists but cannot be read is rejected, never half-accepted."""
-    unreadable = tmp_path / "adir"
-    unreadable.mkdir()
-    assert dictate._read_bounded_text(str(unreadable), 16, label="config") is None
-    assert "bounded input: config unreadable" in (state / "dictate.log").read_text(encoding="utf-8")
 
 
 # --- the recorder table: auto-selection and the exact device/format flags -----------------------
@@ -2380,6 +2389,296 @@ def test_relay_silent_past_client_deadline_logs_reason_timeout_and_falls_back_to
     assert "reason=timeout" in log_text, (
         f"the typed-failure reason did not reach the log; got: {log_text!r}"
     )
+
+
+def _cloud_settings(timeout: float = 5.0) -> dict:
+    """Resolved cloud-backend settings for a relay dial: the deepgram entry, a direct endpoint
+    nothing ever dials (the relay is the only wire), and a caller-chosen deadline."""
+    return dictate.resolve_settings(
+        {
+            "stt": {
+                "backend": "cloud",
+                "cloud": {"provider": "deepgram", "endpoint": "http://127.0.0.1:9"},
+                "timeout": timeout,
+            }
+        },
+        "Linux",
+    )
+
+
+def _bind_scripted_relay(env_dir: Path, script) -> tuple[socket.socket, threading.Thread]:
+    """Bind a real relay socket under a runtime dir and hand the accepted connection to
+    ``script`` — the tests below use it to stand for each relay misbehaviour the client
+    must survive (closing without reading, silence, a non-JSON line, a non-dict line, a
+    clean ok). The modes are what the client's own safety check requires."""
+    sock_dir = env_dir / "voice-loop"
+    sock_dir.mkdir(mode=0o700, exist_ok=True)
+    os.chmod(sock_dir, 0o700)
+    sock_path = sock_dir / "stt.sock"
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server.bind(str(sock_path))
+    os.chmod(sock_path, 0o600)
+    server.listen(1)
+
+    def _serve():
+        try:
+            conn, _ = server.accept()
+        except OSError:
+            return
+        with conn:
+            script(conn)
+
+    t = threading.Thread(target=_serve, daemon=True)
+    t.start()
+    return server, t
+
+
+@needs_af_unix
+def test_relay_socket_absent_falls_back_to_local_whisper(state, monkeypatch, short_socket_dir):
+    """A clean 0700 runtime dir with NO socket bound is the everyday no-session state: the
+    client's safety check cannot vouch for an entry that is not there, the relay dial
+    returns None, and the cloud attempt degrades to the local whisper server — a transcript
+    still lands on the clipboard."""
+    env_dir = short_socket_dir / "runtime"
+    env_dir.mkdir()
+    sock_dir = env_dir / "voice-loop"
+    sock_dir.mkdir(mode=0o700)
+    os.chmod(sock_dir, 0o700)  # deliberately NO stt.sock inside
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(env_dir))
+    monkeypatch.delenv("CLAUDE_PLUGIN_OPTION_STT_API_KEY", raising=False)
+
+    local_transcript = "the local whisper fallback produced this"
+    monkeypatch.setattr(dictate, "_transcribe_lan", lambda *a, **kw: local_transcript)
+
+    s = _cloud_settings()
+    (state / "dictate.wav").write_bytes(b"RIFFfakewav")
+    assert dictate.transcribe(s) == local_transcript
+    assert "relay socket not safe" in _log_of(state)
+
+
+@needs_af_unix
+def test_relay_write_failure_falls_back_without_a_transcript(state, monkeypatch, short_socket_dir):
+    """A relay that accepts and then drops the connection without reading is answered with
+    None: the write failure is logged and the caller degrades. The WAV is far larger than a
+    socket buffer and the relay closes while the client is still mid-sendall, so the kernel's
+    reset — not a faked socket — is what raises."""
+    env_dir = short_socket_dir / "runtime"
+    env_dir.mkdir()
+
+    def _close_without_reading(conn):
+        time.sleep(0.3)
+        conn.close()
+
+    server, t = _bind_scripted_relay(env_dir, _close_without_reading)
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(env_dir))
+    big_wav = b"RIFF" + b"\x00" * (2 * 1024 * 1024)
+    result = dictate._relay_transcribe(
+        _cloud_settings(), providers.STT_PROVIDERS["deepgram"], big_wav
+    )
+    server.close()
+    t.join(timeout=2)
+
+    assert result is None
+    assert "cloud stt: relay write failed" in _log_of(state)
+
+
+@needs_af_unix
+def test_relay_recv_past_the_client_deadline_reports_reason_timeout(
+    state, monkeypatch, short_socket_dir
+):
+    """The client's own deadline, not the relay's politeness: a relay that holds the
+    connection open without ever replying makes recv raise past ``stt.timeout + 5 s``, and
+    the answer is the typed ``timeout`` failure the caller logs before degrading."""
+    env_dir = short_socket_dir / "runtime"
+    env_dir.mkdir()
+
+    def _hold_open(conn):  # noqa: ARG001 — the hold itself is the behaviour under test
+        time.sleep(5.6)  # past the client's deadline (0.1 s + 5 s), never a reply
+
+    server, t = _bind_scripted_relay(env_dir, _hold_open)
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(env_dir))
+    result = dictate._relay_transcribe(
+        _cloud_settings(timeout=0.1), providers.STT_PROVIDERS["deepgram"], b"RIFFfakewav"
+    )
+    server.close()
+    t.join(timeout=1)
+
+    assert result == {"status": "failed", "reason": "timeout"}
+    assert "relay silent past deadline" in _log_of(state)
+
+
+@needs_af_unix
+def test_relay_reply_that_is_not_json_reports_provider_unreachable(
+    state, monkeypatch, short_socket_dir
+):
+    """A newline-terminated reply that does not parse is the provider's failure, not the
+    relay wire's: the typed answer is ``provider-unreachable`` and the caller degrades."""
+    env_dir = short_socket_dir / "runtime"
+    env_dir.mkdir()
+
+    def _reply_garbage(conn):
+        while True:
+            chunk = conn.recv(65536)
+            if not chunk:
+                break
+        conn.sendall(b"not json at all\n")
+
+    server, t = _bind_scripted_relay(env_dir, _reply_garbage)
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(env_dir))
+    result = dictate._relay_transcribe(
+        _cloud_settings(), providers.STT_PROVIDERS["deepgram"], b"RIFFfakewav"
+    )
+    server.close()
+    t.join(timeout=2)
+
+    assert result == {"status": "failed", "reason": "provider-unreachable"}
+
+
+@needs_af_unix
+def test_relay_reply_that_is_not_a_dict_reports_provider_unreachable(
+    state, monkeypatch, short_socket_dir
+):
+    """A reply that parses but is not an object — a bare list, say — is the same typed
+    failure: the wire contract is one JSON object per reply, and anything else is the
+    provider's unreachable arm, never a crash in the hotkey process."""
+    env_dir = short_socket_dir / "runtime"
+    env_dir.mkdir()
+
+    def _reply_list(conn):
+        while True:
+            chunk = conn.recv(65536)
+            if not chunk:
+                break
+        conn.sendall(b"[1, 2, 3]\n")
+
+    server, t = _bind_scripted_relay(env_dir, _reply_list)
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(env_dir))
+    result = dictate._relay_transcribe(
+        _cloud_settings(), providers.STT_PROVIDERS["deepgram"], b"RIFFfakewav"
+    )
+    server.close()
+    t.join(timeout=2)
+
+    assert result == {"status": "failed", "reason": "provider-unreachable"}
+
+
+class _CloseRefusesOnce(socket.socket):
+    """A REAL socket whose close() reports failure exactly once — the one honest way to stand
+    in for the kernel refusing a close without faking any other part of the wire. The
+    descriptor is really closed first, so no connection leaks; the refusal that follows is
+    the event the finally-arm under test must swallow."""
+
+    _refused = False
+
+    def close(self) -> None:
+        super().close()
+        if not self._refused:
+            self._refused = True
+            raise OSError("close refused (stand-in for a kernel close failure)")
+
+
+class _SocketModuleWhoseClosesRefuse:
+    """The ``dictate._socket`` surface with ``socket`` swapped for the refusing subclass."""
+
+    AF_UNIX = socket.AF_UNIX
+    SOCK_STREAM = socket.SOCK_STREAM
+    SHUT_WR = socket.SHUT_WR
+
+    @staticmethod
+    def socket(*args, **kwargs):
+        return _CloseRefusesOnce(*args, **kwargs)
+
+
+@needs_af_unix
+def test_relay_close_failure_is_swallowed_and_the_reply_still_returns(
+    state, monkeypatch, short_socket_dir
+):
+    """The dial's cleanup is best-effort: a close that fails must not eat an already-received
+    reply. The relay answers a clean ok, the client's socket reports a close failure, and
+    the typed reply is returned anyway."""
+    env_dir = short_socket_dir / "runtime"
+    env_dir.mkdir()
+
+    def _reply_ok(conn):
+        while True:
+            chunk = conn.recv(65536)
+            if not chunk:
+                break
+        conn.sendall((json.dumps({"status": "ok", "text": "fine"}) + "\n").encode())
+
+    server, t = _bind_scripted_relay(env_dir, _reply_ok)
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(env_dir))
+    monkeypatch.setattr(dictate, "_socket", _SocketModuleWhoseClosesRefuse)
+    result = dictate._relay_transcribe(
+        _cloud_settings(), providers.STT_PROVIDERS["deepgram"], b"RIFFfakewav"
+    )
+    server.close()
+    t.join(timeout=2)
+
+    assert result == {"status": "ok", "text": "fine"}
+
+
+@needs_af_unix
+def test_relay_socket_safe_refuses_a_permissive_socket_directory(tmp_path):
+    """A group/other-accessible parent directory is refused even when it is ours: the 0700
+    requirement is what keeps another user from swapping the socket entry out from under
+    the vouch-for-it check."""
+    sock_dir = tmp_path / "voice-loop"
+    sock_dir.mkdir(mode=0o755)
+    os.chmod(sock_dir, 0o755)
+    assert not dictate._relay_socket_safe(str(sock_dir / "stt.sock"))
+
+
+@needs_af_unix
+def test_relay_socket_safe_refuses_a_foreign_owned_socket_entry(short_socket_dir, monkeypatch):
+    """A socket entry owned by another user is refused even from a clean, self-owned 0700
+    directory. A test cannot create a foreign-owned file without privileges it must not
+    have, so the uid the client compares against — a kernel-owned boundary — answers the
+    directory check with the real uid and the socket check with a different one: exactly
+    the state a hostile same-host user's socket inside our directory would present."""
+    sock_dir = short_socket_dir / "voice-loop"
+    sock_dir.mkdir(mode=0o700)
+    os.chmod(sock_dir, 0o700)
+    sock_path = sock_dir / "stt.sock"
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server.bind(str(sock_path))
+    os.chmod(sock_path, 0o600)
+    server.close()
+
+    real_uid = os.getuid()
+    uids = iter((real_uid, real_uid + 1))
+    monkeypatch.setattr(dictate.os, "getuid", lambda: next(uids))
+    assert not dictate._relay_socket_safe(str(sock_path))
+
+
+def test_relay_socket_path_falls_back_to_the_state_home_when_no_runtime_dir(tmp_path, monkeypatch):
+    """No XDG_RUNTIME_DIR means the relay socket lives under the state home — the same
+    relocation the relay's own binder honours, mirrored client-side."""
+    monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+    assert dictate._relay_socket_path() == str(tmp_path / "voice-loop" / "relay" / "stt.sock")
+
+
+def test_relay_socket_path_expands_the_default_state_home_when_state_home_is_empty(
+    tmp_path, monkeypatch
+):
+    """An empty XDG_STATE_HOME is an absent one: the default ~/.local/state, expanded against
+    HOME — and a blank XDG_RUNTIME_DIR is as good as no runtime dir."""
+    monkeypatch.setenv("XDG_RUNTIME_DIR", "   ")
+    monkeypatch.delenv("XDG_STATE_HOME", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    assert dictate._relay_socket_path() == str(
+        tmp_path / ".local" / "state" / "voice-loop" / "relay" / "stt.sock"
+    )
+
+
+def test_lan_post_to_a_refused_endpoint_logs_stt_unreachable(state):
+    """The LAN path's own failure arm: a loopback port nothing answers is an unreachable
+    endpoint — logged as such and answered with an empty transcript (``None`` from the
+    POST, the empty string from the response parser) so the caller can degrade. The
+    request is a real dial to a loopback port that refuses it; nothing is faked."""
+    assert dictate._transcribe_lan("http://127.0.0.1:1", "en", b"RIFFfakewav", 2.0) == ""
+    assert "stt unreachable" in _log_of(state)
 
 
 # --- the cross-module framing loop: dictate's multipart through the real /stt -------------------

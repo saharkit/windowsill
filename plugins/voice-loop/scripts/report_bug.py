@@ -418,7 +418,6 @@ LOG_RULES: tuple[tuple[str, str | None], ...] = (
     # so a config that still carries them is warned about. The names never
     # appear in argv or the log; the line is configuration metadata only.
     ("config ignored: ", None),
-    ("bounded input: ", None),
     ("marker with no text", None),
     ("ledger unwritable: ", None),
     ("ledger trim failed: ", None),

@@ -299,13 +299,6 @@ def render(report: dict) -> str:
         lines.append(f"OK: certificates verify from this interpreter — {report['detail']}")
         if report.get("fixed"):
             lines.insert(1, f"    repaired by: {report['fix']['command']}")
-        if report.get("proxy"):
-            # The one thing this green does NOT cover: `pip` and the model download go through the
-            # proxy this probe stepped around, and its CA has to be trusted separately.
-            lines.append(
-                f"    Note: {report['proxy']} is set and this probe bypassed it — pip and the model "
-                "download will not, so a proxy with an untrusted CA can still fail from here."
-            )
         return "\n".join(lines)
     if report["result"] == "unreachable":
         lines.append(f"UNKNOWN: {report['url']} could not be reached — {report['detail']}")

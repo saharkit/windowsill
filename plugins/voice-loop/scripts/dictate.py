@@ -211,10 +211,9 @@ STREAM_HEADER_PROBE_BYTES = 4096
 STREAM_HEADER_TIMEOUT = 3.0
 
 # Input limits at the boundaries this script does not own.  The values are deliberately generous
-# for ordinary dictation, but finite: a broken microphone, endpoint, key file or state file must not
+# for ordinary dictation, but finite: a broken microphone, endpoint or state file must not
 # turn a hotkey into an unbounded read.
 MAX_CONFIG_BYTES = 1 << 20
-MAX_KEY_BYTES = 16 << 10
 MAX_RESPONSE_BYTES = 4 << 20
 MAX_AUDIO_BYTES = 128 << 20
 MAX_STATE_BYTES = 4 << 10
@@ -331,37 +330,17 @@ def _host_addresses(host: str) -> list[str]:
 
 def _clear_text_refusal(s: dict) -> str | None:
     """The clear-text endpoint policy no longer applies here — the relay holds the
-    key, and the relay's own clear-text refusal (R4) is what fires. This function
-    remains in place because the dictation configuration step calls it, but the
-    client cannot know whether a key exists, so it cannot decide whether the
-    relay will refuse on this connection. The relay's typed ``clear-text-refused``
-    reply is the only signal the client logs.
+    key, and the relay's own clear-text refusal (R4) is what fires. Nothing calls
+    this at configuration time any more: the client cannot know whether a key
+    exists, so it cannot decide whether the relay will refuse on this connection,
+    and the relay's typed ``clear-text-refused`` reply is the only signal the
+    client logs. The function stays as the pinned no-op contract.
 
     A ``None`` here is the only correct answer: it lets the request go to the
     relay, where the refusal is decided. Returning a refusal string here would
     re-implement the rule without the key, and the two would diverge.
     """
     return None
-
-
-def _read_bounded_text(path: str, limit: int, *, label: str) -> str | None:
-    """Read a state/config input with a hard byte ceiling and no partial acceptance."""
-    try:
-        with open(path, "rb") as fh:
-            raw = fh.read(limit + 1)
-    except FileNotFoundError:
-        raise
-    except OSError as err:
-        log(f"bounded input: {label} unreadable ({path}): {type(err).__name__}")
-        return None
-    if len(raw) > limit:
-        log(f"bounded input: {label} rejected ({path}): over {limit} bytes")
-        return None
-    try:
-        return raw.decode("utf-8")
-    except UnicodeDecodeError as err:
-        log(f"bounded input: {label} rejected ({path}): {type(err).__name__}")
-        return None
 
 
 def load_config(path: str) -> dict:
@@ -423,8 +402,6 @@ def resolve_paste_target(value) -> str:
 def resolve_tts_provider(name: str):
     """Mirror of speak.resolve_tts_provider — kept local so the dictate script does not
     import speak (speak is the Stop hook process; dictating must not load it)."""
-    if not name:
-        name = providers.DEFAULT_TTS
     entry = providers.TTS_PROVIDERS.get(name)
     if entry is None:
         raise ValueError(f"unknown tts.cloud.provider: {name!r}")
@@ -1300,8 +1277,6 @@ def _relay_socket_safe(path: str) -> bool:
     parent directory is not mode 0700. Same-user processes on a hostile multi-user host
     are the threat; this is the *client*'s vouch-for-it check. The relay's stale-socket
     takeover lives on the other side of the connection."""
-    if not hasattr(os, "getuid"):
-        return True  # Windows — no AF_UNIX relay path is attempted (handled below)
     try:
         dir_st = os.stat(os.path.dirname(path))
     except OSError:
@@ -1338,8 +1313,6 @@ def _relay_transcribe(s: dict, entry, wav_bytes: bytes) -> dict | None:
     if not _relay_socket_safe(path):
         log("cloud stt: relay socket not safe (foreign owner / wrong mode) — falling back to local whisper")
         return None
-    if not os.path.exists(path):
-        return None  # no relay bound — caller falls back to local whisper
     request_line = json.dumps(
         {
             "provider": entry.name,
@@ -2660,13 +2633,6 @@ def main(argv: list[str]) -> int:
     system = platform.system()
     cfg_path = contracts.config_path()
     s = resolve_settings(load_config(cfg_path), system)
-
-    # The endpoint policy, at configuration time — before any request is built or socket dialed,
-    # and ahead of every path below (the toggle, the transcription, the streaming worker).
-    refusal = _clear_text_refusal(s)
-    if refusal:
-        log(refusal)
-        return 1
 
     # The streaming worker (windowsill#99) is this same script, spawned by its own START toggle —
     # never a hotkey invocation. It is dispatched here, ABOVE the debounce and the pidfile mutex,
