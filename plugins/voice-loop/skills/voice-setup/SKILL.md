@@ -2,7 +2,7 @@
 name: voice-setup
 description: Install and configure the voice-loop contour on this machine — probe the OS and hardware, pick a language and speech backends (local, LAN, or cloud), install dependencies in user space, write ~/.config/voice-loop/config.json, wire a push-to-talk hotkey, and prove it works with the hardware-free loopback selftest. Use when the user asks to set up voice, dictation, speak-back, text-to-speech or speech-to-text for Claude Code.
 argument-hint: "[local|lan|cloud] [language]"
-allowed-tools: [Read, Write, Edit, Glob, AskUserQuestion]
+allowed-tools: [Read, Edit(~/.config/voice-loop/config.json), Edit(~/.config/systemd/user/voice-loop.service), Edit(~/.config/pipewire/pipewire.conf.d/voice-loop-echo-cancel.conf), Edit(~/.local/bin/voice-loop-dictate), Edit(~/.config/skhd/skhdrc), Edit(~/.claude/CLAUDE.md), Edit(./CLAUDE.md), Glob, AskUserQuestion]
 ---
 
 # voice-setup — install the voice contour

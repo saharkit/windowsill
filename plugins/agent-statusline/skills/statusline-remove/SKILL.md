@@ -1,7 +1,7 @@
 ---
 name: statusline-remove
 description: Remove the agent-statusline status line — delete only the statusLine key from ~/.claude/settings.json, leave every other key untouched, and delete ~/.claude/tools/agent-statusline.js. Use when the user asks to remove, uninstall or disable the status line.
-allowed-tools: [Read, Edit, AskUserQuestion]
+allowed-tools: [Read, Edit(~/.claude/settings.json), AskUserQuestion]
 ---
 
 # statusline-remove — uninstall the agent-statusline status line
