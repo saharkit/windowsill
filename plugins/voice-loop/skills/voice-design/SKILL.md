@@ -2,7 +2,7 @@
 name: voice-design
 description: Cast a custom synthetic voice for voice-loop using ElevenLabs text-to-voice — turn the user's own description of a timbre into an English voice prompt, generate and present preview samples, iterate on feedback, then save the chosen voice_id into ~/.config/voice-loop/config.json. Use when the user wants to design, choose, audition or change the voice that speaks their Claude Code replies.
 argument-hint: "[a few words about the voice you want]"
-allowed-tools: [Read, Write, Edit, AskUserQuestion, mcp__plugin_voice-loop_voice-loop__design_previews, mcp__plugin_voice-loop_voice-loop__design_save]
+allowed-tools: [Read, Edit(~/.config/voice-loop/**), AskUserQuestion, mcp__plugin_voice-loop_voice-loop__design_previews, mcp__plugin_voice-loop_voice-loop__design_save]
 ---
 
 # voice-design — cast the voice that will speak
