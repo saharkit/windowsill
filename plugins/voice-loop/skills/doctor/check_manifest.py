@@ -327,9 +327,9 @@ CHECK_MANIFEST: list[dict] = [
             "cloud key may be missing or invalid."
         ),
         "fix": (
-            "For cloud STT, check that the key file exists or the "
-            "named environment variable is set, then re-run `/doctor` "
-            "to confirm the diagnosis."
+            "For cloud STT, set the `stt_api_key` plugin option in "
+            "`/config` (sensitive: the voice-loop MCP server holds it), "
+            "then re-run `/doctor` to confirm the diagnosis."
         ),
         "offer_flip": False,
         "check": {

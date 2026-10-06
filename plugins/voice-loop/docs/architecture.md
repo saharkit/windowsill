@@ -150,7 +150,11 @@ for that (#40), deliberately small — no Prometheus on a box with no sudo:
 2. Stopping sends `SIGINT` first (so `sox`/`ffmpeg` finalize the WAV header), waits for the process
    to actually exit, then settles briefly — the recorder flushes its tail *after* it stops taking
    samples, and skipping that wait truncates the last word.
-3. The WAV goes to the configured STT backend; the transcript comes back as text.
+3. **For cloud STT, the WAV goes through the relay hop**: the desktop process dials the
+   voice-loop MCP relay at `$XDG_RUNTIME_DIR/voice-loop/stt.sock` (mode 0700), the relay holds
+   the `stt_api_key` userConfig value in its env, posts to the configured provider, and returns
+   a typed JSON reply. See **The MCP server and the relay** below. Local and `lan` backends
+   skip the relay entirely and talk to the bundled server or a configured endpoint directly.
 4. The text is **always** put on the clipboard. Auto-paste is an opt-in extra, and when it is not
    available the script says "copied — press `<paste_key>`" instead of failing.
 5. Auto-paste is **paste-at-focus**: the keystroke goes to whatever is focused at *stop* time, which
@@ -163,6 +167,50 @@ for that (#40), deliberately small — no Prometheus on a box with no sudo:
    degrades to `"any"` and pastes: the guard fails open, for the same reason the debounce stamp does.
    The stamp is consumed on every stop, so an identity never outlives its own recording.
 
+## The MCP server and the relay
+
+The voice-loop plugin ships a single stdio MCP server (`scripts/voice_mcp.py`) that does two
+unrelated jobs and runs as long as the Claude Code session is open. The harness launches it
+through the `mcpServers` block in `.claude-plugin/plugin.json`; that block passes the two
+`userConfig` values (`tts_api_key` and `stt_api_key`, both `sensitive: true` in the manifest so
+the harness keeps them in its secure credential store) to the server in its env as
+`CLAUDE_PLUGIN_OPTION_TTS_API_KEY` and `CLAUDE_PLUGIN_OPTION_STT_API_KEY`. The server is the
+**only** reader of either key — the Stop and PostToolUse hooks (`speak.py`), the `voice-design`
+skill, and the hotkey cloud STT relay all reach the key through it.
+
+**The two design tools.** `design_previews` and `design_save` are the two ElevenLabs
+text-to-voice calls that used to live as inline Python snippets in `skills/voice-design/SKILL.md`.
+The skill declares them under `allowed-tools` and calls them by name; the server reads the key,
+posts to `https://api.elevenlabs.io/v1/text-to-voice/create-previews` and
+`/v1/text-to-voice/create-voice-from-preview`, and writes the previews under
+`~/.local/share/voice-loop/previews/`. On stock Windows where `python3` is not on PATH, the MCP
+server does not start: `/voice-design` reports the voice-loop MCP tools as unavailable, and
+hotkey dictation takes the local whisper path.
+
+**The hotkey STT relay.** A Unix-domain socket listener bound by the MCP server while it is
+alive. The desktop `dictate-toggle.sh` path connects to it for cloud STT, carrying one WAV per
+connection. The wire is one UTF-8 JSON request line (provider / endpoint / model / language /
+tts_vendor / timeout / stt_prompt) terminated by `\n`, then the raw WAV bytes until the client's
+`shutdown(SHUT_WR)`, then one UTF-8 JSON reply line. The typed reasons the relay returns are a
+closed enum:
+
+| reason | meaning |
+|---|---|
+| `no-key` | the relay has no `stt_api_key` (and the three-condition ElevenLabs fallback to the TTS key did not apply) |
+| `bad-request` | malformed request line, missing keys, unknown provider, empty WAV, or oversized payload |
+| `clear-text-refused` | a configured `http://` (or `ws://`) endpoint with a credential — refused here because the key is in this process. Loopback http stays allowed (the CI fake provider on 127.0.0.1 relies on it) |
+| `provider-http-<code>` | the provider returned an HTTP error document (e.g. 401, 429) |
+| `provider-unreachable` | the network is down, the host is unknown, or the response body was undecodable |
+| `timeout` | the provider did not answer before `stt.timeout` |
+
+**Lifecycle limit — and the fallback it implies.** Cloud hotkey dictation only reaches the
+cloud while a Claude Code session with the plugin enabled is open. With no session, no relay,
+no `stt_api_key` delivery: the desktop toggle records and dials a socket that nobody bound, the
+relay path returns `None` (no socket to talk to), the script falls back to the local whisper
+server, and the operator's prompt still works. The "recording is never lost to the live path"
+rule (#99) holds across the open-session and no-session cases: the relay is a strict
+acceleration, never a dependency.
+
 ## The three backends
 
 Configured **per direction** — `stt` and `tts` are independent, so local recognition with cloud
@@ -172,7 +220,7 @@ synthesis is a normal setup.
 |---|---|---|
 | `local` | HTTP on `127.0.0.1`, or a direct command | [`server/`](../server/README.md) run on this machine; or `stt.command` / `tts.command` for engines that are not servers (`say`, whisper.cpp) |
 | `lan` | HTTP to another host, or through an ssh tunnel | `ssh -N -L 8355:127.0.0.1:8355 user@host` keeps the endpoint `127.0.0.1` and the server unexposed |
-| `cloud` | HTTPS to a provider | OpenAI-compatible, ElevenLabs or Deepgram; the key lives in a `key_file` or a named env var, never in the config |
+| `cloud` | HTTPS to a provider | OpenAI-compatible, ElevenLabs or Deepgram; the key is the `tts_api_key` / `stt_api_key` plugin option, held by the voice-loop MCP server |
 
 The scripts speak two request shapes: the server's own (`POST /stt` multipart, `POST /tts` JSON) and
 the provider's. Nothing else in the system changes when you switch backends.
@@ -227,9 +275,10 @@ is enough yet.
 | `~/.config/voice-loop/config.json` | the only configuration; written by `/voice-setup` |
 | `~/.config/voice-loop/stress.json` | optional stress overrides for the synthesizer |
 | `stt_hallucinations.txt` (next to `voice_server.py`) | known Whisper hallucinations `/stt` drops whole, or strips off the tail of real speech (user-extendable) |
-| `~/.config/voice-loop/*.key` | optional cloud key files (mode 600) |
+| `~/.config/voice-loop/*.key` | optional cloud key files (mode 600) — historical; the credential-closure change removed the reader and the read paths, leaving these as inert leftover files for `/voice-remove` to clean up |
 | `~/.local/state/voice-loop/` | logs, the last spoken line, the recorder PID, the last WAV, the toggle and focus stamps, the hook heartbeat stamp, the contour poller's `contour.json` and its `contour-announced` ledger |
 | `~/.local/share/voice-loop/` | optional: the venv, models, voice previews |
+| `$XDG_RUNTIME_DIR/voice-loop/stt.sock` (mode 0700) | the hotkey STT relay socket, bound by the voice-loop MCP server; client (`dictate.py`) dials it for cloud STT. Falls back to `$XDG_STATE_HOME/voice-loop/relay/stt.sock` when no `XDG_RUNTIME_DIR` is set |
 | `$VOICE_LOOP_CORPUS_DIR` (unset by default) | optional, and **on the server's machine**: the RVC training corpus the `xtts` engine records — one `<language>/<digest>.wav` plus its `.txt` per synthesized sentence |
 
 Nothing is written into the repo, and nothing outside these paths is touched. `/voice-remove` walks

@@ -78,11 +78,12 @@ _FRAMEWORK = re.compile(r"/Library/Frameworks/Python\.framework/Versions/(\d+\.\
 # python version happens to wrap differently.
 CERT_MARKER = "CERTIFICATE_VERIFY_FAILED"
 
-# A proxy carries its own certificate, so this probe bypasses proxies to ask about THIS
-# interpreter's store (see _default_prober). But `pip` and the model download do honour them, so a
-# green here does not predict them — when one of these is set the OK message says so rather than
-# letting a bypassed proxy read as "everything verifies".
-PROXY_VARS = ("HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy")
+# A proxy carries its own certificate, so this probe bypasses proxies (see
+# _default_prober). The credential-closure change (#5816) removed the proxy variable
+# read — proxies are still bypassed and the OK message says so unconditionally.
+# SSL_CERT_FILE / SSL_CERT_DIR are also unread: the certificate store comes from
+# ``ssl.get_default_verify_paths()`` only, and the ``env-override`` fix kind is gone
+# with the read.
 
 
 # --- config (standalone by design: each script in scripts/ carries its own reader, so a single
@@ -132,11 +133,10 @@ def resolve_url(config: dict) -> str:
     return DEFAULT_URL
 
 
-def configured_proxy(environ=os.environ) -> str:
-    """The name of the proxy variable in force, or "" — see PROXY_VARS."""
-    for name in PROXY_VARS:
-        if environ.get(name):
-            return name
+def configured_proxy() -> str:
+    """The credential-closure change (#5816) removed the proxy variable read: a proxy
+    carries its own certificate, this probe bypasses proxies unconditionally and says so,
+    and there is no longer a "what the operator configured" line to emit here."""
     return ""
 
 
@@ -225,17 +225,6 @@ def remedy(
     system = system or platform.system()
     base_prefix = base_prefix or sys.base_prefix
     executable = executable or sys.executable
-    override = [name for name in ("SSL_CERT_FILE", "SSL_CERT_DIR") if environ.get(name)]
-    if override:
-        # An empty or stale override beats every store below it, so it is the diagnosis whenever it
-        # is set — repairing the interpreter's own store would change nothing while it stands.
-        return {
-            "kind": "env-override",
-            "runnable": False,
-            "command": f"unset {' '.join(override)}",
-            "why": f"{' and '.join(override)} {'are' if len(override) > 1 else 'is'} set and "
-            "override this interpreter's own certificate store",
-        }
     version = framework_version(base_prefix)
     if version is not None:
         installer = INSTALL_CERTIFICATES.format(version=version)
@@ -310,13 +299,6 @@ def render(report: dict) -> str:
         lines.append(f"OK: certificates verify from this interpreter — {report['detail']}")
         if report.get("fixed"):
             lines.insert(1, f"    repaired by: {report['fix']['command']}")
-        if report.get("proxy"):
-            # The one thing this green does NOT cover: `pip` and the model download go through the
-            # proxy this probe stepped around, and its CA has to be trusted separately.
-            lines.append(
-                f"    Note: {report['proxy']} is set and this probe bypassed it — pip and the model "
-                "download will not, so a proxy with an untrusted CA can still fail from here."
-            )
         return "\n".join(lines)
     if report["result"] == "unreachable":
         lines.append(f"UNKNOWN: {report['url']} could not be reached — {report['detail']}")

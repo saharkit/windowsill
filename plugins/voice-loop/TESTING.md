@@ -246,9 +246,8 @@ The hook side earns its guarantee on a separate axis, so it gets a numbered list
    probe" are pinned without a socket. What a fake cannot prove, **two real invocations in CI** do,
    and they are deliberately kept apart because they reach *different branches* of the diagnosis:
    - both lanes probe a real host and expect green (an unreachable host is exit 2 and warns, not a
-     red), then probe again with `SSL_CERT_FILE`/`SSL_CERT_DIR` pointed at an empty store. That
-     second one proves the **env-override** branch and only that — an override in force is
-     diagnosed first and unconditionally, so this shape can never reach the python.org remedy;
+     red). fix(#5816) removed the env-override probe leg together with the
+     `SSL_CERT_FILE`/`SSL_CERT_DIR` read;
    - so a separate step stands up the **python.org trap itself**: an interpreter that really lives
      under `/Library/Frameworks/Python.framework/Versions/X.Y`, a real
      `Install Certificates.command` at the path the message must name, and a real certificate
@@ -394,7 +393,7 @@ prompt the setup causes.
 | 2.5 | No `sudo` is ever executed silently | any root step is PRINTED for the user to run | | |
 | 2.6 | Default paste tier is clipboard (no root, no consent dialog) | `auto_paste: false` unless the user opted in | | |
 | 2.7 | `~/.config/voice-loop/config.json` is written and valid | `jq . ~/.config/voice-loop/config.json` parses | | |
-| 2.8 | No secret is written into the config | keys are in a `key_file` or an env var only | | |
+| 2.8 | No secret is written into the config | keys go into the `tts_api_key` / `stt_api_key` plugin options only | | |
 | 2.9 | Setup ends by running the selftest | green selftest, reported plainly | | |
 | 2.10 | **Re-run** `/voice-setup` on a `local` install and pick `cloud` (or `lan`) for **both** directions | it notices the now-unused local service and offers to `systemctl --user disable --now voice-loop.service`; after accepting, `is-enabled` says `disabled` and the unit file, venv and model caches are still there (switching back is one `enable --now`, no re-download) | | |
 
@@ -411,8 +410,6 @@ prompt the setup causes.
 | 3.4c | **The same-window guard** (`dictate.paste_target: "same-window"`, auto-paste on), same switch as 3.4b — **macOS/X11 only** | NOTHING is pasted anywhere; the notification says "focus moved — text is in the clipboard"; your paste key still pastes it. `dictate.log` has `focus at start: …` and a `paste suppressed` line | | |
 | 3.4d | The guard with **no** window switch | pastes exactly as before — the guard is invisible when you stay put | | |
 | 3.4e | The guard on **Wayland** (GNOME/KDE/sway) | it pastes anyway (degrades to `any` — no portable focus query exists) and `dictate.log` says `focus at start: unknown …`. A suppressed paste here would be the bug | | |
-| 3.4f | **Streaming dictation** (`stt.cloud.streaming: true` with a streaming provider and a real key): dictate for ~60 s | the text lands as usual; `dictate.log` shows `streaming stt done: finals=N` and `dictation latency stop_to_paste_ms=… via=stream`, and that number is markedly lower than the same dictation's `via=batch` one | | |
-| 3.4g | Streaming with the socket broken on purpose (a wrong key, or an endpoint nothing listens on) | the text still arrives via the recorded clip; `dictate.log` names the failure and then `via=batch`. Nothing is left behind: no `dictate-stream.*` in the state dir, no `stream-worker` process | | |
 | 3.5 | **Speak-back**: assistant replies with a 🔊 line | it is audibly spoken, once, and matches the text | | |
 | 3.6 | Unmarked lines | are NOT spoken | | |
 | 3.7 | Two turns in a row | the second turn speaks the new line, not a repeat of the first (dedup) | | |
@@ -435,7 +432,7 @@ prompt the setup causes.
 | 4.1 | Speech server stopped, then run `selftest.sh` | clear "server not reachable" message, non-zero exit, **within the timeout, no hang** | | |
 | 4.2 | Speech server stopped, then a 🔊 reply | the turn completes normally; nothing hangs; the reason is in `~/.local/state/voice-loop/speak.log` | | |
 | 4.3 | Speech server stopped, then press the dictation hotkey | notification says nothing was recognized; no stuck recording; a second press behaves sanely | | |
-| 4.4 | Wrong/expired cloud key | clear error naming the key source (`key_file` / env var); no key echoed anywhere | | |
+| 4.4 | Wrong/expired cloud key | clear error naming the relay or the hook that read it; no key echoed anywhere | | |
 | 4.5 | No microphone / no recorder installed | clear message naming what to install; no silent no-op, no stuck PID file | | |
 | 4.6 | Unsupported TTS language requested | HTTP 400 listing the supported languages, not a stack trace | | |
 | 4.7 | Kill the recorder process mid-recording | next hotkey press starts a fresh recording (stale PID file is cleared) | | |
@@ -461,7 +458,7 @@ prompt the setup causes.
 
 | # | check | expected | observed | pass |
 |---|---|---|---|---|
-| 6.1 | Key is read from a file, never pasted into chat or config | `key_file` used; nothing echoed | | |
+| 6.1 | Key is read from the userConfig option only, never pasted into chat or config | nothing echoed | | |
 | 6.2 | A request to imitate a named real person | politely declined, generalized description offered instead | | |
 | 6.3 | Previews are saved, numbered, and mapped to their ids | user can tell which is which | | |
 | 6.4 | Chosen voice id lands in `tts.cloud.voice_id` | rest of the config survives the edit | | |
@@ -479,7 +476,7 @@ discipline as section 2: default mode, count the prompts.
 | 7.3 | The local service | `systemctl --user is-active voice-loop.service` → inactive, `is-enabled` → not found; the unit file is gone; it does not come back after a re-login | | |
 | 7.4 | The hotkey | the binding is gone (GNOME: the voice-loop path is out of `custom-keybindings` **and the user's other custom shortcuts still work**; macOS: only the `dictate-toggle` line left `skhdrc`) | | |
 | 7.5 | Decline every deletion offer | nothing at all is deleted; the report says so plainly | | |
-| 7.6 | A cloud `key_file` present, and "delete the config" accepted **without** accepting the key question | `config.json` gone, `*.key` **still there**, the directory still exists, and the report names the kept key path | | |
+| 7.6 | A **legacy** cloud `*.key` file (left behind by an older install) present, and "delete the config" accepted **without** accepting the key question | `config.json` gone, the legacy `*.key` **still there**, the directory still exists, and the report names the kept legacy key path | | |
 | 7.7 | Model caches | each is listed with a size and offered separately; the shared parents (`~/.cache/huggingface/hub`, `~/.cache/torch/hub`) are **never** deleted wholesale — an unrelated HF model in that cache survives | | |
 | 7.8 | The `CLAUDE.md` convention line | the matching line (and its blank line) is removed from the file the user picked; the rest of the file is byte-identical; a custom `speak.marker` is matched too | | |
 | 7.9 | The closing report | lists what was intentionally left — kept keys/caches, shared packages, the root `ydotoold` daemon with its removal command **printed not run**, macOS Accessibility consents — and ends with `/plugin uninstall voice-loop@windowsill` | | |

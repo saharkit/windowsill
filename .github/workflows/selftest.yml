@@ -325,6 +325,13 @@ jobs:
       - name: directory policy (no Bash in allowed-tools, no pipe-to-shell)
         run: |
           python3 -m pytest tests/test_directory_policy.py
+      # fix(#5816) — credential-closure policy: voice-loop takes provider keys only from
+      # userConfig; the policy test refuses-first on the pre-change tree (f9a0faa) and
+      # passes on the post-change tree, with the OBSOLETE_KEYS / providers.py exemptions
+      # asserted by their own cases.
+      - name: credential policy (voice-loop reads keys from userConfig only)
+        run: |
+          python3 -m pytest tests/test_credential_policy.py
       # `claude plugin validate` checks each manifest's own structure; it does NOT compare the two
       # copies of voice-loop's dependencies — the one in plugin.json and its mirror in the
       # marketplace entry. A change that touches one and forgets the other passes both validations,
@@ -793,13 +800,12 @@ jobs:
           grep -q "ALERT free VRAM is 11 MiB, below the 200 MiB floor" /tmp/contour-vram.txt \
             || { echo "the vram alert lost its message (or read the wrong card)"; cat /tmp/contour-vram.txt; exit 1; }
 
-      - name: TLS-probe contract (real invocation — green, then an overridden store)
+      - name: TLS-probe contract (real invocation — green)
         run: |
-          # The setup probe, both ways round, on both lanes. GREEN first: a real handshake against
-          # a real host from the same python3 the hooks run under. Exit 2 is NOT a probe
-          # regression — it is the probe's own "the host was unreachable, so TLS is neither proven
-          # nor disproven" — and a runner egress hiccup must not read as a broken feature on a
-          # gate-blocking job.
+          # fix(#5816) removed the SSL_CERT_FILE / SSL_CERT_DIR read from tls-probe.py, so the
+          # env-override fix kind is gone too. The probe cannot deliver an "override in force"
+          # diagnosis because there is no override left to read. The python.org branch's own
+          # step below is the one carrying the acceptance criterion (#52).
           set +e
           bash plugins/voice-loop/scripts/tls-probe.sh --timeout 20
           rc=$?
@@ -809,27 +815,6 @@ jobs:
             2) echo "::warning::the probe could not reach its host (exit 2) — TLS unproven, not red" ;;
             *) echo "the probe called a healthy interpreter red (exit $rc)"; exit 1 ;;
           esac
-
-          # Then RED — but only ONE branch at a time, and this is the env-override branch. remedy()
-          # diagnoses SSL_CERT_FILE/SSL_CERT_DIR first and unconditionally, so a store emptied THIS
-          # way can never reach the python.org remedy #52 is about: what it proves is that an
-          # override in force is named as the thing to unset. The python.org branch has its own
-          # step below, and that is the one carrying the acceptance criterion.
-          empty="$RUNNER_TEMP/empty-ca"
-          mkdir -p "$empty" && : > "$empty/none.pem"
-          set +e
-          SSL_CERT_FILE="$empty/none.pem" SSL_CERT_DIR="$empty" \
-            bash plugins/voice-loop/scripts/tls-probe.sh --timeout 20 >/tmp/tls-red.txt 2>&1
-          rc=$?
-          set -e
-          cat /tmp/tls-red.txt
-          [ "$rc" = "1" ] || { echo "a cert-less store did not exit 1 (got $rc)"; exit 1; }
-          grep -q "certificate verification failed" /tmp/tls-red.txt \
-            || { echo "the failure was not classified as a certificate problem"; exit 1; }
-          grep -q "Fix, exactly:" /tmp/tls-red.txt \
-            || { echo "the failure message no longer names a fix -- that IS the feature"; exit 1; }
-          grep -q "unset SSL_CERT_FILE SSL_CERT_DIR" /tmp/tls-red.txt \
-            || { echo "an override in force was not diagnosed as the override"; exit 1; }
 
       - name: TLS-probe contract (real invocation — the python.org trap names its own installer)
         run: |
@@ -1298,28 +1283,26 @@ jobs:
           [ -s "$FAKE_CLIP_FILE" ] \
             || { echo "the transcript never reached the clipboard"; exit 1; }
 
-      - name: streaming dictation contract (real invocation, fake provider on loopback)
+      - name: streaming dictation contract (real invocation, fake provider via the relay)
         env:
           LANGUAGE: ${{ matrix.language }}
         run: |
-          # windowsill#99's real-invocation proof. The unit tests drive run_stream_session against a
-          # real socket, but they cannot show the part that only exists between PROCESSES: that the
-          # START toggle really spawns the worker, that the worker really tails the file the recorder
-          # is writing, and that the STOP toggle really collects its answer and pastes it. The
-          # provider is a fake websocket server on loopback (no key, no metered call, no network);
-          # the transcript it returns is a phrase the local whisper server would never produce, so
-          # "the text came from the STREAM" is an assertion rather than a hope.
-          fake="$RUNNER_TEMP/stream-fake"
+          # fix(#5816) — cloud dictation is batch-only through the voice-loop MCP relay. The hotkey
+          # script holds no key. With stt.cloud.streaming true, the dictate log records the batch-only
+          # line, the relay's BATCH provider call returns the transcript, and the dictation reaches
+          # the clipboard with via=relay. The config asks Deepgram — the one registry entry with a
+          # streaming variant — so the opt-in is answered by the batch-only line itself, not by
+          # the note an entry without a streaming variant would get. The legacy
+          # fake_dg.py (an RFC 6455 websocket fake) cannot answer the relay's batch HTTP request, so
+          # it is replaced here by a stdlib http.server fake on 127.0.0.1.
+          fake="$RUNNER_TEMP/relay-fake"
           mkdir -p "$fake"
           export FAKE_RECORD_WAV="$RUNNER_TEMP/dictate-source.wav"   # the clip the step above made
-          export FAKE_CLIP_FILE="$RUNNER_TEMP/stream-clip.txt"
-          export XDG_STATE_HOME="$RUNNER_TEMP/stream-state"          # own state dir: countable logs
+          export FAKE_CLIP_FILE="$RUNNER_TEMP/relay-clip.txt"
+          export XDG_STATE_HOME="$RUNNER_TEMP/relay-state"           # own state dir: countable logs
           state="$XDG_STATE_HOME/voice-loop"
           cat > "$fake/pw-record" <<'SH'
           #!/usr/bin/env bash
-          # Same fake microphone as the dictation contract step above: copy pre-synthesized speech,
-          # then wait to be stopped WITHOUT exec'ing away — the stop toggle's PID-reuse guard
-          # (windowsill#203) reads /proc/<pid>/cmdline and must still see this recorder in it.
           wav=""
           for arg in "$@"; do wav="$arg"; done
           cp "${FAKE_RECORD_WAV:?}" "${wav:?}"
@@ -1334,168 +1317,145 @@ jobs:
           SH
           chmod +x "$fake/pw-record" "$fake/wl-copy"
 
-          cat > "$RUNNER_TEMP/fake_dg.py" <<'PY'
-          """A fake live-transcription provider: one connection, real RFC 6455 framing."""
-          import base64, hashlib, json, socket, struct, sys
+          cat > "$RUNNER_TEMP/fake_provider.py" <<'PY'
+          """Fake STT provider — one HTTP POST, returns the configured transcript JSON.
 
-          TRANSCRIPT = "the streaming socket said this"
+          The body is Deepgram's batch shape (the transcript nested under the first
+          alternative of the first channel): Deepgram is the one registry entry with a
+          streaming variant, so it is the provider whose ``stt.cloud.streaming`` opt-in
+          is answered with the batch-only line this step asserts on."""
+          import json, socketserver, sys
+          from http.server import BaseHTTPRequestHandler, HTTPServer
 
+          TRANSCRIPT = "the relay batch returned this"
 
-          def frame(opcode: int, payload: bytes) -> bytes:      # server frames are never masked
-              head = bytearray([0x80 | opcode])
-              head.append(len(payload) if len(payload) < 126 else 126)
-              if len(payload) >= 126:
-                  head += struct.pack("!H", len(payload))
-              return bytes(head) + payload
+          class Handler(BaseHTTPRequestHandler):
+              def do_POST(self):  # noqa: N802 — http.server signature
+                  length = int(self.headers.get("Content-Length", "0"))
+                  self.rfile.read(length)
+                  body = json.dumps(
+                      {"results": {"channels": [{"alternatives": [{"transcript": TRANSCRIPT}]}]}}
+                  ).encode()
+                  self.send_response(200)
+                  self.send_header("Content-Type", "application/json")
+                  self.send_header("Content-Length", str(len(body)))
+                  self.end_headers()
+                  self.wfile.write(body)
 
+              def log_message(self, *_args):
+                  pass
 
-          def take(buf: bytearray):
-              if len(buf) < 2:
-                  return None
-              opcode, second = buf[0] & 0x0F, buf[1]
-              length, offset = second & 0x7F, 2
-              if length == 126:
-                  length, offset = struct.unpack_from("!H", buf, 2)[0], 4
-              elif length == 127:
-                  length, offset = struct.unpack_from("!Q", buf, 2)[0], 10
-              if len(buf) < offset + 4 + length:
-                  return None
-              mask = buf[offset:offset + 4]
-              body = buf[offset + 4:offset + 4 + length]
-              del buf[:offset + 4 + length]
-              return opcode, bytes(b ^ mask[i % 4] for i, b in enumerate(body))
+          class NoLookupServer(HTTPServer):
+              """Binds without a name lookup: http.server's server_bind resolves the host
+              with socket.getfqdn, a reverse-DNS query that can stall a runner longer
+              than this step's port wait, so the fake names itself by its address."""
 
+              def server_bind(self):
+                  socketserver.TCPServer.server_bind(self)
+                  self.server_name = "127.0.0.1"
+                  self.server_port = self.server_address[1]
 
-          def results(text: str, final: bool) -> bytes:
-              return json.dumps(
-                  {"type": "Results", "is_final": final,
-                   "channel": {"alternatives": [{"transcript": text}]}}
-              ).encode()
-
-
-          listener = socket.socket()
-          listener.bind(("127.0.0.1", 0))
-          listener.listen(1)
-          # Bounded on both ends so a client that never arrives (the whole point of the assertions
-          # below is that one does) cannot leave this process — and the step's `wait` — hanging.
-          listener.settimeout(120)
-          with open(sys.argv[1], "w") as fh:
-              fh.write(str(listener.getsockname()[1]))
-          conn, _ = listener.accept()
-          conn.settimeout(60)
-          head = b""
-          while b"\r\n\r\n" not in head:
-              head += conn.recv(4096)
-          key = ""
-          for line in head.decode("utf-8", "replace").split("\r\n"):
-              name, sep, value = line.partition(":")
-              if sep and name.strip().lower() == "sec-websocket-key":
-                  key = value.strip()
-          accept = base64.b64encode(
-              hashlib.sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest()
-          ).decode()
-          conn.sendall(
-              b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
-              b"Sec-WebSocket-Accept: " + accept.encode() + b"\r\n\r\n"
-          )
-          buf, audio, spoke = bytearray(), 0, False
-          while True:
-              chunk = conn.recv(65536)
-              if not chunk:
-                  break
-              buf += chunk
-              while True:
-                  taken = take(buf)
-                  if taken is None:
-                      break
-                  opcode, payload = taken
-                  if opcode == 0x2:
-                      audio += len(payload)
-                      if not spoke:
-                          spoke = True
-                          conn.sendall(frame(0x1, results(TRANSCRIPT.split()[0], False)))
-                          conn.sendall(frame(0x1, results(TRANSCRIPT, True)))
-                  elif opcode == 0x1 and b"CloseStream" in payload:
-                      conn.sendall(frame(0x1, json.dumps({"type": "Metadata"}).encode()))
-                      conn.sendall(frame(0x8, struct.pack("!H", 1000)))
-                      print(f"fake provider received {audio} bytes of pcm", flush=True)
-                      sys.exit(0)
-          sys.exit(1)
+          server = NoLookupServer(("127.0.0.1", 0), Handler)
+          open(sys.argv[1], "w").write(str(server.server_address[1]))
+          server.serve_forever()
           PY
-          python3 "$RUNNER_TEMP/fake_dg.py" "$RUNNER_TEMP/fake_dg.port" > "$RUNNER_TEMP/fake_dg.log" 2>&1 &
-          dg=$!
-          for _ in $(seq 1 50); do [ -s "$RUNNER_TEMP/fake_dg.port" ] && break; sleep 0.2; done
-          port=$(cat "$RUNNER_TEMP/fake_dg.port")
+          python3 "$RUNNER_TEMP/fake_provider.py" "$RUNNER_TEMP/fake_provider.port" \
+              > "$RUNNER_TEMP/fake_provider.log" 2>&1 &
+          provider_pid=$!
+          for _ in $(seq 1 50); do [ -s "$RUNNER_TEMP/fake_provider.port" ] && break; sleep 0.2; done
+          port=$(cat "$RUNNER_TEMP/fake_provider.port")
           [ -n "$port" ] || { echo "the fake provider never bound a port"; exit 1; }
 
-          export VOICE_LOOP_CONFIG="$RUNNER_TEMP/stream-config.json"
+          # Start the relay (voice_mcp.py) with the userConfig keys in its own environment
+          # only, on its own socket path. The relay binds to $XDG_RUNTIME_DIR/voice-loop/
+          # stt.sock and answers the dictation client. ``_stdio_loop`` returns when stdin
+          # hits EOF, so we feed it ``tail -f /dev/null`` — a held-open stream that keeps
+          # the MCP stdio loop alive past every dictate toggle. The keys ride the relay's
+          # own ``env`` prefix and are never exported into this step's shell, so every
+          # process started later in the step — the dictation toggles included — runs
+          # without them, and the relay holds the only copy.
+          export XDG_RUNTIME_DIR="$RUNNER_TEMP/relay-runtime"
+          mkdir -p "$XDG_RUNTIME_DIR/voice-loop"
+          chmod 700 "$XDG_RUNTIME_DIR/voice-loop"
+          tail -f /dev/null | env \
+            CLAUDE_PLUGIN_OPTION_STT_API_KEY="not-a-real-key-and-never-leaves-this-runner" \
+            CLAUDE_PLUGIN_OPTION_TTS_API_KEY="" \
+            python3 plugins/voice-loop/scripts/voice_mcp.py > "$RUNNER_TEMP/relay.log" 2>&1 &
+          relay_pid=$!
+          # Trap so a failing assertion leaves the relay and the provider dead, never running
+          # into the next job. ``kill -PIDS`` covers the tail -f wrapper AND the python process.
+          trap 'kill "$relay_pid" "$provider_pid" 2>/dev/null || true; pkill -P "$relay_pid" 2>/dev/null || true' EXIT
+
+          # Wait until the relay has bound the socket — ``_relay_loop`` binds after
+          # ``_ensure_dir_mode``, and the dictation client's safety check refuses to
+          # dial a path that does not exist. Bounded like the fake provider's port wait.
+          for _ in $(seq 1 50); do
+            [ -S "$XDG_RUNTIME_DIR/voice-loop/stt.sock" ] && break
+            sleep 0.2
+          done
+          [ -S "$XDG_RUNTIME_DIR/voice-loop/stt.sock" ] \
+            || { echo "the relay never bound the socket"; cat "$RUNNER_TEMP/relay.log"; exit 1; }
+
+          export VOICE_LOOP_CONFIG="$RUNNER_TEMP/relay-config.json"
           cat > "$VOICE_LOOP_CONFIG" <<JSON
           {
             "language": "$LANGUAGE",
             "stt": {
               "backend": "cloud",
-              "model": "nova-2",
+              "model": "nova-3",
               "cloud": {
                 "provider": "deepgram",
                 "streaming": true,
-                "endpoint": "http://127.0.0.1:$port",
-                "api_key_env": "FAKE_DG_KEY"
+                "endpoint": "http://127.0.0.1:$port"
               }
             },
             "dictate": { "recorder": "pw-record", "clipboard": "wl-copy", "debounce_ms": 0 }
           }
           JSON
-          export FAKE_DG_KEY="not-a-real-key-and-never-leaves-this-runner"
           export PATH="$fake:$PATH"
 
+          # The hotkey dictation processes below inherit THIS shell's environment. The
+          # step never exported the keys — they ride only the relay's own ``env`` prefix
+          # above — so this guard asserts the production condition the loopback is
+          # exercising: the dictation env carries no STT key, and the relay holds the
+          # only copy. The relay's typed ``no-key`` reply is never the live answer here
+          # because the relay was started with the key, so it dials the provider and
+          # returns the transcript; what is under test is that the dictation reached it
+          # without ever holding a key of its own.
+          if env | grep -q "CLAUDE_PLUGIN_OPTION_STT_API_KEY"; then
+            echo "the dictation env still carries the STT key — production condition violated"
+            env | grep CLAUDE_PLUGIN_OPTION || true
+            exit 1
+          fi
+
           python3 plugins/voice-loop/scripts/dictate.py paste \
-            || { echo "dictate start toggle failed (exit $?)"; cat "$state/dictate.log" 2>/dev/null || true; exit 1; }    # toggle 1: record + open the socket
+            || { echo "dictate start toggle failed (exit $?)"; cat "$state/dictate.log" 2>/dev/null || true; exit 1; }
           sleep 2
           python3 plugins/voice-loop/scripts/dictate.py paste \
-            || { echo "dictate stop toggle failed (exit $?)"; cat "$state/dictate.log" 2>/dev/null || true; exit 1; }    # toggle 2: stop -> collect -> paste
-          wait "$dg" || true
+            || { echo "dictate stop toggle failed (exit $?)"; cat "$state/dictate.log" 2>/dev/null || true; exit 1; }
 
           echo "--- dictate.log"; cat "$state/dictate.log"
-          echo "--- fake provider"; cat "$RUNNER_TEMP/fake_dg.log"
+          echo "--- relay log"; cat "$RUNNER_TEMP/relay.log" 2>/dev/null || true
+          echo "--- fake provider"; cat "$RUNNER_TEMP/fake_provider.log"
           echo "--- clipboard capture"; cat "$FAKE_CLIP_FILE" 2>/dev/null || true; echo
-          grep -q "stream worker started pid=" "$state/dictate.log" \
-            || { echo "the start toggle never spawned the stream worker"; exit 1; }
-          grep -q "streaming stt done: finals=" "$state/dictate.log" \
-            || { echo "the stop toggle got no answer from the worker"; exit 1; }
-          grep -q "via=stream" "$state/dictate.log" \
-            || { echo "the dictation did not go via the stream -- it degraded to the batch path"; exit 1; }
-          if grep -q "streaming stt failed" "$state/dictate.log"; then
-            echo "the streaming path degraded"; exit 1
-          fi
-          # THE assertion: the pasted words are the ones the SOCKET returned, and the local whisper
-          # server on 127.0.0.1:8355 could never have produced them
-          grep -q "the streaming socket said this" "$FAKE_CLIP_FILE" \
-            || { echo "the clipboard does not hold what the stream transcribed"; exit 1; }
-          grep -q "dictation latency stop_to_paste_ms=" "$state/dictate.log" \
-            || { echo "no end-of-speech latency was reported"; exit 1; }
-          if grep -q -e "unexpected error" -e "Traceback" "$state/dictate.log"; then
-            echo "the streaming path hit an error"; exit 1
-          fi
-          # nothing outlives the recording: no worker still running, no state left for the next one.
-          # The result document's name carries the worker's pid (windowsill#112), so the leftover
-          # check must go by PATTERN — naming the old fixed `dictate-stream.json` here would be an
-          # assertion that can no longer fail, and this real-invocation step is the one place a
-          # leaked transcript would actually be visible.
-          leftover=$(find "$state" -maxdepth 1 -name 'dictate-stream.*.json')
-          [ ! -e "$state/dictate-stream.pid" ] && [ -z "$leftover" ] \
-            || { echo "the stream worker left its state behind"; ls -l "$state"; exit 1; }
-          if pgrep -f "dictate.py stream-worker" >/dev/null 2>&1; then
-            echo "a stream worker is still running after the stop toggle"; exit 1
-          fi
 
-          # THE DEGRADE, in the same real processes: the same toggle pair with the streaming
-          # endpoint pointed at a port nothing listens on. The recording must still become text —
-          # by the batch path, through the live server this job already started — because "a
-          # recording is never lost to the live path" is the promise, and a promise only unit tests
-          # have made is a promise nobody has kept.
-          export XDG_STATE_HOME="$RUNNER_TEMP/stream-degrade-state"
-          state="$XDG_STATE_HOME/voice-loop"
-          export FAKE_CLIP_FILE="$RUNNER_TEMP/stream-degrade-clip.txt"
+          # streaming=true -> the batch-only line lands in the log, and the relay batch path runs.
+          grep -q "streaming needs a key the hotkey path no longer holds; using batch via the relay" "$state/dictate.log" \
+            || { echo "the streaming-opt-in was not answered with the batch-only line"; exit 1; }
+          grep -q "via=relay" "$state/dictate.log" \
+            || { echo "the dictation did not go via the relay -- it degraded to the batch-local path"; exit 1; }
+          if grep -q -e "unexpected error" -e "Traceback" "$state/dictate.log"; then
+            echo "the relay path hit an error"; exit 1
+          fi
+          # The pasted words come from the fake provider's transcript, not from the local whisper server.
+          grep -q "the relay batch returned this" "$FAKE_CLIP_FILE" \
+            || { echo "the clipboard does not hold what the relay transcribed"; exit 1; }
+          [ -s "$state/dictate-last.wav" ] \
+            || { echo "the clip was not kept"; exit 1; }
+
+          # THE DEGRADE: with the relay still running, point stt.cloud.endpoint at a discard port.
+          # The recording must still become text — by the relay's typed-failure path, falling back to
+          # the local whisper server this job already started.
           python3 -c "
           import json, os
           path = os.environ['VOICE_LOOP_CONFIG']
@@ -1503,21 +1463,23 @@ jobs:
           config['stt']['cloud']['endpoint'] = 'http://127.0.0.1:9'   # discard: never listening
           json.dump(config, open(path, 'w'))
           "
+          export XDG_STATE_HOME="$RUNNER_TEMP/relay-degrade-state"
+          state="$XDG_STATE_HOME/voice-loop"
+          export FAKE_CLIP_FILE="$RUNNER_TEMP/relay-degrade-clip.txt"
           python3 plugins/voice-loop/scripts/dictate.py paste \
             || { echo "dictate start toggle failed on the dead endpoint (exit $?)"; cat "$state/dictate.log" 2>/dev/null || true; exit 1; }
           sleep 2
           python3 plugins/voice-loop/scripts/dictate.py paste \
             || { echo "dictate stop toggle failed on the dead endpoint (exit $?)"; cat "$state/dictate.log" 2>/dev/null || true; exit 1; }
           echo "--- dictate.log (degrade)"; cat "$state/dictate.log"
-          grep -q "streaming stt failed" "$state/dictate.log" \
-            || { echo "the dead endpoint did not produce a streaming failure"; exit 1; }
+          grep -q "reason=provider-unreachable" "$state/dictate.log" \
+            || { echo "the dead endpoint did not produce a typed relay failure"; exit 1; }
           grep -q "via=batch" "$state/dictate.log" \
-            || { echo "the degrade did not reach the batch path"; exit 1; }
+            || { echo "the relay's typed failure did not degrade to local whisper"; exit 1; }
           [ -s "$FAKE_CLIP_FILE" ] \
-            || { echo "the recording was LOST to the failed stream — nothing reached the clipboard"; exit 1; }
+            || { echo "the recording was LOST to the failed relay — nothing reached the clipboard"; exit 1; }
           [ -s "$state/dictate-last.wav" ] \
             || { echo "the clip was not kept for salvage"; exit 1; }
-
       - name: server log on failure
         if: failure()
         run: kill "$(cat /tmp/voice-loop.pid)" 2>/dev/null || true

@@ -1,4 +1,4 @@
-# voice-loop conformance — v0.9.1
+# voice-loop conformance — v0.9.4
 
 A versioned acceptance checklist for the voice-loop plugin. This file is pinned to the
 plugin version it tests: a release that changes behaviour changes this checklist, and a
@@ -15,7 +15,7 @@ In a Claude Code session with voice-loop installed:
 
 The skill walks this checklist interactively: it asks you for the physical acts (tap the
 hotkey, confirm you heard the sound) and probes the machine for everything else. The result
-is one report file (`conformance-v0.9.1-YYYYMMDD.md`) with every row adjudicated. The
+is one report file (`conformance-v0.9.4-YYYYMMDD.md`) with every row adjudicated. The
 report is then offered through the same three transports as `/report-bug` — a GitHub issue
 (with the `conformance` label), a pre-filled new-issue URL, or a mailto:.
 
@@ -32,7 +32,7 @@ SKIP needs a reason in the evidence cell (e.g. "Wayland-only guard, tested on X1
 | OS / version | _(filled at runtime)_ |
 | WSL | _(if Windows: WSL2 kernel + WSLg versions, else n/a — see TESTING §8)_ |
 | desktop / session (GNOME-Wayland, KDE, X11, macOS) | _(filled at runtime)_ |
-| plugin version | 0.9.1 |
+| plugin version | 0.9.4 |
 | backends chosen (stt / tts) | _(filled at runtime)_ |
 | language | _(filled at runtime)_ |
 
@@ -50,7 +50,7 @@ SKIP needs a reason in the evidence cell (e.g. "Wayland-only guard, tested on X1
 | 1.8 | No silent root | No `sudo` is ever executed silently during setup | any root step is PRINTED for the user to run, not executed | | |
 | 1.9 | Default paste tier | The default dictation paste tier is clipboard (no root, no consent) | `auto_paste: false` unless the user explicitly opted in | | |
 | 1.10 | Config written | `~/.config/voice-loop/config.json` is written | `jq . ~/.config/voice-loop/config.json` parses cleanly | | |
-| 1.11 | No secret in config | No API key or token is written inline into config.json | keys are in a `key_file` or an env var only | | |
+| 1.11 | No secret in config | No API key or token is written inline into config.json | keys go into the `tts_api_key` / `stt_api_key` plugin options (set in `/config`) only | | |
 | 1.12 | Setup ends with proof | Setup finishes by running a verification | with HTTP endpoints: green selftest reported; with command-only backends: ear-check offered and explained | | |
 
 ## 2. Dictation — the push-to-talk loop
@@ -69,11 +69,6 @@ SKIP needs a reason in the evidence cell (e.g. "Wayland-only guard, tested on X1
 | 2.10 | Same-window guard on Wayland | Enable `paste_target: same-window` on a Wayland session | it pastes anyway (degrades to `any`); `dictate.log` says `focus at start: unknown …` — a suppressed paste here would be the bug | | |
 | 2.11 | Cloud provider is a config entry | With a cloud STT key configured, set `stt.cloud.provider` to a second registry provider (`openai`, `elevenlabs` or `deepgram`) and dictate again — no other edit | the transcript arrives, from that provider's API, with no code change anywhere | | |
 | 2.12 | Unknown provider says so | Set `stt.cloud.provider` to a name the registry does not carry (e.g. `"nosuchvendor"`), then dictate | `dictate.log` says the provider is not a known one and names the default it used instead — a silent fall-through would be the bug | | |
-| 2.13 | Streaming dictation — on | With a streaming provider configured (`stt.backend: "cloud"`, `stt.cloud.provider: "deepgram"`, `stt.cloud.streaming: true`) and a valid key, dictate for ~60 s and stop | the text lands as usual. `dictate.log` shows `stream worker started pid=…`, `streaming stt done: finals=N` with N > 0, and `dictation latency stop_to_paste_ms=… via=stream` — a `via=batch` line here means the stream degraded, and the reason is the line above it | | |
-| 2.14 | Streaming latency beats batch | Repeat 2.13 with `stt.cloud.streaming: false`, same length of speech | both dictations produce comparable text; the `stop_to_paste_ms` of the `via=stream` run is markedly lower than the `via=batch` one, and the gap grows with the length of the dictation | | |
-| 2.15 | Streaming degrade — a broken socket | With streaming on, make the socket fail (a deliberately wrong key, or `stt.cloud.endpoint` pointed at a port nothing listens on), then dictate | the text still arrives — `dictate.log` names the failure (`streaming stt failed (…)`) and then transcribes the recorded clip (`via=batch`). `dictate-last.wav` holds the recording either way. A dictation lost to a failed socket is a FAIL | | |
-| 2.16 | Streaming leaves no worker behind | After 2.13 and 2.15, list `~/.local/state/voice-loop/` looking for any `dictate-stream` name, and check the process table | the listing holds no `dictate-stream` name at all — neither the `dictate-stream.pid` pidfile nor a `dictate-stream.<pid>.json` result document (e.g. `dictate-stream.31337.json`; the name carries the worker's pid, and a predecessor's is named after ITS pid, not the last one you saw) — and no `dictate.py stream-worker` process is still running. A leftover result document holds the dictated words, so one of those is a FAIL as much as a live socket outliving its recording is | | |
-| 2.17 | Streaming on a provider that has none | Set `stt.cloud.provider: "openai"` with `stt.cloud.streaming: true` and dictate | it works exactly as the batch path does, and `dictate.log` says the provider has no streaming variant — a silently ignored setting would be the bug | | |
 
 ## 3. Speak-back — the assistant's voice
 
@@ -106,7 +101,7 @@ SKIP needs a reason in the evidence cell (e.g. "Wayland-only guard, tested on X1
 | 4.1 | Server stopped — selftest | Stop the speech server, then run `selftest.sh` | clear "server not reachable" message, non-zero exit, within the timeout — no hang | | |
 | 4.2 | Server stopped — speak-back | Speech server stopped, then a 🔊 reply from the assistant | the turn completes normally; nothing hangs; the reason is in `speak.log` | | |
 | 4.3 | Server stopped — dictation | Speech server stopped, then press the dictation hotkey | notification says nothing was recognized; no stuck recording; subsequent presses behave sanely | | |
-| 4.4 | Wrong/expired cloud key | Configure a deliberately wrong cloud API key | clear error naming the key source (`key_file` or env var); no key echoed anywhere | | |
+| 4.4 | Wrong/expired cloud key | Configure a deliberately wrong cloud API key (set the `stt_api_key` / `tts_api_key` plugin option in `/config` to a deliberately wrong value) | clear error naming the relay or the hook that read it; no key echoed anywhere | | |
 | 4.5 | No microphone / no recorder | Remove or disable the recorder; press the dictation hotkey | clear message naming what to install; no silent no-op, no stuck PID file | | |
 | 4.6 | Unsupported TTS language | Request TTS for a language the server does not support | HTTP 400 listing the supported languages, not a stack trace | | |
 | 4.7 | Killed recorder mid-recording | Start dictation, then kill the recorder process externally, then press the hotkey again | next hotkey press starts a fresh recording (stale PID file is cleared) | | |
@@ -124,7 +119,7 @@ SKIP needs a reason in the evidence cell (e.g. "Wayland-only guard, tested on X1
 | 5.3b | Contour schedule stopped | Follow the README's scheduling recipe (timer or cron line), then run `/voice-remove` | the schedule is inventoried in Step 0 and stopped BEFORE the scripts go: `systemctl --user is-enabled voice-loop-contour.timer` → not found, unit files gone; a cron line is PRINTED for the user to delete, never rewritten. A timer still firing a deleted `contour-poll.sh` is a FAIL | | |
 | 5.4 | Hotkey unbound | After accepting the hotkey removal | the binding is gone (GNOME: voice-loop path removed from `custom-keybindings`, user's other shortcuts intact; macOS: dictate-toggle line gone from `skhdrc`) | | |
 | 5.5 | Decline all deletions | Run `/voice-remove` and decline every deletion offer | nothing is deleted; the report says so plainly | | |
-| 5.6 | Key file kept when config deleted | A cloud `key_file` present; accept "delete the config" but decline the key question | `config.json` gone, `*.key` STILL there, the directory still exists; report names the kept key path | | |
+| 5.6 | Legacy key file kept when config deleted | A legacy `~/.config/voice-loop/elevenlabs.key` file (left behind by an older install) present; accept "delete the config" but decline the key question | `config.json` gone, the legacy `*.key` STILL there, the directory still exists; report names the kept legacy key path | | |
 | 5.7 | Model caches listed per-entry | Accept model cache deletion | each cache listed with a size and offered separately; shared parents (`~/.cache/huggingface/hub`, `~/.cache/torch/hub`) are never deleted wholesale | | |
 | 5.8 | CLAUDE.md convention line removed | Accept convention-line removal | the matching line (and its blank line) removed; rest of file byte-identical; custom `speak.marker` matched | | |
 | 5.9 | Closing report | After all deletions complete | lists what was intentionally left (kept keys/caches, shared packages, root daemon with removal command printed not run, macOS consents); ends with `/plugin uninstall voice-loop@windowsill` | | |
@@ -134,5 +129,5 @@ SKIP needs a reason in the evidence cell (e.g. "Wayland-only guard, tested on X1
 
 ---
 
-**Checklist version:** 0.9.1 — pinned to `plugins/voice-loop/.claude-plugin/plugin.json`.
+**Checklist version:** 0.9.4 — pinned to `plugins/voice-loop/.claude-plugin/plugin.json`.
 A mismatch between this version and the plugin version is a stale checklist.

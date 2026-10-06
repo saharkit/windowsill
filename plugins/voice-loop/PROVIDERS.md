@@ -97,8 +97,9 @@ paths are compared on your own machine rather than on a claim in this table.
 asymmetry is the reason the two directions are configured independently — `stt.cloud.provider:
 "deepgram"` beside `tts.cloud.provider: "elevenlabs"` is a perfectly ordinary config. Deepgram's
 voice is the model name (`tts.cloud.model`); `tts.speaker` and `tts.cloud.voice_id` do not select an
-Aura voice. When switching providers, point `tts.cloud.api_key_env` at that provider's own key —
-the ElevenLabs key-sharing rule applies to ElevenLabs STT only.
+Aura voice. When switching providers, set the new provider's key in the
+`tts_api_key` plugin option (in `/config`) — the ElevenLabs key-sharing rule applies to
+ElevenLabs STT only.
 
 ### Streaming text-to-speech — `tts.cloud.streaming`
 

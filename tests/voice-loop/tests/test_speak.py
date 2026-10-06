@@ -168,7 +168,11 @@ def test_defaults_with_empty_config_linux():
     assert s["timeout"] == 60.0
     assert s["backend"] == "lan"
     assert s["language"] == "en"  # explicit-language setups always write the key; the default is English
-    assert s["key_env"] == "VOICE_LOOP_TTS_API_KEY"
+    # The credential-closure change (#5816) removed key_env / key_file: the cloud TTS key
+    # is delivered by the harness as $CLAUDE_PLUGIN_OPTION_TTS_API_KEY only. The setting
+    # dictionary no longer carries key_env, and the legacy settings get one log line.
+    assert "key_env" not in s
+    assert "key_file" not in s
 
 
 def test_speak_sink_is_read_from_config():
@@ -232,11 +236,64 @@ def test_the_output_format_default_follows_the_provider_too():
     assert deepgram["output_format"] == "encoding=linear16&container=wav"
 
 
-def test_key_env_precedence_cloud_over_tts_over_default():
-    tts_level = {"tts": {"api_key_env": "TTS_LEVEL"}}
-    assert speak.resolve_settings(tts_level, "Linux")["key_env"] == "TTS_LEVEL"
-    both = {"tts": {"api_key_env": "TTS_LEVEL", "cloud": {"api_key_env": "CLOUD_LEVEL"}}}
-    assert speak.resolve_settings(both, "Linux")["key_env"] == "CLOUD_LEVEL"
+def test_key_env_precedence_cloud_over_tts_over_default(monkeypatch):
+    # fix(#5816) removed the tts.cloud.api_key_env / tts.cloud.key_file fallbacks. The
+    # cloud TTS key is delivered by the harness as $CLAUDE_PLUGIN_OPTION_TTS_API_KEY only.
+    # A config that still carries one of the legacy names gets a one-line warning from
+    # resolve_settings (see OBSOLETE_KEYS) and the setting is ignored.
+    logged_calls: list[str] = []
+
+    def _spy_log(message: str) -> None:
+        logged_calls.append(message)
+
+    monkeypatch.setattr(speak, "log", _spy_log)
+    cfg = {"tts": {"cloud": {"api_key_env": "CLOUD_LEVEL", "key_file": "/tmp/k"}}}
+    s = speak.resolve_settings(cfg, "Linux")
+    assert "key_env" not in s
+    assert "key_file" not in s
+    # The OBSOLETE_KEYS warning fires once per legacy name. A regression that
+    # drops the warning loop is silent to every other test in the suite.
+    assert any("config ignored: tts.cloud.api_key_env is obsolete" in line for line in logged_calls)
+    assert any("config ignored: tts.cloud.key_file is obsolete" in line for line in logged_calls)
+
+
+def test_obsolete_keys_warning_logs_one_line_per_name(monkeypatch):
+    """fix(#5816) OBSOLETE_KEYS: the resolve_settings warn loop emits exactly one
+    `config ignored: <name> is obsolete` line per name, ONLY when the config still
+    carries that name, and never when the config is clean. A regression that drops
+    the loop is silent to every other test in the suite — this is the discriminating
+    assertion. Mirrored in test_dictate.py for the dictation side.
+    """
+    logged_calls: list[str] = []
+
+    def _spy_log(message: str) -> None:
+        logged_calls.append(message)
+
+    monkeypatch.setattr(speak, "log", _spy_log)
+    # Clean config: no legacy keys -> no warning.
+    speak.resolve_settings({}, "Linux")
+    assert not any("is obsolete" in line for line in logged_calls)
+    logged_calls.clear()
+    # All three legacy keys present: one line per name, in the order they appear
+    # in OBSOLETE_KEYS (which is also the order the loop visits them).
+    speak.resolve_settings(
+        {
+            "tts": {
+                "api_key_env": "T",
+                "cloud": {
+                    "api_key_env": "C",
+                    "key_file": "/tmp/k",
+                },
+            }
+        },
+        "Linux",
+    )
+    obsolete_lines = [line for line in logged_calls if "is obsolete" in line]
+    assert obsolete_lines == [
+        "config ignored: tts.cloud.key_file is obsolete — set the tts_api_key plugin option in /config",
+        "config ignored: tts.cloud.api_key_env is obsolete — set the tts_api_key plugin option in /config",
+        "config ignored: tts.api_key_env is obsolete — set the tts_api_key plugin option in /config",
+    ]
 
 
 def test_voice_settings_passthrough_is_a_dict_or_none():
@@ -248,67 +305,26 @@ def test_voice_settings_passthrough_is_a_dict_or_none():
     assert speak.resolve_settings(junk, "Linux")["voice_settings"] is None
 
 
-# --- read_key: key_file wins, whitespace stripped, never from argv ------------------------------
+# --- read_key: only the userConfig option; whitespace stripped, never from argv --------------
 
 
-def test_key_file_wins_over_env(tmp_path):
-    key_file = tmp_path / "k"
-    key_file.write_text(" sk-fromfile \n")
-    assert speak.read_key(str(key_file), "K_ENV", {"K_ENV": "sk-fromenv"}) == "sk-fromfile"
-
-
-def test_missing_key_file_falls_back_to_env(tmp_path):
-    assert speak.read_key(str(tmp_path / "absent"), "K_ENV", {"K_ENV": "sk-fromenv"}) == "sk-fromenv"
-    assert speak.read_key("", "K_ENV", {}) == ""
-
-
-def test_user_config_option_wins_over_key_file_and_env(tmp_path):
-    """The `tts_api_key` plugin option (exposed as $CLAUDE_PLUGIN_OPTION_TTS_API_KEY by the
-    harness) wins over the key file and the named env var — the option is the documented
-    carrier when voice-loop runs from a Claude Code hook, and `sensitive: true` keeps the value
-    out of the settings file."""
-    key_file = tmp_path / "k"
-    key_file.write_text(" sk-fromfile \n")
-    env = {
-        "CLAUDE_PLUGIN_OPTION_TTS_API_KEY": " sk-from-option \n",
-        "K_ENV": "sk-fromenv",
-    }
-    assert speak.read_key(str(key_file), "K_ENV", env) == "sk-from-option"
-
-
-def test_empty_user_config_option_falls_back_to_key_file(tmp_path):
-    """A non-empty option wins, but a WHITESPACE-only value falls through to key_file — an
-    option the user typed a space into would otherwise win silently."""
-    key_file = tmp_path / "k"
-    key_file.write_text("sk-fromfile\n")
-    env = {"CLAUDE_PLUGIN_OPTION_TTS_API_KEY": "   \t  ", "K_ENV": "sk-fromenv"}
-    assert speak.read_key(str(key_file), "K_ENV", env) == "sk-fromfile"
-
-
-def test_absent_user_config_option_falls_back_to_key_file_then_env(tmp_path):
-    """Without the option env var, the precedence falls back to key_file then the named env."""
-    key_file = tmp_path / "k"
-    key_file.write_text("sk-fromfile\n")
-    env = {"K_ENV": "sk-fromenv"}
-    assert speak.read_key(str(key_file), "K_ENV", env) == "sk-fromfile"
-    assert speak.read_key(str(tmp_path / "absent"), "K_ENV", env) == "sk-fromenv"
-    assert speak.read_key("", "K_ENV", env) == "sk-fromenv"
+def test_user_config_option_is_the_only_key_source():
+    """The cloud TTS key is delivered by the harness as $CLAUDE_PLUGIN_OPTION_TTS_API_KEY
+    only — key_file and api_key_env fallbacks were removed in fix(#5816)."""
+    assert speak.read_key({}) == ""
+    assert speak.read_key({"CLAUDE_PLUGIN_OPTION_TTS_API_KEY": " sk-with-whitespace \n"}) == "sk-with-whitespace"
+    assert speak.read_key({"CLAUDE_PLUGIN_OPTION_TTS_API_KEY": "sk-stripped"}) == "sk-stripped"
 
 
 def test_user_config_option_wins_and_never_logs_the_value(state, monkeypatch):
-    """The CLAUDE_PLUGIN_OPTION_TTS_API_KEY branch wins on the hook path and never logs the key.
+    """The CLAUDE_PLUGIN_OPTION_TTS_API_KEY branch returns the key and never logs the key.
 
-    The docstring on read_key claims the type name only, never the key, never its length —
-    the existing test for the key-file branch (`test_non_utf8_key_file_falls_back_to_env_and
-    _never_logs_content`) pins that claim against the only branch that actually logs. The
-    new CLAUDE_PLUGIN_OPTION branch has no log call, so the test exercises the same assertion
-    on a path that is silent by construction: a sentinel that, if it ever leaks into the log,
-    is the only way the docstring can be falsified. A regression that adds a `log(...)` of
-    the key (or its length, or its head) makes this test red.
+    The docstring on read_key claims the type name only, never the key, never its length.
+    A regression that adds a `log(...)` of the key (or its length, or its head) makes this
+    test red.
     """
     sentinel = "sk-SENTINEL-option-1234567890"  # a 28-character fake that no real prefix matches
     # Pre-touch the log so we can read it; speak.log only materialises when log() is called
-    # (the option branch never calls it), and the assertion that follows reads the file.
     (state / "speak.log").write_text("", encoding="utf-8")
     # Capture every log() invocation in-memory, regardless of whether it writes to disk.
     logged_calls: list[str] = []
@@ -317,16 +333,9 @@ def test_user_config_option_wins_and_never_logs_the_value(state, monkeypatch):
         logged_calls.append(message)
 
     monkeypatch.setattr(speak, "log", _spy_log)
-    key_file = state / "k"
-    key_file.write_text("sk-fromfile\n")
-    env = {
-        "CLAUDE_PLUGIN_OPTION_TTS_API_KEY": sentinel,
-        "K_ENV": "sk-fromenv",
-    }
-    # The option wins; key_file and env are not even read.
-    assert speak.read_key(str(key_file), "K_ENV", env) == sentinel
-    # No log call was made on the option path (the only branch that runs is the early return
-    # at the top of read_key), so the spy is empty.
+    env = {"CLAUDE_PLUGIN_OPTION_TTS_API_KEY": sentinel}
+    assert speak.read_key(env) == sentinel
+    # No log call was made on the option path
     assert logged_calls == [], (
         f"the option branch must not log, but log() was called with: {logged_calls}"
     )
@@ -681,13 +690,20 @@ def test_absent_config_stays_silent(state):
     assert not (state / "speak.log").exists()
 
 
-def test_non_utf8_key_file_falls_back_to_env_and_never_logs_content(state):
-    key_file = state / "k"
-    key_file.write_bytes(b"\xff\xfe topsecretbytes")
-    assert speak.read_key(str(key_file), "K_ENV", {"K_ENV": "sk-fromenv"}) == "sk-fromenv"
-    logged = (state / "speak.log").read_text(encoding="utf-8")
-    assert "UnicodeDecodeError" in logged
-    assert "topsecret" not in logged
+def test_non_utf8_key_file_falls_back_to_env_and_never_logs_content(state, monkeypatch):
+    # fix(#5816): the key_file / api_key_env fallbacks were removed. The TTS key now
+    # comes from $CLAUDE_PLUGIN_OPTION_TTS_API_KEY only. This test pins the userConfig
+    # option's log silence: a missing / empty option returns "" and never logs (the
+    # cloud TTS no-key log fires only when play_text is called, not here).
+    logged_calls: list[str] = []
+
+    def _spy_log(message: str) -> None:
+        logged_calls.append(message)
+
+    monkeypatch.setattr(speak, "log", _spy_log)
+    assert speak.read_key({"CLAUDE_PLUGIN_OPTION_TTS_API_KEY": ""}) == ""
+    assert speak.read_key({}) == ""
+    assert logged_calls == []
 
 
 # --- the bare-marker fast path: a decided "nothing to say" burns zero backoff -------------------
@@ -1260,7 +1276,7 @@ def test_a_clear_text_cloud_endpoint_is_refused_at_configuration_time(state, mon
     placed there now lands on the vendor's https host and is NOT refused — the resolution order
     moved the policy's reach to the new key."""
     fake = opener(b"MP3-audio-bytes")
-    monkeypatch.setenv("VOICE_LOOP_TTS_API_KEY", "sk-secret")
+    monkeypatch.setenv("CLAUDE_PLUGIN_OPTION_TTS_API_KEY", "sk-secret")
     s = speak.resolve_settings(
         {"tts": {"backend": "cloud",
                  "cloud": {"endpoint": "http://192.168.1.100:8080",
@@ -1281,7 +1297,7 @@ def test_an_endpoint_name_that_merely_starts_with_127_is_refused(state, monkeypa
 
     windowsill#270: the host now goes in ``tts.cloud.endpoint`` (rank 1). The asserted message
     string is unchanged by the move."""
-    monkeypatch.setenv("VOICE_LOOP_TTS_API_KEY", "sk-secret")
+    monkeypatch.setenv("CLAUDE_PLUGIN_OPTION_TTS_API_KEY", "sk-secret")
     monkeypatch.setattr(
         speak.socket, "getaddrinfo", lambda host, *a, **k: [["", "", "", "", ("93.184.216.34", 0)]]
     )
@@ -1311,7 +1327,7 @@ def test_a_local_by_resolution_endpoint_is_classified_once_not_per_request(state
         return [["", "", "", "", ("127.0.0.1", 0)]]
 
     monkeypatch.setattr(speak.socket, "getaddrinfo", one_address)
-    monkeypatch.setenv("VOICE_LOOP_TTS_API_KEY", "sk-secret")
+    monkeypatch.setenv("CLAUDE_PLUGIN_OPTION_TTS_API_KEY", "sk-secret")
     s = speak.resolve_settings(
         {"tts": {"backend": "cloud",
                  "cloud": {"endpoint": "http://tunnel.internal:8355",
@@ -1332,7 +1348,7 @@ def test_the_default_local_cloud_path_is_never_refused(state, monkeypatch, opene
     has a remote default_host now (``https://api.openai.com``); the test still passes because
     https is not clear text — the policy guards the SCHEME, not the address."""
     fake = opener(b"WAV-audio-bytes")
-    monkeypatch.setenv("VOICE_LOOP_TTS_API_KEY", "sk-secret")
+    monkeypatch.setenv("CLAUDE_PLUGIN_OPTION_TTS_API_KEY", "sk-secret")
     s = speak.resolve_settings({"tts": {"backend": "cloud"}}, "Linux")
     assert speak._clear_text_refusal(s) is None
     assert speak.synthesize("hi", s, "sk-secret") == b"WAV-audio-bytes"
@@ -1341,7 +1357,7 @@ def test_the_default_local_cloud_path_is_never_refused(state, monkeypatch, opene
 def test_a_keyless_clear_text_config_is_not_the_guard_s_business(monkeypatch):
     """No credential configured, nothing rides the clear text — the guard stays out of the way
     (the cloud path refuses keyless calls itself, unchanged)."""
-    monkeypatch.delenv("VOICE_LOOP_TTS_API_KEY", raising=False)
+    monkeypatch.delenv("CLAUDE_PLUGIN_OPTION_TTS_API_KEY", raising=False)
     s = speak.resolve_settings(
         {"tts": {"backend": "cloud", "endpoint": "http://192.168.1.100:8080"}}, "Linux"
     )
@@ -1374,7 +1390,7 @@ def test_main_refuses_a_clear_text_cloud_config_and_never_builds_a_request(state
     transcript.write_text(_assistant("🔊 hello") + "\n", encoding="utf-8")
     _contour_status(state, [_DEMOTED])
     monkeypatch.setenv("VOICE_LOOP_CONFIG", str(config))
-    monkeypatch.setenv("VOICE_LOOP_TTS_API_KEY", "sk-secret")
+    monkeypatch.setenv("CLAUDE_PLUGIN_OPTION_TTS_API_KEY", "sk-secret")
     monkeypatch.setattr(
         speak.sys, "stdin", io.StringIO(json.dumps({"transcript_path": str(transcript)}))
     )
@@ -1402,7 +1418,7 @@ def test_a_clear_text_host_at_tts_endpoint_no_longer_triggers_the_refusal(state,
     a clear-text host in the TOP-LEVEL ``tts.endpoint`` (rank 3) now resolves to the vendor's
     https host via ``default_host`` and returns None — the config's own key still travels https to
     the vendor. The refusal policy is still bit-exact on the keys it now guards."""
-    monkeypatch.setenv("VOICE_LOOP_TTS_API_KEY", "sk-secret")
+    monkeypatch.setenv("CLAUDE_PLUGIN_OPTION_TTS_API_KEY", "sk-secret")
     # a clear-text host at tts.endpoint (rank 3) loses to default_host (rank 2). The refusal is
     # None and the resolved URL is the vendor's https host.
     s = speak.resolve_settings(
@@ -1506,7 +1522,7 @@ def test_a_cloud_synthesis_whose_endpoint_resolved_to_loopback_logs_the_diagnosi
     """windowsill#270, acceptance clause (h): a failed cloud synthesis whose endpoint resolved to a
     local address logs the new line. The LAN branch shares the same return path, so the backend
     check is part of the predicate: this test pins the FIRED case."""
-    monkeypatch.setenv("VOICE_LOOP_TTS_API_KEY", "sk-secret")
+    monkeypatch.setenv("CLAUDE_PLUGIN_OPTION_TTS_API_KEY", "sk-secret")
     monkeypatch.setattr(speak, "_post", lambda *args, **kwargs: None)
     s = speak.resolve_settings(
         {"tts": {"backend": "cloud", "cloud": {"endpoint": "http://127.0.0.1:8355"}}}, "Linux"
@@ -1520,7 +1536,7 @@ def test_a_cloud_synthesis_against_a_remote_endpoint_does_not_log_the_loopback_l
     """windowsill#270, clause (h) second half: a cloud POST against a REMOTE endpoint does NOT
     read the new line — only loopback resolutions do."""
     fake = opener(b"WAV-audio-bytes")
-    monkeypatch.setenv("VOICE_LOOP_TTS_API_KEY", "sk-secret")
+    monkeypatch.setenv("CLAUDE_PLUGIN_OPTION_TTS_API_KEY", "sk-secret")
     s = speak.resolve_settings(
         {"tts": {"backend": "cloud", "cloud": {"endpoint": "https://speech.example.com"}}}, "Linux"
     )
@@ -4254,17 +4270,21 @@ def test_play_text_passes_a_literal_pipe_as_argv(state, monkeypatch):
 
 
 def test_play_text_returns_false_when_cloud_backend_has_no_key(state, monkeypatch):
-    """A cloud configuration with neither key_file nor env is logged as 'no key' and turns into
-    False — synthesis never happens, the blob fallback is not even tried."""
-    monkeypatch.delenv("VOICE_LOOP_TTS_API_KEY", raising=False)
+    """A cloud configuration with no $CLAUDE_PLUGIN_OPTION_TTS_API_KEY in the env is logged
+    as 'no key' and turns into False — synthesis never happens, the blob fallback is not
+    even tried. The credential-closure change (#5816) removed key_file / api_key_env; the
+    userConfig option is the only key source, and a missing option is the only "no key"
+    condition the script knows about."""
+    monkeypatch.delenv("CLAUDE_PLUGIN_OPTION_TTS_API_KEY", raising=False)
     s = speak.resolve_settings(
         {"tts": {"backend": "cloud", "cloud": {"provider": "elevenlabs", "voice_id": "v1"}}}, "Linux"
     )
-    assert s["key_file"] == ""
+    assert "key_file" not in s
+    assert "key_env" not in s
     assert speak.play_text("hi", s, time.monotonic(), extract_ms=0) is False
     log = (state / "speak.log").read_text(encoding="utf-8")
     assert "cloud tts: no key" in log
-    assert "VOICE_LOOP_TTS_API_KEY" in log
+    assert "tts_api_key" in log  # the new log line names the userConfig option
 
 
 def test_play_text_uses_cloud_stream_holder_when_configured(state, monkeypatch):
@@ -4302,7 +4322,7 @@ def test_play_text_uses_cloud_stream_holder_when_configured(state, monkeypatch):
         {"tts": {"backend": "cloud", "cloud": {"provider": "elevenlabs", "voice_id": "v1", "streaming": True}}},
         "Linux",
     )
-    monkeypatch.setenv("VOICE_LOOP_TTS_API_KEY", "k")
+    monkeypatch.setenv("CLAUDE_PLUGIN_OPTION_TTS_API_KEY", "k")
     assert speak.play_text("hi", s, clock(), extract_ms=0) is True
     assert fake_conn.closed is True  # closed in the finally block
     log = (state / "speak.log").read_text(encoding="utf-8")
@@ -4344,7 +4364,7 @@ def test_play_text_falls_back_to_local_voice_when_cloud_stream_degrades(state, m
         {"tts": {"backend": "cloud", "cloud": {"provider": "elevenlabs", "voice_id": "v1", "streaming": True}}},
         "Linux",
     )
-    monkeypatch.setenv("VOICE_LOOP_TTS_API_KEY", "k")
+    monkeypatch.setenv("CLAUDE_PLUGIN_OPTION_TTS_API_KEY", "k")
     assert speak.play_text("the line", s, clock(), extract_ms=0) is True
     # the synthesized audio came from the LOCAL voice, not the cloud (key is "")
     assert synthesize_calls and synthesize_calls[0][2] == ""
@@ -4375,7 +4395,7 @@ def test_play_text_logs_when_cloud_stream_returns_none_connection(state, monkeyp
         {"tts": {"backend": "cloud", "cloud": {"provider": "elevenlabs", "voice_id": "v1", "streaming": True}}},
         "Linux",
     )
-    monkeypatch.setenv("VOICE_LOOP_TTS_API_KEY", "k")
+    monkeypatch.setenv("CLAUDE_PLUGIN_OPTION_TTS_API_KEY", "k")
     assert speak.play_text("the line", s, clock(), extract_ms=0) is True
     log = (state / "speak.log").read_text(encoding="utf-8")
     # cloud_streaming_wanted was true but the connection was None -> the cloud blob path was used
@@ -4476,7 +4496,7 @@ def test_play_text_handles_a_cloud_open_stream_socket_close_error(state, monkeyp
         {"tts": {"backend": "cloud", "cloud": {"provider": "elevenlabs", "voice_id": "v1", "streaming": True}}},
         "Linux",
     )
-    monkeypatch.setenv("VOICE_LOOP_TTS_API_KEY", "k")
+    monkeypatch.setenv("CLAUDE_PLUGIN_OPTION_TTS_API_KEY", "k")
     assert speak.play_text("hi", s, clock(), extract_ms=0) is True
 
 
@@ -4946,7 +4966,7 @@ def test_contour_alerts_filters_alerts_with_non_string_keys_or_messages():
 def test_clear_text_refusal_returns_none_when_no_credential_configured(state, monkeypatch):
     """The clear-text-credential policy short-circuits when the cloud key is missing — no
     credential rides the clear text, nothing to refuse."""
-    monkeypatch.delenv("VOICE_LOOP_TTS_API_KEY", raising=False)
+    monkeypatch.delenv("CLAUDE_PLUGIN_OPTION_TTS_API_KEY", raising=False)
     s = speak.resolve_settings(
         {"tts": {"backend": "cloud", "cloud": {"provider": "elevenlabs", "voice_id": "v1"}}}, "Linux"
     )

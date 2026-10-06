@@ -169,33 +169,29 @@ Deepgram is the cheapest and quickest for recognition and the `$200` new-account
 evaluation, but its synthesis does not speak Russian or Ukrainian; ElevenLabs and OpenAI do both.
 
 **ElevenLabs STT reuses your existing ElevenLabs API key — when TTS is also ElevenLabs.** If
-you already configured `/voice-design` (or set `VOICE_LOOP_TTS_API_KEY`) and
-`tts.cloud.provider` is `elevenlabs`, dictation works without a second key. When
-`stt.cloud.provider` is `elevenlabs`, the script looks for a key in this order:
-
-1. Your configured STT key: the `stt_api_key` plugin option
-   (`$CLAUDE_PLUGIN_OPTION_STT_API_KEY`, exposed by Claude Code when the plugin runs from a
-   hook — declared `sensitive: true` in the manifest, so it is stored in the secure
-   credential store, never in the settings file), then `stt.cloud.key_file`, then
-   `stt.cloud.api_key_env` (default `VOICE_LOOP_STT_API_KEY`).
-2. The TTS key (same precedence as STT, via `tts_api_key` → `tts.cloud.key_file` →
-   `tts.cloud.api_key_env`) — one credentials home, not a second one, and **only when the
-   TTS provider is also ElevenLabs** (windowsill#5867). With `tts.cloud.provider` set to
-   `openai` or `deepgram`, the variable the TTS entry points at holds a different vendor's
-   key, and the borrow is OFF so it is never sent to `api.elevenlabs.io`.
+you already configured the `tts_api_key` plugin option in `/config` and `tts.cloud.provider` is
+`elevenlabs`, dictation works without a second key. When `stt.cloud.provider` is `elevenlabs`,
+`stt_api_key` is empty, and `tts.cloud.provider` is also `elevenlabs` (windowsill#5867), the
+voice-loop MCP relay falls back to `CLAUDE_PLUGIN_OPTION_TTS_API_KEY` — one credentials home, not a
+second one. With `tts.cloud.provider` set to `openai` or `deepgram`, `tts_api_key` holds a different
+vendor's key, and the borrow is OFF so it is never sent to `api.elevenlabs.io`.
 
 That shared-key rule is ElevenLabs' alone, because it is the one provider covering both directions
 with one account here: a `deepgram` STT config is never handed an ElevenLabs key, and an
 `elevenlabs` STT config is never handed an OpenAI or Deepgram TTS key. A user on a local TTS
-backend who relied on `VOICE_LOOP_TTS_API_KEY` for STT must now set
-`stt.cloud.api_key_env` or `tts.cloud.provider: "elevenlabs"` explicitly.
+backend who relied on the TTS key for STT must now set `stt_api_key` in `/config` or
+`tts.cloud.provider: "elevenlabs"` explicitly.
 
 The hotkey dictation path (`scripts/dictate-toggle.sh` / `.cmd`) and the `voice-design` skill are
-not started by Claude Code, so they read the option's env var, find it unset, and fall through to
-`key_file` then the named env var. Users who need the key on those paths as well point
-`stt.cloud.key_file` (or `tts.cloud.key_file`) at the same key file. The same applies to the
-voice-setup skill — its key step recommends the plugin option AND the key file because the hotkey
-and the skill both bypass the harness.
+not started by Claude Code — they reach the key through the voice-loop plugin MCP server
+(declared under `mcpServers` in the manifest, server key `voice-loop`). The MCP server
+holds the two userConfig values in its env; the Stop / PostToolUse hooks (`speak.py`),
+the hotkey dictation path, and the `voice-design` skill all read the same env var when
+they need a key. The key never leaves userConfig or, transitively, the env the harness
+sets it in — no `key_file`, no `api_key_env`, no config-embedded copy. On stock Windows
+where `python3` is not on PATH, the MCP server does not start: `/voice-design` reports
+the voice-loop MCP tools as unavailable, and hotkey dictation takes the local whisper
+path.
 
 **A configured endpoint that would carry the key over clear text is refused, not warned about.**
 An `http://` (or `ws://`) `stt.cloud.endpoint` / `tts.cloud.endpoint` together with a configured key
@@ -216,35 +212,38 @@ where your voice goes, what `/report-bug` strips — is [PRIVACY.md](../../PRIVA
 in `PROVIDERS.md` — no dispatch path in the plugin compares a provider name against a literal, and
 a test enforces that.
 
-### Streaming dictation — the transcript arrives while you speak
+### Streaming dictation — batch-only while the key lives in the relay
 
-A batch dictation makes a long one pay twice: you speak for a minute, then wait at the end while
-the whole clip uploads and transcribes. Where the provider's registry entry has a **streaming
-variant** (today: `deepgram`), one setting feeds the recording to its live socket *while the
-microphone is open*, so at stop-time the text is already assembled:
+Cloud dictation is **batch-only** while the provider key lives in the voice-loop plugin MCP server
+(#5816). The hotkey dictation path holds no key of its own — the relay holds the userConfig value,
+and the streaming path's key resolution was removed from the script together with the rest of the
+credential-closure change. Setting `stt.cloud.streaming: true` therefore logs
 
-```json
-{ "stt": { "backend": "cloud", "cloud": { "provider": "deepgram", "streaming": true } } }
+```
+streaming needs a key the hotkey path no longer holds; using batch via the relay
 ```
 
-It is **off by default** — a live socket is a second failure surface, and you should ask for it.
-What does not change when you do:
+and takes the relay batch path (the same record → POST flow the rest of this section describes).
+Streaming is restored by [#5881](https://github.com/saharkit/windowsill/issues/5881), relayed through
+the same MCP server; it is not part of the current release.
 
-- the **WAV is still written** and still kept as `dictate-last.wav`. The socket *tails* the
-  recording; it never stands between the recorder and the disk;
-- **any** failure falls back to the ordinary record → POST flow with a line in `dictate.log` — no
-  key, a socket that will not open, an auth refusal, a server that hangs up mid-recording, a stream
-  that carried nothing. A recording is never lost to the live path;
+What this does not change:
+
+- `stt.cloud.streaming: true` is still **off by default** — a live socket is a second failure
+  surface, and you should ask for it.
+- the **WAV is still written** and still kept as `dictate-last.wav`;
+- **any** failure falls back to local whisper with a line in `dictate.log` — the relay answered
+  `no-key`, the relay was unreachable past the client's socket deadline, the provider HTTP call
+  failed, or the request line was malformed. A recording is never lost to the relay path;
 - your hotkey, your debounce, the min-clip guard, the clipboard tier and the paste rules are the
   same code they were.
 
-Every dictation logs what it cost, both ways, so you can compare them on your own machine:
+Every dictation logs what it cost:
 
 ```
-dictation latency stop_to_paste_ms=412 via=stream to=paste
+dictation latency stop_to_paste_ms=412 via=relay to=paste
 ```
 
-Turning it on for a provider that has no streaming variant changes nothing and says so in the log.
 `stt.model` and `stt.language` are the same axes as the batch call. See
 [`PROVIDERS.md`](PROVIDERS.md) for which providers stream and what the billing difference is.
 
@@ -739,17 +738,14 @@ The list is short and every entry has a reason.
   credential-named ones are reported as `<set>`, the value never leaves your machine). It then
   files the bundle through your own `gh` login (lines 1093–1133) **after** showing you the bundle
   in chat and asking before anything is sent.
-- **`tls-probe.py`** reads the `PROXY_VARS` (`configured_proxy`, lines 85 and 135–140) and
-  `SSL_CERT_FILE`/`SSL_CERT_DIR` (line 228), then makes one TLS handshake. The proxy variables
-  are diagnostic only — they are checked but never sent.
+- **`tls-probe.py`** makes one TLS handshake to the host you name. Proxies are bypassed
+  and the OK message says so unconditionally; the certificate store comes from
+  `ssl.get_default_verify_paths()`. No environment variables are read.
 - **The hook command** itself reads the cloud TTS/STT key from `$CLAUDE_PLUGIN_OPTION_TTS_API_KEY`
-  / `$CLAUDE_PLUGIN_OPTION_STT_API_KEY` (the `tts_api_key` / `stt_api_key` plugin options) when
-  voice-loop runs from Claude Code, falling back to `tts.cloud.key_file` /
-  `stt.cloud.key_file` and then to `tts.cloud.api_key_env` / `stt.cloud.api_key_env`. The hotkey
-  dictation path (`scripts/dictate-toggle.sh` / `.cmd`) and the `voice-design` skill are not started
-  by Claude Code and therefore read only the key file and the env var on that path; users who need
-  the key on those paths as well point `key_file` at the same file. Nothing the script reads is
-  stored in `config.json`.
+  / `$CLAUDE_PLUGIN_OPTION_STT_API_KEY` (the `tts_api_key` / `stt_api_key` plugin options). The
+  hotkey dictation path (`scripts/dictate-toggle.sh` / `.cmd`) and the `voice-design` skill are not
+  started by Claude Code and reach the key through the voice-loop plugin MCP server. The key never
+  leaves the userConfig or, transitively, the MCP server's env.
 
 ## What this plugin fetches at runtime
 
@@ -776,8 +772,9 @@ you every byte of it in chat and asks before anything is sent**, naming where it
 
 What the collector strips before you ever see it:
 
-- **keys and tokens** — by shape, and by config key name (`api_key` goes; `api_key_env` and
-  `key_file` stay, because "which variable was consulted" is half the diagnosis);
+- **keys and tokens** — by shape, and by config key name (`api_key` goes); credential-named
+  `VOICE_LOOP_*` environment variables are skipped entirely from the bundle (the plugin
+  no longer documents a credential-shaped variable for the installer to set);
 - **you** — your username and home paths, and every host except loopback;
 - **what was said.** A log line carrying speech keeps its event and loses its words:
   `transcript: <redacted 30 chars>`. The length is a diagnostic; the sentence is yours. Third-party
