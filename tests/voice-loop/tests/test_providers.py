@@ -49,8 +49,10 @@ def test_no_dispatch_path_compares_a_provider_against_a_literal():
     ones that decide where a request goes. The idiomatic ``.get()`` spelling is the other one a
     naive grep misses, and is covered by ``_PROVIDER_BRANCH`` (see the self-test below).
 
-    This file is exempt from its own rule: the pattern below is data, and the string it looks for
-    has to be written down somewhere.
+    No script is exempt: a match anywhere under ``plugins/voice-loop/scripts`` fails the
+    test. The pattern below is data in this test module, which sits outside the scanned
+    scripts directory — the string it looks for has to be written down somewhere, and
+    this is the one place the scan never reads.
     """
     offenders = []
     for path in sorted(_SCRIPTS.glob("*.py")):

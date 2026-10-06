@@ -28,6 +28,7 @@ from pathlib import Path
 
 import pytest
 
+from conftest import needs_af_unix
 from test_wsclient import Server, accept_for, parse_client_frame, read_http_head, server_frame
 
 _DICTATE_PATH = Path(__file__).resolve().parents[3] / "plugins" / "voice-loop" / "scripts" / "dictate.py"
@@ -2173,8 +2174,9 @@ def _log_of(state) -> str:
 # --- the streaming-opt-in path: batch-only line and relay batch ---------------------------------
 
 
+@needs_af_unix
 def test_streaming_opt_in_logs_batch_only_and_takes_the_relay_batch_path(
-    state, monkeypatch, tmp_path
+    state, monkeypatch, tmp_path, short_socket_dir
 ):
     """fix(#5816): with ``stt.cloud.streaming`` true the hotkey dictation path logs the
     batch-only line ("streaming needs a key the hotkey path no longer holds; using
@@ -2188,8 +2190,10 @@ def test_streaming_opt_in_logs_batch_only_and_takes_the_relay_batch_path(
     the relay rather than the local whisper server. The relay holds no key in this
     test — the production condition is "the hotkey process holds no key"; the
     relay in this test is a fake that echoes a fixed transcript, so the dictation
-    reaches the clipboard through the relay path with no provider call."""
-    env_dir = tmp_path / "runtime"
+    reaches the clipboard through the relay path with no provider call. The socket
+    is bound under the short socket directory: the client dials the very path the
+    fake relay binds, and both must sit below the kernel's sun_path width."""
+    env_dir = short_socket_dir / "runtime"
     env_dir.mkdir()
     sock_dir = env_dir / "voice-loop"
     sock_dir.mkdir(mode=0o700)
@@ -2320,8 +2324,9 @@ def _bind_silent_relay(directory: Path, monkeypatch):
     return server, t
 
 
+@needs_af_unix
 def test_relay_silent_past_client_deadline_logs_reason_timeout_and_falls_back_to_local_whisper(
-    state, monkeypatch, tmp_path
+    state, monkeypatch, short_socket_dir
 ):
     """fix(#5816): the client's socket deadline is ``stt.timeout + 5 s``. A relay that accepts the
     connection and never replies past that deadline is answered with
@@ -2332,8 +2337,10 @@ def test_relay_silent_past_client_deadline_logs_reason_timeout_and_falls_back_to
     newline-terminated reply) on a real Unix socket. The dictation reaches the relay, the
     client's deadline elapses, the typed-failure reply is logged, and the local whisper path
     runs the recording to its own transcript. The local-whisper transcript is what the
-    clipboard receives — a lost-recording scenario would surface as ``paste_text not called``."""
-    env_dir = tmp_path / "runtime"
+    clipboard receives — a lost-recording scenario would surface as ``paste_text not called``.
+    The socket is bound under the short socket directory so its path stays below the
+    kernel's sun_path width."""
+    env_dir = short_socket_dir / "runtime"
     env_dir.mkdir()
     server, t = _bind_silent_relay(env_dir, monkeypatch)
     monkeypatch.setenv("XDG_RUNTIME_DIR", str(env_dir))

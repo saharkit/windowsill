@@ -10,10 +10,14 @@ from __future__ import annotations
 
 import io
 import os
+import shutil
+import socket
 import sys
+import tempfile
 import threading
 import types
 import wave
+from pathlib import Path
 
 import pytest
 from pytest import ExitCode
@@ -24,6 +28,38 @@ try:
 except ImportError:
     TestClient = None  # type: ignore[assignment]
     voice_server = None  # type: ignore[assignment]
+
+
+# --- platform guards for the relay's AF_UNIX sockets -------------------------
+#
+# The relay is a POSIX-only feature: the dictation client refuses the relay path where
+# `socket` lacks AF_UNIX, and the relay's own bind/probe helpers assume it. The kernel
+# also caps a bound path at the sockaddr_un `sun_path` width (104 bytes on macOS),
+# which pytest's tmp_path can overshoot on its own, before a test appends anything.
+# Two shared answers keep every socket test on the same footing: a skip where the
+# platform has no AF_UNIX to speak, and a socket directory whose paths stay short no
+# matter how deep the runner's temporary tree sits.
+
+needs_af_unix = pytest.mark.skipif(
+    not hasattr(socket, "AF_UNIX"),
+    reason="the relay speaks AF_UNIX sockets, which this platform's socket module does not provide",
+)
+
+
+@pytest.fixture
+def short_socket_dir():
+    """A directory near the filesystem root, for paths a test BINDS a socket at.
+
+    mkdtemp creates it with mode 0700 a few dozen bytes from the root, so every path
+    under it stays far below the kernel's sun_path width on each POSIX platform, while
+    pytest's tmp_path sits wherever the runner put it and may already be too deep to
+    bind at. Anything that is not a socket path keeps using tmp_path.
+    """
+    directory = tempfile.mkdtemp(prefix="voice-loop-sockets-", dir="/tmp")
+    try:
+        yield Path(directory)
+    finally:
+        shutil.rmtree(directory, ignore_errors=True)
 
 
 class GateHeldTwice(RuntimeError):

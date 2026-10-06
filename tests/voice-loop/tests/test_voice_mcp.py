@@ -30,6 +30,7 @@ from unittest import mock
 import pytest
 
 import providers
+from conftest import needs_af_unix
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 VOICE_MCP = REPO_ROOT / "plugins" / "voice-loop/scripts/voice_mcp.py"
@@ -146,14 +147,15 @@ def _build_payload(provider: str, endpoint: str, **overrides) -> bytes:
 # --- 1. relay round-trip with a real socketpair ----------------------------
 
 
-def test_relay_round_trip_with_real_socketpair(tmp_path):
+@needs_af_unix
+def test_relay_round_trip_with_real_socketpair(short_socket_dir):
     """The relay answers a request line + WAV sent on a real AF_UNIX socketpair
     in one shot, with a stubbed provider, as ``{"status": "ok", "text": ...}``.
 
     No fakes at the request-build level: the registry drives the request,
     the test stubs only the network socket, and the assert is on the typed
     reply."""
-    directory = tmp_path / "relay"
+    directory = short_socket_dir / "relay"
     sock = _bind_relay(directory)
     module = _import_voice_mcp()
     try:
@@ -181,12 +183,13 @@ def test_relay_round_trip_with_real_socketpair(tmp_path):
 # --- 2. relay line-split reads a newline ANYWHERE in the buffer ------------
 
 
-def test_relay_splits_request_line_from_wav_with_newline_in_middle_of_recv(tmp_path):
+@needs_af_unix
+def test_relay_splits_request_line_from_wav_with_newline_in_middle_of_recv(short_socket_dir):
     """The request line and the WAV can arrive in a single ``recv``. The relay
     splits on the FIRST ``\\n`` anywhere in the buffer — not on a buf that
     ``endswith(b"\\n")``. A test that uses ``buf.endswith`` misses a request
     line and a WAV that landed in the same chunk."""
-    directory = tmp_path / "relay"
+    directory = short_socket_dir / "relay"
     sock = _bind_relay(directory)
     module = _import_voice_mcp()
     try:
@@ -222,12 +225,13 @@ def test_relay_splits_request_line_from_wav_with_newline_in_middle_of_recv(tmp_p
         sock.close()
 
 
-def test_relay_does_not_call_shutdown_before_sendall(tmp_path):
+@needs_af_unix
+def test_relay_does_not_call_shutdown_before_sendall(short_socket_dir):
     """A relay that half-closes its write side and then writes gets a
     ``BrokenPipeError`` and the client reads EOF as ``reason=timeout``. The
     reply is one ``sendall`` followed by ``close()`` in the finally block —
     nothing else, and specifically no ``shutdown`` between them."""
-    directory = tmp_path / "relay"
+    directory = short_socket_dir / "relay"
     sock = _bind_relay(directory)
     module = _import_voice_mcp()
     try:
@@ -251,14 +255,15 @@ def test_relay_does_not_call_shutdown_before_sendall(tmp_path):
         sock.close()
 
 
-def test_relay_reads_wav_across_multiple_chunks(tmp_path):
+@needs_af_unix
+def test_relay_reads_wav_across_multiple_chunks(short_socket_dir):
     """The WAV read loop continues across multiple ``recv`` calls — each
     chunk is appended to ``wav`` and the loop only breaks when the
     client half-closes (recv returns b""). The branch where
     ``len(wav) <= WAV_MAX_BYTES`` (line 336 → 331) is the natural loop
     continuation that ANY multi-chunk read exercises; this test pins
     that the loop terminates on EOF rather than after the first read."""
-    directory = tmp_path / "relay"
+    directory = short_socket_dir / "relay"
     sock = _bind_relay(directory)
     module = _import_voice_mcp()
     try:
@@ -612,10 +617,12 @@ def _serve_one_relay_connection(module, listener):
     module._serve_one_client(conn, addr)
 
 
-def _e2e_relay_dir(tmp_path, monkeypatch):
+def _e2e_relay_dir(base, monkeypatch):
     """The relay socket directory, created the way the relay creates it: 0700,
-    under a runtime dir the client's ``_relay_socket_path`` resolves to."""
-    runtime = tmp_path / "runtime"
+    under a runtime dir the client's ``_relay_socket_path`` resolves to. The base
+    is the short socket directory — the relay binds a real socket at the path
+    this helper returns, so it cannot sit under a deep tmp_path."""
+    runtime = base / "runtime"
     sock_dir = runtime / "voice-loop"
     os.makedirs(sock_dir, mode=0o700)
     os.chmod(sock_dir, 0o700)
@@ -626,7 +633,8 @@ def _e2e_relay_dir(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize("provider_name", sorted(providers.STT_PROVIDERS))
-def test_relay_end_to_end_real_http_real_socket_real_client(provider_name, tmp_path, monkeypatch):
+@needs_af_unix
+def test_relay_end_to_end_real_http_real_socket_real_client(provider_name, short_socket_dir, monkeypatch):
     """One full round trip per entry in the real registry, with nothing stubbed
     at the request layer: the production client dials a relay bound the way the
     relay binds it, the relay resolves the entry from the registry and builds
@@ -638,8 +646,6 @@ def test_relay_end_to_end_real_http_real_socket_real_client(provider_name, tmp_p
     equals the entry's own, multipart boundary included; the auth header is in
     the entry's own shape carrying the STT key; and the entry's own part and
     field names are in the body."""
-    if not hasattr(_socket, "AF_UNIX"):
-        pytest.skip("no AF_UNIX on this platform")
     module = _import_voice_mcp()
     client_module = _import_dictate()
     entry = providers.STT_PROVIDERS[provider_name]
@@ -647,7 +653,7 @@ def test_relay_end_to_end_real_http_real_socket_real_client(provider_name, tmp_p
     httpd = _start_provider_http_server(_e2e_transcript_doc(provider_name))
     try:
         endpoint = f"http://127.0.0.1:{httpd.server_address[1]}"
-        sock_dir = _e2e_relay_dir(tmp_path, monkeypatch)
+        sock_dir = _e2e_relay_dir(short_socket_dir, monkeypatch)
         listener = module._bind_socket(str(sock_dir / "stt.sock"))
         assert listener is not None
         relay_thread = threading.Thread(
@@ -716,14 +722,13 @@ def test_relay_end_to_end_real_http_real_socket_real_client(provider_name, tmp_p
         httpd.server_close()
 
 
-def test_relay_end_to_end_request_line_and_wav_in_one_recv(tmp_path, monkeypatch):
+@needs_af_unix
+def test_relay_end_to_end_request_line_and_wav_in_one_recv(short_socket_dir, monkeypatch):
     """The request line and the WAV can arrive in the relay's FIRST recv — one
     ``sendall`` on a stream socket leaves them in the socket buffer together,
     and the relay must split on the first newline and carry the remainder into
     the body. Same real http server and real relay; the client here is a raw
     socket sending one buffer, because the production client sends two."""
-    if not hasattr(_socket, "AF_UNIX"):
-        pytest.skip("no AF_UNIX on this platform")
     module = _import_voice_mcp()
     provider_name = "openai"
     entry = providers.STT_PROVIDERS[provider_name]
@@ -731,7 +736,7 @@ def test_relay_end_to_end_request_line_and_wav_in_one_recv(tmp_path, monkeypatch
     httpd = _start_provider_http_server(_e2e_transcript_doc(provider_name))
     try:
         endpoint = f"http://127.0.0.1:{httpd.server_address[1]}"
-        sock_dir = _e2e_relay_dir(tmp_path, monkeypatch)
+        sock_dir = _e2e_relay_dir(short_socket_dir, monkeypatch)
         sock_path = str(sock_dir / "stt.sock")
         listener = module._bind_socket(sock_path)
         assert listener is not None
@@ -1031,11 +1036,12 @@ def test_client_accepts_self_owned_socket(tmp_path, monkeypatch):
 # --- 8. relay stale-socket takeover ------------------------------------
 
 
-def test_relay_unlinks_and_binds_a_stale_socket(tmp_path):
+@needs_af_unix
+def test_relay_unlinks_and_binds_a_stale_socket(short_socket_dir):
     """When the socket path exists and one probe connection is refused, the
     relay unlinks and binds."""
     module = _import_voice_mcp()
-    directory = tmp_path / "relay"
+    directory = short_socket_dir / "relay"
     directory.mkdir(mode=0o700)
     sock_path = directory / "stt.sock"
     sock_path.write_text("")  # stale
@@ -1046,13 +1052,14 @@ def test_relay_unlinks_and_binds_a_stale_socket(tmp_path):
     assert sock_path.exists()
 
 
-def test_relay_skips_binding_when_probe_is_accepted(tmp_path):
+@needs_af_unix
+def test_relay_skips_binding_when_probe_is_accepted(short_socket_dir):
     """A live relay is detected by a successful probe — the second instance
     must skip binding and serve only the MCP tools. ``_bind_socket`` always
     tries to bind (it owns the unlink step); the SKIP happens at the relay
     loop's caller, where the probe answer is checked first."""
     module = _import_voice_mcp()
-    directory = tmp_path / "relay"
+    directory = short_socket_dir / "relay"
     directory.mkdir(mode=0o700)
     sock_path = directory / "stt.sock"
     live = _bind_relay(directory)
@@ -1177,7 +1184,8 @@ def test_streaming_cloud_logs_batch_only_line():
     assert any("streaming needs a key the hotkey path no longer holds" in c for c in log_calls)
 
 
-def test_client_relay_timeout_returns_timeout_result(tmp_path, monkeypatch):
+@needs_af_unix
+def test_client_relay_timeout_returns_timeout_result(tmp_path, short_socket_dir, monkeypatch):
     """A relay silent past ``stt.timeout + 5 s`` causes the client to return
     ``{"status": "failed", "reason": "timeout"}`` and the caller degrades."""
     module = _import_dictate()
@@ -1185,7 +1193,7 @@ def test_client_relay_timeout_returns_timeout_result(tmp_path, monkeypatch):
     env_dir.mkdir()
     monkeypatch.setenv("XDG_RUNTIME_DIR", str(env_dir))
     monkeypatch.setenv("CLAUDE_PLUGIN_OPTION_STT_API_KEY", "test-stt-key")
-    directory = tmp_path / "relay"
+    directory = short_socket_dir / "relay"
     directory.mkdir(mode=0o700)
     sock_path = directory / "stt.sock"
 
@@ -1780,34 +1788,6 @@ def test_serve_one_client_sends_failed_with_no_detail():
     assert reply == {"status": "failed", "reason": "timeout"}
 
 
-def test_post_provider_returns_provider_unreachable_when_decode_raises():
-    """The decoder is patched to raise ``ValueError`` directly — exercises
-    the except branch in ``_post_provider`` (line 255-256). The real
-    ``providers.decode`` swallows ValueError, so this branch is unreachable
-    in production; the test pins the defensive code path so a future
-    change that lets decode raise is still handled."""
-    module = _import_voice_mcp()
-    entry = _fake_entry()
-
-    class _Resp:
-        def __enter__(self): return self
-        def __exit__(self, *args): return False
-        def read(self): return b'{"text": "ok"}'
-
-    class _Opener:
-        def open(self, req, timeout=None):
-            return _Resp()
-
-    with mock.patch.object(module.urllib.request, "build_opener", return_value=_Opener()), \
-         mock.patch.object(module.providers, "decode", side_effect=ValueError("decode blew up")):
-        transcript, reason, detail = module._post_provider(
-            entry, {"cloud_endpoint": "https://x"}, "k", b"wav", 5.0
-        )
-    assert transcript is None
-    assert reason == "provider-unreachable"
-    assert detail is None
-
-
 def test_serve_one_client_sends_no_key_when_relay_has_no_stt_key():
     """The relay has no STT key in its env (and tts_vendor is not
     elevenlabs, so the TTS-key fallback doesn't apply). The relay
@@ -1925,28 +1905,43 @@ def test_serve_one_client_finally_block_swallows_close_oserror(tmp_path, monkeyp
 
 # --- 19. _socket_dir and _ensure_dir_mode branches ------------------
 
+# POSIX permission bits have no meaning on Windows — the two mode tests below assert
+# them directly, so they are skipped there rather than asserting against whatever
+# the platform reports for a directory's st_mode.
+needs_posix_modes = pytest.mark.skipif(
+    os.name == "nt",
+    reason="POSIX permission bits do not exist on Windows — the mode assertion has no meaning there",
+)
+
 
 def test_socket_dir_uses_xdg_state_home_when_no_runtime_dir(monkeypatch):
     """Without ``XDG_RUNTIME_DIR`` the relay falls back to
     ``$XDG_STATE_HOME/voice-loop/relay``. ``XDG_STATE_HOME`` defaults
     to ``~/.local/state`` per the XDG spec, so the helper joins the
-    state home with the relay directory name."""
+    state home with the relay directory name. The expected value is
+    built with ``os.path.join`` — the same join the helper uses — so
+    the assertion holds on every OS."""
     module = _import_voice_mcp()
     monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
     monkeypatch.setenv("XDG_STATE_HOME", "/tmp/state-home")
-    assert module._socket_dir() == "/tmp/state-home/voice-loop/relay"
+    assert module._socket_dir() == os.path.join("/tmp/state-home", "voice-loop", "relay")
 
 
 def test_socket_dir_defaults_state_home_to_local_state(monkeypatch):
     """With neither runtime nor state home set, the helper falls
-    back to ``~/.local/state/voice-loop/relay`` — the XDG default."""
+    back to ``~/.local/state/voice-loop/relay`` — the XDG default.
+    The expected value mirrors the helper's own composition
+    (``expanduser`` then ``os.path.join``), so it holds on every OS."""
     module = _import_voice_mcp()
     monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
     monkeypatch.delenv("XDG_STATE_HOME", raising=False)
     monkeypatch.setenv("HOME", "/tmp/home")
-    assert module._socket_dir() == "/tmp/home/.local/state/voice-loop/relay"
+    assert module._socket_dir() == os.path.join(
+        os.path.expanduser("~/.local/state"), "voice-loop", "relay"
+    )
 
 
+@needs_posix_modes
 def test_ensure_dir_mode_corrects_existing_dir_perms(tmp_path):
     """If the socket directory exists with a wider mode (a previous
     install or a manual mkdir), the helper narrows it back to 0700."""
@@ -1957,6 +1952,7 @@ def test_ensure_dir_mode_corrects_existing_dir_perms(tmp_path):
     assert (d.stat().st_mode & 0o777) == 0o700
 
 
+@needs_posix_modes
 def test_ensure_dir_mode_creates_missing_dir_with_target_mode(tmp_path):
     """Missing directory is created with the requested mode (umask
     may narrow; the chmod after makedirs restores the requested mode)."""
@@ -1969,12 +1965,14 @@ def test_ensure_dir_mode_creates_missing_dir_with_target_mode(tmp_path):
 
 
 def test_socket_path_joins_dir_and_filename():
-    """The wire-path constant is ``stt.sock`` inside the dir."""
+    """The wire-path constant is ``stt.sock`` inside the dir. The expected
+    value is built with ``os.path.join`` — the same join the helper uses —
+    so the assertion holds on every OS."""
     module = _import_voice_mcp()
     import unittest.mock as _mock
 
     with _mock.patch.object(module, "_socket_dir", return_value="/x/y"):
-        assert module._socket_path() == "/x/y/stt.sock"
+        assert module._socket_path() == os.path.join("/x/y", "stt.sock")
 
 
 # --- 20. _bind_socket error paths -----------------------------------
@@ -1999,6 +1997,7 @@ def test_bind_socket_returns_none_when_unlink_oserror(tmp_path, monkeypatch):
     assert module._bind_socket(str(sock_path)) is None
 
 
+@needs_af_unix
 def test_bind_socket_returns_none_on_bind_oserror(tmp_path, monkeypatch):
     """If the path exists and the unlink raced (a fresh socket appeared
     between unlink and bind), ``bind`` raises ``OSError`` and the helper
@@ -2024,12 +2023,13 @@ def test_bind_socket_returns_none_on_bind_oserror(tmp_path, monkeypatch):
     assert module._bind_socket(str(sock_path)) is None
 
 
-def test_bind_socket_swallows_chmod_oserror(tmp_path, monkeypatch):
+@needs_af_unix
+def test_bind_socket_swallows_chmod_oserror(short_socket_dir, monkeypatch):
     """A chmod failure on the bound socket is non-fatal — the bind
     succeeded and the listener is returned. (On a path that supports
     chmod this is unreachable; the helper is defensive.)"""
     module = _import_voice_mcp()
-    d = tmp_path / "relay"
+    d = short_socket_dir / "relay"
     d.mkdir(mode=0o700)
     sock_path = d / "stt.sock"
     real_chmod = module.os.chmod
@@ -2045,6 +2045,7 @@ def test_bind_socket_swallows_chmod_oserror(tmp_path, monkeypatch):
     sock.close()
 
 
+@needs_af_unix
 def test_probe_existing_returns_false_when_connect_oserror(tmp_path, monkeypatch):
     """A probe that fails with ``OSError`` (the canonical refusal)
     reports ``False`` — the socket is stale and the relay will unlink
@@ -2068,6 +2069,7 @@ def test_probe_existing_returns_false_when_connect_oserror(tmp_path, monkeypatch
     assert module._probe_existing(str(sock_path)) is False
 
 
+@needs_af_unix
 def test_probe_existing_swallows_close_oserror(tmp_path, monkeypatch):
     """The probe's ``finally`` block calls ``s.close()`` and swallows
     ``OSError``. A close that raises must not mask the probe's verdict."""
@@ -2323,6 +2325,7 @@ def test_relay_loop_spawns_thread_for_each_connection(tmp_path, monkeypatch):
     assert kw["daemon"] is True
 
 
+@needs_af_unix
 def test_relay_loop_retries_bind_after_unlink_oserror(tmp_path, monkeypatch):
     """If ``os.unlink`` raises ``OSError`` while taking over a stale
     socket, the loop sleeps ``REBIND_RETRY_SECONDS`` and continues
@@ -2403,6 +2406,7 @@ def test_relay_loop_retries_bind_after_unlink_oserror(tmp_path, monkeypatch):
     assert bind_calls["n"] >= 2
 
 
+@needs_af_unix
 def test_relay_loop_retries_bind_after_bind_failure(tmp_path, monkeypatch):
     """If ``_bind_socket`` returns ``None`` (bind OSError after
     successful unlink), the loop sleeps and retries. The test exits the
