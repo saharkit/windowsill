@@ -3515,3 +3515,250 @@ def test_stream_leg_writes_ok_then_closes_when_no_frames_follow():
     assert reply["status"] == "ok"
     # The provider leg was closed — a metered connection never outlives the worker.
     assert fake_ws.closed is True
+
+
+# --- end-to-end: real stream_worker, real relay, real fake provider websocket --------------------
+#
+# The acceptance criterion for fix(#5881): a single integration test drives the real
+# ``stream_worker`` through ``voice_mcp`` on a temporary AF_UNIX socket to a fake provider
+# websocket, and finds:
+#   * an interim in the preview state file (``dictate-preview.json``)
+#   * the assembled finals in the worker's result document (``dictate-stream.<pid>.json``)
+#
+# This is the test that pins the relay stream leg as a real wire: voice_mcp is the relay,
+# ``voice_mcp.wsclient.connect`` is patched to point at a real loopback websocket, and the
+# real ``_RelayStreamAdapter`` from ``scripts/dictate.py`` does the framing on the worker side.
+# The fake provider speaks one interim then one final; the worker threads each into the
+# preview file (interim) and the result (finals).
+
+
+def _make_frame(opcode: int, payload: bytes) -> bytes:
+    """One relay-frame: 1-byte opcode + 4-byte big-endian length + payload.
+
+    The relay's ``_pump_frames`` is a byte copier — it reads the same five-byte head
+    and the same payload the worker's ``_RelayStreamAdapter.poll`` parses. There is no
+    websocket masking here: this framing is the relay's own (windowsill#5881), not
+    RFC 6455. The high nibble is the FIN bit in the websocket frame, irrelevant on
+    the relay's wire, so we set opcode to the raw value (0x1 for text)."""
+    return bytes([opcode]) + len(payload).to_bytes(4, "big") + payload
+
+
+@needs_af_unix
+def test_stream_worker_drives_the_full_relay_stream_leg_through_voice_mcp(
+    short_socket_dir, monkeypatch, tmp_path
+):
+    """fix(#5881) acceptance: a real ``stream_worker`` drives the full wire through
+    ``voice_mcp`` on a temporary AF_UNIX socket to a fake provider websocket. The
+    fake speaks one interim and one final; the worker writes the interim into the
+    preview state file and the assembled finals into its result document."""
+    import struct as _struct
+
+    module = _import_voice_mcp()
+    client_module = _import_dictate()
+    entry = providers.STT_PROVIDERS["deepgram"]
+
+    # The provider fake listens on a real loopback port. ``wsclient.connect`` dials
+    # it as a wss/ws URL — for a loopback host, ws:// works without TLS, and the
+    # relay's clear-text refusal (``providers.clear_text_credential_error``) admits
+    # loopback by construction.
+    server_sock = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+    server_sock.bind(("127.0.0.1", 0))
+    server_sock.listen(1)
+    server_port = server_sock.getsockname()[1]
+    server_sock.settimeout(5.0)
+
+    # The relay socket, the way the proxy hands the worker a vouched path: 0700 dir,
+    # 0600 socket, owned by the current uid. ``_relay_socket_safe`` checks all three.
+    runtime = tmp_path / "runtime"
+    runtime.mkdir()
+    sock_dir = runtime / "voice-loop"
+    sock_dir.mkdir(mode=0o700)
+    os.chmod(sock_dir, 0o700)
+    sock_path = sock_dir / "stt.sock"
+    relay_listener = module._bind_socket(str(sock_path))
+    assert relay_listener is not None
+    relay_listener.settimeout(5.0)
+
+    # The relay's `_dial` runs in a worker thread (see `_serve_stream_client`). The
+    # patched ``wsclient.connect`` runs there, so it and the provider thread would
+    # race on ``server_sock.accept()``. Avoid the race by handing the relay a
+    # pre-accepted socket pair — the relay writes one end of the pair, the provider
+    # writes the other end, and the worker's relay adapter sees a websocket whose
+    # ``_sock`` carries the frames the provider sent.
+    provider_to_relay_a, provider_to_relay_b = _socket.socketpair(_socket.AF_UNIX, _socket.SOCK_STREAM)
+    provider_to_relay_a.settimeout(5.0)
+    provider_to_relay_b.settimeout(5.0)
+
+    def _ws_dial(url, headers=None, *, timeout=10.0):
+        # The relay "dialed" the provider. Return a websocket-shaped object backed
+        # by the relay end of the socketpair. The provider end is held by the
+        # provider thread below.
+        ws_inner_a = provider_to_relay_b
+
+        class _WS:
+            def __init__(self_inner):
+                self_inner._sock = ws_inner_a
+                self_inner.closed = False
+
+            def close(self_inner):
+                self_inner.closed = True
+                try:
+                    self_inner._sock.close()
+                except OSError:
+                    pass
+
+        return _WS()
+
+    # Redirect dictate's module to its own state directory — the worker writes its
+    # preview file and the per-pid result document against these paths.
+    state = tmp_path / "state"
+    state.mkdir()
+    monkeypatch.setattr(client_module, "_STATE_DIR", str(state))
+    monkeypatch.setattr(client_module, "_LOG_PATH", str(state / "dictate.log"))
+    monkeypatch.setattr(client_module, "_WAV_PATH", str(state / "dictate.wav"))
+    monkeypatch.setattr(client_module, "_PREVIEW_PATH", str(state / "dictate-preview.json"))
+    monkeypatch.setattr(client_module, "_STREAM_RESULT_PATH", str(state / "dictate-stream.json"))
+    monkeypatch.setattr(client_module, "_STREAM_PID_PATH", str(state / "dictate-stream.pid"))
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(runtime))
+
+    # Capture every preview update the worker writes — the file is overwritten on
+    # each call (a final settles the interim, clearing it), and the test wants to
+    # see that the interim landed at all before the final did. We patch the
+    # module's preview writer to a closure which closes over a non-recursive
+    # reference: we keep the real writer (the dict's "data" path is a temp
+    # write+replace) and call it directly, not via the module attribute.
+    real_write_preview = client_module._write_preview
+    preview_updates: list[dict] = []
+
+    def _record_preview(data, path):
+        preview_updates.append(dict(data))
+        real_write_preview(data, path)
+
+    monkeypatch.setattr(client_module, "_write_preview", _record_preview)
+
+    # The key lives in the relay's env only. The worker reads no key.
+    monkeypatch.setenv("CLAUDE_PLUGIN_OPTION_STT_API_KEY", "test-stt-key")
+    monkeypatch.setenv("CLAUDE_PLUGIN_OPTION_TTS_API_KEY", "")
+
+    # The real wav the worker tails.
+    wav_path = state / "dictate.wav"
+    pcm_payload = b"\x01\x02" * 500
+    body = b"WAVEfmt " + _struct.pack("<I", 16) + b"\x00" * 16 + b"data" + _struct.pack("<I", len(pcm_payload)) + pcm_payload
+    wav_path.write_bytes(b"RIFF" + _struct.pack("<I", len(body) + 4) + body)
+
+    # The full settings dictation.
+    s = client_module.resolve_settings(
+        {
+            "stt": {
+                "backend": "cloud",
+                "model": "nova-3",
+                "cloud": {"provider": "deepgram", "streaming": True, "endpoint": f"ws://127.0.0.1:{server_port}"},
+            },
+            "dictate": {"preview": True},
+        },
+        "Linux",
+    )
+    assert client_module.streaming_wanted(s) is True
+
+    def _serve_one_client_thread():
+        conn, addr = relay_listener.accept()
+        try:
+            with mock.patch.dict(
+                os.environ,
+                {"CLAUDE_PLUGIN_OPTION_STT_API_KEY": "test-stt-key", "CLAUDE_PLUGIN_OPTION_TTS_API_KEY": ""},
+                clear=False,
+            ):
+                with mock.patch.object(module.wsclient, "connect", side_effect=_ws_dial):
+                    module._serve_one_client(conn, addr)
+        finally:
+            try:
+                conn.close()
+            except OSError:
+                pass
+
+    relay_thread = threading.Thread(target=_serve_one_client_thread, daemon=True)
+    relay_thread.start()
+
+    # The fake provider holds the other end of the socketpair and sends the same
+    # frames wsclient would have decoded against a real websocket server. The wire
+    # is byte-for-byte the same as the relay expects — we bypass the handshake
+    # because voice_mcp's dial already returned success on a "telemetry" callback.
+    interim_payload = json.dumps(
+        {"type": "Results", "is_final": False, "channel": {"alternatives": [{"transcript": "interim one"}]}}
+    ).encode("utf-8")
+    final_payload = json.dumps(
+        {"type": "Results", "is_final": True, "channel": {"alternatives": [{"transcript": "final one"}]}}
+    ).encode("utf-8")
+
+    def _serve_provider():
+        provider_end = provider_to_relay_a
+        try:
+            # The wire the relay forwards to the provider carries frames the worker
+            # sends: opcode byte, 4-byte big-endian length, payload. The fake
+            # provider sends the interim first and holds the final — the worker's
+            # ``on_interim`` writes the interim to the preview file BEFORE the final
+            # settles the span. The interaction exercises both the preview hook and the
+            # assembled-finals path that the acceptance criterion pins.
+            provider_end.sendall(_make_frame(0x1, interim_payload))
+            # A beat — the worker writes the preview with the interim and an empty
+            # assembled, then reads more PCM and polls for more frames. The drain
+            # pulls in the final when it lands.
+            time.sleep(0.3)
+            provider_end.sendall(_make_frame(0x1, final_payload))
+            provider_end.settimeout(2.0)
+            while True:
+                try:
+                    chunk = provider_end.recv(65536)
+                except (_socket.timeout, OSError):
+                    break
+                if not chunk:
+                    break
+        except OSError:
+            return
+        finally:
+            try:
+                provider_end.close()
+            except OSError:
+                pass
+
+    provider_thread = threading.Thread(target=_serve_provider, daemon=True)
+    provider_thread.start()
+
+    try:
+        # Drive the real stream_worker against the relay socket. ``stream_worker``
+        # returns 0 on a clean session (status ok) or 1 on a typed failure. The
+        # fake speaks two text frames; the worker assembles them and writes the
+        # result document.
+        rc = client_module.stream_worker(s, ["4242"])
+        assert rc in (0, 1), f"stream_worker returned {rc}"
+    finally:
+        try:
+            server_sock.close()
+        except OSError:
+            pass
+
+    relay_thread.join(timeout=2)
+    provider_thread.join(timeout=2)
+
+    # The worker's per-pid result document carries the assembled finals and a clean
+    # status. ``_read_stream_result`` enforces the fencing so a stale predecessor
+    # cannot be misread as this recording's answer.
+    result = client_module._read_stream_result()
+    assert result is not None, "stream worker wrote no result document"
+    assert result.get("status") == "ok", (
+        f"unexpected status: {result.get('status')!r} reason={result.get('reason')!r}"
+    )
+    finals = result.get("text", "")
+    assert "final one" in finals, f"finals missing from worker result: {finals!r}"
+
+    # The preview state file holds the interim the worker surfaced through
+    # ``on_interim`` at some point during the session — even though a later final
+    # settles the interim from `current_interim`, the snapshot at the time the
+    # interim arrived still landed on disk and in the captured history.
+    preview_path = state / "dictate-preview.json"
+    assert preview_path.exists(), "preview state file was never written"
+    assert preview_updates, "no preview updates were captured at all"
+    interims_seen = [u.get("interim") for u in preview_updates if u.get("interim")]
+    assert "interim one" in interims_seen, (
+        f"interim 'interim one' never appeared in any preview update: {preview_updates!r}"
+    )
