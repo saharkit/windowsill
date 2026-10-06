@@ -683,3 +683,118 @@ def test_no_plugin_source_pipe_a_fetcher_into_a_shell() -> None:
             f"{p.relative_to(REPO_ROOT)}:{n} -> {l}" for p, n, l in offenders
         )
     )
+
+
+# --- the scoped-Edit allowlist check (saharkit/sahar#6141 finding 4) ---------------------------
+
+
+# The directory's allowlist of paths an ``allowed-tools`` Edit(<path>) entry may name. A
+# future scope addition must be reviewed and added here — a skill whose Edit scope is
+# not in the list fails the main assertion. Paths the skills tree edits today are listed
+# verbatim; the one glob (``./conformance-v*-*.md``) is the conformance report filename
+# whose version+date are part of the name and so cannot be enumerated to exact paths. A
+# future author who writes a bare ``Edit`` (no scope) is caught by a separate rule below
+# (a bare Edit does not match the ``Edit(<path>)`` shape, so it lands in the bare-Edit
+# offenders, not in this list).
+_EDIT_PATH_ALLOWLIST = frozenset(
+    {
+        "~/.claude/settings.json",
+        "~/.claude/settings.json.bak",
+        "~/.claude/tools/agent-statusline.js",
+        "~/.config/voice-loop/config.json",
+        "~/.config/systemd/user/voice-loop.service",
+        "~/.config/pipewire/pipewire.conf.d/voice-loop-echo-cancel.conf",
+        "~/.local/bin/voice-loop-dictate",
+        "~/.config/skhd/skhdrc",
+        "~/.claude/CLAUDE.md",
+        "./CLAUDE.md",
+        "./conformance-v*-*.md",
+    }
+)
+
+
+def _edit_scope_paths(path: Path) -> list[str | None]:
+    """The list of ``Edit(<path>)`` scopes a skill file declares, with bare ``Edit``
+    entries reported as ``None`` so the main assertion can separate the two failure
+    modes.
+
+    Returns ``None`` for files with no front matter / no ``allowed-tools`` line. Each
+    entry is either the inner path of a scoped Edit (``Edit(~/.claude/settings.json)`` ->
+    ``~/.claude/settings.json``) or ``None`` for a bare ``Edit`` (a scope the directory
+    refuses on the ALLOWED_TOOLS_BROAD principle: bare Edit is just as broad as bare
+    Bash when it overwrites an arbitrary file). The harness's glob syntax for scopes
+    (``*``, ``**``) is matched verbatim against the listed strings, so a future scope
+    using a glob the directory has not vetted lands in the offenders."""
+    items = _allowed_tools_items(path)
+    if items is None:
+        return []
+    scopes: list[str | None] = []
+    for item in items:
+        if item == "Edit":
+            scopes.append(None)
+        elif item.startswith("Edit(") and item.endswith(")"):
+            scopes.append(item[len("Edit(") : -len(")")])
+    return scopes
+
+
+def test_edit_scope_refuses_a_path_not_in_the_allowlist(tmp_path: Path) -> None:
+    """Refusal fixture: a real SKILL.md on tmp_path with an ``Edit(<path>)`` scope whose
+    path is not in the directory's allowlist fails the check. Pinned first so a regression
+    that turns the scope check into a silent pass (or that hardcodes the allowlist to
+    include the offender's path) fails loudly with this test name visible."""
+    skill = tmp_path / "skills" / "out-of-scope-edit" / "SKILL.md"
+    _write_skill_md(
+        skill,
+        "  - Edit(/etc/passwd)\n  - Read\n",
+    )
+    offenders = [
+        (skill, scope)
+        for scope in _edit_scope_paths(skill)
+        if scope is None or scope not in _EDIT_PATH_ALLOWLIST
+    ]
+    assert offenders, (
+        "the out-of-scope Edit refusal fixture did not surface its own offender; "
+        f"offenders={offenders!r}"
+    )
+
+
+def test_edit_scope_refuses_a_bare_edit_entry(tmp_path: Path) -> None:
+    """Refusal fixture: a real SKILL.md on tmp_path with a bare ``Edit`` (no scope) is
+    caught by the rule. The directory's ALLOWED_TOOLS_BROAD principle (windowsill#5867)
+    is read here to also apply to bare Edit: the scope tightening added by
+    saharkit/sahar#6141 takes every bare Edit off the table, and a future author who
+    re-adds one fails this test."""
+    skill = tmp_path / "skills" / "bare-edit" / "SKILL.md"
+    _write_skill_md(skill, "  - Edit\n  - Read\n")
+    offenders = [
+        (s, scope) for s in [skill] for scope in _edit_scope_paths(s) if scope is None
+    ]
+    assert offenders, (
+        "the bare-Edit refusal fixture did not surface its own offender; the bare-Edit "
+        f"detector missed it, offenders={offenders!r}"
+    )
+
+
+def test_no_skill_declares_an_out_of_scope_edit_entry() -> None:
+    """No skill / command / agent file under the plugins tree declares an
+    ``Edit(<path>)`` scope whose path is not in the directory's allowlist, AND no file
+    declares a bare ``Edit`` (no scope). The scope tightening added by
+    saharkit/sahar#6141 (a) takes every bare Edit off the table and (b) requires every
+    remaining Edit scope to be reviewed against an explicit allowlist before the
+    directory accepts it. A future skill that adds a new Edit scope fails here until
+    the path is reviewed and added to ``_EDIT_PATH_ALLOWLIST``."""
+    offenders: list[tuple[Path, str]] = []
+    for path in _skill_files():
+        for scope in _edit_scope_paths(path):
+            if scope is None:
+                offenders.append((path, "<bare Edit>"))
+            elif scope not in _EDIT_PATH_ALLOWLIST:
+                offenders.append((path, scope))
+    assert not offenders, (
+        "skill files declare an Edit scope that is not in the directory's allowlist "
+        "(the scope tightening added by saharkit/sahar#6141 takes every bare Edit off "
+        "the table and requires every remaining Edit scope to be reviewed against an "
+        "explicit allowlist; the cure is either to narrow the scope to a path on the "
+        "list, or to add the path to the list after review): "
+        + ", ".join(f"{p.relative_to(REPO_ROOT)} -> {s}" for p, s in offenders)
+    )
