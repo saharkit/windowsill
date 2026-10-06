@@ -72,7 +72,7 @@ SKIP needs a reason in the evidence cell (e.g. "Wayland-only guard, tested on X1
 | 2.13 | Streaming dictation — opt-in runs | With `stt.cloud.streaming: true` on a provider that has a streaming variant (e.g. `deepgram`), dictate a short sentence | the transcript arrives via the stream path; `dictate.log` records `via=stream` | | |
 | 2.14 | Streaming — clear-text refusal at the relay | With `stt.cloud.streaming: true`, set `stt.cloud.endpoint` to a non-loopback `ws://` URL | the relay answers `clear-text-refused` before any dial; the dictate log names it; the recording falls back to the batch path | | |
 | 2.15 | Streaming — no key falls back | With `stt.cloud.streaming: true`, the plugin MCP server has no STT key in its env | the relay answers `no-key`; the dictate log names it; the recording falls back to the relay batch path, then to local whisper | | |
-| 2.16 | Streaming — provider dies mid-stream | With the streaming path live, drop the network (or kill the connection from the provider side) | `dictate.log` records `streaming stt failed`; the recording is on disk and the batch path transcribes the clip | | |
+| 2.16 | Streaming — provider dies mid-stream | With the streaming path live, drop the network (or kill the connection from the provider side) | `dictate.log` records `streaming stt failed (the server closed the stream while the microphone was open) — using the recorded clip`; the recording is on disk and the batch path transcribes the clip | | |
 | 2.17 | Streaming — log evidence | After 2.13, inspect `dictate.log` | `dictation latency stop_to_paste_ms=… via=stream to=…`; `streaming stt done: finals=N audio_bytes=M` | | |
 
 ## 3. Speak-back — the assistant's voice

@@ -1283,18 +1283,17 @@ jobs:
           [ -s "$FAKE_CLIP_FILE" ] \
             || { echo "the transcript never reached the clipboard"; exit 1; }
 
-      - name: streaming dictation contract (real invocation, fake provider via the relay)
+      - name: batch dictation through the relay (real invocation, fake provider)
         env:
           LANGUAGE: ${{ matrix.language }}
         run: |
-          # fix(#5816) — cloud dictation is batch-only through the voice-loop MCP relay. The hotkey
-          # script holds no key. With stt.cloud.streaming true, the dictate log records the batch-only
-          # line, the relay's BATCH provider call returns the transcript, and the dictation reaches
-          # the clipboard with via=relay. The config asks Deepgram — the one registry entry with a
-          # streaming variant — so the opt-in is answered by the batch-only line itself, not by
-          # the note an entry without a streaming variant would get. The legacy
-          # fake_dg.py (an RFC 6455 websocket fake) cannot answer the relay's batch HTTP request, so
-          # it is replaced here by a stdlib http.server fake on 127.0.0.1.
+          # Cloud dictation with stt.cloud.streaming off — the BATCH leg of the voice-loop
+          # MCP relay. The hotkey script holds no key; the relay holds the only copy, makes
+          # the batch provider call, and the dictation reaches the clipboard with via=relay.
+          # The config asks Deepgram because the fake answers with Deepgram's batch JSON
+          # shape, which is the body the batch leg parses. The legacy fake_dg.py (an RFC 6455
+          # websocket fake) cannot answer the relay's batch HTTP request, so it is replaced
+          # here by a stdlib http.server fake on 127.0.0.1.
           fake="$RUNNER_TEMP/relay-fake"
           mkdir -p "$fake"
           export FAKE_RECORD_WAV="$RUNNER_TEMP/dictate-source.wav"   # the clip the step above made
@@ -1321,9 +1320,8 @@ jobs:
           """Fake STT provider — one HTTP POST, returns the configured transcript JSON.
 
           The body is Deepgram's batch shape (the transcript nested under the first
-          alternative of the first channel): Deepgram is the one registry entry with a
-          streaming variant, so it is the provider whose ``stt.cloud.streaming`` opt-in
-          is answered with the batch-only line this step asserts on."""
+          alternative of the first channel) — the body the relay's batch leg parses
+          into a transcript for the clipboard."""
           import json, socketserver, sys
           from http.server import BaseHTTPRequestHandler, HTTPServer
 
@@ -1405,7 +1403,7 @@ jobs:
               "model": "nova-3",
               "cloud": {
                 "provider": "deepgram",
-                "streaming": true,
+                "streaming": false,
                 "endpoint": "http://127.0.0.1:$port"
               }
             },
@@ -1439,9 +1437,7 @@ jobs:
           echo "--- fake provider"; cat "$RUNNER_TEMP/fake_provider.log"
           echo "--- clipboard capture"; cat "$FAKE_CLIP_FILE" 2>/dev/null || true; echo
 
-          # streaming=true -> the batch-only line lands in the log, and the relay batch path runs.
-          grep -q "streaming needs a key the hotkey path no longer holds; using batch via the relay" "$state/dictate.log" \
-            || { echo "the streaming-opt-in was not answered with the batch-only line"; exit 1; }
+          # streaming=false -> the relay's batch provider call runs and the transcript comes back.
           grep -q "via=relay" "$state/dictate.log" \
             || { echo "the dictation did not go via the relay -- it degraded to the batch-local path"; exit 1; }
           if grep -q -e "unexpected error" -e "Traceback" "$state/dictate.log"; then
@@ -1487,10 +1483,12 @@ jobs:
         run: |
           # fix(#5881) — streaming cloud dictation is the wire through the relay's stream leg.
           # A real websocket fake (`fake_dg.py`, an RFC 6455 server that speaks the Deepgram
-          # live shape) accepts the relay's dial, the relay forwards the worker's binary frames
-          # into the provider and the provider's text frames back, and the worker assembles
-          # the finals into the clipboard. ``via=stream`` lands in dictate.log; the fake's
-          # transcript is what reaches the clipboard.
+          # live shape) accepts the relay's dial. The relay CONVERTS on that leg: the worker's
+          # 5-byte client-leg frames become masked RFC 6455 frames toward the provider, and the
+          # provider's unmasked frames become 5-byte frames toward the worker. The fake's text
+          # frames reach the worker, the finals assemble into the clipboard, and ``via=stream``
+          # lands in dictate.log. TRANSCRIPT is the string the fake speaks and the greps expect.
+          TRANSCRIPT="the relay stream returned this"
           fake="$RUNNER_TEMP/stream-fake"
           mkdir -p "$fake"
           export FAKE_RECORD_WAV="$RUNNER_TEMP/dictate-source.wav"
@@ -1516,127 +1514,191 @@ jobs:
           cat > "$RUNNER_TEMP/fake_dg.py" <<'PY'
           """A minimal Deepgram live websocket server, stdlib only.
 
-          The relay dials this with the URL the worker computed (entry.streaming.url); the
-          fake answers the websocket handshake and emits one interim and one final, then a
-          Metadata close. The worker forwards its PCM frames to the fake (the relay is a byte
-          copier, so anything the worker sends arrives here) and the fake's frames are forwarded
-          back the same way. ``TRANSCRIPT`` is what the clipboard receives."""
+          The relay dials this with the URL the worker computed (entry.streaming.url)
+          and speaks RFC 6455 on that leg. The fake answers the websocket handshake,
+          emits one interim and one final as soon as the stream is up, and answers
+          CloseStream with a trailing final, a Metadata message and a close frame.
+          The worker's audio arrives as masked client frames — the relay converts
+          the worker's 5-byte client-leg frames into RFC 6455 toward the provider —
+          and everything the fake sends back is an UNMASKED server frame, because
+          RFC 6455 forbids a server from masking and the client refuses a masked
+          one. TRANSCRIPT (argv[2]) is what the clipboard receives."""
           import json
-import secrets
-import socket
-import socketserver
-import struct
-import sys
-from typing import Tuple
+          import socket
+          import socketserver
+          import struct
+          import sys
+          import time
 
-TRANSCRIPT = "the relay stream returned this"
-
-GUID = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
-
-
-def _accept_token(key: bytes) -> bytes:
-    import base64
-    import hashlib
-    return base64.b64encode(hashlib.sha1(key + GUID).digest())
+          GUID = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+          TRANSCRIPT = sys.argv[2] if len(sys.argv) > 2 else "the relay stream returned this"
+          # One connection may not outlive the step: the tail wait, the drain and the
+          # stop toggle's own bound all fit well inside this ceiling.
+          SESSION_LIMIT_SECONDS = 12.0
 
 
-def _read_request(conn: socket.socket) -> bytes:
-            buf = b""
-            while b"\r\n\r\n" not in buf:
-                chunk = conn.recv(65536)
-                if not chunk:
-                    break
-                buf += chunk
-            return buf
+          def _accept_token(key):
+              import base64
+              import hashlib
+              return base64.b64encode(hashlib.sha1(key + GUID).digest())
 
 
-def _frame(opcode: int, payload: bytes) -> bytes:
-            mask = secrets.token_bytes(4) if opcode != 0x8 else b""
-            length = len(payload)
-            if length < 126:
-                header = bytes([0x80 | opcode]) + bytes([0x80 | length]) + mask
-            elif length < (1 << 16):
-                header = bytes([0x80 | opcode, 0x80 | 126]) + struct.pack("!H", length) + mask
-            else:
-                header = bytes([0x80 | opcode, 0x80 | 127]) + struct.pack("!Q", length) + mask
-            if mask:
-                payload = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
-            return header + payload
+          def _frame(opcode, payload):
+              """One unmasked server->client frame. A server MUST NOT mask (RFC 6455);
+              the websocket client refuses a masked server frame outright."""
+              head = bytearray([0x80 | opcode])
+              length = len(payload)
+              if length < 126:
+                  head.append(length)
+              elif length < (1 << 16):
+                  head.append(126)
+                  head += struct.pack("!H", length)
+              else:
+                  head.append(127)
+                  head += struct.pack("!Q", length)
+              return bytes(head) + payload
 
 
-class _Handler:
-    def __init__(self, conn: socket.socket, addr: Tuple[str, int]) -> None:
-        self.conn = conn
-        self.addr = addr
-        self.received_audio = bytearray()
-
-    def serve(self) -> None:
-        try:
-            request = _read_request(self.conn)
-            lines = request.split(b"\r\n")
-            key_line = next(line for line in lines if line.lower().startswith(b"sec-websocket-key:"))
-            key = key_line.split(b":", 1)[1].strip()
-            handshake = (
-                b"HTTP/1.1 101 Switching Protocols\r\n"
-                b"Upgrade: websocket\r\nConnection: Upgrade\r\n"
-                b"Sec-WebSocket-Accept: " + _accept_token(key) + b"\r\n\r\n"
-            )
-            self.conn.sendall(handshake)
-            interim = json.dumps(
-                {
-                    "type": "Results",
-                    "is_final": False,
-                    "channel": {"alternatives": [{"transcript": TRANSCRIPT}]},
-                }
-            ).encode()
-            final = json.dumps(
-                {
-                    "type": "Results",
-                    "is_final": True,
-                    "channel": {"alternatives": [{"transcript": TRANSCRIPT}]},
-                }
-            ).encode()
-            metadata = json.dumps({"type": "Metadata"}).encode()
-            self.conn.sendall(_frame(0x1, interim))
-            self.conn.sendall(_frame(0x1, final))
-            # Drain a couple of client frames so the relay's client->provider leg has
-            # something to forward — proves the byte-copier is wired both ways.
-            self.conn.settimeout(0.5)
-            try:
-                while True:
-                    chunk = self.conn.recv(65536)
-                    if not chunk:
-                        break
-                    self.received_audio.extend(chunk)
-            except (socket.timeout, OSError):
-                pass
-            self.conn.sendall(_frame(0x1, metadata))
-            self.conn.sendall(_frame(0x8, b""))
-        finally:
-            try:
-                self.conn.close()
-            except OSError:
-                pass
+          def _results(text, final):
+              return json.dumps(
+                  {"type": "Results", "is_final": final,
+                   "channel": {"alternatives": [{"transcript": text}]}}
+              ).encode()
 
 
-class _NoLookupServer(socketserver.TCPServer):
-    allow_reuse_address = True
+          class _Handler:
+              """One websocket connection: the handshake, then the live shape."""
 
-    def server_bind(self):
-        socketserver.TCPServer.server_bind(self)
-        self.server_name = "127.0.0.1"
-        self.server_port = self.server_address[1]
+              def __init__(self, conn, addr):
+                  self.conn = conn
+                  self.addr = addr
+                  self.audio = bytearray()
+                  self.texts = []
+                  self.deadline = time.monotonic() + SESSION_LIMIT_SECONDS
+
+              def _read_exact(self, n):
+                  buf = bytearray()
+                  while len(buf) < n:
+                      remaining = self.deadline - time.monotonic()
+                      if remaining <= 0:
+                          return None
+                      self.conn.settimeout(remaining)
+                      try:
+                          chunk = self.conn.recv(n - len(buf))
+                      except OSError:
+                          return None
+                      if not chunk:
+                          return None
+                      buf += chunk
+                  return bytes(buf)
+
+              def _read_client_frame(self):
+                  """One masked client frame as (opcode, payload), or None on a dead wire."""
+                  head = self._read_exact(2)
+                  if head is None:
+                      return None
+                  opcode = head[0] & 0x0F
+                  if not head[1] & 0x80:
+                      return None  # a client frame must be masked; a bare frame ends the read
+                  length = head[1] & 0x7F
+                  if length == 126:
+                      ext = self._read_exact(2)
+                      if ext is None:
+                          return None
+                      length = struct.unpack("!H", ext)[0]
+                  elif length == 127:
+                      ext = self._read_exact(8)
+                      if ext is None:
+                          return None
+                      length = struct.unpack("!Q", ext)[0]
+                  mask = self._read_exact(4)
+                  if mask is None:
+                      return None
+                  payload = self._read_exact(length) if length else b""
+                  if payload is None:
+                      return None
+                  return opcode, bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+
+              def _speak_results(self, final):
+                  self.conn.sendall(_frame(0x1, _results(TRANSCRIPT, final)))
+
+              def serve(self):
+                  try:
+                      request = b""
+                      while b"\r\n\r\n" not in request:
+                          chunk = self.conn.recv(65536)
+                          if not chunk:
+                              return
+                          request += chunk
+                      key = next(
+                          line.split(b":", 1)[1].strip()
+                          for line in request.split(b"\r\n")
+                          if line.lower().startswith(b"sec-websocket-key:")
+                      )
+                      self.conn.sendall(
+                          b"HTTP/1.1 101 Switching Protocols\r\n"
+                          b"Upgrade: websocket\r\nConnection: Upgrade\r\n"
+                          b"Sec-WebSocket-Accept: " + _accept_token(key) + b"\r\n\r\n"
+                      )
+                      # One interim, then one final: proves interims are not assembled twice.
+                      self._speak_results(final=False)
+                      self._speak_results(final=True)
+                      while True:
+                          frame = self._read_client_frame()
+                          if frame is None:
+                              return
+                          opcode, payload = frame
+                          if opcode == 0x2:
+                              self.audio += payload
+                          elif opcode == 0x1:
+                              self.texts.append(payload)
+                              if b"CloseStream" in payload:
+                                  # The finals the server still owed, then the goodbye.
+                                  self._speak_results(final=True)
+                                  self.conn.sendall(_frame(0x1, json.dumps({"type": "Metadata"}).encode()))
+                                  self.conn.sendall(_frame(0x8, b""))
+                                  return
+                          elif opcode == 0x8:
+                              return
+                  except OSError:
+                      return
+                  finally:
+                      print(
+                          "fake dg: %d pcm bytes, texts=%r"
+                          % (len(self.audio), [t.decode("utf-8", "replace") for t in self.texts]),
+                          flush=True,
+                      )
+                      try:
+                          self.conn.close()
+                      except OSError:
+                          pass
 
 
-class _Threaded(socketserver.ThreadingMixIn, _NoLookupServer):
-    daemon_threads = True
+          class Handler(socketserver.BaseRequestHandler):
+              """socketserver's hook: hand the raw connection to the speaking handler."""
+
+              def handle(self):
+                  _Handler(self.request, self.client_address).serve()
 
 
-server = _Threaded(("127.0.0.1", 0), lambda *a, **kw: None)
-open(sys.argv[1], "w").write(str(server.server_address[1]))
-server.serve_forever()
+          class _NoLookupServer(socketserver.TCPServer):
+              allow_reuse_address = True
+
+              def server_bind(self):
+                  socketserver.TCPServer.server_bind(self)
+                  self.server_name = "127.0.0.1"
+                  self.server_port = self.server_address[1]
+
+
+          class _Threaded(socketserver.ThreadingMixIn, _NoLookupServer):
+              daemon_threads = True
+
+
+          server = _Threaded(("127.0.0.1", 0), Handler)
+          open(sys.argv[1], "w").write(str(server.server_address[1]))
+          server.serve_forever()
           PY
-          python3 "$RUNNER_TEMP/fake_dg.py" "$RUNNER_TEMP/fake_dg.port" \
+          python3 "$RUNNER_TEMP/fake_dg.py" "$RUNNER_TEMP/fake_dg.port" "$TRANSCRIPT" \
               > "$RUNNER_TEMP/fake_dg.log" 2>&1 &
           dg_pid=$!
           for _ in $(seq 1 50); do [ -s "$RUNNER_TEMP/fake_dg.port" ] && break; sleep 0.2; done

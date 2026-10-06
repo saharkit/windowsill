@@ -28,7 +28,7 @@ from pathlib import Path
 
 import pytest
 
-from conftest import needs_af_unix
+from conftest import FakeDeepgram, needs_af_unix
 from test_wsclient import Server, accept_for, parse_client_frame, read_http_head, server_frame
 
 _DICTATE_PATH = Path(__file__).resolve().parents[3] / "plugins" / "voice-loop" / "scripts" / "dictate.py"
@@ -2280,6 +2280,39 @@ def test_streaming_opt_in_routes_through_the_relay_stream_leg(
     assert parsed["timeout"] == 5.0
 
 
+@needs_af_unix
+def test_the_relay_adapter_keeps_a_zero_length_close_frame():
+    """A control frame is meaningful with an empty payload: a bare close opcode and a zero
+    length is how the relay says the provider hung up, so ``poll`` must not drop the frame on
+    its length check. The worker reads that frame as the end of the session — swallowing it
+    turns a provider's goodbye into an idle wait."""
+    adapter = dictate._RelayStreamAdapter(
+        {"stt_backend": "cloud"},
+        provider_name="deepgram",
+        url="ws://127.0.0.1:9/v1/listen",
+        tts_vendor="openai",
+        timeout=1.0,
+    )
+    ours, theirs = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        adapter._sock = ours
+        adapter.closed = False
+        theirs.sendall(bytes([dictate.wsclient.OP_CLOSE]) + (0).to_bytes(4, "big"))
+        # poll is non-blocking by design, so the test waits on the wire, not on the
+        # code under test — the frame lands in microseconds.
+        frames: list = []
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            frames = adapter.poll(0.0)
+            if frames:
+                break
+            time.sleep(0.01)
+        assert frames == [(dictate.wsclient.OP_CLOSE, b"")]
+    finally:
+        ours.close()
+        theirs.close()
+
+
 def _bind_silent_relay(directory: Path, monkeypatch):
     """Bind a Unix socket that accepts but never replies — for the timeout test."""
     sock_dir = directory / "voice-loop"
@@ -2816,78 +2849,10 @@ _OP = dictate.wsclient
 providers = dictate.providers
 
 
-def _results(text: str, *, final: bool) -> bytes:
-    """A Deepgram live message, in the shape the registry entry parses."""
-    return json.dumps(
-        {"type": "Results", "is_final": final, "channel": {"alternatives": [{"transcript": text}]}}
-    ).encode("utf-8")
-
-
 def _wav_bytes(pcm: bytes) -> bytes:
     """A real, canonical 44-byte-header WAV around some PCM."""
     body = b"WAVEfmt " + struct.pack("<I", 16) + b"\x00" * 16 + b"data" + struct.pack("<I", len(pcm)) + pcm
     return b"RIFF" + struct.pack("<I", len(body) + 4) + body
-
-
-class FakeDeepgram:
-    """A listening socket that answers like a live-transcription API.
-
-    It speaks once the audio starts flowing (an interim, then a final — proving interims are not
-    assembled twice), and answers CloseStream with the last final the server still owed, a
-    Metadata message and a close frame. That order IS the contract the drain exists for: the tail
-    of a dictation arrives AFTER the client has stopped sending.
-    """
-
-    def __init__(self, *, close_early: bool = False, reset_early: bool = False) -> None:
-        self.audio = bytearray()
-        self.close_early = close_early
-        # reset_early is the DEATH the close frame is not: SO_LINGER 0 makes close() send a TCP
-        # RST, so the client meets a dead socket rather than a polite goodbye — which is what a
-        # provider dropping out mid-dictation actually looks like.
-        self.reset_early = reset_early
-        self.server = Server(self._handle)
-
-    @property
-    def endpoint(self) -> str:
-        return f"http://127.0.0.1:{self.server.port}"
-
-    def _handle(self, server, conn) -> None:
-        head = read_http_head(conn)
-        conn.sendall(
-            b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n"
-            b"Sec-WebSocket-Accept: " + accept_for(head).encode() + b"\r\n\r\n"
-        )
-        spoke = False
-        buf = bytearray()
-        while True:
-            chunk = conn.recv(65536)
-            if not chunk:
-                return
-            buf += chunk
-            while True:
-                frame = parse_client_frame(buf)
-                if frame is None:
-                    break
-                opcode, payload = frame
-                server.frames.append(frame)
-                if opcode == _OP.OP_BINARY:
-                    self.audio += payload
-                    if self.reset_early:
-                        conn.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
-                        conn.close()
-                        return
-                    if self.close_early:
-                        conn.sendall(server_frame(_OP.OP_CLOSE, struct.pack("!H", 1011)))
-                        return
-                    if not spoke:
-                        spoke = True
-                        conn.sendall(server_frame(_OP.OP_TEXT, _results("привет это", final=False)))
-                        conn.sendall(server_frame(_OP.OP_TEXT, _results("Привет, это", final=True)))
-                elif opcode == _OP.OP_TEXT and b"CloseStream" in payload:
-                    conn.sendall(server_frame(_OP.OP_TEXT, _results("диктовка.", final=True)))
-                    conn.sendall(server_frame(_OP.OP_TEXT, b'{"type":"Metadata","duration":1.5}'))
-                    conn.sendall(server_frame(_OP.OP_CLOSE, struct.pack("!H", 1000)))
-                    return
 
 
 def _streaming_settings(endpoint: str) -> dict:
@@ -3573,34 +3538,43 @@ class TestTheWorkerEntryPoint:
         assert result["status"] == "failed"
         assert "no streaming variant" in result["reason"]
 
-    def test_the_worker_runs_the_session_and_writes_its_answer(self, state, monkeypatch):
-        """fix(#5881): with streaming restored, the worker dials the relay. A short
-        invocation against a real Deepgram provider speaks the recording and writes a
-        ``status: ok`` result with the assembled finals. The ``connect=`` slot takes the
-        relay adapter; the run stays the same code the logic on top of it expects."""
+    def test_a_worker_with_a_key_in_its_env_still_needs_the_relay(
+        self, state, monkeypatch, short_socket_dir
+    ):
+        """fix(#5881): the worker dials the relay — only the relay. A key in the worker's
+        own env buys nothing on the streaming path: with no relay bound the dial itself is
+        the failure, the reason names the relay, and the worker exits 1 rather than
+        reaching for the provider socket directly."""
         monkeypatch.setenv("CLAUDE_PLUGIN_OPTION_STT_API_KEY", "dg-secret")
+        env_dir = short_socket_dir / "runtime"
+        env_dir.mkdir()
+        monkeypatch.setenv("XDG_RUNTIME_DIR", str(env_dir))
         s = dictate.resolve_settings(
             {"stt": {"backend": "cloud", "cloud": {"provider": "deepgram", "streaming": True}}}, "Linux"
         )
-        # Plant a relay-shaped record so the worker has no relay to dial but the
-        # worker still runs through ``run_stream_session`` shape; we just assert the
-        # worker exited (the prior failure mode was a typed refusal).
-        assert dictate.stream_worker(s, ["4242"]) in (0, 1)
+        assert dictate.stream_worker(s, ["4242"]) == 1
         result = dictate._read_stream_result()
-        assert result is not None
-        assert "status" in result
+        assert result["status"] == "failed"
+        assert "relay" in result["reason"].lower()
 
-    def test_a_worker_told_no_recorder_pid_still_runs_rather_than_crashing(self, state, monkeypatch):
+    def test_a_worker_told_no_recorder_pid_still_runs_rather_than_crashing(
+        self, state, monkeypatch, short_socket_dir
+    ):
         """argv is a contract with ourselves, and a broken one must degrade like everything
         else. fix(#5881): a missing recorder pid is treated as "the recorder is dead" and
-        the worker still runs the session — the worker NEVER crashes the worker."""
+        the worker still runs rather than crashing — here the relay dial fails first, and
+        the failure is the typed kind, never a traceback."""
+        monkeypatch.delenv("CLAUDE_PLUGIN_OPTION_STT_API_KEY", raising=False)
+        env_dir = short_socket_dir / "runtime"
+        env_dir.mkdir()
+        monkeypatch.setenv("XDG_RUNTIME_DIR", str(env_dir))
         s = dictate.resolve_settings(
             {"stt": {"backend": "cloud", "cloud": {"provider": "deepgram", "streaming": True}}}, "Linux"
         )
-        assert dictate.stream_worker(s, []) in (0, 1)
+        assert dictate.stream_worker(s, []) == 1
         result = dictate._read_stream_result()
-        assert result is not None
-        assert "status" in result
+        assert result["status"] == "failed"
+        assert "relay" in result["reason"].lower()
 
 
 # --- live preview surface (windowsill#115) --------------------------------------------------------
@@ -3708,25 +3682,39 @@ class TestOnInterimCallback:
 class TestPreviewLifecycle:
     """Preview starts with the recording and clears when the text is delivered."""
 
-    def test_stream_worker_writes_preview_when_enabled(self, state, monkeypatch):
-        """fix(#5881): the stream worker reaches the relay-adapter's preview hook when
-        ``dictate.preview`` is on. The worker never crashes the worker; when no relay
-        is bound the typed-failure path runs (no preview written, no session)."""
+    def test_stream_worker_leaves_no_preview_when_enabled_and_no_relay_is_bound(
+        self, state, monkeypatch, short_socket_dir
+    ):
+        """fix(#5881): the preview hook fires from inside the session, and the session
+        needs the relay. With no relay bound the dial fails before one interim could
+        exist, so even ``dictate.preview`` on leaves the preview file unwritten."""
+        monkeypatch.delenv("CLAUDE_PLUGIN_OPTION_STT_API_KEY", raising=False)
+        env_dir = short_socket_dir / "runtime"
+        env_dir.mkdir()
+        monkeypatch.setenv("XDG_RUNTIME_DIR", str(env_dir))
         s = _streaming_settings("http://127.0.0.1:9")
         s["preview"] = True
-        # With no relay bound, the worker returns a typed failure without ever reaching
-        # the session. The preview file is therefore never written.
-        assert dictate.stream_worker(s, ["4242"]) in (0, 1)
+        assert dictate.stream_worker(s, ["4242"]) == 1
         result = dictate._read_stream_result()
-        assert result is not None
-        assert "status" in result
+        assert result["status"] == "failed"
+        assert "relay" in result["reason"].lower()
+        assert not (state / "dictate-preview.json").exists()
 
-    def test_stream_worker_does_not_write_preview_when_disabled(self, state, monkeypatch):
+    def test_stream_worker_does_not_write_preview_when_disabled(
+        self, state, monkeypatch, short_socket_dir
+    ):
         """The default — preview off — never touches the preview file. The worker
         runs through its typed-failure path when no relay is bound."""
+        monkeypatch.delenv("CLAUDE_PLUGIN_OPTION_STT_API_KEY", raising=False)
+        env_dir = short_socket_dir / "runtime"
+        env_dir.mkdir()
+        monkeypatch.setenv("XDG_RUNTIME_DIR", str(env_dir))
         s = _streaming_settings("http://127.0.0.1:9")
         s["preview"] = False
-        assert dictate.stream_worker(s, ["4242"]) in (0, 1)
+        assert dictate.stream_worker(s, ["4242"]) == 1
+        result = dictate._read_stream_result()
+        assert result["status"] == "failed"
+        assert "relay" in result["reason"].lower()
         assert not (state / "dictate-preview.json").exists()
 
     def test_preview_is_not_started_without_streaming(self, state, monkeypatch):

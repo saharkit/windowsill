@@ -2207,7 +2207,8 @@ def stream_worker(s: dict, args: list[str]) -> int:
     """The child process: run the streaming session, write the one answer, exit.
 
     After #5881 the streaming path is reachable again: the worker dials the voice-loop MCP relay,
-    which holds the key, and the provider websocket is framed through the relay byte-for-byte.
+    which holds the key, and the provider websocket is reached through the relay: the worker's
+    private 5-byte frames and the provider's RFC 6455 frames are converted inside the relay, so
     ``run_stream_session`` runs UNCHANGED — the ``connect=`` argument takes the relay adapter in
     place of ``wsclient.connect``, so every behaviour windowsill#99 and #115 test (interim
     parsing, keepalive, close_message, drain) is exactly the same code.
@@ -2300,8 +2301,10 @@ def stream_worker(s: dict, args: list[str]) -> int:
 # ``run_stream_session`` expects a ``connect=`` callable whose shape is ``wsclient.connect``:
 # ``(url, headers, timeout=...)`` -> an object with ``send_binary``, ``send_text``, ``poll``,
 # ``close``, ``closed``. The worker dials the relay over the vouched AF_UNIX socket and asks the
-# relay to dial the provider; the relay is then a byte copier. The adapter EXPOSES the wsclient
-# methods over that socket and IGNORES ``headers`` (the relay builds them with the key it holds).
+# relay to dial the provider; the relay CONVERTS between this adapter's 5-byte frames and the
+# provider's RFC 6455 websocket, so the adapter speaks only the private framing. The adapter
+# EXPOSES the wsclient methods over that socket and IGNORES ``headers`` (the relay builds them
+# with the key it holds).
 #
 # Every adapter failure (no socket, a vouching refusal, a failed stream line, EOF mid-stream) is
 # raised in the adapter as ``wsclient.WebSocketError`` — ``run_stream_session`` already maps that
@@ -2493,7 +2496,10 @@ class _RelayStreamAdapter:
                 self.closed = True
                 return []
             payload += chunk
-        if length > 0:
+        # A control frame is meaningful with an empty payload: a bare close
+        # opcode and a zero length is the provider hanging up, so the length
+        # guard must not swallow it — the session ends on that frame.
+        if length > 0 or opcode == self.OP_CLOSE:
             frames.append((opcode, payload))
         return frames
 

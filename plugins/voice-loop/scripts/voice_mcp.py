@@ -12,8 +12,9 @@ One stdlib stdio MCP server that does two unrelated jobs:
   with mode 0700, the relay owns the stale-socket question, and the client vouches for
   ownership before it dials (the mitigate is in ``scripts/dictate.py``). Two legs share
   the socket — the historical batch path (one WAV in, one transcript out) and the
-  streaming dictation path (one stream-line in, the provider socket framed through the
-  relay byte-for-byte). The dispatch is at the front of ``_serve_one_client``: a line
+  streaming dictation path (one stream-line in, then the relay CONVERTING between the
+  worker's private framing on the client leg and RFC 6455 on the provider leg). The
+  dispatch is at the front of ``_serve_one_client``: a line
   without ``mode`` is the batch line, a line with ``mode == "stream"`` is the stream
   line and is handled by ``_serve_stream_client``. The clear-text refusal, the
   three-step key resolution and the closed ``_REASONS`` set are the same on both legs.
@@ -99,8 +100,8 @@ WAV_MAX_BYTES = 32 * 1024 * 1024
 # client's local cap; declared here so the relay does not import dictate.
 PROVIDER_RESPONSE_MAX_BYTES = 4 * 1024 * 1024
 
-# Per-frame cap on the byte copier that carries frames between the client and the
-# provider. A stream leg never carries a frame larger than the wsclient
+# Per-frame cap on the converter that carries frames between the client and the
+# provider legs. A stream leg never carries a frame larger than the wsclient
 # ceiling (1 MiB), but a hostile peer could ask for a read that big — a cap here
 # keeps the relay from allocating its way out of memory if it ever does.
 STREAM_FRAME_MAX_BYTES = wsclient.MAX_FRAME_BYTES
@@ -110,6 +111,12 @@ STREAM_FRAME_MAX_BYTES = wsclient.MAX_FRAME_BYTES
 # the wall-clock bound around the dial, the place a connect timeout is reported
 # versus an unreachable host (windowsill#5881 R6).
 STREAM_DIAL_TIMEOUT_SECONDS = 5.0
+# One wait slice for the converter threads: how long either leg may block on a
+# quiet peer before re-examining the session's stop flag. Short enough that the
+# leg which ends first is noticed by the other within one slice (a metered
+# provider connection never outlives the worker by more than this), long enough
+# that an idle session costs a handful of wakeups a second rather than a spin.
+STREAM_POLL_SECONDS = 0.25
 
 
 # --- server version ----------------------------------------------------------
@@ -192,9 +199,12 @@ def _validate_request_line(line: str) -> tuple[dict | None, str | None]:
 
     A line that names ``mode == "stream"`` is the streaming dictation request and is validated by
     ``_validate_stream_line`` instead — the four conditions above describe the BATCH request, which
-    is exactly the request that has carried the seven keys since the v0 contract. A stream line without
-    a ``mode`` is still the batch line (the worker dials without setting ``mode``), so a non-dict
-    request line is the batch line's own concern and routes through the existing four-condition path.
+    is exactly the request that has carried the seven keys since the v0 contract. A line without
+    a ``mode`` is still the batch line (the worker dials without setting ``mode``). A line whose
+    ``mode`` is anything other than ``"stream"`` is malformed and answered here: the dispatch in
+    ``_serve_one_client`` routes only ``"stream"`` to the streaming leg, so any other value would
+    fall through to the batch reader, which indexes the seven batch keys such a line does not
+    carry — a missing-key crash on the reply path instead of a bad-request reply.
     """
     try:
         parsed = json.loads(line)
@@ -202,11 +212,6 @@ def _validate_request_line(line: str) -> tuple[dict | None, str | None]:
         return None, f"request line is not valid JSON: {type(err).__name__}"
     if not isinstance(parsed, dict):
         return None, "request line is not a JSON object"
-    # A stream line declares its mode on its own JSON and doesn't lie: any line without
-    # "mode" is the historical batch line, and the seven-key check covers it. A line that
-    # names "mode" with a value other than "stream" is malformed and gets bad-request at
-    # the dispatch step (``_dispatch_request_line``), where the dispatch decides batch
-    # vs stream — not at the validator.
     if "mode" not in parsed:
         required = (
             "provider",
@@ -222,7 +227,10 @@ def _validate_request_line(line: str) -> tuple[dict | None, str | None]:
             return None, f"missing keys: {missing}"
         if parsed["provider"] not in _VALID_PROVIDERS:
             return None, f"unknown provider: {parsed['provider']!r}"
-    return parsed, None
+        return parsed, None
+    if parsed["mode"] == "stream":
+        return _validate_stream_line(line)
+    return None, f"unknown mode: {parsed['mode']!r}"
 
 
 def _validate_stream_line(line: str) -> tuple[dict | None, str | None]:
@@ -441,8 +449,10 @@ def _serve_one_client(client_sock: _socket.socket, addr) -> None:
         # so the batch validator would answer ``missing keys`` — wrong reason,
         # wrong verdict. The dispatch below hands the connection to
         # ``_serve_stream_client`` and reads nothing further off the socket;
-        # the relay is then a bidirectional frame copier until both legs say
-        # goodbye.
+        # the relay then converts frames between the worker's private wire and
+        # the provider's websocket until both legs say goodbye. Any OTHER mode
+        # value is not routed here and is answered by the batch validator as a
+        # bad request naming the mode.
         try:
             peek = json.loads(line)
         except (ValueError, UnicodeDecodeError):
@@ -562,28 +572,40 @@ def _serve_one_client(client_sock: _socket.socket, addr) -> None:
 #
 # Wire (from the client side):
 #   {"mode": "stream", "provider": ..., "url": ..., "tts_vendor": ..., "timeout": ...}\n
-# Then both sides write FRAMED byte sequences:
+# Then the client leg carries the relay's PRIVATE framing:
 #   1 byte opcode (wsclient OP_TEXT/OP_BINARY/OP_CLOSE)
 #   4 bytes big-endian payload length
 #   <payload>
-# The relay is a BYTE COPIER between the two legs. Every frame arriving on
-# the client leg is forwarded to the provider leg and vice versa, one thread
-# per direction, beside the batch handler. A frame's worth of reads closes both
-# legs on EOF or any error — a metered provider connection never outlives
-# the worker.
+# The provider leg is a websocket (RFC 6455, spoken by ``wsclient``): masked
+# client frames toward the provider, unmasked server frames back. The relay is
+# a CONVERTER between the two framings, one thread per direction — the 5-byte
+# framing never reaches the provider socket and websocket bytes never reach the
+# worker. Either leg ending (a close frame, EOF, any error) stops the session
+# and closes both legs within one poll slice — a metered provider connection
+# never outlives the worker.
 
 
-def _read_exact(client_sock: _socket.socket, n: int) -> bytes | None:
-    """Read exactly ``n`` bytes, returning ``None`` on EOF before that point.
+def _read_exact(client_sock, n: int, *, stop: threading.Event | None = None) -> bytes | None:
+    """Read exactly ``n`` bytes, returning ``None`` on EOF, on error, or once ``stop`` is set.
 
-    Frames are small (8-byte head + ≤1 MiB payload) so this is a bounded
+    Frames are small (5-byte head + ≤1 MiB payload) so this is a bounded
     dance: each call returns the whole thing or signals end-of-stream, and
     the caller falls through to a typed failure. A short read is a partial
-    read we complete before moving on, not a failure to retry."""
+    read we complete before moving on, not a failure to retry.
+
+    ``stop`` is checked on every pass, and a recv timeout is one more pass
+    rather than an error: the client socket is read in ``STREAM_POLL_SECONDS``
+    slices so a reader waiting on a quiet peer still returns promptly once the
+    session's other direction has ended — without this, a worker that vanished
+    would leave this read pinned on a socket nobody will ever write again."""
     buf = bytearray()
     while len(buf) < n:
+        if stop is not None and stop.is_set():
+            return None
         try:
             chunk = client_sock.recv(n - len(buf))
+        except TimeoutError:  # socket.timeout is this, on every supported Python
+            continue
         except OSError:
             return None
         if not chunk:
@@ -605,30 +627,88 @@ def _stream_reply_failure(client_sock: _socket.socket, reason: str, detail: str 
         pass
 
 
-def _pump_frames(reader_sock, writer_sock, *, name: str, errors: list) -> None:
-    """Copy one direction's frames between two sockets, byte for byte.
+def _pump_client_to_provider(client_sock, ws, *, name: str, errors: list, stop: threading.Event) -> None:
+    """Carry the worker's private frames onto the provider's websocket.
 
-    Each frame: 1-byte opcode, 4-byte big-endian length, then the payload.
-    Errors (OSError, websocketError, anything the provider hands back as a
-    death signal) land in ``errors`` and the loop returns — the caller
-    closes both legs."""
-    while True:
-        head = _read_exact(reader_sock, 5)
+    The client leg speaks the relay's 5-byte framing; the provider leg speaks
+    RFC 6455. This thread DECODES the client framing and hands each payload to
+    the websocket's public surface: binary audio as ``send_binary``, the
+    registry's text control messages (KeepAlive, CloseStream) as ``send_text``,
+    a close opcode as ``ws.close()`` and the end of the session. Any other
+    opcode is a wire violation from a peer that is not the worker — the session
+    ends rather than guessing at a translation. The declared length is capped
+    BEFORE the payload is read. The websocket's own pings are answered by
+    ``wsclient`` on its read path, not here.
+
+    Errors land in the shared ``errors`` list; every exit sets ``stop`` and
+    closes the provider leg, so the other direction comes down within one poll
+    slice and a metered provider connection never outlives the worker."""
+    client_sock.settimeout(STREAM_POLL_SECONDS)
+    while not stop.is_set():
+        head = _read_exact(client_sock, 5, stop=stop)
         if head is None:
-            return
+            break
         opcode = head[0]
         length = int.from_bytes(head[1:5], "big")
         if length > STREAM_FRAME_MAX_BYTES:
             errors.append(f"{name}: frame over {STREAM_FRAME_MAX_BYTES} bytes")
-            return
-        payload = _read_exact(reader_sock, length) if length else b""
+            break
+        payload = _read_exact(client_sock, length, stop=stop) if length else b""
         if payload is None:
-            return
+            break
         try:
-            writer_sock.sendall(bytes([opcode]) + length.to_bytes(4, "big") + payload)
+            if opcode == wsclient.OP_BINARY:
+                ws.send_binary(payload)
+            elif opcode == wsclient.OP_TEXT:
+                ws.send_text(payload.decode("utf-8"))
+            elif opcode == wsclient.OP_CLOSE:
+                ws.close()
+                break
+            else:
+                errors.append(f"{name}: unknown opcode {opcode}")
+                break
+        except (wsclient.WebSocketError, OSError, UnicodeDecodeError) as err:
+            errors.append(f"{name}: {err}")
+            break
+    stop.set()
+    ws.close()
+
+
+def _pump_provider_to_client(ws, client_sock, *, name: str, errors: list, stop: threading.Event) -> None:
+    """Carry the provider's websocket messages back to the worker.
+
+    The reverse conversion: every complete message the websocket hands back —
+    ``wsclient.poll`` reassembles fragments and answers the provider's pings
+    itself — becomes one 5-byte frame on the client leg, opcodes intact. A
+    close opcode is FORWARDED, payload and all, and ends the session: it is how
+    the worker learns the provider hung up. ``poll`` runs in
+    ``STREAM_POLL_SECONDS`` slices so this thread re-examines ``stop`` on every
+    quiet one — when the client leg has ended, the provider connection comes
+    down within a slice, not at the next frame that never comes.
+
+    Errors land in the shared ``errors`` list; every exit sets ``stop`` and
+    closes the provider leg."""
+    while not stop.is_set():
+        try:
+            frames = ws.poll(STREAM_POLL_SECONDS)
+        except (wsclient.WebSocketError, OSError) as err:
+            errors.append(f"{name}: {err}")
+            break
+        if not frames:
+            continue
+        closed = False
+        try:
+            for opcode, payload in frames:
+                client_sock.sendall(bytes([opcode]) + len(payload).to_bytes(4, "big") + payload)
+                if opcode == wsclient.OP_CLOSE:
+                    closed = True
         except OSError as err:
             errors.append(f"{name}: {err}")
-            return
+            break
+        if closed:
+            break
+    stop.set()
+    ws.close()
 
 
 def _serve_stream_client(client_sock: _socket.socket, line: str, addr) -> None:
@@ -706,14 +786,26 @@ def _serve_stream_client(client_sock: _socket.socket, line: str, addr) -> None:
         ws.close()
         return
     errors: list = []
-    # A thread per direction. Each one is a pure byte copier — no
-    # request-level work, no JSON, no decoding. Errors land in the shared
-    # ``errors`` tuple and both legs close on the first one.
+    stop = threading.Event()
+    # One converter thread per direction, and no other work in either: the
+    # client leg's 5-byte framing is decoded onto the provider's websocket
+    # through its public send surface, and the provider's messages are encoded
+    # back onto the client leg. The two share ``errors`` and ``stop``; whichever
+    # direction ends first — a close frame, EOF, any error — takes the session
+    # with it, and both threads bound their waits to one poll slice so neither
+    # can outlive the other by more than that. ``ws.close()`` never raises, so
+    # the two threads racing each other to close the provider leg is safe.
     client_to_provider = threading.Thread(
-        target=_pump_frames, args=(client_sock, ws._sock), kwargs={"name": "client->provider", "errors": errors}, daemon=True
+        target=_pump_client_to_provider,
+        args=(client_sock, ws),
+        kwargs={"name": "client->provider", "errors": errors, "stop": stop},
+        daemon=True,
     )
     provider_to_client = threading.Thread(
-        target=_pump_frames, args=(ws._sock, client_sock), kwargs={"name": "provider->client", "errors": errors}, daemon=True
+        target=_pump_provider_to_client,
+        args=(ws, client_sock),
+        kwargs={"name": "provider->client", "errors": errors, "stop": stop},
+        daemon=True,
     )
     client_to_provider.start()
     provider_to_client.start()
@@ -721,7 +813,8 @@ def _serve_stream_client(client_sock: _socket.socket, line: str, addr) -> None:
     provider_to_client.join()
     # Close both legs — a metered provider connection never outlives the
     # worker, and a worker whose client side just disconnected leaves a
-    # dangling socket otherwise (windowsill#5881 R3).
+    # dangling socket otherwise (windowsill#5881 R3). Both pumps have already
+    # closed the websocket on their way out; this is the belt to their braces.
     try:
         ws.close()
     except OSError:
