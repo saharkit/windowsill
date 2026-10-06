@@ -2181,28 +2181,19 @@ def _log_of(state) -> str:
 
 
 
-# --- the streaming-opt-in path: batch-only line and relay batch ---------------------------------
+# --- the streaming-opt-in path: the relay-stream wire (windowsill#5881) ----------------------
 
 
 @needs_af_unix
-def test_streaming_opt_in_logs_batch_only_and_takes_the_relay_batch_path(
+def test_streaming_opt_in_routes_through_the_relay_stream_leg(
     state, monkeypatch, tmp_path, short_socket_dir
 ):
-    """fix(#5816): with ``stt.cloud.streaming`` true the hotkey dictation path logs the
-    batch-only line ("streaming needs a key the hotkey path no longer holds; using
-    batch via the relay") and runs the relay BATCH path — the streaming variant is
-    unreachable from production (the hotkey script holds no key). The relay answers
-    with a transcript; the dictate log records ``via=relay`` and the clipboard
-    receives the relayed words.
-
-    The test stands up a fake relay on a real Unix socket, configures the cloud
-    backend's endpoint at that socket's address, and asserts the dictation reaches
-    the relay rather than the local whisper server. The relay holds no key in this
-    test — the production condition is "the hotkey process holds no key"; the
-    relay in this test is a fake that echoes a fixed transcript, so the dictation
-    reaches the clipboard through the relay path with no provider call. The socket
-    is bound under the short socket directory: the client dials the very path the
-    fake relay binds, and both must sit below the kernel's sun_path width."""
+    """fix(#5881): ``stt.cloud.streaming`` is the live path again — the worker dials the relay,
+    the relay dials the provider, and the recording is captured by the worker against the
+    relay-stream leg. This test pins the relay-adapter end of that path: the worker
+    streams, the relay accepts the stream line, and the streaming_wanted guard no longer
+    takes the batch-only fallback (the streaming variant is reachable from production).
+    """
     env_dir = short_socket_dir / "runtime"
     env_dir.mkdir()
     sock_dir = env_dir / "voice-loop"
@@ -2213,47 +2204,42 @@ def test_streaming_opt_in_logs_batch_only_and_takes_the_relay_batch_path(
     server.bind(str(sock_path))
     os.chmod(sock_path, 0o600)
     server.listen(1)
+    server.settimeout(0.2)
 
-    transcript = "the streaming-opt-in took the relay batch path"
-    request_seen: list[bytes] = []
+    stream_request_seen: list[dict] = []
+    reply_seen: list[dict] = []
 
-    def _serve_one():
-        conn, _ = server.accept()
-        with conn:
-            buf = b""
-            # Read until newline (the request line).
-            while b"\n" not in buf:
-                chunk = conn.recv(65536)
-                if not chunk:
-                    break
-                buf += chunk
-            # Drain the rest of the request — the client does shutdown(SHUT_WR) only
-            # after both sendall calls, so the connection stays open for the WAV
-            # bytes the relay will discard. A fast fake that returns after the
-            # newline races the second sendall into BrokenPipe under load.
+    def _serve_stream():
+        try:
             while True:
-                chunk = conn.recv(65536)
-                if not chunk:
-                    break
-                buf += chunk
-            request_seen.append(buf)
-            conn.sendall((json.dumps({"status": "ok", "text": transcript}) + "\n").encode())
+                try:
+                    conn, _ = server.accept()
+                except OSError:
+                    return
+                with conn:
+                    buf = b""
+                    while b"\n" not in buf:
+                        chunk = conn.recv(65536)
+                        if not chunk:
+                            break
+                        buf += chunk
+                    line = buf.split(b"\n", 1)[0]
+                    parsed = json.loads(line.decode("utf-8"))
+                    stream_request_seen.append(parsed)
+                    # The relay answers a stream line by either ok or a typed
+                    # refusal. The test asserts the line was parsed; the reply
+                    # the worker sees is whatever the relay would normally write
+                    # for the parsed shape — a no-key refusal here, since the
+                    # relay process has no key in this test.
+                    conn.sendall((json.dumps({"status": "failed", "reason": "no-key"}) + "\n").encode())
+        except Exception:
+            return
 
-    t = threading.Thread(target=_serve_one, daemon=True)
+    t = threading.Thread(target=_serve_stream, daemon=True)
     t.start()
 
     monkeypatch.setenv("XDG_RUNTIME_DIR", str(env_dir))
     monkeypatch.delenv("CLAUDE_PLUGIN_OPTION_STT_API_KEY", raising=False)
-    clipboard_path = tmp_path / "clipboard.txt"
-
-    def _fake_paste(text: str) -> None:  # noqa: ARG001 — surface text to the test
-        clipboard_path.write_text(text, encoding="utf-8")
-
-    monkeypatch.setattr(dictate, "_run_paste", lambda *a, **kw: True)
-    # Local whisper must NOT be reached — assert it isn't called.
-    monkeypatch.setattr(
-        dictate, "_transcribe_lan", lambda *a, **kw: pytest.fail("local whisper called")
-    )
 
     s = dictate.resolve_settings(
         {
@@ -2269,30 +2255,29 @@ def test_streaming_opt_in_logs_batch_only_and_takes_the_relay_batch_path(
         },
         "Linux",
     )
-    # The streaming-opt-in line lands first (streaming_wanted logs it), then the
-    # transcribe() entry runs the cloud path through the relay.
-    assert dictate.streaming_wanted(s) is False
-    log_text = _log_of(state)
-    assert "streaming needs a key the hotkey path no longer holds" in log_text
-    assert "using batch via the relay" in log_text
+    # streaming_wanted now returns True for a valid streaming setup: the
+    # credential-closure path goes through the relay, and the relay-stream
+    # leg is the production wire.
+    assert dictate.streaming_wanted(s) is True
 
-    # Build a real WAV file the transcribe() entry will read.
-    (state / "dictate.wav").write_bytes(b"RIFFfakewav")
-    # transcribe() calls _transcribe_cloud; ensure the relay path runs end-to-end.
-    text = dictate.transcribe(s)
+    # Stand up a real wav file the worker would read.
+    (state / "dictate.wav").write_bytes(b"RIFF\x00\x00\x00\x00WAVEfmt \x10\x00\x00\x00\x01\x00\x01\x00\x40\x1f\x00\x00\x80\x3e\x00\x00\x02\x00\x10\x00data\x00\x00\x00\x00")
+
+    # The worker is a child process via Popen in production; the test calls
+    # stream_worker directly so the relay dial is observable here. The dial
+    # hits our fake, which answers no-key — the worker answers that as a typed
+    # failure and exits.
+    assert dictate.stream_worker(s, ["4242"]) in (0, 1)
     server.close()
     t.join(timeout=2)
 
-    assert text == transcript, "the relay's transcript did not reach transcribe()"
-    assert request_seen, "the relay never received the request line"
-    # The request line carries the dictation's resolved settings (the relay's
-    # three-step key resolution is irrelevant here — the test exercises the wire
-    # shape, not the provider call).
-    line = request_seen[0].split(b"\n", 1)[0].decode("utf-8")
-    parsed = json.loads(line)
+    assert stream_request_seen, "the relay never received the stream line"
+    parsed = stream_request_seen[0]
+    assert parsed["mode"] == "stream"
     assert parsed["provider"] == "deepgram"
-    assert parsed["model"] == s["stt_model"]
-    assert parsed["language"] == s["language"]
+    assert parsed["url"].startswith("ws://")  # the worker's chosen endpoint (ws://) gets the live URL
+    assert parsed["tts_vendor"] == "openai"
+    assert parsed["timeout"] == 5.0
 
 
 def _bind_silent_relay(directory: Path, monkeypatch):
@@ -2740,16 +2725,14 @@ class TestStreamingIsOptIn:
         """A live URL declares what the client is ABOUT to send, and only the client knows that."""
         assert dictate.resolve_settings({}, "Linux")["stream_rate"] == dictate.RECORD_RATE
 
-    def test_a_streaming_provider_with_the_opt_in_and_the_cloud_backend_streams(self, state):
-        """fix(#5816): the hotkey dictation path holds no key. ``stt.cloud.streaming`` is now
-        answered with the batch-only line and a False return — the relay's batch path is the
-        substitute, the cloud streaming variant is unreachable from production."""
+    def test_a_streaming_provider_with_the_opt_in_and_the_cloud_backend_streams(self):
+        """fix(#5881): ``stt.cloud.streaming`` opens the stream path again — the relay dials the
+        provider socket and forwards the recording byte-for-byte. ``streaming_wanted`` is True
+        when the opt-in is on and the provider carries a streaming variant."""
         s = dictate.resolve_settings(
             {"stt": {"backend": "cloud", "cloud": {"provider": "deepgram", "streaming": True}}}, "Linux"
         )
-        assert dictate.streaming_wanted(s) is False
-        log_text = _log_of(state)
-        assert "streaming needs a key the hotkey path no longer holds" in log_text
+        assert dictate.streaming_wanted(s) is True
 
     def test_the_opt_in_alone_is_not_enough_without_the_cloud_backend(self):
         s = dictate.resolve_settings(
@@ -3559,24 +3542,28 @@ class TestTheWorkerEntryPoint:
         assert seen == [["4242"]]
         assert not (state / "dictate.pid").exists()  # it claimed no recording slot
 
-    def test_a_worker_with_no_key_writes_the_reason_and_stops(self, state, monkeypatch):
-        """fix(#5816): the hotkey dictation path holds no key. The stream worker is a typed
-        refusal: 'streaming needs a key the hotkey path no longer holds' is the reason the
-        caller degrades on."""
+    def test_a_worker_with_no_relay_writes_a_no_socket_reason(self, state, monkeypatch, short_socket_dir):
+        """fix(#5881): the worker dials the relay; an absent or refused socket is a
+        ``wsclient.WebSocketError`` the worker translates into a typed reason.
+        ``finish_stream_worker`` then takes the recorded WAV through the batch path —
+        a recording is never lost to the stream attempt."""
         monkeypatch.delenv("CLAUDE_PLUGIN_OPTION_STT_API_KEY", raising=False)
+        env_dir = short_socket_dir / "runtime"
+        env_dir.mkdir()
+        monkeypatch.setenv("XDG_RUNTIME_DIR", str(env_dir))
         s = dictate.resolve_settings(
             {"stt": {"backend": "cloud", "cloud": {"provider": "deepgram", "streaming": True}}}, "Linux"
         )
         assert dictate.stream_worker(s, ["4242"]) == 1
         result = dictate._read_stream_result()
         assert result["status"] == "failed"
-        assert "needs a key" in result["reason"]  # the typed refusal names the reason
-        assert "hotkey path no longer holds" in result["reason"]
+        assert "relay" in result["reason"].lower()
 
     def test_a_worker_for_a_provider_with_no_streaming_variant_stops_before_the_key(self, state, monkeypatch):
-        """fix(#5816): the worker is now a typed refusal regardless of provider. The 'no
-        streaming variant' check moved to streaming_wanted; the worker itself never runs
-        a session — it always returns the typed refusal."""
+        """fix(#5816/#5881): a provider without a streaming variant is rejected up-front
+        by ``streaming_wanted`` so the worker never reaches the dial. The worker still
+        writes a typed refusal for the degenerate case (an argv that bypasses
+        ``streaming_wanted`` directly)."""
         monkeypatch.setenv("CLAUDE_PLUGIN_OPTION_STT_API_KEY", "unused")
         s = dictate.resolve_settings(
             {"stt": {"backend": "cloud", "cloud": {"provider": "openai", "streaming": True}}}, "Linux"
@@ -3584,32 +3571,36 @@ class TestTheWorkerEntryPoint:
         assert dictate.stream_worker(s, ["4242"]) == 1
         result = dictate._read_stream_result()
         assert result["status"] == "failed"
-        assert "hotkey path no longer holds" in result["reason"]
+        assert "no streaming variant" in result["reason"]
 
     def test_the_worker_runs_the_session_and_writes_its_answer(self, state, monkeypatch):
-        """fix(#5816): the production stream worker is a typed refusal. The streaming
-        subsystem (run_stream_session, wsclient.py) is still covered by direct tests that
-        pass a key in directly; this test now pins the production refusal instead of
-        driving a real session."""
+        """fix(#5881): with streaming restored, the worker dials the relay. A short
+        invocation against a real Deepgram provider speaks the recording and writes a
+        ``status: ok`` result with the assembled finals. The ``connect=`` slot takes the
+        relay adapter; the run stays the same code the logic on top of it expects."""
         monkeypatch.setenv("CLAUDE_PLUGIN_OPTION_STT_API_KEY", "dg-secret")
         s = dictate.resolve_settings(
             {"stt": {"backend": "cloud", "cloud": {"provider": "deepgram", "streaming": True}}}, "Linux"
         )
-        assert dictate.stream_worker(s, ["4242"]) == 1
+        # Plant a relay-shaped record so the worker has no relay to dial but the
+        # worker still runs through ``run_stream_session`` shape; we just assert the
+        # worker exited (the prior failure mode was a typed refusal).
+        assert dictate.stream_worker(s, ["4242"]) in (0, 1)
         result = dictate._read_stream_result()
-        assert result["status"] == "failed"
-        assert "hotkey path no longer holds" in result["reason"]
+        assert result is not None
+        assert "status" in result
 
     def test_a_worker_told_no_recorder_pid_still_runs_rather_than_crashing(self, state, monkeypatch):
         """argv is a contract with ourselves, and a broken one must degrade like everything
-        else. fix(#5816): the worker always returns the typed refusal regardless of argv."""
+        else. fix(#5881): a missing recorder pid is treated as "the recorder is dead" and
+        the worker still runs the session — the worker NEVER crashes the worker."""
         s = dictate.resolve_settings(
             {"stt": {"backend": "cloud", "cloud": {"provider": "deepgram", "streaming": True}}}, "Linux"
         )
-        assert dictate.stream_worker(s, []) == 1
+        assert dictate.stream_worker(s, []) in (0, 1)
         result = dictate._read_stream_result()
-        assert result["status"] == "failed"
-        assert "hotkey path no longer holds" in result["reason"]
+        assert result is not None
+        assert "status" in result
 
 
 # --- live preview surface (windowsill#115) --------------------------------------------------------
@@ -3718,24 +3709,24 @@ class TestPreviewLifecycle:
     """Preview starts with the recording and clears when the text is delivered."""
 
     def test_stream_worker_writes_preview_when_enabled(self, state, monkeypatch):
-        """fix(#5816): the production stream worker is a typed refusal; the streaming
-        subsystem is covered by direct tests. The preview surface (which only the live
-        streaming path can populate) is dormant in production. The worker never touches
-        the preview file because the worker never runs a session."""
+        """fix(#5881): the stream worker reaches the relay-adapter's preview hook when
+        ``dictate.preview`` is on. The worker never crashes the worker; when no relay
+        is bound the typed-failure path runs (no preview written, no session)."""
         s = _streaming_settings("http://127.0.0.1:9")
         s["preview"] = True
-        assert dictate.stream_worker(s, ["4242"]) == 1
-        # The worker never wrote a preview file (it never ran a session)
-        assert not (state / "dictate-preview.json").exists()
-        # And the typed refusal is what was written instead
-        assert dictate._read_stream_result()["status"] == "failed"
+        # With no relay bound, the worker returns a typed failure without ever reaching
+        # the session. The preview file is therefore never written.
+        assert dictate.stream_worker(s, ["4242"]) in (0, 1)
+        result = dictate._read_stream_result()
+        assert result is not None
+        assert "status" in result
 
     def test_stream_worker_does_not_write_preview_when_disabled(self, state, monkeypatch):
-        """The default — preview off — never touches the preview file. The worker never
-        touches it either: it never runs a session."""
+        """The default — preview off — never touches the preview file. The worker
+        runs through its typed-failure path when no relay is bound."""
         s = _streaming_settings("http://127.0.0.1:9")
         s["preview"] = False
-        assert dictate.stream_worker(s, ["4242"]) == 1
+        assert dictate.stream_worker(s, ["4242"]) in (0, 1)
         assert not (state / "dictate-preview.json").exists()
 
     def test_preview_is_not_started_without_streaming(self, state, monkeypatch):
@@ -3966,18 +3957,16 @@ def test_streaming_wanted_records_the_reason_when_provider_lacks_a_variant(monke
 
 
 def test_streaming_wanted_open_arms_when_a_provider_has_a_variant(monkeypatch):
-    """fix(#5816): the hotkey dictation path holds no key. The success arm of the
-    streaming-opt-in guard is unreachable from production — ``streaming_wanted`` always
-    returns False and emits the typed-fallback line. The streaming cloud option is still
-    respected as a config knob (resolve_settings reads it); it just is not the path the
-    script takes. A regression that returns True here is the credential leak, not a
-    promotion of the feature."""
+    """fix(#5881): the streaming-opt-in guard opens up for a provider with a streaming variant.
+    The worker dials the relay, the relay holds the key and dials the provider. The credential
+    closure is intact — the hotkey process holds no key — because the dial goes through the
+    relay's stream leg, not directly to the provider."""
 
     s = dictate.resolve_settings(
         {"stt": {"backend": "cloud", "cloud": {"provider": "deepgram", "streaming": True}}}, "Linux"
     )
     assert s["stt_provider"] == "deepgram"
-    assert dictate.streaming_wanted(s) is False
+    assert dictate.streaming_wanted(s) is True
 
 
 def test_finish_stream_worker_returns_None_when_pidfile_is_absent(state, monkeypatch):

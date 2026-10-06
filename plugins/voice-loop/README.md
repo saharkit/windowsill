@@ -212,40 +212,67 @@ where your voice goes, what `/report-bug` strips — is [PRIVACY.md](../../PRIVA
 in `PROVIDERS.md` — no dispatch path in the plugin compares a provider name against a literal, and
 a test enforces that.
 
-### Streaming dictation — batch-only while the key lives in the relay
+### Streaming dictation — the live path is back
 
-Cloud dictation is **batch-only** while the provider key lives in the voice-loop plugin MCP server
-(#5816). The hotkey dictation path holds no key of its own — the relay holds the userConfig value,
-and the streaming path's key resolution was removed from the script together with the rest of the
-credential-closure change. Setting `stt.cloud.streaming: true` therefore logs
+A batch dictation pays twice for a long sentence: you speak for a minute, then wait at the end while
+the whole clip uploads and transcribes. A provider whose entry has a **streaming variant** can be
+fed the recording *while the microphone is open*, so by the time you stop, the transcript is
+already assembled.
 
+The hotkey dictation path holds no provider key — the voice-loop plugin MCP server does, and the
+streaming variant runs **through** the same socket the batch path uses
+([#5881](https://github.com/saharkit/windowsill/issues/5881)). The wire is one UTF-8 JSON stream
+line (`{"mode":"stream","provider","url","tts_vendor","timeout"}\n`), then framed bytes both ways:
+1-byte opcode, 4-byte big-endian length, payload. The relay holds the credentials and dials the
+provider's websocket — the worker holds none.
+
+**Guarantees:**
+
+- `stt.cloud.streaming: true` is **off by default** — opt in.
+- the **WAV is still written** and still kept as `dictate-last.wav` — the worker tails the file,
+  it does not stand between the recorder and the disk;
+- **any** failure falls back to the relay batch path, then to local whisper, with a line in
+  `dictate.log` — the relay answered `no-key`, the relay was unreachable, the streaming URL was
+  refused as clear-text, the dial timed out, the server closed the stream while the microphone
+  was open, or the stream carried nothing. **A recording is never lost to the live path.**
+- the **model and language are the same axes** as the batch call (`stt.model`, `stt.language`).
+- the dial-failure mapping is shared with the batch path: a wall-clock timeout on the dial is
+  `timeout`; any other `WebSocketError` is `provider-unreachable`. The two legs cannot drift.
+- a metered provider connection never outlives the worker — closing either leg closes the other.
+- on a platform without `AF_UNIX` (Windows without AF_UNIX in the stdlib build), the streaming
+  path logs `stt.cloud.streaming: AF_UNIX unavailable on this platform — using batch via the
+  relay` and takes the batch path.
+
+```json
+{ "stt": { "backend": "cloud", "cloud": { "provider": "deepgram", "streaming": true } } }
 ```
-streaming needs a key the hotkey path no longer holds; using batch via the relay
-```
-
-and takes the relay batch path (the same record → POST flow the rest of this section describes).
-Streaming is restored by [#5881](https://github.com/saharkit/windowsill/issues/5881), relayed through
-the same MCP server; it is not part of the current release.
 
 What this does not change:
 
-- `stt.cloud.streaming: true` is still **off by default** — a live socket is a second failure
-  surface, and you should ask for it.
-- the **WAV is still written** and still kept as `dictate-last.wav`;
-- **any** failure falls back to local whisper with a line in `dictate.log` — the relay answered
-  `no-key`, the relay was unreachable past the client's socket deadline, the provider HTTP call
-  failed, or the request line was malformed. A recording is never lost to the relay path;
 - your hotkey, your debounce, the min-clip guard, the clipboard tier and the paste rules are the
-  same code they were.
+  same code they were;
+- the live preview surface (windowsill#115) is unchanged when `dictate.preview: true`;
+- `dictate.py` may be tuned (`STREAM_CONNECT_TIMEOUT`, `STREAM_KEEPALIVE_SECONDS`, `STREAM_DRAIN_SECONDS`)
+  without changing this contract.
 
 Every dictation logs what it cost:
 
 ```
-dictation latency stop_to_paste_ms=412 via=relay to=paste
+dictation latency stop_to_paste_ms=412 via=stream|batch to=paste
 ```
 
-`stt.model` and `stt.language` are the same axes as the batch call. See
-[`PROVIDERS.md`](PROVIDERS.md) for which providers stream and what the billing difference is.
+`via=stream` means the worker carried the dictation; `via=batch` means it fell back through the
+relay's batch leg. The two paths are compared on your own machine, not on a claim in this table.
+
+### Failure rows (windowsill#5881)
+
+| symptom | dictate.log line | outcome |
+|---|---|---|
+| relay not bound / socket refused | `cloud stt: relay connect refused` / `relay connect refused: …` | batch via relay, then local whisper |
+| relay `no-key` | `cloud stt via relay: reason=no-key` | local whisper |
+| stream line `clear-text-refused` | `relay refused stream: clear-text-refused` | batch via relay, then local whisper |
+| dial timeout | `relay refused stream: timeout` | batch via relay, then local whisper |
+| stream carried nothing | `streaming stt heard nothing back from the server — using the recorded clip` | batch via relay |
 
 ### Streaming synthesis — first sound in ~200 ms on a held socket
 
@@ -573,7 +600,7 @@ plugins/voice-loop/
   scripts/dictate.py          the toggle: record -> transcribe -> clipboard/paste-into-prompt
   scripts/providers.py        the speech provider registry: one entry per provider, per direction
   PROVIDERS.md                 provider comparison: latency, cost, language coverage and privacy
-  scripts/wsclient.py         a minimal stdlib RFC 6455 client — what streaming dictation and the streaming synthesis holder talk over
+  scripts/wsclient.py         a minimal stdlib RFC 6455 client — the streaming TTS holder talks to the provider directly; the streaming dictation worker relays through the plugin MCP server (voice_mcp.py), which dials the provider via this same client
   scripts/selftest.sh         hardware-free loopback proof (TTS -> STT -> compare)
   scripts/report-bug.sh       bug-report launcher (stable entry point for /report-bug)
   scripts/report_bug.py       the collector: diagnostics -> redaction -> one bundle -> a transport

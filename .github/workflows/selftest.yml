@@ -1480,6 +1480,225 @@ jobs:
             || { echo "the recording was LOST to the failed relay — nothing reached the clipboard"; exit 1; }
           [ -s "$state/dictate-last.wav" ] \
             || { echo "the clip was not kept for salvage"; exit 1; }
+
+      - name: streaming dictation contract (real invocation, fake provider via the relay stream leg)
+        env:
+          LANGUAGE: ${{ matrix.language }}
+        run: |
+          # fix(#5881) — streaming cloud dictation is the wire through the relay's stream leg.
+          # A real websocket fake (`fake_dg.py`, an RFC 6455 server that speaks the Deepgram
+          # live shape) accepts the relay's dial, the relay forwards the worker's binary frames
+          # into the provider and the provider's text frames back, and the worker assembles
+          # the finals into the clipboard. ``via=stream`` lands in dictate.log; the fake's
+          # transcript is what reaches the clipboard.
+          fake="$RUNNER_TEMP/stream-fake"
+          mkdir -p "$fake"
+          export FAKE_RECORD_WAV="$RUNNER_TEMP/dictate-source.wav"
+          export FAKE_CLIP_FILE="$RUNNER_TEMP/stream-clip.txt"
+          export XDG_STATE_HOME="$RUNNER_TEMP/stream-state"
+          state="$XDG_STATE_HOME/voice-loop"
+          cat > "$fake/pw-record" <<'SH'
+          #!/usr/bin/env bash
+          wav=""
+          for arg in "$@"; do wav="$arg"; done
+          cp "${FAKE_RECORD_WAV:?}" "${wav:?}"
+          sleep 60 &
+          waiter=$!
+          trap 'kill "$waiter" 2>/dev/null; exit 0' INT TERM
+          wait "$waiter"
+          SH
+          cat > "$fake/wl-copy" <<'SH'
+          #!/usr/bin/env bash
+          cat >> "${FAKE_CLIP_FILE:?}"
+          SH
+          chmod +x "$fake/pw-record" "$fake/wl-copy"
+
+          cat > "$RUNNER_TEMP/fake_dg.py" <<'PY'
+          """A minimal Deepgram live websocket server, stdlib only.
+
+          The relay dials this with the URL the worker computed (entry.streaming.url); the
+          fake answers the websocket handshake and emits one interim and one final, then a
+          Metadata close. The worker forwards its PCM frames to the fake (the relay is a byte
+          copier, so anything the worker sends arrives here) and the fake's frames are forwarded
+          back the same way. ``TRANSCRIPT`` is what the clipboard receives."""
+          import json
+import secrets
+import socket
+import socketserver
+import struct
+import sys
+from typing import Tuple
+
+TRANSCRIPT = "the relay stream returned this"
+
+GUID = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+
+def _accept_token(key: bytes) -> bytes:
+    import base64
+    import hashlib
+    return base64.b64encode(hashlib.sha1(key + GUID).digest())
+
+
+def _read_request(conn: socket.socket) -> bytes:
+            buf = b""
+            while b"\r\n\r\n" not in buf:
+                chunk = conn.recv(65536)
+                if not chunk:
+                    break
+                buf += chunk
+            return buf
+
+
+def _frame(opcode: int, payload: bytes) -> bytes:
+            mask = secrets.token_bytes(4) if opcode != 0x8 else b""
+            length = len(payload)
+            if length < 126:
+                header = bytes([0x80 | opcode]) + bytes([0x80 | length]) + mask
+            elif length < (1 << 16):
+                header = bytes([0x80 | opcode, 0x80 | 126]) + struct.pack("!H", length) + mask
+            else:
+                header = bytes([0x80 | opcode, 0x80 | 127]) + struct.pack("!Q", length) + mask
+            if mask:
+                payload = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+            return header + payload
+
+
+class _Handler:
+    def __init__(self, conn: socket.socket, addr: Tuple[str, int]) -> None:
+        self.conn = conn
+        self.addr = addr
+        self.received_audio = bytearray()
+
+    def serve(self) -> None:
+        try:
+            request = _read_request(self.conn)
+            lines = request.split(b"\r\n")
+            key_line = next(line for line in lines if line.lower().startswith(b"sec-websocket-key:"))
+            key = key_line.split(b":", 1)[1].strip()
+            handshake = (
+                b"HTTP/1.1 101 Switching Protocols\r\n"
+                b"Upgrade: websocket\r\nConnection: Upgrade\r\n"
+                b"Sec-WebSocket-Accept: " + _accept_token(key) + b"\r\n\r\n"
+            )
+            self.conn.sendall(handshake)
+            interim = json.dumps(
+                {
+                    "type": "Results",
+                    "is_final": False,
+                    "channel": {"alternatives": [{"transcript": TRANSCRIPT}]},
+                }
+            ).encode()
+            final = json.dumps(
+                {
+                    "type": "Results",
+                    "is_final": True,
+                    "channel": {"alternatives": [{"transcript": TRANSCRIPT}]},
+                }
+            ).encode()
+            metadata = json.dumps({"type": "Metadata"}).encode()
+            self.conn.sendall(_frame(0x1, interim))
+            self.conn.sendall(_frame(0x1, final))
+            # Drain a couple of client frames so the relay's client->provider leg has
+            # something to forward — proves the byte-copier is wired both ways.
+            self.conn.settimeout(0.5)
+            try:
+                while True:
+                    chunk = self.conn.recv(65536)
+                    if not chunk:
+                        break
+                    self.received_audio.extend(chunk)
+            except (socket.timeout, OSError):
+                pass
+            self.conn.sendall(_frame(0x1, metadata))
+            self.conn.sendall(_frame(0x8, b""))
+        finally:
+            try:
+                self.conn.close()
+            except OSError:
+                pass
+
+
+class _NoLookupServer(socketserver.TCPServer):
+    allow_reuse_address = True
+
+    def server_bind(self):
+        socketserver.TCPServer.server_bind(self)
+        self.server_name = "127.0.0.1"
+        self.server_port = self.server_address[1]
+
+
+class _Threaded(socketserver.ThreadingMixIn, _NoLookupServer):
+    daemon_threads = True
+
+
+server = _Threaded(("127.0.0.1", 0), lambda *a, **kw: None)
+open(sys.argv[1], "w").write(str(server.server_address[1]))
+server.serve_forever()
+          PY
+          python3 "$RUNNER_TEMP/fake_dg.py" "$RUNNER_TEMP/fake_dg.port" \
+              > "$RUNNER_TEMP/fake_dg.log" 2>&1 &
+          dg_pid=$!
+          for _ in $(seq 1 50); do [ -s "$RUNNER_TEMP/fake_dg.port" ] && break; sleep 0.2; done
+          dg_port=$(cat "$RUNNER_TEMP/fake_dg.port")
+          [ -n "$dg_port" ] || { echo "the fake dg never bound a port"; exit 1; }
+
+          export XDG_RUNTIME_DIR="$RUNNER_TEMP/stream-runtime"
+          mkdir -p "$XDG_RUNTIME_DIR/voice-loop"
+          chmod 700 "$XDG_RUNTIME_DIR/voice-loop"
+          tail -f /dev/null | env \
+            CLAUDE_PLUGIN_OPTION_STT_API_KEY="not-a-real-key-and-never-leaves-this-runner" \
+            CLAUDE_PLUGIN_OPTION_TTS_API_KEY="" \
+            python3 plugins/voice-loop/scripts/voice_mcp.py > "$RUNNER_TEMP/stream-relay.log" 2>&1 &
+          relay_pid=$!
+          trap 'kill "$relay_pid" "$dg_pid" 2>/dev/null || true; pkill -P "$relay_pid" 2>/dev/null || true' EXIT
+
+          for _ in $(seq 1 50); do
+            [ -S "$XDG_RUNTIME_DIR/voice-loop/stt.sock" ] && break
+            sleep 0.2
+          done
+          [ -S "$XDG_RUNTIME_DIR/voice-loop/stt.sock" ] \
+            || { echo "the relay never bound the socket"; cat "$RUNNER_TEMP/stream-relay.log"; exit 1; }
+
+          export VOICE_LOOP_CONFIG="$RUNNER_TEMP/stream-config.json"
+          cat > "$VOICE_LOOP_CONFIG" <<JSON
+          {
+            "language": "$LANGUAGE",
+            "stt": {
+              "backend": "cloud",
+              "model": "nova-3",
+              "cloud": {
+                "provider": "deepgram",
+                "streaming": true,
+                "endpoint": "http://127.0.0.1:$dg_port"
+              }
+            },
+            "dictate": { "recorder": "pw-record", "clipboard": "wl-copy", "debounce_ms": 0 }
+          }
+          JSON
+          export PATH="$fake:$PATH"
+
+          python3 plugins/voice-loop/scripts/dictate.py paste \
+            || { echo "dictate start toggle failed (exit $?)"; cat "$state/dictate.log" 2>/dev/null || true; exit 1; }
+          sleep 2
+          python3 plugins/voice-loop/scripts/dictate.py paste \
+            || { echo "dictate stop toggle failed (exit $?)"; cat "$state/dictate.log" 2>/dev/null || true; exit 1; }
+
+          echo "--- dictate.log"; cat "$state/dictate.log"
+          echo "--- stream relay log"; cat "$RUNNER_TEMP/stream-relay.log" 2>/dev/null || true
+          echo "--- fake dg"; cat "$RUNNER_TEMP/fake_dg.log" 2>/dev/null || true
+          echo "--- clipboard capture"; cat "$FAKE_CLIP_FILE" 2>/dev/null || true; echo
+
+          # The streaming path lands via=stream, with the relay's stream leg in front.
+          grep -q "via=stream" "$state/dictate.log" \
+            || { echo "the dictation did not go via the streaming path"; exit 1; }
+          if grep -q -e "unexpected error" -e "Traceback" "$state/dictate.log"; then
+            echo "the streaming path hit an error"; exit 1
+          fi
+          grep -q "$TRANSCRIPT" "$FAKE_CLIP_FILE" \
+            || { echo "the clipboard does not hold what the relayed stream produced"; exit 1; }
+          [ -s "$state/dictate-last.wav" ] \
+            || { echo "the clip was not kept for salvage"; exit 1; }
       - name: server log on failure
         if: failure()
         run: kill "$(cat /tmp/voice-loop.pid)" 2>/dev/null || true

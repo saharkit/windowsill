@@ -10,7 +10,13 @@ One stdlib stdio MCP server that does two unrelated jobs:
 * The hotkey STT relay — a Unix-socket listener that the desktop ``dictate-toggle.sh``
   path connects to for cloud STT. The socket lives under ``$XDG_RUNTIME_DIR/voice-loop``
   with mode 0700, the relay owns the stale-socket question, and the client vouches for
-  ownership before it dials (the mitigate is in ``scripts/dictate.py``).
+  ownership before it dials (the mitigate is in ``scripts/dictate.py``). Two legs share
+  the socket — the historical batch path (one WAV in, one transcript out) and the
+  streaming dictation path (one stream-line in, the provider socket framed through the
+  relay byte-for-byte). The dispatch is at the front of ``_serve_one_client``: a line
+  without ``mode`` is the batch line, a line with ``mode == "stream"`` is the stream
+  line and is handled by ``_serve_stream_client``. The clear-text refusal, the
+  three-step key resolution and the closed ``_REASONS`` set are the same on both legs.
 
 The server holds ONE thing of its own — the two plugin userConfig values, delivered as
 ``CLAUDE_PLUGIN_OPTION_TTS_API_KEY`` and ``CLAUDE_PLUGIN_OPTION_STT_API_KEY`` in its env
@@ -42,6 +48,7 @@ _PLUGINS_DIR = os.path.dirname(os.path.abspath(__file__))
 if _PLUGINS_DIR not in sys.path:
     sys.path.insert(0, _PLUGINS_DIR)
 import providers  # noqa: E402 — sys.path injection above is the contract
+import wsclient  # noqa: E402 — same sys.path contract; wsclient dials the provider stream
 
 # --- constants --------------------------------------------------------------
 
@@ -91,6 +98,18 @@ WAV_MAX_BYTES = 32 * 1024 * 1024
 # process on ``resp.read()`` with no upper bound. Same shape as the dictate
 # client's local cap; declared here so the relay does not import dictate.
 PROVIDER_RESPONSE_MAX_BYTES = 4 * 1024 * 1024
+
+# Per-frame cap on the byte copier that carries frames between the client and the
+# provider. A stream leg never carries a frame larger than the wsclient
+# ceiling (1 MiB), but a hostile peer could ask for a read that big — a cap here
+# keeps the relay from allocating its way out of memory if it ever does.
+STREAM_FRAME_MAX_BYTES = wsclient.MAX_FRAME_BYTES
+# How long a frame's worth of reads can sit idle between the two legs. A live
+# socket between a worker (who am reading a 250 ms WavChunk at a time) and a
+# provider (who am talking the same socket) never idles this long; the cap is
+# the wall-clock bound around the dial, the place a connect timeout is reported
+# versus an unreachable host (windowsill#5881 R6).
+STREAM_DIAL_TIMEOUT_SECONDS = 5.0
 
 
 # --- server version ----------------------------------------------------------
@@ -170,6 +189,12 @@ def _validate_request_line(line: str) -> tuple[dict | None, str | None]:
        ``tts_vendor``, ``timeout``, ``stt_prompt``);
     3. the named ``provider`` is not in the registry;
     4. zero WAV bytes arrived after the newline (the caller enforces this).
+
+    A line that names ``mode == "stream"`` is the streaming dictation request and is validated by
+    ``_validate_stream_line`` instead — the four conditions above describe the BATCH request, which
+    is exactly the request that has carried the seven keys since the v0 contract. A stream line without
+    a ``mode`` is still the batch line (the worker dials without setting ``mode``), so a non-dict
+    request line is the batch line's own concern and routes through the existing four-condition path.
     """
     try:
         parsed = json.loads(line)
@@ -177,21 +202,73 @@ def _validate_request_line(line: str) -> tuple[dict | None, str | None]:
         return None, f"request line is not valid JSON: {type(err).__name__}"
     if not isinstance(parsed, dict):
         return None, "request line is not a JSON object"
-    required = (
-        "provider",
-        "endpoint",
-        "model",
-        "language",
-        "tts_vendor",
-        "timeout",
-        "stt_prompt",
-    )
+    # A stream line declares its mode on its own JSON and doesn't lie: any line without
+    # "mode" is the historical batch line, and the seven-key check covers it. A line that
+    # names "mode" with a value other than "stream" is malformed and gets bad-request at
+    # the dispatch step (``_dispatch_request_line``), where the dispatch decides batch
+    # vs stream — not at the validator.
+    if "mode" not in parsed:
+        required = (
+            "provider",
+            "endpoint",
+            "model",
+            "language",
+            "tts_vendor",
+            "timeout",
+            "stt_prompt",
+        )
+        missing = [k for k in required if k not in parsed]
+        if missing:
+            return None, f"missing keys: {missing}"
+        if parsed["provider"] not in _VALID_PROVIDERS:
+            return None, f"unknown provider: {parsed['provider']!r}"
+    return parsed, None
+
+
+def _validate_stream_line(line: str) -> tuple[dict | None, str | None]:
+    """The streaming dictation return from a stream-line parse: ``(parsed, None)`` on success or
+    ``(None, error_message)`` on bad-request.
+
+    Bad-request covers exactly three conditions (windowsill#5881 R1):
+    1. the line is not valid UTF-8 JSON;
+    2. one of ``provider`` / ``url`` / ``tts_vendor`` / ``timeout`` is missing;
+    3. the named ``provider`` is not in the registry, or its entry has ``streaming=None``
+       (the same registry the batch dial keys off — no check, there is a name comparison).
+
+    A stream line that names a clear-text ``ws://`` endpoint with a key is refused at the relay
+    (the same ``clear-text-credential_error`` policy the batch dial applies) BEFORE this point, in
+    the connection handler — the guard reads the resolved key, not the request line, so a missing
+    key cannot disguise a clear-text endpoint and a present key cannot be carried in the clear.
+    """
+    try:
+        parsed = json.loads(line)
+    except (ValueError, UnicodeDecodeError) as err:
+        return None, f"stream line is not valid JSON: {type(err).__name__}"
+    if not isinstance(parsed, dict):
+        return None, "stream line is not a JSON object"
+    required = ("provider", "url", "tts_vendor", "timeout")
     missing = [k for k in required if k not in parsed]
     if missing:
-        return None, f"missing keys: {missing}"
-    if parsed["provider"] not in _VALID_PROVIDERS:
-        return None, f"unknown provider: {parsed['provider']!r}"
+        return None, f"stream line missing keys: {missing}"
+    name = parsed["provider"]
+    if name not in _VALID_PROVIDERS:
+        return None, f"stream line unknown provider: {name!r}"
+    if providers.STT_PROVIDERS[name].streaming is None:
+        return None, f"stream line provider {name!r} has no streaming variant"
     return parsed, None
+
+
+def _stream_dial_failure(reason: str) -> str:
+    """Map a ``wsclient.WebSocketError`` from the dial to the relay's typed reason.
+
+    wsclient reports a connect timeout as `WebSocketError("could not reach ...: …")` — the same
+    message it uses for an unreachable host. The two cannot be distinguished from the exception
+    text, so the relay enforces the line's ``timeout`` as a wall-clock bound around the dial
+    and reports the breach as ``"timeout"``. Every other ``WebSocketError`` from the dial is
+    ``"provider-unreachable"``, the same token the batch dial returns for a transport-level
+    failure (windowsill#5881 R6: batch and stream cannot drift).
+    """
+    return "provider-unreachable" if reason != "timeout" else "timeout"
 
 
 def _socket_timeout() -> type[OSError] | None:
@@ -316,6 +393,12 @@ def _serve_one_client(client_sock: _socket.socket, addr) -> None:
     read returned a newline in the middle of the buffer. The 64 KiB cap on the
     request line is applied ONLY to the bytes before the first newline.
 
+    A line that names ``mode == "stream"`` is the streaming dictation request
+    (windowsill#5881). The line arrives without a trailing WAV — the streaming
+    client writes ONE byte back when it has finished its frame — and the dispatch
+    below hands the connection to ``_serve_stream_client``. A line without
+    ``mode`` is the historical batch line, unchanged.
+
     We never call ``shutdown(SHUT_WR)`` here — the client already half-closed
     its write side. A relay that half-closes its own write side and then
     sendall's the reply gets a ``BrokenPipeError`` and the client reads EOF as
@@ -351,6 +434,22 @@ def _serve_one_client(client_sock: _socket.socket, addr) -> None:
                 return
         newline_pos = buf.find(b"\n")
         line = buf[:newline_pos].decode("utf-8", errors="replace")
+        # A stream line declares its mode on its own JSON. We peek at the parsed
+        # shape BEFORE running the full batch validator: a stream line carries
+        # ``mode == "stream"`` and NOT the seven batch keys (the worker's
+        # request line is ``{"mode", "provider", "url", "tts_vendor", "timeout"}``),
+        # so the batch validator would answer ``missing keys`` — wrong reason,
+        # wrong verdict. The dispatch below hands the connection to
+        # ``_serve_stream_client`` and reads nothing further off the socket;
+        # the relay is then a bidirectional frame copier until both legs say
+        # goodbye.
+        try:
+            peek = json.loads(line)
+        except (ValueError, UnicodeDecodeError):
+            peek = None
+        if isinstance(peek, dict) and peek.get("mode") == "stream":
+            _serve_stream_client(client_sock, line, addr)
+            return
         # The remainder is the start of the WAV; more bytes follow.
         wav = buf[newline_pos + 1:]
         parsed, err = _validate_request_line(line)
@@ -450,6 +549,183 @@ def _serve_one_client(client_sock: _socket.socket, addr) -> None:
             client_sock.close()
         except OSError:
             pass
+
+
+# --- STT streaming wire protocol (windowsill#5881) ----------------------------
+#
+# The streaming variant runs over the same AF_UNIX socket as the batch path
+# and uses the same vouching — the client owns the lstat / mode check
+# (dictate._relay_socket_safe) before it dials, and the relay owns the
+# stale-socket question. The same single CONNECTED stream dial is what
+# restores what #5870 cut: streaming cloud dictation, which the hotkey
+# dictation path can no longer reach directly because it holds no key.
+#
+# Wire (from the client side):
+#   {"mode": "stream", "provider": ..., "url": ..., "tts_vendor": ..., "timeout": ...}\n
+# Then both sides write FRAMED byte sequences:
+#   1 byte opcode (wsclient OP_TEXT/OP_BINARY/OP_CLOSE)
+#   4 bytes big-endian payload length
+#   <payload>
+# The relay is a BYTE COPIER between the two legs. Every frame arriving on
+# the client leg is forwarded to the provider leg and vice versa, one thread
+# per direction, beside the batch handler. A frame's worth of reads closes both
+# legs on EOF or any error — a metered provider connection never outlives
+# the worker.
+
+
+def _read_exact(client_sock: _socket.socket, n: int) -> bytes | None:
+    """Read exactly ``n`` bytes, returning ``None`` on EOF before that point.
+
+    Frames are small (8-byte head + ≤1 MiB payload) so this is a bounded
+    dance: each call returns the whole thing or signals end-of-stream, and
+    the caller falls through to a typed failure. A short read is a partial
+    read we complete before moving on, not a failure to retry."""
+    buf = bytearray()
+    while len(buf) < n:
+        try:
+            chunk = client_sock.recv(n - len(buf))
+        except OSError:
+            return None
+        if not chunk:
+            return None
+        buf.extend(chunk)
+    return bytes(buf)
+
+
+def _stream_reply_failure(client_sock: _socket.socket, reason: str, detail: str | None = None) -> None:
+    """Write one JSON line ``{"status": "failed", "reason": R[, "detail": ...]}`` and return. The
+    caller closes. We use the same wire envelope the batch dial writes so the client's parser
+    is the same one (windowsill#5881 R2)."""
+    payload: dict = {"status": "failed", "reason": reason}
+    if detail is not None:
+        payload["detail"] = detail
+    try:
+        client_sock.sendall((json.dumps(payload) + "\n").encode())
+    except OSError:
+        pass
+
+
+def _pump_frames(reader_sock, writer_sock, *, name: str, errors: list) -> None:
+    """Copy one direction's frames between two sockets, byte for byte.
+
+    Each frame: 1-byte opcode, 4-byte big-endian length, then the payload.
+    Errors (OSError, websocketError, anything the provider hands back as a
+    death signal) land in ``errors`` and the loop returns — the caller
+    closes both legs."""
+    while True:
+        head = _read_exact(reader_sock, 5)
+        if head is None:
+            return
+        opcode = head[0]
+        length = int.from_bytes(head[1:5], "big")
+        if length > STREAM_FRAME_MAX_BYTES:
+            errors.append(f"{name}: frame over {STREAM_FRAME_MAX_BYTES} bytes")
+            return
+        payload = _read_exact(reader_sock, length) if length else b""
+        if payload is None:
+            return
+        try:
+            writer_sock.sendall(bytes([opcode]) + length.to_bytes(4, "big") + payload)
+        except OSError as err:
+            errors.append(f"{name}: {err}")
+            return
+
+
+def _serve_stream_client(client_sock: _socket.socket, line: str, addr) -> None:
+    """The streaming leg of the relay: one stream request, one ok/fail JSON line,
+    then bidirectional frame pumping until either end says goodbye.
+
+    The dial has the wall-clock bound the line's ``timeout`` carries, the
+    clear-text refusal is the same as the batch dial's, and the failure
+    reasons are the same closed set (``_REASONS``). A metered provider
+    connection outlives the worker on no path: any error on either leg closes
+    the other (windowsill#5881 R3)."""
+    parsed, err = _validate_stream_line(line)
+    if err is not None:
+        client_sock.sendall((json.dumps(_bad_request(err) | {"reason": "bad-request"}) + "\n").encode())
+        return
+    name = parsed["provider"]
+    url = parsed["url"]
+    tts_vendor = parsed.get("tts_vendor", "")
+    timeout = float(parsed["timeout"])
+    entry = providers.STT_PROVIDERS[name]
+    # Key resolution is the SAME three-step rule the batch dial applies
+    # (windowsill#5881 R5: "STT key first, TTS key only when the entry's
+    # ``fallback_vendors`` admits the request's ``tts_vendor``"). A missing
+    # key answers ``no-key`` BEFORE the clear-text refusal runs.
+    key = _stt_key_from_env(entry, tts_vendor)
+    if not key:
+        _stream_reply_failure(client_sock, "no-key")
+        return
+    # Endpoint policy: the clear-text refusal (windowsill#5881 R4). wsclient
+    # accepts ws:// freely — the library carries no scheme refusal — so the
+    # guard is the relay's. ``providers.clear_text_credential_error`` admits
+    # loopback, so the CI fake on 127.0.0.1 and the pytest fake provider are
+    # unaffected. On refusal we answer the exact token the batch dial already
+    # uses (``clear-text-refused``) and do not open the provider socket.
+    clear_text_refusal = providers.clear_text_credential_error(url, has_credential=True)
+    if clear_text_refusal is not None:
+        client_sock.sendall(
+            (
+                json.dumps(
+                    {"status": "failed", "reason": "clear-text-refused", "detail": clear_text_refusal}
+                )
+                + "\n"
+            ).encode()
+        )
+        return
+    # Wall-clock bound around the dial: wsclient raises ``WebSocketError
+    # "could not reach ..."`` identically for a connect timeout and an
+    # unreachable host, so the line's ``timeout`` is what tells them apart
+    # (windowsill#5881 R6). We wrap the dial in a deadline thread.
+    deadline = time.monotonic() + max(0.001, timeout)
+    dial_result: dict = {"status": None}
+
+    def _dial() -> None:
+        try:
+            dial_result["ws"] = wsclient.connect(url, entry.streaming.headers(key), timeout=timeout)
+            dial_result["status"] = "ok"
+        except wsclient.WebSocketError as err:
+            dial_result["error"] = str(err)
+
+    dial_thread = threading.Thread(target=_dial, daemon=True)
+    dial_thread.start()
+    dial_thread.join(timeout + 0.5)
+    if dial_result.get("status") != "ok":
+        reason = "timeout" if time.monotonic() >= deadline else _stream_dial_failure(
+            "provider-unreachable"
+        )
+        _stream_reply_failure(client_sock, reason)
+        return
+    ws = dial_result["ws"]
+    # ``ok`` line — the worker's adapter polls for it before the session
+    # proceeds. From here both legs carry framed bytes.
+    try:
+        client_sock.sendall((json.dumps({"status": "ok"}) + "\n").encode())
+    except OSError:
+        ws.close()
+        return
+    errors: list = []
+    # A thread per direction. Each one is a pure byte copier — no
+    # request-level work, no JSON, no decoding. Errors land in the shared
+    # ``errors`` tuple and both legs close on the first one.
+    client_to_provider = threading.Thread(
+        target=_pump_frames, args=(client_sock, ws._sock), kwargs={"name": "client->provider", "errors": errors}, daemon=True
+    )
+    provider_to_client = threading.Thread(
+        target=_pump_frames, args=(ws._sock, client_sock), kwargs={"name": "provider->client", "errors": errors}, daemon=True
+    )
+    client_to_provider.start()
+    provider_to_client.start()
+    client_to_provider.join()
+    provider_to_client.join()
+    # Close both legs — a metered provider connection never outlives the
+    # worker, and a worker whose client side just disconnected leaves a
+    # dangling socket otherwise (windowsill#5881 R3).
+    try:
+        ws.close()
+    except OSError:
+        pass
 
 
 def _socket_dir() -> str:

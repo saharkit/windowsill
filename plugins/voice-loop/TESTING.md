@@ -410,6 +410,8 @@ prompt the setup causes.
 | 3.4c | **The same-window guard** (`dictate.paste_target: "same-window"`, auto-paste on), same switch as 3.4b — **macOS/X11 only** | NOTHING is pasted anywhere; the notification says "focus moved — text is in the clipboard"; your paste key still pastes it. `dictate.log` has `focus at start: …` and a `paste suppressed` line | | |
 | 3.4d | The guard with **no** window switch | pastes exactly as before — the guard is invisible when you stay put | | |
 | 3.4e | The guard on **Wayland** (GNOME/KDE/sway) | it pastes anyway (degrades to `any` — no portable focus query exists) and `dictate.log` says `focus at start: unknown …`. A suppressed paste here would be the bug | | |
+| 3.4f | **Streaming dictation** (with `stt.cloud.streaming: true` on a provider that has a streaming variant): dictate a short sentence | the transcript arrives via the stream path; `dictate.log` records `via=stream`. A relay-down cycle degrades to `via=batch` with a `relay refused stream` line | | |
+| 3.4g | **Streaming, no key** (with `stt.cloud.streaming: true` while the plugin MCP server has no STT key in its env) | the relay answers `no-key`; `dictate.log` names it; the recording falls back to the relay batch path, then to local whisper | | |
 | 3.5 | **Speak-back**: assistant replies with a 🔊 line | it is audibly spoken, once, and matches the text | | |
 | 3.6 | Unmarked lines | are NOT spoken | | |
 | 3.7 | Two turns in a row | the second turn speaks the new line, not a repeat of the first (dedup) | | |

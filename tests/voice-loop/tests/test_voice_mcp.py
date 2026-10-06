@@ -23,6 +23,7 @@ import socket as _socket
 import socketserver
 import struct
 import threading
+import time
 import urllib.error
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -1223,9 +1224,11 @@ def test_dictate_does_not_gate_relay_on_its_own_env(tmp_path, monkeypatch):
 # --- 11. streaming cloud log line + client-side timeout -----------------
 
 
-def test_streaming_cloud_logs_batch_only_line():
-    """``streaming_wanted`` returns False on the hotkey path with a log
-    line stating that streaming needs a key the hotkey path no longer holds."""
+def test_streaming_cloud_returns_true_when_provider_has_a_streaming_variant():
+    """fix(#5881): ``streaming_wanted`` returns True on the hotkey path when
+    the registry entry has a streaming variant — the relay holds the key and
+    the worker dials it. The credential-closure path goes through the relay,
+    not through the local whisper server."""
     module = _import_dictate()
     s = {
         "streaming": True,
@@ -1238,10 +1241,7 @@ def test_streaming_cloud_logs_batch_only_line():
         entry.name = "deepgram"
         entry.streaming = mock.Mock()  # provider HAS a streaming variant
         resolve.return_value = entry
-        with mock.patch.object(module, "log") as fake_log:
-            assert module.streaming_wanted(s) is False
-    log_calls = [str(c) for c in fake_log.call_args_list]
-    assert any("streaming needs a key the hotkey path no longer holds" in c for c in log_calls)
+        assert module.streaming_wanted(s) is True
 
 
 @needs_af_unix
@@ -3169,3 +3169,349 @@ def test_module_invokes_main(monkeypatch, tmp_path):
     # main() returned 0 (the stdio loop read EOF, returned None, loop
     # exited, main returned 0), and sys.exit(0) ran.
     assert captured_exit["code"] == 0
+
+
+# --- streaming dictation (windowsill#5881) ---------------------------------------------------
+#
+# The streaming leg of the relay: one stream line in, an ``ok`` line or a typed failure out,
+# then bidirectional frame forwarding until both sides say goodbye. The worker-side adapter
+# lives in scripts/dictate.py; the relay-side guard and dial-failure mapping live here.
+
+
+def _build_stream_line(provider: str = "deepgram", url: str = "wss://api.deepgram.com/v1/listen", **overrides) -> bytes:
+    """The stream-line wire shape the worker sends."""
+    request = {
+        "mode": "stream",
+        "provider": provider,
+        "url": url,
+        "tts_vendor": overrides.get("tts_vendor", "openai"),
+        "timeout": overrides.get("timeout", 5.0),
+    }
+    return json.dumps(request).encode() + b"\n"
+
+
+class _FakeStreamClient:
+    """A fake the relay's ``_serve_one_client`` writes to and reads from on the stream leg.
+
+    The relay reads one UTF-8 JSON stream line terminated by ``\\n``, then either:
+    - writes an ``ok`` line and begins bidirectional frame pumping, or
+    - writes a typed-failure line and closes.
+
+    This fake collects the frames the relay forwards to it (the worker side of the stream) so a
+    test can assert the relay did NOT forward anything until it answered ok, did forward after
+    ok, and closed both legs on a close frame."""
+
+    def __init__(self, payload: bytes) -> None:
+        self.buf_out = bytearray()
+        self.buf_in = bytearray(payload)
+        self.closed = False
+        self.shutdown_called = False
+
+    def settimeout(self, _t):
+        pass
+
+    def recv(self, n):
+        if not self.buf_in:
+            return b""
+        chunk = bytes(self.buf_in[:n])
+        self.buf_in = self.buf_in[n:]
+        return chunk
+
+    def sendall(self, data):
+        self.buf_out.extend(data)
+
+    def shutdown(self, _how):
+        self.shutdown_called = True
+        raise AssertionError(
+            "relay called client_sock.shutdown — the wire protocol is one sendall + close, "
+            "never a server-side shutdown"
+        )
+
+    def close(self):
+        self.closed = True
+
+
+def test_stream_line_parsing_rejects_unknown_provider():
+    """The stream validator answers bad-request for an unknown provider, the same way the batch
+    validator does. The relay does not name a provider's existence differently per leg."""
+    module = _import_voice_mcp()
+    parsed, err = module._validate_stream_line(
+        json.dumps(
+            {
+                "mode": "stream",
+                "provider": "nonexistent",
+                "url": "wss://example.com/listen",
+                "tts_vendor": "openai",
+                "timeout": 5,
+            }
+        )
+    )
+    assert parsed is None
+    assert err is not None
+    assert "unknown provider" in err.lower() or "nonexistent" in err
+
+
+def test_stream_line_parsing_rejects_provider_without_streaming_variant():
+    """``openai`` has no streaming variant. The stream validator answers bad-request and names the
+    provider — a silently-ignored setting is the failure class #5816 was careful to avoid."""
+    module = _import_voice_mcp()
+    parsed, err = module._validate_stream_line(
+        json.dumps(
+            {
+                "mode": "stream",
+                "provider": "openai",
+                "url": "wss://example.com/listen",
+                "tts_vendor": "openai",
+                "timeout": 5,
+            }
+        )
+    )
+    assert parsed is None
+    assert err is not None
+    assert "no streaming variant" in err.lower()
+
+
+def test_stream_line_parsing_rejects_missing_url():
+    """``url`` is one of the four required keys (provider, url, tts_vendor, timeout). A stream
+    line without it is malformed and the relay answers the bad-request condition the validator
+    owns (windowsill#5881 R1)."""
+    module = _import_voice_mcp()
+    parsed, err = module._validate_stream_line(
+        json.dumps(
+            {"mode": "stream", "provider": "deepgram", "tts_vendor": "openai", "timeout": 5}
+        )
+    )
+    assert parsed is None
+    assert err is not None
+    assert "missing keys" in err.lower() or "url" in err.lower()
+
+
+def test_stream_line_parsing_accepts_deepgram_streaming():
+    """Deepgram is the one shipped STT entry with a streaming variant. The stream validator
+    accepts the line and returns the parsed shape — the relay then resolves the key and dials."""
+    module = _import_voice_mcp()
+    parsed, err = module._validate_stream_line(
+        json.dumps(
+            {
+                "mode": "stream",
+                "provider": "deepgram",
+                "url": "wss://api.deepgram.com/v1/listen",
+                "tts_vendor": "openai",
+                "timeout": 5,
+            }
+        )
+    )
+    assert parsed is not None
+    assert err is None
+
+
+def test_stream_leg_answers_no_key_when_relay_has_no_stt_key():
+    """The stream leg applies the same three-step key resolution as the batch dial. No
+    key in the relay's env -> ``no-key`` reply, before any clear-text check or dial —
+    a missing key and a plain-text endpoint are two different configuration errors."""
+    module = _import_voice_mcp()
+    payload = _build_stream_line("deepgram", "wss://api.deepgram.com/v1/listen")
+    fake = _FakeStreamClient(payload)
+    with mock.patch.dict(
+        os.environ,
+        {"CLAUDE_PLUGIN_OPTION_STT_API_KEY": "", "CLAUDE_PLUGIN_OPTION_TTS_API_KEY": ""},
+        clear=False,
+    ):
+        module._serve_one_client(fake, None)
+    reply = json.loads(fake.buf_out.decode())
+    assert reply["status"] == "failed"
+    assert reply["reason"] == "no-key"
+
+
+def test_stream_leg_answers_clear_text_refused_for_non_local_ws_endpoint():
+    """A configured ``ws://`` endpoint (non-loopback) with a credential is REFUSED at the relay
+    before the dial. The reply is the exact token the batch dial already uses:
+    ``{"status": "failed", "reason": "clear-text-refused"}``. No websocket dial is made."""
+    module = _import_voice_mcp()
+    payload = _build_stream_line("deepgram", "ws://api.deepgram.com/v1/listen")
+    fake = _FakeStreamClient(payload)
+    captured = {"dialed": False}
+
+    def _no_dial(*args, **kwargs):
+        captured["dialed"] = True
+        raise AssertionError("no dial should be made on clear-text refusal")
+
+    with mock.patch.dict(
+        os.environ,
+        {"CLAUDE_PLUGIN_OPTION_STT_API_KEY": "test-stt-key", "CLAUDE_PLUGIN_OPTION_TTS_API_KEY": ""},
+        clear=False,
+    ):
+        with mock.patch.object(module, "wsclient", wraps=module.wsclient) as ws_mod:
+            ws_mod.connect = _no_dial
+            module._serve_one_client(fake, None)
+    reply = json.loads(fake.buf_out.decode())
+    assert reply["status"] == "failed"
+    assert reply["reason"] == "clear-text-refused"
+    assert captured["dialed"] is False
+
+
+def test_stream_leg_admits_loopback_ws_endpoint():
+    """Loopback http:// / ws:// stays allowed — the CI fake on 127.0.0.1 and the pytest fake
+    provider rely on it. A relay that refuses loopback breaks the harness."""
+    module = _import_voice_mcp()
+    payload = _build_stream_line("deepgram", "ws://127.0.0.1:9999/v1/listen")
+    fake = _FakeStreamClient(payload)
+
+    class _FakeSock:
+        def sendall(self, _data):
+            pass
+
+        def recv(self, _n):
+            return b""
+
+        def close(self):
+            pass
+
+    class _FakeWS:
+        def __init__(self):
+            self.closed = False
+            self._sock = _FakeSock()
+
+        def close(self):
+            self.closed = True
+
+    fake_ws = _FakeWS()
+    with mock.patch.dict(
+        os.environ,
+        {"CLAUDE_PLUGIN_OPTION_STT_API_KEY": "test-stt-key", "CLAUDE_PLUGIN_OPTION_TTS_API_KEY": ""},
+        clear=False,
+    ):
+        with mock.patch.object(module.wsclient, "connect", return_value=fake_ws):
+            module._serve_one_client(fake, None)
+    # The relay wrote an ``ok`` line; we did NOT get a typed failure.
+    reply = json.loads(fake.buf_out.decode())
+    assert reply["status"] == "ok"
+
+
+def test_stream_leg_maps_dial_failure_to_provider_unreachable():
+    """Any WebSocketError from the dial that is not a timeout maps to ``provider-unreachable``,
+    the same token the batch dial returns for a transport-level failure. Batch and stream
+    cannot drift (windowsill#5881 R6)."""
+    module = _import_voice_mcp()
+    payload = _build_stream_line("deepgram", "ws://127.0.0.1:9/v1/listen")
+    fake = _FakeStreamClient(payload)
+
+    def _refuse(*args, **kwargs):
+        raise module.wsclient.WebSocketError("could not reach 127.0.0.1:9: connection refused")
+
+    with mock.patch.dict(
+        os.environ,
+        {"CLAUDE_PLUGIN_OPTION_STT_API_KEY": "test-stt-key", "CLAUDE_PLUGIN_OPTION_TTS_API_KEY": ""},
+        clear=False,
+    ):
+        with mock.patch.object(module.wsclient, "connect", side_effect=_refuse):
+            module._serve_one_client(fake, None)
+    reply = json.loads(fake.buf_out.decode())
+    assert reply["status"] == "failed"
+    assert reply["reason"] == "provider-unreachable"
+
+
+def test_stream_leg_maps_dial_timeout_to_timeout():
+    """A connect timeout is reported as ``timeout`` — the dial-failure mapping rule
+    (windowsill#5881 R6). The relay enforces the line's timeout as a wall-clock bound around
+    the provider dial; on breach the relay answers ``timeout``. Other WebSocketError messages
+    from the dial map to ``provider-unreachable``."""
+    module = _import_voice_mcp()
+    # ``timeout=0`` on the line forces an immediate breach regardless of dial speed.
+    payload = _build_stream_line("deepgram", "ws://127.0.0.1:9/v1/listen", timeout=0.0)
+    fake = _FakeStreamClient(payload)
+
+    def _hang(*args, **kwargs):
+        # Sleep past the deadline; the relay's wall-clock bound will mark this as timeout.
+        time.sleep(0.05)
+        raise module.wsclient.WebSocketError("could not reach 127.0.0.1:9: timeout")
+
+    with mock.patch.dict(
+        os.environ,
+        {"CLAUDE_PLUGIN_OPTION_STT_API_KEY": "test-stt-key", "CLAUDE_PLUGIN_OPTION_TTS_API_KEY": ""},
+        clear=False,
+    ):
+        with mock.patch.object(module.wsclient, "connect", side_effect=_hang):
+            module._serve_one_client(fake, None)
+    reply = json.loads(fake.buf_out.decode())
+    assert reply["status"] == "failed"
+    assert reply["reason"] == "timeout"
+
+
+def test_stream_leg_dispatches_on_mode_stream():
+    """A request line with ``mode == "stream"`` reaches ``_serve_stream_client`` and never
+    runs the batch parser. A batch line (no ``mode``) reaches the batch parser and never
+    runs the stream validator. The dispatch is the one the relay sees first."""
+    module = _import_voice_mcp()
+    # stream line goes through the stream validator. Without a key, that path
+    # answers no-key; we use that as the marker for "the stream path ran".
+    payload = _build_stream_line("deepgram", "wss://api.deepgram.com/v1/listen")
+    fake = _FakeStreamClient(payload)
+    with mock.patch.dict(
+        os.environ,
+        {"CLAUDE_PLUGIN_OPTION_STT_API_KEY": "", "CLAUDE_PLUGIN_OPTION_TTS_API_KEY": ""},
+        clear=False,
+    ):
+        module._serve_one_client(fake, None)
+    reply = json.loads(fake.buf_out.decode())
+    assert reply["status"] == "failed"
+    assert reply["reason"] == "no-key"
+    # A batch line without mode keys reaches the batch parser and the four-key check.
+    payload_batch = json.dumps(
+        {
+            "provider": "deepgram",
+            "endpoint": "ws://127.0.0.1:9",
+            "model": "nova-3",
+            "language": "en",
+            "tts_vendor": "openai",
+            "timeout": 5,
+            "stt_prompt": "",
+        }
+    ).encode() + b"\n" + _make_wav_header()
+    fake2 = _FakeClient(payload_batch)
+    module._serve_one_client(fake2, None)
+    reply2 = json.loads(fake2.buf_out.decode())
+    # The batch parser with no STT key returns no-key (when the provider
+    # has no streaming variant, the validator reaches bad-request); here
+    # we set the keys to empty in the env, so no-key wins regardless.
+    assert reply2["status"] == "failed"
+
+
+def test_stream_leg_writes_ok_then_closes_when_no_frames_follow():
+    """A stream leg that receives the ``ok`` line but no follow-up frames closes both legs
+    cleanly. The relay never holds a metered provider socket open past the worker."""
+    module = _import_voice_mcp()
+    payload = _build_stream_line("deepgram", "ws://127.0.0.1:9/v1/listen")
+    fake = _FakeStreamClient(payload)
+
+    class _FakeSock:
+        def sendall(self, _data):
+            pass
+
+        def recv(self, _n):
+            return b""
+
+        def close(self):
+            pass
+
+    class _FakeWS:
+        def __init__(self):
+            self.closed = False
+            self._sock = _FakeSock()
+
+        def close(self):
+            self.closed = True
+
+    fake_ws = _FakeWS()
+    with mock.patch.dict(
+        os.environ,
+        {"CLAUDE_PLUGIN_OPTION_STT_API_KEY": "test-stt-key", "CLAUDE_PLUGIN_OPTION_TTS_API_KEY": ""},
+        clear=False,
+    ):
+        with mock.patch.object(module.wsclient, "connect", return_value=fake_ws):
+            module._serve_one_client(fake, None)
+    # The relay wrote ok then exited (no follow-up frames from the client side).
+    reply = json.loads(fake.buf_out.decode())
+    assert reply["status"] == "ok"
+    # The provider leg was closed — a metered connection never outlives the worker.
+    assert fake_ws.closed is True
