@@ -2666,12 +2666,19 @@ def test_relay_socket_path_expands_the_default_state_home_when_state_home_is_emp
     tmp_path, monkeypatch
 ):
     """An empty XDG_STATE_HOME is an absent one: the default ~/.local/state, expanded against
-    HOME — and a blank XDG_RUNTIME_DIR is as good as no runtime dir."""
+    the user's home — and a blank XDG_RUNTIME_DIR is as good as no runtime dir. HOME answers
+    that expansion on POSIX and USERPROFILE on Windows, so both are pinned to tmp_path; the
+    expected value is composed exactly the way the product composes it, because Windows keeps
+    the literal "~/" slash through the expansion, and the startswith check is what proves the
+    expansion ran against this test's home rather than the runner's."""
     monkeypatch.setenv("XDG_RUNTIME_DIR", "   ")
     monkeypatch.delenv("XDG_STATE_HOME", raising=False)
     monkeypatch.setenv("HOME", str(tmp_path))
-    assert dictate._relay_socket_path() == str(
-        tmp_path / ".local" / "state" / "voice-loop" / "relay" / "stt.sock"
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    path = dictate._relay_socket_path()
+    assert path.startswith(str(tmp_path))
+    assert path == os.path.join(
+        os.path.expanduser("~/.local/state"), "voice-loop", "relay", "stt.sock"
     )
 
 
