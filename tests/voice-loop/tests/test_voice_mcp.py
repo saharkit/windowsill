@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import os
 import socket as _socket
+import socketserver
 import struct
 import threading
 import urllib.error
@@ -603,8 +604,19 @@ class _RecordingSTTHandler(BaseHTTPRequestHandler):
         pass
 
 
+class _NoFqdnHTTPServer(ThreadingHTTPServer):
+    """Binds without a name lookup: http.server's ``server_bind`` resolves the host with
+    ``socket.getfqdn``, a reverse-DNS query that can stall a CI runner far past the
+    suite's global test timeout, so the loopback fake names itself by its address."""
+
+    def server_bind(self):
+        socketserver.TCPServer.server_bind(self)
+        self.server_name = "127.0.0.1"
+        self.server_port = self.server_address[1]
+
+
 def _start_provider_http_server(doc):
-    httpd = ThreadingHTTPServer(("127.0.0.1", 0), _RecordingSTTHandler)
+    httpd = _NoFqdnHTTPServer(("127.0.0.1", 0), _RecordingSTTHandler)
     httpd.requests = []
     httpd.transcript_doc = doc
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
