@@ -400,11 +400,13 @@ def resolve_paste_target(value) -> str:
 
 
 def resolve_tts_provider(name: str):
-    """Mirror of speak.resolve_tts_provider — kept local so the dictate script does not
-    import speak (speak is the Stop hook process; dictating must not load it)."""
-    entry = providers.TTS_PROVIDERS.get(name)
+    """Mirror of speak.resolve_tts_provider — same registry lookup, same default-entry fallback,
+    same log line, kept local so the dictate script does not import speak (speak is the Stop hook
+    process; dictating must not load it)."""
+    entry = providers.tts_provider(name)
     if entry is None:
-        raise ValueError(f"unknown tts.cloud.provider: {name!r}")
+        log(f'tts.cloud.provider is not a known provider — using "{providers.DEFAULT_TTS}" instead of {name!r}')
+        entry = providers.TTS_PROVIDERS[providers.DEFAULT_TTS]
     return entry
 
 

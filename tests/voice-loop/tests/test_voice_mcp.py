@@ -16,6 +16,7 @@ silent regression.
 
 from __future__ import annotations
 
+import http.client
 import json
 import os
 import socket as _socket
@@ -953,6 +954,53 @@ def test_clear_text_refused_with_non_local_http_endpoint():
     assert "http" in reply["detail"].lower() or "clear" in reply["detail"].lower()
 
 
+def test_no_key_replied_first_for_non_local_http_endpoint():
+    """A non-loopback ``http://`` endpoint with no key configured reports
+    ``no-key`` (not ``clear-text-refused``): a missing key and a clear-text
+    endpoint are two different configuration errors, and the operator's fix
+    depends on which one the reply names. Key resolution runs before the
+    clear-text check so the absence of a key is what the client sees."""
+    module = _import_voice_mcp()
+    captured = {"called": False}
+
+    class _FakeOpenAI:
+        name = "openai"
+        default_host = "https://api.openai.com"
+        default_model = "whisper-1"
+        fallback_vendors = ()
+
+        def endpoint(self, s):
+            return s.get("cloud_endpoint") or self.default_host
+
+        def request(self, s, key, wav_bytes, boundary):
+            return None  # never reached
+
+        def transcript(self, data):
+            return "ok"
+
+        def error_summary(self, data):
+            return ""
+
+    payload = _build_payload("openai", "http://api.example.com/v1/audio/transcriptions")
+    fake = _FakeClient(payload)
+    with mock.patch.dict(
+        os.environ,
+        {"CLAUDE_PLUGIN_OPTION_STT_API_KEY": "", "CLAUDE_PLUGIN_OPTION_TTS_API_KEY": ""},
+        clear=False,
+    ):
+        with mock.patch.object(
+            module.urllib.request, "build_opener",
+            side_effect=AssertionError("no HTTP request should be made"),
+        ):
+            with mock.patch.object(
+                module.providers, "stt_provider", return_value=_FakeOpenAI()
+            ):
+                module._serve_one_client(fake, None)
+    reply = json.loads(fake.buf_out.decode())
+    assert reply["status"] == "failed"
+    assert reply["reason"] == "no-key"
+
+
 def test_clear_text_allowed_for_loopback_endpoint():
     """Loopback http:// stays allowed (the CI fake provider on 127.0.0.1
     relies on it). A relay that refuses loopback breaks the test harness."""
@@ -1492,6 +1540,119 @@ def test_post_provider_returns_provider_unreachable_on_generic_oserror():
             entry, {"cloud_endpoint": "https://x"}, "k", b"wav", 5.0
         )
     assert reason == "provider-unreachable"
+
+
+def test_post_provider_returns_provider_unreachable_on_http_client_exception_at_open():
+    """``http.client.HTTPException`` (IncompleteRead, BadStatusLine, LineTooLong) is not
+    an ``OSError`` — without the explicit handler the exception would propagate out of
+    ``_serve_one_client``, the per-connection thread would die, and the dictation
+    client would wait out its own deadline. The relay treats it as
+    provider-unreachable, the same verdict any other transport-level failure earns."""
+    module = _import_voice_mcp()
+    entry = _fake_entry()
+
+    class _Opener:
+        def open(self, req, timeout=None):
+            raise http.client.IncompleteRead(b"")
+
+    with mock.patch.object(module.urllib.request, "build_opener", return_value=_Opener()):
+        transcript, reason, detail = module._post_provider(
+            entry, {"cloud_endpoint": "https://x"}, "k", b"wav", 5.0
+        )
+    assert reason == "provider-unreachable"
+
+
+def test_post_provider_returns_provider_unreachable_on_http_client_exception_at_read():
+    """Same handler, but the exception is raised from ``resp.read`` (a partial body that
+    ends mid-frame). Both shapes are transport-level failures from the relay's view."""
+    module = _import_voice_mcp()
+    entry = _fake_entry()
+
+    class _Resp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self, n=-1):
+            raise http.client.IncompleteRead(b"")
+
+    class _Opener:
+        def open(self, req, timeout=None):
+            return _Resp()
+
+    with mock.patch.object(module.urllib.request, "build_opener", return_value=_Opener()):
+        transcript, reason, detail = module._post_provider(
+            entry, {"cloud_endpoint": "https://x"}, "k", b"wav", 5.0
+        )
+    assert reason == "provider-unreachable"
+
+
+def test_post_provider_returns_provider_unreachable_on_oversized_response():
+    """A response that exceeds the cap (a chatty error page, a misconfigured endpoint
+    that streams forever) is provider-unreachable, not a memory-exhaustion path. The
+    cap is enforced by reading cap+1 bytes; a body of cap+1 is the boundary case."""
+    module = _import_voice_mcp()
+    entry = _fake_entry()
+
+    class _Resp:
+        def __init__(self):
+            self.calls = 0
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self, n=-1):
+            self.calls += 1
+            return b"x" * (module.PROVIDER_RESPONSE_MAX_BYTES + 1)
+
+    class _Opener:
+        def open(self, req, timeout=None):
+            return _Resp()
+
+    with mock.patch.object(module.urllib.request, "build_opener", return_value=_Opener()):
+        transcript, reason, detail = module._post_provider(
+            entry, {"cloud_endpoint": "https://x"}, "k", b"wav", 5.0
+        )
+    assert transcript is None
+    assert reason == "provider-unreachable"
+    assert detail is not None and "over" in detail and str(module.PROVIDER_RESPONSE_MAX_BYTES) in detail
+
+
+def test_post_provider_decodes_a_normal_response_under_the_cap():
+    """A small body well under the cap still decodes through the bounded read — the
+    cap is a refusal boundary, not a transformation. Pins the happy path so the cap
+    cannot silently truncate ordinary responses."""
+    module = _import_voice_mcp()
+    entry = _fake_entry(transcript=lambda data: data.get("text", ""))
+
+    class _Resp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def read(self, n=-1):
+            # The cap is generous; a real transcript is far under it. Return one
+            # well-formed JSON body.
+            return json.dumps({"text": "hello there"}).encode()
+
+    class _Opener:
+        def open(self, req, timeout=None):
+            return _Resp()
+
+    with mock.patch.object(module.urllib.request, "build_opener", return_value=_Opener()):
+        transcript, reason, detail = module._post_provider(
+            entry, {"cloud_endpoint": "https://x"}, "k", b"wav", 5.0
+        )
+    assert transcript == "hello there"
+    assert reason is None
+    assert detail is None
 
 
 def test_post_provider_returns_provider_unreachable_on_undecodable_body():

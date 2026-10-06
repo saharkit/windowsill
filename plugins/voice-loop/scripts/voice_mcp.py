@@ -25,6 +25,7 @@ keeps its key passed directly by the holder process — that path is unchanged.
 from __future__ import annotations
 
 import base64
+import http.client
 import json
 import os
 import socket as _socket
@@ -83,6 +84,13 @@ REQUEST_LINE_MAX_BYTES = 64 * 1024
 # is possible but every shipped recorder tops out well under that, and a body
 # without a cap is a memory-exhaustion surface.
 WAV_MAX_BYTES = 32 * 1024 * 1024
+
+# 4 MiB cap on the provider response. A transcript is far under 100 KiB, so 4 MiB is
+# generous for every shipped entry; the cap is here because a server that streams
+# forever (a chatty error page, a misconfigured endpoint) would otherwise pin this
+# process on ``resp.read()`` with no upper bound. Same shape as the dictate
+# client's local cap; declared here so the relay does not import dictate.
+PROVIDER_RESPONSE_MAX_BYTES = 4 * 1024 * 1024
 
 
 # --- server version ----------------------------------------------------------
@@ -246,13 +254,34 @@ def _post_provider(
     )
     try:
         with opener.open(req, timeout=timeout) as resp:
-            raw = resp.read()
+            # Read at most cap+1 bytes — the extra byte is the boundary the cap
+            # decision uses (a body of exactly cap is fine; a body of cap+1 is
+            # over). Tiny test doubles may expose only the no-argument urllib
+            # shape, so the read is wrapped in a TypeError guard the same way
+            # dictate.py's _bounded_response_read does.
+            try:
+                raw = resp.read(PROVIDER_RESPONSE_MAX_BYTES + 1)
+            except TypeError:
+                raw = resp.read()
+            if len(raw) > PROVIDER_RESPONSE_MAX_BYTES:
+                return None, "provider-unreachable", (
+                    f"response over {PROVIDER_RESPONSE_MAX_BYTES} bytes"
+                )
     except urllib.error.HTTPError as err:
         return None, f"provider-http-{err.code}", None
     except urllib.error.URLError:
         return None, "provider-unreachable", None
     except (TimeoutError, _SOCKET_TIMEOUT):
         return None, "timeout", None
+    except http.client.HTTPException:
+        # http.client raises HTTPException for protocol-level failures
+        # (IncompleteRead, BadStatusLine, LineTooLong) that are not OSError
+        # subclasses. Without this handler the exception propagates out of
+        # _serve_one_client, the per-connection thread dies, and no reply line is
+        # ever written — the client waits out its own deadline. The relay
+        # treats it as provider-unreachable, the same verdict any other
+        # transport-level failure earns.
+        return None, "provider-unreachable", None
     except OSError:
         return None, "provider-unreachable", None
     try:
@@ -370,12 +399,25 @@ def _serve_one_client(client_sock: _socket.socket, addr) -> None:
             "cloud_endpoint": parsed.get("endpoint", ""),
             "endpoint": "",  # the entry picks the default host from cloud_endpoint first
         }
-        # Clear-text refusal happens BEFORE we attach the key. The relay holds the
-        # key, and a configured http:// (or ws://) endpoint with a credential is a
-        # configuration error refused here, not a warning sent along (windowsill
-        # #215). The refusal text is the relay's reply detail.
+        # Three-step STT key resolution: the STT key; the TTS key only when the
+        # request's tts_vendor is in the entry's fallback_vendors (registry data
+        # — the relay holds no provider-name comparison); else no-key. Resolved
+        # BEFORE the clear-text check so the absence of a key is reported as
+        # ``no-key`` even on a non-local http:// endpoint — a missing key and a
+        # plain-text endpoint are two different configuration errors, and the
+        # operator's fix depends on which one the reply names.
+        key = _stt_key_from_env(entry, parsed.get("tts_vendor", ""))
+        if not key:
+            client_sock.sendall((json.dumps(_failed("no-key")) + "\n").encode())
+            return
+        # Clear-text refusal happens after the key check, with the resolved
+        # key as the credential flag. A configured http:// (or ws://) endpoint
+        # with a credential is a configuration error refused here, not a
+        # warning sent along (windowsill #215). The key never leaves this
+        # process before the clear-text check has passed; the request builder
+        # below only runs on the accepted path.
         clear_text_refusal = providers.clear_text_credential_error(
-            entry.endpoint(s), has_credential=True
+            entry.endpoint(s), has_credential=bool(key)
         )
         if clear_text_refusal is not None:
             client_sock.sendall(
@@ -390,13 +432,6 @@ def _serve_one_client(client_sock: _socket.socket, addr) -> None:
                     + "\n"
                 ).encode()
             )
-            return
-        # Three-step STT key resolution: the STT key; the TTS key only when the
-        # request's tts_vendor is in the entry's fallback_vendors (registry data
-        # — the relay holds no provider-name comparison); else no-key.
-        key = _stt_key_from_env(entry, parsed.get("tts_vendor", ""))
-        if not key:
-            client_sock.sendall((json.dumps(_failed("no-key")) + "\n").encode())
             return
         transcript, reason, detail = _post_provider(
             entry, s, key, wav, float(parsed["timeout"])

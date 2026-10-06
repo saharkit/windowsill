@@ -221,12 +221,13 @@ def test_unknown_stt_cloud_provider_falls_back_to_the_default_entry_loudly(state
     assert "stt.cloud.provider is not a known provider" in _log_of(state)
 
 
-def test_unknown_tts_cloud_provider_raises_at_configuration_time(state):
-    """A typo in ``tts.cloud.provider`` is a hard error, not a silent default: the STT provider
-    falls back loudly, but the TTS side raises, and the raise is what resolve_settings surfaces
-    to the caller. Pinned as the current contract of the mirror lookup."""
-    with pytest.raises(ValueError, match="unknown tts.cloud.provider"):
-        dictate.resolve_settings({"tts": {"cloud": {"provider": "no-such-provider"}}}, "Linux")
+def test_unknown_tts_cloud_provider_falls_back_to_the_default_entry_loudly(state):
+    """A typo in ``tts.cloud.provider`` lands on the default TTS entry, and says so in the
+    dictate log — silently landing on a wrong provider's wire shape is the historical failure
+    this guard exists to name. Mirrors the STT guard above."""
+    s = dictate.resolve_settings({"tts": {"cloud": {"provider": "no-such-provider"}}}, "Linux")
+    assert s["tts_vendor"] == providers.TTS_PROVIDERS[providers.DEFAULT_TTS].name
+    assert "tts.cloud.provider is not a known provider" in _log_of(state)
 
 
 def test_oversized_config_is_ignored(tmp_path):
