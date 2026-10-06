@@ -2207,7 +2207,17 @@ def test_streaming_opt_in_logs_batch_only_and_takes_the_relay_batch_path(
         conn, _ = server.accept()
         with conn:
             buf = b""
+            # Read until newline (the request line).
             while b"\n" not in buf:
+                chunk = conn.recv(65536)
+                if not chunk:
+                    break
+                buf += chunk
+            # Drain the rest of the request — the client does shutdown(SHUT_WR) only
+            # after both sendall calls, so the connection stays open for the WAV
+            # bytes the relay will discard. A fast fake that returns after the
+            # newline races the second sendall into BrokenPipe under load.
+            while True:
                 chunk = conn.recv(65536)
                 if not chunk:
                     break
