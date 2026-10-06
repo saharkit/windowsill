@@ -1284,11 +1284,14 @@ def test_dictate_does_not_gate_relay_on_its_own_env(tmp_path, monkeypatch):
 # --- 11. streaming cloud log line + client-side timeout -----------------
 
 
+@needs_af_unix
 def test_streaming_cloud_returns_true_when_provider_has_a_streaming_variant():
     """fix(#5881): ``streaming_wanted`` returns True on the hotkey path when
     the registry entry has a streaming variant — the relay holds the key and
     the worker dials it. The credential-closure path goes through the relay,
-    not through the local whisper server."""
+    not through the local whisper server. The open arm is the AF_UNIX-present
+    one: where the socket module has no AF_UNIX the product answers False by
+    design, so this pin skips there."""
     module = _import_dictate()
     s = {
         "streaming": True,
@@ -3894,7 +3897,11 @@ def test_stream_worker_drives_the_full_relay_stream_leg_through_voice_mcp(
     monkeypatch.setattr(client_module, "_write_preview", _record_preview)
 
     # A complete recording: the session is about the wire, not about waiting on a recorder.
-    pcm = b"\x01\x02" * 4096
+    # 1 MiB of PCM — several times an AF_UNIX send buffer — so the worker's burst of sends
+    # meets a FULL buffer before the clip is out: a poll that leaves the socket non-blocking
+    # fails right here (the send turns EAGAIN and the session degrades), a poll that keeps
+    # the socket's own timeout mode just waits for the relay to drain.
+    pcm = b"\x01\x02" * 524288
     (state / "dictate.wav").write_bytes(_wav_bytes(pcm))
 
     s = client_module.resolve_settings(
@@ -4030,3 +4037,149 @@ def test_a_provider_that_hangs_up_mid_stream_names_the_open_microphone(
     assert result is not None, "stream worker wrote no result document"
     assert result.get("status") == "failed"
     assert result.get("reason") == "the server closed the stream while the microphone was open"
+
+
+def test_stream_line_parsing_rejects_a_line_that_is_not_json():
+    """A stream line that does not parse is answered bad-request, not crashed on — the same
+    refusal the batch validator gives a malformed request line."""
+    module = _import_voice_mcp()
+    parsed, err = module._validate_stream_line("{not json")
+    assert parsed is None
+    assert err is not None and err.startswith("stream line is not valid JSON")
+
+
+def test_stream_line_parsing_rejects_a_line_that_is_not_a_json_object():
+    """A stream line that parses to a non-object (an array, a bare string) is not a request;
+    the validator refuses it rather than keying into a type the relay never speaks to."""
+    module = _import_voice_mcp()
+    parsed, err = module._validate_stream_line("[1, 2]")
+    assert parsed is None
+    assert err == "stream line is not a JSON object"
+
+
+def test_read_exact_returns_none_when_the_socket_read_raises():
+    """A read error is an ended stream, not a crash: the reader answers None so the caller
+    falls through to its typed failure — the same answer EOF gets."""
+    module = _import_voice_mcp()
+
+    class _BrokenClient:
+        def settimeout(self, _t):
+            pass
+
+        def recv(self, _n):
+            raise OSError("the worker's socket was reset")
+
+    assert module._read_exact(_BrokenClient(), 5) is None
+
+
+@needs_af_unix
+def test_stream_reply_failure_writes_the_reason_and_the_detail():
+    """The failure line carries the detail field whenever one is given — the client surfaces
+    that text to the operator, so a dropped detail is a lost diagnosis. The wire here is a
+    real AF_UNIX socketpair, so the platform without AF_UNIX has no wire to pin."""
+    module = _import_voice_mcp()
+    ours, theirs = _socket.socketpair(_socket.AF_UNIX, _socket.SOCK_STREAM)
+    try:
+        module._stream_reply_failure(ours, "provider-http-500", "the provider's refusal")
+        buf = b""
+        while not buf.endswith(b"\n"):
+            buf += theirs.recv(65536)
+        reply = json.loads(buf.decode())
+        assert reply == {
+            "status": "failed",
+            "reason": "provider-http-500",
+            "detail": "the provider's refusal",
+        }
+    finally:
+        ours.close()
+        theirs.close()
+
+
+def test_stream_reply_failure_swallows_a_dead_client_socket():
+    """The client may already be gone when the relay answers; the failure write must not
+    raise past the session's cleanup."""
+    module = _import_voice_mcp()
+
+    class _DeadClient:
+        def sendall(self, _data):
+            raise OSError("the worker hung up first")
+
+    assert module._stream_reply_failure(_DeadClient(), "no-key") is None
+
+
+def test_the_client_leg_pump_returns_without_reading_once_stopped():
+    """A session already stopped before the pump's first pass takes no frame and still
+    closes the provider leg — the metered connection never outlives the stop decision."""
+    module = _import_voice_mcp()
+
+    class _MustNotBeRead:
+        def settimeout(self, _t):
+            pass  # the pump sets its poll slice before it checks stop — that touch is fine
+
+        def recv(self, _n):
+            raise AssertionError("a stopped pump must not read a frame")
+
+    ws = _RecordingWS()
+    stop = threading.Event()
+    stop.set()
+    errors: list = []
+    module._pump_client_to_provider(
+        _MustNotBeRead(), ws, name="client->provider", errors=errors, stop=stop
+    )
+    assert errors == []
+    assert ws.binary == [] and ws.texts == []
+    assert ws.closed is True and stop.is_set()
+
+
+def test_stream_leg_answers_bad_request_for_a_stream_line_missing_its_keys():
+    """The stream leg validates its own line before anything is dialed: a request missing
+    the stream keys gets the bad-request reply on the stream wire, and no provider socket
+    is opened for it."""
+    module = _import_voice_mcp()
+    payload = json.dumps({"mode": "stream", "provider": "deepgram"})
+    fake = _FakeStreamClient(b"")
+    captured = {"dialed": False}
+
+    def _no_dial(*args, **kwargs):
+        captured["dialed"] = True
+        raise AssertionError("no dial should be made for a malformed stream line")
+
+    with mock.patch.dict(
+        os.environ,
+        {"CLAUDE_PLUGIN_OPTION_STT_API_KEY": "test-stt-key", "CLAUDE_PLUGIN_OPTION_TTS_API_KEY": ""},
+        clear=False,
+    ):
+        with mock.patch.object(module.wsclient, "connect", side_effect=_no_dial):
+            module._serve_stream_client(fake, payload, None)
+    reply = json.loads(fake.buf_out.decode())
+    assert reply["status"] == "failed"
+    assert reply["reason"] == "bad-request"
+    assert captured["dialed"] is False
+
+
+def test_stream_leg_closes_the_provider_leg_when_the_ok_line_write_fails():
+    """A worker that vanishes between its request line and the relay's ``ok`` leaves a dead
+    client socket; the write fails, and the provider connection the dial just opened comes
+    down with it — the session never reaches the frame pumps."""
+    module = _import_voice_mcp()
+    payload = _build_stream_line("deepgram", "ws://127.0.0.1:9/v1/listen")
+    fake_ws = _RecordingWS()
+
+    class _VanishedClient:
+        def settimeout(self, _t):
+            pass
+
+        def recv(self, _n):
+            return b""
+
+        def sendall(self, _data):
+            raise OSError("the worker closed its end")
+
+    with mock.patch.dict(
+        os.environ,
+        {"CLAUDE_PLUGIN_OPTION_STT_API_KEY": "test-stt-key", "CLAUDE_PLUGIN_OPTION_TTS_API_KEY": ""},
+        clear=False,
+    ):
+        with mock.patch.object(module.wsclient, "connect", return_value=fake_ws):
+            module._serve_stream_client(_VanishedClient(), payload.decode(), None)
+    assert fake_ws.closed is True, "the provider leg stayed open past the dead client"

@@ -1630,11 +1630,20 @@ jobs:
                           if not chunk:
                               return
                           request += chunk
-                      key = next(
-                          line.split(b":", 1)[1].strip()
-                          for line in request.split(b"\r\n")
-                          if line.lower().startswith(b"sec-websocket-key:")
-                      )
+                      key = None
+                      for line in request.split(b"\r\n"):
+                          if line.lower().startswith(b"sec-websocket-key:"):
+                              key = line.split(b":", 1)[1].strip()
+                              break
+                      if key is None:
+                          # Not a websocket upgrade — the batch fallback POSTs to this
+                          # same port. Answer it as a plain HTTP refusal and close, so
+                          # the log carries the request, never a traceback.
+                          self.conn.sendall(
+                              b"HTTP/1.1 400 Bad Request\r\n"
+                              b"Content-Length: 0\r\nConnection: close\r\n\r\n"
+                          )
+                          return
                       self.conn.sendall(
                           b"HTTP/1.1 101 Switching Protocols\r\n"
                           b"Upgrade: websocket\r\nConnection: Upgrade\r\n"

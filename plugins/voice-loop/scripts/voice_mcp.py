@@ -815,10 +815,10 @@ def _serve_stream_client(client_sock: _socket.socket, line: str, addr) -> None:
     # worker, and a worker whose client side just disconnected leaves a
     # dangling socket otherwise (windowsill#5881 R3). Both pumps have already
     # closed the websocket on their way out; this is the belt to their braces.
-    try:
-        ws.close()
-    except OSError:
-        pass
+    # Bare call: ``wsclient.WebSocket.close`` is documented never to raise — it
+    # swallows OSError on both of its own socket calls — so a guard here would
+    # be code no run can reach.
+    ws.close()
 
 
 def _socket_dir() -> str:

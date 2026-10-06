@@ -2758,10 +2758,13 @@ class TestStreamingIsOptIn:
         """A live URL declares what the client is ABOUT to send, and only the client knows that."""
         assert dictate.resolve_settings({}, "Linux")["stream_rate"] == dictate.RECORD_RATE
 
+    @needs_af_unix
     def test_a_streaming_provider_with_the_opt_in_and_the_cloud_backend_streams(self):
         """fix(#5881): ``stt.cloud.streaming`` opens the stream path again — the relay dials the
         provider socket and forwards the recording byte-for-byte. ``streaming_wanted`` is True
-        when the opt-in is on and the provider carries a streaming variant."""
+        when the opt-in is on and the provider carries a streaming variant. The open arm is
+        the AF_UNIX-present one: where the socket module has no AF_UNIX the product answers
+        False by design, so this pin skips there."""
         s = dictate.resolve_settings(
             {"stt": {"backend": "cloud", "cloud": {"provider": "deepgram", "streaming": True}}}, "Linux"
         )
@@ -3507,11 +3510,13 @@ class TestTheWorkerEntryPoint:
         assert seen == [["4242"]]
         assert not (state / "dictate.pid").exists()  # it claimed no recording slot
 
+    @needs_af_unix
     def test_a_worker_with_no_relay_writes_a_no_socket_reason(self, state, monkeypatch, short_socket_dir):
         """fix(#5881): the worker dials the relay; an absent or refused socket is a
         ``wsclient.WebSocketError`` the worker translates into a typed reason.
         ``finish_stream_worker`` then takes the recorded WAV through the batch path —
-        a recording is never lost to the stream attempt."""
+        a recording is never lost to the stream attempt. The dial is an AF_UNIX dial,
+        so the platform without AF_UNIX has no relay arm to pin here."""
         monkeypatch.delenv("CLAUDE_PLUGIN_OPTION_STT_API_KEY", raising=False)
         env_dir = short_socket_dir / "runtime"
         env_dir.mkdir()
@@ -3538,13 +3543,15 @@ class TestTheWorkerEntryPoint:
         assert result["status"] == "failed"
         assert "no streaming variant" in result["reason"]
 
+    @needs_af_unix
     def test_a_worker_with_a_key_in_its_env_still_needs_the_relay(
         self, state, monkeypatch, short_socket_dir
     ):
         """fix(#5881): the worker dials the relay — only the relay. A key in the worker's
         own env buys nothing on the streaming path: with no relay bound the dial itself is
         the failure, the reason names the relay, and the worker exits 1 rather than
-        reaching for the provider socket directly."""
+        reaching for the provider socket directly. The dial is an AF_UNIX dial, so the
+        platform without AF_UNIX has no relay arm to pin here."""
         monkeypatch.setenv("CLAUDE_PLUGIN_OPTION_STT_API_KEY", "dg-secret")
         env_dir = short_socket_dir / "runtime"
         env_dir.mkdir()
@@ -3557,13 +3564,15 @@ class TestTheWorkerEntryPoint:
         assert result["status"] == "failed"
         assert "relay" in result["reason"].lower()
 
+    @needs_af_unix
     def test_a_worker_told_no_recorder_pid_still_runs_rather_than_crashing(
         self, state, monkeypatch, short_socket_dir
     ):
         """argv is a contract with ourselves, and a broken one must degrade like everything
         else. fix(#5881): a missing recorder pid is treated as "the recorder is dead" and
         the worker still runs rather than crashing — here the relay dial fails first, and
-        the failure is the typed kind, never a traceback."""
+        the failure is the typed kind, never a traceback. The dial is an AF_UNIX dial, so
+        the platform without AF_UNIX has no relay arm to pin here."""
         monkeypatch.delenv("CLAUDE_PLUGIN_OPTION_STT_API_KEY", raising=False)
         env_dir = short_socket_dir / "runtime"
         env_dir.mkdir()
@@ -3682,12 +3691,15 @@ class TestOnInterimCallback:
 class TestPreviewLifecycle:
     """Preview starts with the recording and clears when the text is delivered."""
 
+    @needs_af_unix
     def test_stream_worker_leaves_no_preview_when_enabled_and_no_relay_is_bound(
         self, state, monkeypatch, short_socket_dir
     ):
         """fix(#5881): the preview hook fires from inside the session, and the session
         needs the relay. With no relay bound the dial fails before one interim could
-        exist, so even ``dictate.preview`` on leaves the preview file unwritten."""
+        exist, so even ``dictate.preview`` on leaves the preview file unwritten. The
+        dial is an AF_UNIX dial, so the platform without AF_UNIX has no relay arm to
+        pin here."""
         monkeypatch.delenv("CLAUDE_PLUGIN_OPTION_STT_API_KEY", raising=False)
         env_dir = short_socket_dir / "runtime"
         env_dir.mkdir()
@@ -3700,11 +3712,13 @@ class TestPreviewLifecycle:
         assert "relay" in result["reason"].lower()
         assert not (state / "dictate-preview.json").exists()
 
+    @needs_af_unix
     def test_stream_worker_does_not_write_preview_when_disabled(
         self, state, monkeypatch, short_socket_dir
     ):
         """The default — preview off — never touches the preview file. The worker
-        runs through its typed-failure path when no relay is bound."""
+        runs through its typed-failure path when no relay is bound. The dial is an
+        AF_UNIX dial, so the platform without AF_UNIX has no relay arm to pin here."""
         monkeypatch.delenv("CLAUDE_PLUGIN_OPTION_STT_API_KEY", raising=False)
         env_dir = short_socket_dir / "runtime"
         env_dir.mkdir()
@@ -3944,11 +3958,14 @@ def test_streaming_wanted_records_the_reason_when_provider_lacks_a_variant(monke
     assert any("openai has no streaming variant" in line for line in log_calls), log_calls
 
 
+@needs_af_unix
 def test_streaming_wanted_open_arms_when_a_provider_has_a_variant(monkeypatch):
     """fix(#5881): the streaming-opt-in guard opens up for a provider with a streaming variant.
     The worker dials the relay, the relay holds the key and dials the provider. The credential
     closure is intact — the hotkey process holds no key — because the dial goes through the
-    relay's stream leg, not directly to the provider."""
+    relay's stream leg, not directly to the provider. The open arm is the AF_UNIX-present one:
+    where the socket module has no AF_UNIX the product answers False by design, so this pin
+    skips there."""
 
     s = dictate.resolve_settings(
         {"stt": {"backend": "cloud", "cloud": {"provider": "deepgram", "streaming": True}}}, "Linux"
@@ -6417,3 +6434,782 @@ class TestConsoleCtrlCDecisions:
             raise AttributeError("module 'ctypes' has no attribute 'WinDLL'")
 
         assert dictate._win_console_ctrl_c(4321, api_factory=_no_kernel32) is False
+
+
+# --- the relay stream adapter and the worker around it: every failure is typed -----------------
+#
+# The worker dials the relay's stream leg with ``_RelayStreamAdapter``; both sides of that
+# dial are error surfaces a recording must survive. The tests here drive the real adapter
+# and the real worker against scripted relays and socket stand-ins — the same seams the
+# batch-relay tests above use — and assert the typed refusal each failure produces.
+
+
+class _NoAfUnixSocketModule:
+    """The ``dictate._socket`` surface for a platform that has no AF_UNIX at all."""
+
+    SOCK_STREAM = socket.SOCK_STREAM
+
+
+class _AdapterSocketModule:
+    """The ``dictate._socket`` surface with ``socket`` swapped for one scripted stand-in."""
+
+    AF_UNIX = getattr(socket, "AF_UNIX", None)
+    SOCK_STREAM = socket.SOCK_STREAM
+
+    def __init__(self, sock):
+        self._sock = sock
+
+    def socket(self, *_args, **_kwargs):
+        return self._sock
+
+
+def _adapter_on_shim(monkeypatch, fake_sock) -> "dictate._RelayStreamAdapter":
+    """An adapter whose every socket call lands on ``fake_sock`` — the relay path is vouched
+    for and the socket factory is the shim, so the real AF_UNIX surface is never touched."""
+    monkeypatch.setattr(dictate, "_socket", _AdapterSocketModule(fake_sock))
+    monkeypatch.setattr(dictate, "_relay_socket_path", lambda: "/unused/relay/stt.sock")
+    monkeypatch.setattr(dictate, "_relay_socket_safe", lambda _path: True)
+    return dictate._RelayStreamAdapter(
+        _cloud_settings(),
+        provider_name="deepgram",
+        url="ws://127.0.0.1:9/v1/listen",
+        tts_vendor="openai",
+        timeout=1.0,
+    )
+
+
+def _worker_result() -> dict:
+    """The one result document the worker writes for its own pid."""
+    return json.loads(Path(dictate._stream_result_path()).read_text(encoding="utf-8"))
+
+
+@needs_af_unix
+def test_cloud_dictation_returns_the_relay_batch_transcript(state, monkeypatch, short_socket_dir):
+    """The batch leg's success arm: the relay answers ``ok`` with a transcript and that text
+    is what ``transcribe`` returns — the local-whisper fallback is not taken when the relay
+    delivers."""
+    env_dir = short_socket_dir / "runtime"
+    env_dir.mkdir()
+    transcript = "words the relay returned for the recording"
+
+    def _reply_ok(conn):
+        buf = b""
+        while b"\n" not in buf:
+            chunk = conn.recv(65536)
+            if not chunk:
+                return
+            buf += chunk
+        while True:
+            chunk = conn.recv(65536)
+            if not chunk:
+                break
+        conn.sendall((json.dumps({"status": "ok", "text": transcript}) + "\n").encode())
+
+    server, t = _bind_scripted_relay(env_dir, _reply_ok)
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(env_dir))
+    monkeypatch.delenv("CLAUDE_PLUGIN_OPTION_STT_API_KEY", raising=False)
+    monkeypatch.setattr(dictate, "_transcribe_lan", lambda *a, **kw: pytest.fail("local whisper called"))
+    (state / "dictate.wav").write_bytes(b"RIFFfakewav")
+
+    assert dictate.transcribe(_cloud_settings()) == transcript
+    server.close()
+    t.join(timeout=2)
+
+
+def test_streaming_opt_in_takes_the_batch_path_where_the_platform_has_no_af_unix(monkeypatch, state):
+    """Without AF_UNIX there is no relay socket to dial, so the streaming opt-in is answered
+    the same way a provider without a streaming variant is: the batch path, with a line in
+    the log so the setting is never silently ignored."""
+    monkeypatch.setattr(dictate, "_socket", _NoAfUnixSocketModule())
+    s = dictate.resolve_settings(
+        {
+            "stt": {
+                "backend": "cloud",
+                "cloud": {"provider": "deepgram", "streaming": True, "endpoint": "http://127.0.0.1:9"},
+                "timeout": 5.0,
+            }
+        },
+        "Linux",
+    )
+    assert dictate.streaming_wanted(s) is False
+    assert "AF_UNIX unavailable" in _log_of(state)
+
+
+@needs_af_unix
+def test_stream_worker_answers_a_typed_failure_for_a_recorder_pid_that_is_not_a_number(
+    state, monkeypatch, short_socket_dir
+):
+    """The worker reads the recorder pid from its argument; a value that is not a number is
+    "no live recorder", not a crash — the session still runs against the relay and the
+    worker still writes its one result document."""
+    env_dir = short_socket_dir / "runtime"
+    env_dir.mkdir()
+
+    def _reply_no_key(conn):
+        buf = b""
+        while b"\n" not in buf:
+            chunk = conn.recv(65536)
+            if not chunk:
+                return
+            buf += chunk
+        conn.sendall((json.dumps({"status": "failed", "reason": "no-key"}) + "\n").encode())
+
+    server, t = _bind_scripted_relay(env_dir, _reply_no_key)
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(env_dir))
+    assert dictate.stream_worker(_cloud_settings(), ["not-a-pid"]) == 1
+    server.close()
+    t.join(timeout=2)
+    result = _worker_result()
+    assert result["status"] == "failed"
+    assert result["reason"] == "relay refused stream: no-key"
+
+
+def test_stream_worker_answers_a_typed_failure_when_the_streaming_url_cannot_be_built(
+    state, monkeypatch
+):
+    """A provider entry whose streaming URL cannot be built is a configuration failure the
+    worker answers in its result document — the recording is not lost to an unhandled
+    exception in the child."""
+
+    class _BrokenStreamingUrl:
+        def url(self, *_args):
+            raise TypeError("no url for this configuration")
+
+    import dataclasses
+
+    real_entry = providers.STT_PROVIDERS["deepgram"]
+    monkeypatch.setitem(
+        providers.STT_PROVIDERS,
+        "deepgram",
+        dataclasses.replace(real_entry, streaming=_BrokenStreamingUrl()),
+    )
+    assert dictate.stream_worker(_cloud_settings(), ["4242"]) == 1
+    result = _worker_result()
+    assert result["status"] == "failed"
+    assert result["reason"].startswith("streaming url build failed")
+
+
+@needs_af_unix
+def test_stream_worker_answers_the_websocket_failure_the_stream_session_raises(
+    state, monkeypatch, short_socket_dir
+):
+    """A websocket failure inside the stream session is the worker's typed failure — the
+    same surface ``run_stream_session`` raising directly presents to the stop toggle."""
+
+    def _reply_ok_then_drain(conn):
+        conn.sendall((json.dumps({"status": "ok"}) + "\n").encode())
+        while True:
+            if not conn.recv(65536):
+                return
+
+    env_dir = short_socket_dir / "runtime"
+    env_dir.mkdir()
+    server, t = _bind_scripted_relay(env_dir, _reply_ok_then_drain)
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(env_dir))
+
+    def _raise(*_args, **_kwargs):
+        raise dictate.wsclient.WebSocketError("the provider hung up mid-session")
+
+    monkeypatch.setattr(dictate, "run_stream_session", _raise)
+    assert dictate.stream_worker(_cloud_settings(), ["4242"]) == 1
+    server.close()
+    t.join(timeout=2)
+    result = _worker_result()
+    assert result["status"] == "failed"
+    assert result["reason"] == "the provider hung up mid-session"
+
+
+@needs_af_unix
+def test_stream_worker_answers_a_typed_failure_when_the_recording_cannot_be_read(
+    state, monkeypatch, short_socket_dir
+):
+    """An OSError out of the stream session is the recording being unreadable; the worker
+    names exactly that in its result document rather than dying with a traceback."""
+
+    def _reply_ok_then_drain(conn):
+        conn.sendall((json.dumps({"status": "ok"}) + "\n").encode())
+        while True:
+            if not conn.recv(65536):
+                return
+
+    env_dir = short_socket_dir / "runtime"
+    env_dir.mkdir()
+    server, t = _bind_scripted_relay(env_dir, _reply_ok_then_drain)
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(env_dir))
+
+    def _raise(*_args, **_kwargs):
+        raise OSError("the wav file vanished")
+
+    monkeypatch.setattr(dictate, "run_stream_session", _raise)
+    assert dictate.stream_worker(_cloud_settings(), ["4242"]) == 1
+    server.close()
+    t.join(timeout=2)
+    result = _worker_result()
+    assert result["status"] == "failed"
+    assert result["reason"].startswith("recording could not be read")
+
+
+def test_the_relay_stream_adapter_refuses_to_open_where_the_platform_has_no_af_unix(monkeypatch):
+    """The adapter's first check is the platform's: no AF_UNIX means no relay to dial, and
+    the refusal is the websocket error the worker already knows how to answer."""
+    monkeypatch.setattr(dictate, "_socket", _NoAfUnixSocketModule())
+    adapter = dictate._RelayStreamAdapter(
+        _cloud_settings(), provider_name="deepgram", url="ws://127.0.0.1:9/v1/listen",
+        tts_vendor="openai", timeout=1.0,
+    )
+    with pytest.raises(dictate.wsclient.WebSocketError, match="AF_UNIX unavailable"):
+        adapter.open()
+
+
+def test_the_relay_stream_adapter_names_a_refused_connect_even_when_the_close_fails(monkeypatch):
+    """A refused connect is a typed refusal; a socket that also fails to close on the way
+    out cannot eat it."""
+
+    class _RefusingSock:
+        def settimeout(self, _t):
+            pass
+
+        def connect(self, _path):
+            raise OSError("connection refused")
+
+        def close(self):
+            raise OSError("close refused (stand-in for a kernel close failure)")
+
+    adapter = _adapter_on_shim(monkeypatch, _RefusingSock())
+    with pytest.raises(dictate.wsclient.WebSocketError, match="relay connect refused"):
+        adapter.open()
+
+
+def test_the_relay_stream_adapter_names_a_request_line_write_that_fails(monkeypatch):
+    """The stream line the adapter writes can fail on a dead relay socket; the failure is
+    typed and the socket is closed."""
+
+    class _SendRefusingSock:
+        closed = False
+
+        def settimeout(self, _t):
+            pass
+
+        def connect(self, _path):
+            return None
+
+        def sendall(self, _data):
+            raise OSError("the relay hung up")
+
+        def close(self):
+            self.closed = True
+
+    sock = _SendRefusingSock()
+    adapter = _adapter_on_shim(monkeypatch, sock)
+    with pytest.raises(dictate.wsclient.WebSocketError, match="relay write failed"):
+        adapter.open()
+    assert sock.closed is True
+
+
+def test_the_relay_stream_adapter_names_a_reply_read_that_fails(monkeypatch):
+    """A reply read that raises — not a timeout, a hard error — is the relay leg dying;
+    the adapter types it and closes the socket."""
+
+    class _ReadRefusingSock:
+        closed = False
+
+        def settimeout(self, _t):
+            pass
+
+        def connect(self, _path):
+            return None
+
+        def sendall(self, _data):
+            return None
+
+        def recv(self, _n):
+            raise OSError("the relay socket was reset")
+
+        def close(self):
+            self.closed = True
+
+    sock = _ReadRefusingSock()
+    adapter = _adapter_on_shim(monkeypatch, sock)
+    with pytest.raises(dictate.wsclient.WebSocketError, match="relay read failed"):
+        adapter.open()
+    assert sock.closed is True
+
+
+@needs_af_unix
+def test_the_relay_stream_adapter_names_a_relay_that_closes_before_the_reply_line(
+    monkeypatch, short_socket_dir
+):
+    """EOF before the newline is the relay going away mid-reply; the adapter types the
+    refusal rather than returning a half-open stream."""
+
+    def _close_after_the_line(conn):
+        buf = b""
+        while b"\n" not in buf:
+            chunk = conn.recv(65536)
+            if not chunk:
+                return
+            buf += chunk
+        # the line was read, so the close is a clean EOF — no reply line ever arrives
+
+    env_dir = short_socket_dir / "runtime"
+    env_dir.mkdir()
+    server, t = _bind_scripted_relay(env_dir, _close_after_the_line)
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(env_dir))
+    adapter = dictate._RelayStreamAdapter(
+        _cloud_settings(), provider_name="deepgram", url="ws://127.0.0.1:9/v1/listen",
+        tts_vendor="openai", timeout=1.0,
+    )
+    with pytest.raises(dictate.wsclient.WebSocketError, match="relay closed before sending a reply"):
+        adapter.open()
+    server.close()
+    t.join(timeout=2)
+
+
+@needs_af_unix
+def test_the_relay_stream_adapter_refuses_a_reply_line_past_sixty_four_kib(
+    monkeypatch, short_socket_dir
+):
+    """A reply line with no newline past 64 KiB is not a reply the adapter will buffer
+    without bound — the refusal is typed and the socket closed."""
+
+    def _flood(conn):
+        conn.sendall(b"n" * 70000)
+        while True:
+            if not conn.recv(65536):
+                return
+
+    env_dir = short_socket_dir / "runtime"
+    env_dir.mkdir()
+    server, t = _bind_scripted_relay(env_dir, _flood)
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(env_dir))
+    adapter = dictate._RelayStreamAdapter(
+        _cloud_settings(), provider_name="deepgram", url="ws://127.0.0.1:9/v1/listen",
+        tts_vendor="openai", timeout=1.0,
+    )
+    with pytest.raises(dictate.wsclient.WebSocketError, match="relay reply over 64 KiB"):
+        adapter.open()
+    server.close()
+    t.join(timeout=2)
+
+
+@needs_af_unix
+def test_the_relay_stream_adapter_refuses_a_reply_line_that_is_not_json(
+    monkeypatch, short_socket_dir
+):
+    """A reply that does not parse is not an ``ok`` — the adapter types the refusal."""
+
+    def _reply_garbage(conn):
+        conn.recv(65536)
+        conn.sendall(b"not json\n")
+
+    env_dir = short_socket_dir / "runtime"
+    env_dir.mkdir()
+    server, t = _bind_scripted_relay(env_dir, _reply_garbage)
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(env_dir))
+    adapter = dictate._RelayStreamAdapter(
+        _cloud_settings(), provider_name="deepgram", url="ws://127.0.0.1:9/v1/listen",
+        tts_vendor="openai", timeout=1.0,
+    )
+    with pytest.raises(dictate.wsclient.WebSocketError, match="relay reply not JSON"):
+        adapter.open()
+    server.close()
+    t.join(timeout=2)
+
+
+@needs_af_unix
+def test_the_relay_stream_adapter_refuses_a_reply_line_that_is_not_an_object(
+    monkeypatch, short_socket_dir
+):
+    """A reply that parses to a non-object is not a reply the adapter can read a status
+    from — typed refusal, same as garbage."""
+
+    def _reply_list(conn):
+        conn.recv(65536)
+        conn.sendall(b"[1, 2]\n")
+
+    env_dir = short_socket_dir / "runtime"
+    env_dir.mkdir()
+    server, t = _bind_scripted_relay(env_dir, _reply_list)
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(env_dir))
+    adapter = dictate._RelayStreamAdapter(
+        _cloud_settings(), provider_name="deepgram", url="ws://127.0.0.1:9/v1/listen",
+        tts_vendor="openai", timeout=1.0,
+    )
+    with pytest.raises(dictate.wsclient.WebSocketError, match="relay reply is not a JSON object"):
+        adapter.open()
+    server.close()
+    t.join(timeout=2)
+
+
+def test_the_relay_stream_adapter_refuses_to_connect_before_it_was_opened():
+    """The ``connect=`` slot refuses an adapter that never opened — the session cannot
+    start on a socket that does not exist."""
+    adapter = dictate._RelayStreamAdapter(
+        _cloud_settings(), provider_name="deepgram", url="ws://127.0.0.1:9/v1/listen",
+        tts_vendor="openai", timeout=1.0,
+    )
+    with pytest.raises(dictate.wsclient.WebSocketError, match="relay stream adapter was not opened"):
+        adapter.connect_to_provider("ws://127.0.0.1:9/v1/listen", {}, timeout=1.0)
+
+
+def test_the_relay_stream_adapter_refuses_to_connect_after_it_closed():
+    """A closed stream answers the ``connect=`` slot with the closed-stream refusal — the
+    session cannot restart on the same adapter."""
+    adapter = dictate._RelayStreamAdapter(
+        _cloud_settings(), provider_name="deepgram", url="ws://127.0.0.1:9/v1/listen",
+        tts_vendor="openai", timeout=1.0,
+    )
+    adapter._sock = object()  # the socket half of "open", so the closed check is the one that fires
+    adapter.closed = True
+    with pytest.raises(dictate.wsclient.WebSocketError, match="the relay stream is closed"):
+        adapter.connect_to_provider("ws://127.0.0.1:9/v1/listen", {}, timeout=1.0)
+
+
+def test_the_relay_stream_adapter_refuses_a_send_after_the_stream_closed():
+    """A send on a closed stream is the typed closed-stream refusal, not an OSError from a
+    dead socket the session would have to guess at."""
+    adapter = dictate._RelayStreamAdapter(
+        _cloud_settings(), provider_name="deepgram", url="ws://127.0.0.1:9/v1/listen",
+        tts_vendor="openai", timeout=1.0,
+    )
+    adapter._sock = object()
+    adapter.closed = True
+    with pytest.raises(dictate.wsclient.WebSocketError, match="the relay stream is closed"):
+        adapter.send_binary(b"\x01")
+
+
+@needs_af_unix
+def test_the_relay_stream_adapter_refuses_a_frame_past_the_wire_cap():
+    """A frame past the websocket cap is refused before it is written, the same bound the
+    provider leg enforces."""
+    adapter = dictate._RelayStreamAdapter(
+        _cloud_settings(), provider_name="deepgram", url="ws://127.0.0.1:9/v1/listen",
+        tts_vendor="openai", timeout=1.0,
+    )
+    ours, theirs = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        adapter._sock = ours
+        adapter.closed = False
+        with pytest.raises(dictate.wsclient.WebSocketError, match="frame over"):
+            adapter.send_binary(b"x" * (dictate.wsclient.MAX_FRAME_BYTES + 1))
+    finally:
+        ours.close()
+        theirs.close()
+
+
+@needs_af_unix
+def test_the_relay_stream_adapter_names_a_frame_write_that_fails():
+    """A frame write onto a dead socket marks the adapter closed and types the failure —
+    the polling loop reads the closed flag, not a bare OSError."""
+    adapter = dictate._RelayStreamAdapter(
+        _cloud_settings(), provider_name="deepgram", url="ws://127.0.0.1:9/v1/listen",
+        tts_vendor="openai", timeout=1.0,
+    )
+    ours, theirs = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+    ours.close()  # a socket whose fd is already gone: the write cannot succeed
+    theirs.close()
+    adapter._sock = ours
+    adapter.closed = False
+    with pytest.raises(dictate.wsclient.WebSocketError, match="relay write failed"):
+        adapter.send_binary(b"\x01")
+    assert adapter.closed is True
+
+
+@needs_af_unix
+def test_the_relay_stream_adapter_poll_drains_buffered_frames_before_touching_the_socket():
+    """Frames already buffered answer ``poll`` directly and empty the buffer — the socket
+    is not read while buffered frames remain."""
+
+    class _MustNotBeRead:
+        def fileno(self):
+            raise AssertionError("poll must drain the buffer before the socket")
+
+        def recv(self, _n):
+            raise AssertionError("poll must drain the buffer before the socket")
+
+    adapter = dictate._RelayStreamAdapter(
+        _cloud_settings(), provider_name="deepgram", url="ws://127.0.0.1:9/v1/listen",
+        tts_vendor="openai", timeout=1.0,
+    )
+    adapter._sock = _MustNotBeRead()
+    adapter.closed = False
+    adapter._buf_in = [(dictate.wsclient.OP_TEXT, b"already here")]
+    assert adapter.poll(0.0) == [(dictate.wsclient.OP_TEXT, b"already here")]
+    assert adapter._buf_in == []
+
+
+def test_the_relay_stream_adapter_poll_is_quiet_before_the_stream_was_opened():
+    """A poll before the open is quiet, not an error — the session has not started."""
+    adapter = dictate._RelayStreamAdapter(
+        _cloud_settings(), provider_name="deepgram", url="ws://127.0.0.1:9/v1/listen",
+        tts_vendor="openai", timeout=1.0,
+    )
+    assert adapter.poll(0.0) == []
+
+
+@needs_af_unix
+def test_the_relay_stream_adapter_poll_ends_the_stream_on_a_head_cut_short():
+    """A head shorter than five bytes is the relay going away mid-frame; the stream is
+    marked closed and the poll is quiet — the session ends, it does not spin."""
+
+    def _wait_until_closed():
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline and not adapter.closed:
+            adapter.poll(0.0)
+            time.sleep(0.01)
+
+    adapter = dictate._RelayStreamAdapter(
+        _cloud_settings(), provider_name="deepgram", url="ws://127.0.0.1:9/v1/listen",
+        tts_vendor="openai", timeout=1.0,
+    )
+    ours, theirs = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        adapter._sock = ours
+        adapter.closed = False
+        theirs.sendall(b"\x01\x02")  # two bytes: no opcode-and-length head can be built
+        theirs.close()
+        _wait_until_closed()
+        assert adapter.closed is True
+    finally:
+        ours.close()
+        theirs.close()
+
+
+@needs_af_unix
+def test_the_relay_stream_adapter_poll_ends_the_stream_when_the_payload_never_arrives():
+    """A head whose declared payload never arrives is an ended stream: the frame read
+    runs in the socket's own timeout mode, the expiry is the typed failure, the
+    adapter closes, and the poll is quiet."""
+
+    def _wait_until_closed():
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline and not adapter.closed:
+            adapter.poll(0.0)
+            time.sleep(0.01)
+
+    adapter = dictate._RelayStreamAdapter(
+        _cloud_settings(), provider_name="deepgram", url="ws://127.0.0.1:9/v1/listen",
+        tts_vendor="openai", timeout=1.0,
+    )
+    ours, theirs = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        adapter._sock = ours
+        adapter.closed = False
+        # A raw socketpair has no deadline; open() is what gives the adapter's
+        # socket one, so the test sets the same shape itself — short, because the
+        # declared payload below is never coming.
+        ours.settimeout(0.25)
+        # A head declaring four payload bytes — and nothing else is ever written.
+        theirs.sendall(bytes([dictate.wsclient.OP_TEXT]) + (4).to_bytes(4, "big"))
+        _wait_until_closed()
+        assert adapter.closed is True
+    finally:
+        ours.close()
+        theirs.close()
+
+
+@needs_af_unix
+def test_the_relay_stream_adapter_poll_ends_the_stream_when_the_payload_is_cut_short():
+    """EOF inside a declared payload is the relay going away mid-frame; the stream is
+    marked closed and the partial frame is dropped rather than handed up."""
+
+    def _wait_until_closed():
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline and not adapter.closed:
+            adapter.poll(0.0)
+            time.sleep(0.01)
+
+    adapter = dictate._RelayStreamAdapter(
+        _cloud_settings(), provider_name="deepgram", url="ws://127.0.0.1:9/v1/listen",
+        tts_vendor="openai", timeout=1.0,
+    )
+    ours, theirs = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        adapter._sock = ours
+        adapter.closed = False
+        theirs.sendall(bytes([dictate.wsclient.OP_TEXT]) + (4).to_bytes(4, "big") + b"ab")
+        theirs.close()
+        _wait_until_closed()
+        assert adapter.closed is True
+    finally:
+        ours.close()
+        theirs.close()
+
+
+@needs_af_unix
+def test_the_relay_stream_adapter_poll_skips_a_zero_length_frame_that_is_not_a_close():
+    """A zero-length frame that is not a close carries nothing — not even an empty
+    payload — so it is skipped, and the stream stays open for the frames after it."""
+    adapter = dictate._RelayStreamAdapter(
+        _cloud_settings(), provider_name="deepgram", url="ws://127.0.0.1:9/v1/listen",
+        tts_vendor="openai", timeout=1.0,
+    )
+    ours, theirs = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        adapter._sock = ours
+        adapter.closed = False
+        theirs.sendall(bytes([dictate.wsclient.OP_TEXT]) + (0).to_bytes(4, "big"))
+        frames: list = []
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            frames = adapter.poll(0.0)
+            if frames or adapter.closed:
+                break
+            time.sleep(0.01)
+        assert frames == []
+        assert adapter.closed is False
+    finally:
+        ours.close()
+        theirs.close()
+
+
+@needs_af_unix
+def test_the_relay_stream_adapter_keeps_sending_after_a_poll_once_the_buffer_fills():
+    """fix(#6100): ``poll`` used to flip its socket to non-blocking and leave it there, so
+    the first send that found the send buffer full raised EAGAIN — a WebSocketError the
+    session answered with the batch fallback. A poll now never touches the blocking mode:
+    a payload far larger than the socket buffer waits for the peer to drain, and every
+    byte arrives framed."""
+    adapter = dictate._RelayStreamAdapter(
+        _cloud_settings(), provider_name="deepgram", url="ws://127.0.0.1:9/v1/listen",
+        tts_vendor="openai", timeout=1.0,
+    )
+    ours, theirs = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+    frame_bytes = 65536
+    frames_sent = 64  # 4 MiB in total — far past any AF_UNIX send buffer
+    drained = bytearray()
+    drained_all = threading.Event()
+
+    def _drain_slowly():
+        """16 KiB every 3 ms: the peer stays behind the sender, so the sender's buffer
+        is full for most of the run — the exact condition the broken poll turned into a
+        failure."""
+        expected = frames_sent * (frame_bytes + 5)
+        while len(drained) < expected:
+            try:
+                chunk = theirs.recv(16384)
+            except OSError:
+                return
+            if not chunk:
+                return
+            drained.extend(chunk)
+            time.sleep(0.003)
+        drained_all.set()
+
+    drain = threading.Thread(target=_drain_slowly, daemon=True)
+    drain.start()
+    try:
+        adapter._sock = ours
+        adapter.closed = False
+        # A quiet poll first — the very call that used to leave the socket non-blocking
+        # for every send that followed it.
+        assert adapter.poll(0.05) == []
+        payload = b"\x7f" * frame_bytes
+        for _ in range(frames_sent):
+            adapter.send_binary(payload)
+        assert drained_all.wait(timeout=10), f"the peer drained {len(drained)} of {frames_sent * (frame_bytes + 5)} bytes"
+        expected_frame = bytes([dictate.wsclient.OP_BINARY]) + frame_bytes.to_bytes(4, "big") + payload
+        assert bytes(drained) == expected_frame * frames_sent
+    finally:
+        ours.close()
+        theirs.close()
+        drain.join(timeout=5)
+
+
+@needs_af_unix
+def test_the_relay_stream_adapter_poll_returns_whole_a_frame_that_arrives_in_pieces():
+    """A frame the relay writes in pieces — the payload split across two writes with a
+    pause between them — is returned whole: once the head has arrived the frame completes
+    in the socket's own timeout mode, so the polling loop never sees a partial frame."""
+    adapter = dictate._RelayStreamAdapter(
+        _cloud_settings(), provider_name="deepgram", url="ws://127.0.0.1:9/v1/listen",
+        tts_vendor="openai", timeout=1.0,
+    )
+    ours, theirs = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+    payload = b"a payload the relay writes in two pieces"
+    head = bytes([dictate.wsclient.OP_TEXT]) + len(payload).to_bytes(4, "big")
+
+    def _send_in_pieces():
+        theirs.sendall(head + payload[: len(payload) // 2])
+        time.sleep(0.2)
+        theirs.sendall(payload[len(payload) // 2 :])
+
+    sender = threading.Thread(target=_send_in_pieces, daemon=True)
+    sender.start()
+    try:
+        adapter._sock = ours
+        adapter.closed = False
+        # The deadline open() would have given the socket — a raw socketpair has none.
+        ours.settimeout(2.0)
+        frames: list = []
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            frames = adapter.poll(0.05)
+            if frames or adapter.closed:
+                break
+        assert frames == [(dictate.wsclient.OP_TEXT, payload)]
+    finally:
+        ours.close()
+        theirs.close()
+        sender.join(timeout=5)
+
+
+@needs_af_unix
+def test_the_relay_stream_adapter_poll_ends_the_stream_when_the_socket_cannot_be_queried():
+    """A socket whose descriptor is already gone cannot even be asked about readability;
+    the refusal is an ended stream — the adapter closes and the poll is quiet — never an
+    exception into the polling loop."""
+    adapter = dictate._RelayStreamAdapter(
+        _cloud_settings(), provider_name="deepgram", url="ws://127.0.0.1:9/v1/listen",
+        tts_vendor="openai", timeout=1.0,
+    )
+    ours, theirs = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+    ours.close()  # a socket whose fd is already gone: readability cannot be asked of it
+    theirs.close()
+    adapter._sock = ours
+    adapter.closed = False
+    assert adapter.poll(0.0) == []
+    assert adapter.closed is True
+
+
+@needs_af_unix
+def test_the_relay_stream_adapter_close_survives_a_socket_that_fails_on_both_calls():
+    """``close`` never raises: a socket that refuses both the goodbye frame and its own
+    close is swallowed, and the adapter still lands closed with no socket left."""
+
+    class _DyingSock:
+        def __init__(self):
+            self.sendall_called = False
+            self.close_called = False
+
+        def sendall(self, _data):
+            self.sendall_called = True
+            raise OSError("the goodbye could not be written")
+
+        def close(self):
+            self.close_called = True
+            raise OSError("close refused (stand-in for a kernel close failure)")
+
+    sock = _DyingSock()
+    adapter = dictate._RelayStreamAdapter(
+        _cloud_settings(), provider_name="deepgram", url="ws://127.0.0.1:9/v1/listen",
+        tts_vendor="openai", timeout=1.0,
+    )
+    adapter._sock = sock
+    adapter.closed = False
+    adapter.close()
+    assert adapter.closed is True
+    assert adapter._sock is None
+    assert sock.sendall_called and sock.close_called
+
+
+def test_the_preview_hook_swallows_a_preview_write_that_fails(monkeypatch):
+    """The preview hook runs inside the live session; a preview file that cannot be
+    written must not take the session down with it."""
+
+    def _refuse(*_args, **_kwargs):
+        raise OSError("the preview file could not be written")
+
+    monkeypatch.setattr(dictate, "_write_preview", _refuse)
+    hook = dictate._preview_writer({"preview": True})
+    hook("interim words", "final words")

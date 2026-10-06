@@ -105,6 +105,7 @@ import ntpath
 import os
 import platform
 import re
+import select
 import shlex
 import shutil
 import signal
@@ -2283,10 +2284,9 @@ def stream_worker(s: dict, args: list[str]) -> int:
             outcome.clear()
             outcome.update({"status": "failed", "reason": f"recording could not be read: {err}"})
         finally:
-            try:
-                adapter.close()
-            except OSError:
-                pass
+            # ``_RelayStreamAdapter.close`` swallows OSError on both of its own socket calls,
+            # so there is no failure left for this arm to catch.
+            adapter.close()
 
     run_thread = threading.Thread(target=_run, daemon=True)
     run_thread.start()
@@ -2457,45 +2457,59 @@ class _RelayStreamAdapter:
             self.closed = True
             raise wsclient.WebSocketError(f"relay write failed: {err}") from err
 
+    def _recv_exact(self, count: int) -> bytes | None:
+        """Read exactly ``count`` bytes in the socket's own timeout mode.
+
+        None is the typed failure — an EOF mid-read or a dead socket — so the
+        caller ends the stream instead of handing a partial frame up. The socket
+        keeps the timeout ``open()`` gave it; this helper never touches the
+        blocking mode."""
+        buf = b""
+        while len(buf) < count:
+            try:
+                chunk = self._sock.recv(count - len(buf))  # type: ignore[union-attr] — guarded by poll
+            except OSError:
+                return None
+            if not chunk:
+                return None
+            buf += chunk
+        return buf
+
     def poll(self, timeout: float) -> list[tuple[int, bytes]]:
-        """Drain whatever frames are already buffered; never block.
+        """The frames already available within ``timeout``, and nothing more.
 
         ``run_stream_session`` polls with a small positive timeout (idle) or 0.0
-        (active). The adapter never blocks on recv — the relay has its own
-        read thread for the client->provider leg, so reading the relay socket
-        is only a fallback. Frames already in the buffer drain first. A blocking
-        recv for the leftover frames would have stalled the microphone."""
-        del timeout  # never blocks — the worker owns the clock
+        (active). Frames already in the buffer drain first. The socket's blocking
+        mode is NEVER touched: readability is ``select``'s question, not a reason
+        to flip the socket to non-blocking — a poll that left it there would turn
+        the next ``sendall`` into an EAGAIN the moment the send buffer was full,
+        and the session into a batch fallback. When a frame has started arriving
+        it is read WHOLE in the socket's own timeout mode; a frame that cannot
+        complete is a dead stream, and the adapter closes. A quiet socket answers
+        an empty list, so the polling loop owns the clock."""
         frames = list(self._buf_in)
         self._buf_in.clear()
         if frames:
             return frames
-        # Try one non-blocking read for frames the relay has not yet written
-        # through us. If anything arrives we hand it back, and we stop looping on
-        # EAGAIN (a frame would block) — the polling loop is what comes back.
         if self._sock is None or self.closed:
             return []
-        self._sock.settimeout(0.0)
         try:
-            head = self._sock.recv(5)
-        except (BlockingIOError, OSError):
+            ready, _, _ = select.select([self._sock], [], [], timeout)
+        except (OSError, ValueError):
+            self.closed = True
             return []
-        if not head or len(head) < 5:
+        if not ready:
+            return []
+        head = self._recv_exact(5)
+        if head is None:
             self.closed = True
             return []
         opcode = head[0]
         length = int.from_bytes(head[1:5], "big")
-        payload = b""
-        while len(payload) < length:
-            try:
-                chunk = self._sock.recv(length - len(payload))
-            except OSError:
-                self.closed = True
-                return []
-            if not chunk:
-                self.closed = True
-                return []
-            payload += chunk
+        payload = self._recv_exact(length) if length else b""
+        if payload is None:
+            self.closed = True
+            return []
         # A control frame is meaningful with an empty payload: a bare close
         # opcode and a zero length is the provider hanging up, so the length
         # guard must not swallow it — the session ends on that frame.
