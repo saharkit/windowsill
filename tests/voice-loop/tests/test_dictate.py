@@ -2580,9 +2580,12 @@ class _CloseRefusesOnce(socket.socket):
 class _SocketModuleWhoseClosesRefuse:
     """The ``dictate._socket`` surface with ``socket`` swapped for the refusing subclass."""
 
-    AF_UNIX = socket.AF_UNIX
+    # getattr, not attribute access: the class body runs at import, and the Windows
+    # socket module has no AF_UNIX to mirror. The stand-in only ever reaches a real
+    # socket through needs_af_unix tests, which skip where these stay None.
+    AF_UNIX = getattr(socket, "AF_UNIX", None)
     SOCK_STREAM = socket.SOCK_STREAM
-    SHUT_WR = socket.SHUT_WR
+    SHUT_WR = getattr(socket, "SHUT_WR", None)
 
     @staticmethod
     def socket(*args, **kwargs):
