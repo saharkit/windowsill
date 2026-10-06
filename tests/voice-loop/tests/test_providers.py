@@ -49,18 +49,11 @@ def test_no_dispatch_path_compares_a_provider_against_a_literal():
     ones that decide where a request goes. The idiomatic ``.get()`` spelling is the other one a
     naive grep misses, and is covered by ``_PROVIDER_BRANCH`` (see the self-test below).
 
-    fix(#5816): the only legitimate ``provider ==`` in the plugin's code is the Three-step
-    STT key resolution (``_stt_key_from_env`` in ``voice_mcp.py``), which gates the TTS-key
-    borrow on the ElevenLabs STT-and-TTS condition. That is a configuration predicate, not a
-    dispatch site — the request still goes through the provider entry's ``request()`` and
-    ``transcript()`` methods. The grep is exempted from that one site so the credential-closure
-    change can ship without rewriting a one-line predicate into a registry lookup.
+    This file is exempt from its own rule: the pattern below is data, and the string it looks for
+    has to be written down somewhere.
     """
     offenders = []
     for path in sorted(_SCRIPTS.glob("*.py")):
-        if path.name == "voice_mcp.py":
-            # Exempt: the Three-step STT key resolution is a config predicate, not a dispatch.
-            continue
         for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
             if _PROVIDER_BRANCH.search(line):
                 offenders.append(f"{path.name}:{number}: {line.strip()}")
@@ -442,9 +435,9 @@ def test_the_credentials_home_rule_lives_on_the_entry():
     """ElevenLabs is the one provider that accepts the TTS key for STT, and that is a FIELD now —
     the fallback list, in order, most-specific first. The borrow is gated by the TTS provider name
     (windowsill#5867), so the predicate is keyed on ``tts_provider`` rather than the entry alone.
-    The entry exposes its candidates as ``key_env_fallbacks`` and the dispatch site
-    (``providers.effective_key_envs``) reads the per-entry ``fallback_vendors`` set rather than
-    branching on the provider name."""
+    The entry exposes its candidates as ``key_env_fallbacks`` and the relay's key resolution
+    (``_stt_key_from_env`` in ``voice_mcp.py``) reads the per-entry ``fallback_vendors`` data
+    rather than branching on the provider name."""
     elevenlabs = providers.STT_PROVIDERS["elevenlabs"]
     openai = providers.STT_PROVIDERS["openai"]
     deepgram = providers.STT_PROVIDERS["deepgram"]
@@ -455,27 +448,24 @@ def test_the_credentials_home_rule_lives_on_the_entry():
     )
     assert openai.key_envs("MY_KEY") == ("MY_KEY",)
     assert deepgram.key_envs("MY_KEY") == ("MY_KEY",)
-    # the dispatch site (``effective_key_envs``) activates the fallbacks only when the tts
-    # provider matches the entry's ``fallback_vendors`` set — the same-vendor rule
-    assert providers.effective_key_envs(elevenlabs, "VOICE_LOOP_STT_API_KEY", "elevenlabs") == (
-        "VOICE_LOOP_STT_API_KEY",
-        "VOICE_LOOP_TTS_API_KEY",
-    )
-    assert providers.effective_key_envs(openai, "MY_KEY", "elevenlabs") == ("MY_KEY",)
-    assert providers.effective_key_envs(deepgram, "MY_KEY", "elevenlabs") == ("MY_KEY",)
+    # the relay activates the fallback only when the request's tts_vendor is inside the
+    # entry's ``fallback_vendors`` data — the same-vendor rule, as data per entry
+    assert elevenlabs.fallback_vendors == ("elevenlabs",)
+    assert openai.fallback_vendors == ()
+    assert deepgram.fallback_vendors == ()
 
 
 def test_elevenlabs_stt_key_envs_refuses_the_tts_borrow_for_other_vendors():
     """The same-vendor rule (windowsill#5867) closes the credential leak: an OpenAI or Deepgram
-    TTS key must NEVER be offered to api.elevenlabs.io. An UNSET ``tts_provider`` resolves through
-    the registry's default (OpenAI, ``providers.DEFAULT_TTS``) and so also refuses the borrow —
-    a user on a local TTS backend who relied on ``VOICE_LOOP_TTS_API_KEY`` must now set
-    ``stt.cloud.api_key_env`` or ``tts.cloud.provider: "elevenlabs"`` explicitly."""
+    TTS key must NEVER be offered to api.elevenlabs.io. As registry data that is the shape of the
+    ``fallback_vendors`` set itself — every tts_vendor outside it fails the membership test the
+    relay applies, so an unset or differently-vendored TTS config refuses the borrow."""
     elevenlabs = providers.STT_PROVIDERS["elevenlabs"]
+    assert set(elevenlabs.fallback_vendors) == {"elevenlabs"}
     for tts in ("openai", "deepgram", ""):
-        assert providers.effective_key_envs(elevenlabs, "VOICE_LOOP_STT_API_KEY", tts) == (
-            "VOICE_LOOP_STT_API_KEY",
-        ), f"tts_provider={tts!r} must not borrow the TTS key"
+        assert tts not in elevenlabs.fallback_vendors, (
+            f"tts_vendor={tts!r} must not borrow the TTS key"
+        )
 
 
 # --- the comparison surface ----------------------------------------------------------------------

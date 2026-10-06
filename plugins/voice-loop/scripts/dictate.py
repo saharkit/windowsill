@@ -536,20 +536,6 @@ def resolve_settings(config: dict, system: str) -> dict:
     }
 
 
-def read_key(environ) -> str:
-    """Whether the STT side has a credential configured.
-
-    This script no longer reads the key itself — the voice-loop MCP server holds it and
-    answers STT over its Unix-domain relay. What this function returns is whether the
-    relay has anything to answer: a non-empty ``$CLAUDE_PLUGIN_OPTION_STT_API_KEY``
-    means the relay will produce a transcript; an empty value means the relay will
-    answer ``no-key`` and the script falls back to local whisper. The function takes
-    ``environ`` for testability; the live caller passes ``os.environ``.
-    """
-    plugin_option = environ.get("CLAUDE_PLUGIN_OPTION_STT_API_KEY", "")
-    return plugin_option.strip()
-
-
 # Names of settings removed in the credential-closure change. A config that still
 # carries any of them gets one log line — never a read. The policy test (the
 # repo-root tests/test_credential_policy.py) allows the names to appear HERE, as

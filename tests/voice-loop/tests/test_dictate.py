@@ -211,17 +211,6 @@ def test_stt_cloud_endpoint_defaults_to_empty():
     assert dictate.resolve_settings({}, "Linux")["cloud_endpoint"] == ""
 
 
-# --- read_key: only the userConfig option; whitespace stripped, never from argv --------------
-
-
-def test_user_config_option_is_the_only_key_source():
-    """The cloud STT key is delivered by the harness as $CLAUDE_PLUGIN_OPTION_STT_API_KEY
-    only — key_file and api_key_env fallbacks were removed in fix(#5816)."""
-    assert dictate.read_key({}) == ""
-    assert dictate.read_key({"CLAUDE_PLUGIN_OPTION_STT_API_KEY": " sk-with-whitespace \n"}) == "sk-with-whitespace"
-    assert dictate.read_key({"CLAUDE_PLUGIN_OPTION_STT_API_KEY": "sk-stripped"}) == "sk-stripped"
-
-
 def test_oversized_config_is_ignored(tmp_path):
     """L2: a malformed giant config must fail closed instead of consuming the hotkey process."""
     config = tmp_path / "config.json"
@@ -1102,15 +1091,6 @@ def test_non_utf8_config_is_ignored_and_logged(state):
 def test_absent_config_stays_silent(state):
     assert dictate.load_config(str(state / "absent.json")) == {}
     assert not (state / "dictate.log").exists()
-
-
-def test_non_utf8_key_file_falls_back_to_env_and_never_logs_content(state):
-    # fix(#5816): the key_file / api_key_env fallbacks were removed. The STT key now
-    # comes from $CLAUDE_PLUGIN_OPTION_STT_API_KEY only. The non-UTF-8-key-file test
-    # shape no longer applies: the function does not read a key file at all.
-    assert dictate.read_key({}) == ""
-    assert dictate.read_key({"CLAUDE_PLUGIN_OPTION_STT_API_KEY": "  \t  "}) == ""
-    assert dictate.read_key({"CLAUDE_PLUGIN_OPTION_STT_API_KEY": "real-key"}) == "real-key"
 
 
 # --- applescript_escape: config-controlled text cannot break out of the literal -----------------

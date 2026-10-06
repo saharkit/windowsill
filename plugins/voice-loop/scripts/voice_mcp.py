@@ -14,8 +14,9 @@ One stdlib stdio MCP server that does two unrelated jobs:
 
 The server holds ONE thing of its own — the two plugin userConfig values, delivered as
 ``CLAUDE_PLUGIN_OPTION_TTS_API_KEY`` and ``CLAUDE_PLUGIN_OPTION_STT_API_KEY`` in its env
-block. The relay resolves the STT key itself in three steps (STT key, TTS key under
-three conditions, else ``no-key``) and never reads ``config.json``.
+block. The relay resolves the STT key itself in three steps (the STT key; the TTS key
+only when the resolved registry entry's ``fallback_vendors`` admits the request's
+``tts_vendor``; else ``no-key``) and never reads ``config.json``.
 
 The streaming TTS over the resident websocket (``speak.py`` still uses ``wsclient``)
 keeps its key passed directly by the holder process — that path is unchanged.
@@ -107,15 +108,15 @@ def _read_plugin_version() -> str:
 # --- key resolution ---------------------------------------------------------
 
 
-def _stt_key_from_env(provider: str, tts_vendor: str) -> str:
+def _stt_key_from_env(entry: providers.SttProvider, tts_vendor: str) -> str:
     """The STT key, resolved in three steps — never through ``key_envs``.
 
     1. ``CLAUDE_PLUGIN_OPTION_STT_API_KEY`` if non-empty.
-    2. else, ONLY when ALL three conditions hold:
-       - the request names provider ``elevenlabs``,
-       - ``CLAUDE_PLUGIN_OPTION_STT_API_KEY`` is empty,
-       - the request carries ``"tts_vendor": "elevenlabs"``,
-       then ``CLAUDE_PLUGIN_OPTION_TTS_API_KEY``.
+    2. else, ONLY when the request's ``tts_vendor`` is in the resolved entry's
+       ``fallback_vendors`` — registry DATA, not a provider-name comparison here —
+       then ``CLAUDE_PLUGIN_OPTION_TTS_API_KEY``. ElevenLabs is the only entry
+       that carries a non-empty set, so no other provider's STT request can ever
+       borrow the TTS key.
     3. else ``""`` — the caller responds ``no-key``.
 
     The relay does not call ``providers.SttProvider.key_envs`` — those return env-var
@@ -125,7 +126,7 @@ def _stt_key_from_env(provider: str, tts_vendor: str) -> str:
     stt = os.environ.get(ENV_STT_KEY, "").strip()
     if stt:
         return stt
-    if provider == "elevenlabs" and tts_vendor == "elevenlabs":
+    if tts_vendor in entry.fallback_vendors:
         return os.environ.get(ENV_TTS_KEY, "").strip()
     return ""
 
@@ -218,6 +219,10 @@ def _post_provider(
     ``ProxyHandler({})``. Each provider's own request builder knows its own
     auth header (Bearer / xi-api-key / Token), its own path, its own field
     names and its own content type — the relay no longer spells any of those.
+    The entry's ``content_type`` rides as the ``Content-Type`` header the way
+    ``dictate.py``'s ``_post_bytes`` sends it: without it a multipart body
+    ships as ``application/x-www-form-urlencoded`` and the provider cannot
+    parse the form at all.
     """
     # The entry's endpoint() chooses among cloud_endpoint / default_host /
     # endpoint; the relay hands the entry the request line's "endpoint" under
@@ -236,7 +241,7 @@ def _post_provider(
     req = urllib.request.Request(
         request.url,
         data=request.body,
-        headers=request.headers,
+        headers={"Content-Type": request.content_type, **request.headers},
         method="POST",
     )
     try:
@@ -386,9 +391,10 @@ def _serve_one_client(client_sock: _socket.socket, addr) -> None:
                 ).encode()
             )
             return
-        # Three-step STT key resolution (R3): STT key, TTS key only when
-        # provider == "elevenlabs" AND tts_vendor == "elevenlabs", else "".
-        key = _stt_key_from_env(provider_name, parsed.get("tts_vendor", ""))
+        # Three-step STT key resolution: the STT key; the TTS key only when the
+        # request's tts_vendor is in the entry's fallback_vendors (registry data
+        # — the relay holds no provider-name comparison); else no-key.
+        key = _stt_key_from_env(entry, parsed.get("tts_vendor", ""))
         if not key:
             client_sock.sendall((json.dumps(_failed("no-key")) + "\n").encode())
             return

@@ -20,11 +20,16 @@ import json
 import os
 import socket as _socket
 import struct
+import threading
 import urllib.error
+import urllib.parse
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest import mock
 
 import pytest
+
+import providers
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 VOICE_MCP = REPO_ROOT / "plugins" / "voice-loop/scripts/voice_mcp.py"
@@ -523,35 +528,294 @@ def test_relay_empty_transcript_is_success():
     assert err is None
 
 
-# --- 4. STT key fallback (R3) ----------------------------------------------
+# --- 3b. END-TO-END: real provider HTTP, real AF_UNIX relay, real client -----
+#
+# Nothing in this section mocks providers, urllib or the socket. A stdlib
+# http.server answers on an ephemeral loopback port with the provider's real
+# batch transcript shape, the relay serves one client over a real AF_UNIX socket
+# bound the way the relay binds it, and the production client
+# (``dictate._relay_transcribe``) dials it. Loopback http:// may carry a
+# credential — ``providers.clear_text_credential_error`` admits literal loopback
+# hosts — which is what lets the relay POST the key at this server.
 
 
-def test_stt_key_fallback_elevenlabs_all_three_conditions():
-    """The relay applies the TTS-key fallback for ElevenLabs STT only when ALL
-    three conditions hold: provider=elevenlabs, STT key empty, tts_vendor=elevenlabs."""
+# The fixed transcript each provider's real shape answers with, and the body
+# marks that prove the ENTRY's own part and field names made it onto the wire
+# (deepgram has none: its WAV is the whole body, not a multipart part).
+_E2E_TRANSCRIPTS = {
+    "openai": "the openai entry built this request",
+    "elevenlabs": "the elevenlabs entry built this request",
+    "deepgram": "the deepgram entry built this request",
+}
+_E2E_BODY_MARKS = {
+    "openai": (b'name="model"', b'name="language"', b'name="file"'),
+    "elevenlabs": (b'name="model_id"', b'name="language_code"', b'name="file"'),
+    "deepgram": (),
+}
+# The auth header each entry's own builder spells, with the STT key in it.
+_E2E_AUTH = {
+    "openai": ("authorization", "Bearer test-stt-key"),
+    "elevenlabs": ("xi-api-key", "test-stt-key"),
+    "deepgram": ("authorization", "Token test-stt-key"),
+}
+
+
+def _e2e_transcript_doc(provider_name):
+    """The provider's real batch response shape — the document its own
+    ``transcript()`` walks. Deepgram nests; openai and elevenlabs are flat."""
+    if provider_name == "deepgram":
+        return {
+            "results": {
+                "channels": [{"alternatives": [{"transcript": _E2E_TRANSCRIPTS["deepgram"]}]}]
+            }
+        }
+    return {"text": _E2E_TRANSCRIPTS[provider_name]}
+
+
+class _RecordingSTTHandler(BaseHTTPRequestHandler):
+    """Records method, path, every header and the raw body of one provider POST,
+    then answers with the transcript document set on the server instance."""
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length") or 0)
+        body = self.rfile.read(length)
+        self.server.requests.append(
+            {
+                "method": self.command,
+                "path": self.path,
+                "headers": {k.lower(): v for k, v in self.headers.items()},
+                "body": body,
+            }
+        )
+        payload = json.dumps(self.server.transcript_doc).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def log_message(self, _fmt, *_args):
+        pass
+
+
+def _start_provider_http_server(doc):
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), _RecordingSTTHandler)
+    httpd.requests = []
+    httpd.transcript_doc = doc
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    return httpd
+
+
+def _serve_one_relay_connection(module, listener):
+    """Accept exactly one client on the bound relay socket and serve it."""
+    conn, addr = listener.accept()
+    module._serve_one_client(conn, addr)
+
+
+def _e2e_relay_dir(tmp_path, monkeypatch):
+    """The relay socket directory, created the way the relay creates it: 0700,
+    under a runtime dir the client's ``_relay_socket_path`` resolves to."""
+    runtime = tmp_path / "runtime"
+    sock_dir = runtime / "voice-loop"
+    os.makedirs(sock_dir, mode=0o700)
+    os.chmod(sock_dir, 0o700)
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(runtime))
+    monkeypatch.setenv("CLAUDE_PLUGIN_OPTION_STT_API_KEY", "test-stt-key")
+    monkeypatch.setenv("CLAUDE_PLUGIN_OPTION_TTS_API_KEY", "")
+    return sock_dir
+
+
+@pytest.mark.parametrize("provider_name", sorted(providers.STT_PROVIDERS))
+def test_relay_end_to_end_real_http_real_socket_real_client(provider_name, tmp_path, monkeypatch):
+    """One full round trip per entry in the real registry, with nothing stubbed
+    at the request layer: the production client dials a relay bound the way the
+    relay binds it, the relay resolves the entry from the registry and builds
+    the POST through the entry's own request builder, and a real stdlib http
+    server on an ephemeral loopback port records what arrived.
+
+    The assertions pin, in order: the reply is a clean ``ok`` (no broken pipe,
+    no timeout); the server saw the path the ENTRY builds; the ``Content-Type``
+    equals the entry's own, multipart boundary included; the auth header is in
+    the entry's own shape carrying the STT key; and the entry's own part and
+    field names are in the body."""
+    if not hasattr(_socket, "AF_UNIX"):
+        pytest.skip("no AF_UNIX on this platform")
     module = _import_voice_mcp()
-    env = {
-        "CLAUDE_PLUGIN_OPTION_TTS_API_KEY": "test-tts-key",
-    }
-    # All three -> TTS key
-    with mock.patch.dict(os.environ, {"CLAUDE_PLUGIN_OPTION_STT_API_KEY": ""} | env, clear=False):
-        assert module._stt_key_from_env("elevenlabs", "elevenlabs") == "test-tts-key"
-    # provider not elevenlabs -> STT key only, even if empty
-    with mock.patch.dict(os.environ, {"CLAUDE_PLUGIN_OPTION_STT_API_KEY": ""} | env, clear=False):
-        assert module._stt_key_from_env("openai", "elevenlabs") == ""
-    # tts_vendor not elevenlabs -> STT key only
-    with mock.patch.dict(os.environ, {"CLAUDE_PLUGIN_OPTION_STT_API_KEY": ""} | env, clear=False):
-        assert module._stt_key_from_env("elevenlabs", "openai") == ""
-    # STT key set -> STT key wins, regardless of provider / tts_vendor
-    with mock.patch.dict(
-        os.environ, {"CLAUDE_PLUGIN_OPTION_STT_API_KEY": "stt-key-set"} | env, clear=False
-    ):
-        assert module._stt_key_from_env("openai", "openai") == "stt-key-set"
-        assert module._stt_key_from_env("elevenlabs", "elevenlabs") == "stt-key-set"
-    # deepgram with empty STT key and tts_vendor=elevenlabs -> "" (the
-    # R3 case: not elevenlabs STT, so the TTS key does NOT back-stop it)
-    with mock.patch.dict(os.environ, {"CLAUDE_PLUGIN_OPTION_STT_API_KEY": ""} | env, clear=False):
-        assert module._stt_key_from_env("deepgram", "elevenlabs") == ""
+    client_module = _import_dictate()
+    entry = providers.STT_PROVIDERS[provider_name]
+
+    httpd = _start_provider_http_server(_e2e_transcript_doc(provider_name))
+    try:
+        endpoint = f"http://127.0.0.1:{httpd.server_address[1]}"
+        sock_dir = _e2e_relay_dir(tmp_path, monkeypatch)
+        listener = module._bind_socket(str(sock_dir / "stt.sock"))
+        assert listener is not None
+        relay_thread = threading.Thread(
+            target=_serve_one_relay_connection, args=(module, listener), daemon=True
+        )
+        relay_thread.start()
+        try:
+            wav = _make_wav_header()
+            reply = client_module._relay_transcribe(
+                {
+                    "stt_model": entry.default_model,
+                    "language": "en",
+                    "tts_vendor": "openai",
+                    "timeout": 5.0,
+                    "cloud_endpoint": endpoint,
+                    "stt_prompt": "",
+                },
+                entry,
+                wav,
+            )
+            relay_thread.join(timeout=20)
+        finally:
+            listener.close()
+
+        # The whole round trip: a clean ok reply, the fixed transcript the
+        # entry's own parser read out of the real HTTP response.
+        assert reply == {"status": "ok", "text": _E2E_TRANSCRIPTS[provider_name]}
+        [recorded] = httpd.requests
+        assert recorded["method"] == "POST"
+
+        # The ENTRY, not the relay, spelled this request. Rebuild it through
+        # the entry with the boundary the relay chose (it is visible in the
+        # recorded Content-Type) and compare path, headers and body byte for byte.
+        content_type = recorded["headers"].get("content-type", "")
+        boundary = content_type.split("boundary=", 1)[1] if "boundary=" in content_type else ""
+        expected = entry.request(
+            {
+                "stt_model": entry.default_model,
+                "language": "en",
+                "stt_prompt": "",
+                "cloud_endpoint": endpoint,
+                "endpoint": "",
+            },
+            "test-stt-key",
+            _make_wav_header(),
+            boundary,
+        )
+        split = urllib.parse.urlsplit(expected.url)
+        expected_path = split.path + (f"?{split.query}" if split.query else "")
+        assert recorded["path"] == expected_path
+        # The entry's content type on the wire, multipart boundary included.
+        assert content_type == expected.content_type
+        # the entry's own auth header, with the STT key in it
+        for name, value in expected.headers.items():
+            assert recorded["headers"].get(name.lower()) == value
+        auth_name, auth_value = _E2E_AUTH[provider_name]
+        assert recorded["headers"].get(auth_name) == auth_value
+        # the entry's own part and field names, in so many bytes
+        assert recorded["body"] == expected.body
+        for mark in _E2E_BODY_MARKS[provider_name]:
+            assert mark in recorded["body"]
+        if provider_name == "deepgram":
+            assert recorded["body"] == _make_wav_header()  # the WAV IS the body
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def test_relay_end_to_end_request_line_and_wav_in_one_recv(tmp_path, monkeypatch):
+    """The request line and the WAV can arrive in the relay's FIRST recv — one
+    ``sendall`` on a stream socket leaves them in the socket buffer together,
+    and the relay must split on the first newline and carry the remainder into
+    the body. Same real http server and real relay; the client here is a raw
+    socket sending one buffer, because the production client sends two."""
+    if not hasattr(_socket, "AF_UNIX"):
+        pytest.skip("no AF_UNIX on this platform")
+    module = _import_voice_mcp()
+    provider_name = "openai"
+    entry = providers.STT_PROVIDERS[provider_name]
+
+    httpd = _start_provider_http_server(_e2e_transcript_doc(provider_name))
+    try:
+        endpoint = f"http://127.0.0.1:{httpd.server_address[1]}"
+        sock_dir = _e2e_relay_dir(tmp_path, monkeypatch)
+        sock_path = str(sock_dir / "stt.sock")
+        listener = module._bind_socket(sock_path)
+        assert listener is not None
+        relay_thread = threading.Thread(
+            target=_serve_one_relay_connection, args=(module, listener), daemon=True
+        )
+        relay_thread.start()
+        try:
+            wav = _make_wav_header()
+            request_line = json.dumps(
+                {
+                    "provider": provider_name,
+                    "endpoint": endpoint,
+                    "model": entry.default_model,
+                    "language": "en",
+                    "tts_vendor": "openai",
+                    "timeout": 5.0,
+                    "stt_prompt": "",
+                }
+            )
+            sock = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+            sock.settimeout(20.0)
+            try:
+                sock.connect(sock_path)
+                # ONE buffer: the line, the newline, and the WAV ride together.
+                sock.sendall(request_line.encode("utf-8") + b"\n" + wav)
+                sock.shutdown(_socket.SHUT_WR)
+                buf = b""
+                while not buf.endswith(b"\n"):
+                    chunk = sock.recv(65536)
+                    if not chunk:
+                        break
+                    buf = buf + chunk
+            finally:
+                sock.close()
+            relay_thread.join(timeout=20)
+        finally:
+            listener.close()
+
+        reply = json.loads(buf[:-1].decode("utf-8"))
+        assert reply == {"status": "ok", "text": _E2E_TRANSCRIPTS[provider_name]}
+        [recorded] = httpd.requests
+        assert recorded["path"].startswith("/v1/audio/transcriptions")
+        assert recorded["headers"].get("content-type", "").startswith(
+            "multipart/form-data; boundary="
+        )
+        # the WAV bytes that shared the first recv with the request line are the
+        # ones that reached the provider
+        assert wav in recorded["body"]
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+# --- 4. STT key fallback (registry data, not a provider literal) ------------
+
+
+def test_stt_key_resolution_table_through_the_entry_data(monkeypatch):
+    """The same-vendor borrow is registry data: step 2 of the relay's key
+    resolution holds only when the request's ``tts_vendor`` is in the resolved
+    entry's ``fallback_vendors``, and ElevenLabs is the only entry that carries
+    a non-empty set — so a deepgram or openai STT config is never handed the
+    ElevenLabs TTS key, whatever ``tts_vendor`` says. The STT key set wins for
+    every entry."""
+    module = _import_voice_mcp()
+    elevenlabs = providers.STT_PROVIDERS["elevenlabs"]
+    openai = providers.STT_PROVIDERS["openai"]
+    deepgram = providers.STT_PROVIDERS["deepgram"]
+
+    monkeypatch.setenv("CLAUDE_PLUGIN_OPTION_STT_API_KEY", "")
+    monkeypatch.setenv("CLAUDE_PLUGIN_OPTION_TTS_API_KEY", "test-tts-key")
+    # empty STT key + tts_vendor inside the entry's fallback_vendors -> TTS key
+    assert module._stt_key_from_env(elevenlabs, "elevenlabs") == "test-tts-key"
+    # elevenlabs STT with any other tts_vendor -> no key
+    assert module._stt_key_from_env(elevenlabs, "openai") == ""
+    # a deepgram STT config is never handed an ElevenLabs key
+    assert module._stt_key_from_env(deepgram, "elevenlabs") == ""
+    assert module._stt_key_from_env(openai, "elevenlabs") == ""
+
+    # the STT key set wins for every entry, whatever tts_vendor says
+    monkeypatch.setenv("CLAUDE_PLUGIN_OPTION_STT_API_KEY", "stt-key-set")
+    for entry in (elevenlabs, openai, deepgram):
+        assert module._stt_key_from_env(entry, "elevenlabs") == "stt-key-set"
+        assert module._stt_key_from_env(entry, "openai") == "stt-key-set"
 
 
 # --- 5. typed-failure reasons --------------------------------------------
