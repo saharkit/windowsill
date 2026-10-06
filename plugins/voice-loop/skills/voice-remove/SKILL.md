@@ -2,7 +2,7 @@
 name: voice-remove
 description: Uninstall the voice-loop contour from this machine — stop and disable the local speech service, unbind the push-to-talk hotkey, delete the config, state and model caches the user confirms (keeping key files unless they say otherwise), take the spoken-summary convention line back out of CLAUDE.md, and print exactly what was intentionally left behind. Use when the user asks to remove, uninstall, disable, undo or clean up voice-loop, voice, dictation or speak-back.
 argument-hint: "[all|service|hotkey|config|models|convention]"
-allowed-tools: [Read, Edit, Glob, AskUserQuestion]
+allowed-tools: [Read, Edit(~/.config/skhd/skhdrc), Edit(~/.claude/CLAUDE.md), Edit(./CLAUDE.md), Glob, AskUserQuestion]
 ---
 
 # voice-remove — take the contour back off

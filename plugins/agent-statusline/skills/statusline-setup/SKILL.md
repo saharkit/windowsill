@@ -1,7 +1,7 @@
 ---
 name: statusline-setup
 description: Install the agent-statusline status line for Claude Code — copy the renderer to ~/.claude/tools/, write the statusLine key into ~/.claude/settings.json preserving every other key, and prove it works by rendering the bundled fixture. Use when the user asks to set up, install or enable a status line, or to show context use, weekly spend or the model name in Claude Code.
-allowed-tools: [Read, Write, Edit, AskUserQuestion]
+allowed-tools: [Read, Edit(~/.claude/tools/agent-statusline.js), Edit(~/.claude/settings.json), Edit(~/.claude/settings.json.bak), AskUserQuestion]
 ---
 
 # statusline-setup — install the agent-statusline status line
