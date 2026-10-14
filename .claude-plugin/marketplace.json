@@ -90,7 +90,7 @@
     {
       "name": "agent-statusline",
       "description": "One line at the bottom of Claude Code: how much of the context window is gone, how much of the weekly budget is spent, and which model is answering. Every figure is read from the payload the harness pipes to the script on stdin, so nothing is host-specific. Needs node and nothing else.",
-      "version": "0.2.2",
+      "version": "0.2.3",
       "author": {
         "name": "Sahar"
       },
