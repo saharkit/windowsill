@@ -35,7 +35,9 @@ def run_helper(tmp_path: Path, *args: str, extra_env: dict[str, str] | None = No
 
 
 def settings_path(tmp_path: Path) -> Path:
-    return tmp_path / "home/.claude/settings.json"
+    path = tmp_path / "home/.claude/settings.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path
 
 
 def digest(path: Path) -> str:
@@ -114,6 +116,41 @@ def test_missing_settings_has_no_backup_and_remove_is_noop(tmp_path):
     assert result.returncode == 0, result.stderr
     assert not path.exists()
     assert not list(path.parent.glob("settings.json.bak.*"))
+
+
+COLLIDE_PRELOAD = (
+    "const fs=require('node:fs'); const path=require('node:path'); "
+    "const d=path.join(require('node:os').homedir(), '.claude'); "
+    "fs.writeFileSync(path.join(d, `.settings.json.tmp-${process.pid}-${'b'.repeat(32)}`), 'keep'); "
+    "const c=require('node:crypto'); c.randomBytes=()=>Buffer.from('b'.repeat(32),'hex');"
+)
+
+
+@pytest.mark.parametrize("failure", ["read-only-directory", "temp-collision-exhaustion"])
+def test_failed_first_set_leaves_settings_absent(tmp_path, failure):
+    """L2 GAP: catches a failed first-time set that leaves an empty, partial or backup settings file."""
+    path = settings_path(tmp_path)
+    extra_env = None
+    if failure == "read-only-directory":
+        if os.geteuid() == 0:
+            pytest.skip("read-only directory semantics are bypassed by root")
+        path.parent.chmod(0o555)
+    else:
+        preload = tmp_path / "collide.cjs"
+        preload.write_text(COLLIDE_PRELOAD)
+        extra_env = {"NODE_OPTIONS": f"--require={preload}"}
+    try:
+        result = run_helper(tmp_path, "set", STATUS_PATH, extra_env=extra_env)
+    finally:
+        path.parent.chmod(0o755)
+    assert result.returncode != 0
+    assert result.stderr
+    assert result.stdout == ""
+    assert not path.exists()
+    assert not list(path.parent.glob("settings.json.bak.*"))
+    assert sorted(p.read_text() for p in path.parent.glob(".settings.json.tmp-*")) == (
+        ["keep"] if failure == "temp-collision-exhaustion" else []
+    )
 
 
 def test_backup_collision_and_stray_temp_are_safe(tmp_path):
