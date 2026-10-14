@@ -24,8 +24,9 @@ directory-listing acceptance test, run by `validate`), `test_directory_policy.py
 directory-policy acceptance test: no `Bash` in any skill's `allowed-tools`, and no fetcher piped into
 a shell anywhere under the plugins tree — both holds windowsill#5867 raised after #5816 merged,
 neither of which `claude plugin validate --strict` catches — run by the same CI job that runs
-`test_directory_listing.py`), and `test_credential_policy.py` (the credential-closure policy test for
-the voice-loop plugin, run by `validate`)), `tales/` (story content, not a plugin — the
+`test_directory_listing.py`), `test_credential_policy.py` (the credential-closure policy test for
+the voice-loop plugin, run by `validate`), and `test_statusline_settings.py` (the agent-statusline
+settings-helper test, run by `validate`)), `tales/` (story content, not a plugin — the
 told tales, the `canon/` core of universe-model laws and the entity registry, and `CONTRIBUTING.md`
 for tales), `LICENSE`, `.gitignore`, `.gitattributes`, `.claude/`, this file.
 

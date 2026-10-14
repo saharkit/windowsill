@@ -38,9 +38,8 @@ When the payload is missing the fields the renderer needs (`context_window_size`
 bundled fixture through the installed renderer, the way `/voice-setup` ends in a passing
 selftest.
 
-The install needs `node` and nothing else. There is no `jq`, no `npm install`, no
-`pip install`. The plugin itself does not run during install — it is a static script and a
-settings file.
+The install needs `node` and nothing else. There is no `npm install` or `pip install`. Setup
+runs the renderer once against the bundled fixture as its proof step.
 
 **The installation paths are POSIX-only.** The script lives at `~/.claude/tools/` and the
 settings file at `~/.claude/settings.json`; on Windows the file lives elsewhere and this
@@ -48,11 +47,15 @@ plugin is not the bridge for that.
 
 ## Remove
 
+Run `/statusline-remove` before uninstalling the plugin. Otherwise `statusLine` continues to
+invoke the copied renderer at `~/.claude/tools/agent-statusline.js` after the plugin and its
+remove skill are gone. If the plugin is already uninstalled, remove the `statusLine` key by hand
+and delete `~/.claude/tools/agent-statusline.js` before reinstalling it.
+
 `/statusline-remove` deletes only the `statusLine` key from `~/.claude/settings.json` and the
 copied renderer file. Every other settings key is untouched. It does not delete
-`~/.claude/settings.json.bak` — that is the user's own rollback file, made by
-`/statusline-setup` if `statusLine` was overwritten, and its retention is the user's
-decision.
+the timestamped backups — those are rollback files made when an existing settings file is
+changed, and their retention is the user's decision.
 
 ## Degradation
 
@@ -74,22 +77,23 @@ only.
 
 ## For developers
 
-The renderer is a plain Node script at `statusline.js`. Two fixtures ship in `fixtures/`:
-both pass through `node statusline.js < <fixture>` to produce a known line. The exact
+The renderer is a plain Node script at `statusline.js`. Three fixtures ship in `fixtures/`:
+each passes through `node statusline.js < <fixture>` to produce a known line. The exact
 rendered outputs:
 
 | fixture | rendered line |
 |---|---|
 | `payload-pro.json` | `◐ ctx 84k/200k (42%) wk 63%/5h 15% Opus 5` |
 | `payload-apikey.json` | `◐ ctx 84k/200k (42%) Opus 5` |
+| `fixtures/payload-blank.json` | fallback line for a blank payload |
 
 Off the happy path: unparseable or empty stdin prints nothing to stdout, prints one line
 naming the parse failure to stderr, and exits 1. Both fixtures exit 0.
 
 ## Eval suite
 
-No eval suite: the one skill writes the `statusLine` key of the user's Claude settings,
-which an eval's temporary home isolates, so a case would test the isolation, not the plugin.
+The two skills write and remove the `statusLine` key of the user's Claude settings. The settings
+helper is exercised under a temporary home by the shelf's test suite.
 
 ## License
 
