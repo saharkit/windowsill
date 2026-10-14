@@ -325,6 +325,9 @@ jobs:
       - name: directory policy (no Bash in allowed-tools, no pipe-to-shell)
         run: |
           python3 -m pytest tests/test_directory_policy.py
+      - name: agent-statusline settings helper
+        run: |
+          python3 -m pytest tests/test_statusline_settings.py
       # fix(#5816) — credential-closure policy: voice-loop takes provider keys only from
       # userConfig; the policy test refuses-first on the pre-change tree (f9a0faa) and
       # passes on the post-change tree, with the OBSOLETE_KEYS / providers.py exemptions
